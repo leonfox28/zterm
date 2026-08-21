@@ -184,11 +184,11 @@ zterm 是一个面向长时间远程终端任务的跨网络连接工具。用�
 
 ### Z. 第零阶段环境与公网 Relay
 
-- [ ] 当前开发机经“探测后补齐”具备精确固定的Rust/Cargo 1.98.0、rustfmt、Clippy、Cargo质量检查、Docker Engine/Compose和仓库固定Protobuf生成环境；已有Rust/Xcode/Homebrew配置未被无故覆盖，空workspace的check/fmt/clippy/test/deny命令通过，浮动stable升级不会绕过版本变更与质量门。
-- [ ] `deploy/relay` 只下载并校验官方 Iroh v1.0.3 `iroh-relay` release artifact，不包含自有转发实现；本地镜像固定上游版本/checksum和最终digest，Compose config、启动、health、私有metrics、日志轮转、停止与回滚smoke通过。
-- [ ] 本地验证通过后助手明确暂停并通知用户提供公网服务器连接方式；提供之前没有服务器连接尝试，SSH私钥、token、真实`.env`等秘密没有写入仓库、任务产物或日志。
-- [ ] 获得连接方式并完成只读preflight后，公网服务器以Docker运行单实例relay；`relay.zenithconsulting.cn` 的外部TLS与真实Iroh握手、宿主回环38451/9090、Everyone/no-limits、health和metrics隔离通过smoke。UDP/QAD保持关闭且没有防火墙变更；文档明确它是可选直连辅助而非relay回退依赖。
-- [ ] 固定digest回滚演练通过；relay停止不会影响本地开发环境，服务器与容器持久卷/日志中没有zterm终端明文、PairTicket或设备私钥。第零阶段证据完成前不进入第一阶段Gate 0。
+- [x] 当前开发机经“探测后补齐”具备精确固定的Rust/Cargo 1.98.0、rustfmt、Clippy、Cargo质量检查、Docker Engine/Compose和仓库固定Protobuf生成环境；已有Rust/Xcode/Homebrew配置未被无故覆盖，空workspace的check/fmt/clippy/test/deny命令通过，浮动stable升级不会绕过版本变更与质量门。
+- [x] `deploy/relay` 只下载并校验官方 Iroh v1.0.3 `iroh-relay` release artifact，不包含自有转发实现；本地镜像固定上游版本/checksum和最终digest，Compose config、启动、health、私有metrics、日志轮转、停止与回滚smoke通过。
+- [x] 本地验证通过后助手明确暂停并通知用户提供公网服务器连接方式；提供之前没有服务器连接尝试，SSH私钥、token、真实`.env`等秘密没有写入仓库、任务产物或日志。
+- [x] 获得连接方式并完成只读preflight后，公网服务器以Docker运行单实例relay；`relay.zenithconsulting.cn` 的外部TLS与真实Iroh握手、宿主回环38451/9090、Everyone/no-limits、health和metrics隔离通过smoke。UDP/QAD保持关闭且没有防火墙变更；文档明确它是可选直连辅助而非relay回退依赖。
+- [x] 固定digest回滚演练通过；relay停止不会影响本地开发环境，服务器与容器持久卷/日志中没有zterm终端明文、PairTicket或设备私钥。第零阶段证据完成前不进入第一阶段Gate 0。
 
 ### A. 安装、权限与进程生命周期
 

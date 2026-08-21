@@ -132,6 +132,10 @@ path events 和直连成功率，再依据证据决定是否需要 QAD-only 服�
 目标公开 GitHub 仓库已创建，`main` 已推送。首次 manual 开发工作流已从
 `43b06ff` 构建并公开发布 `zterm-relay-dev:phase-zero`，其 multi-platform
 digest、匿名拉取和 amd64/arm64 运行均已验证。Compose 项目已迁移到 1Panel
-根路径并通过公网握手；已部署的本地校验 arm64 image ID 仍是显式临时例外，
-只有生产 `zterm-relay` package 经稳定 release 产生真实 digest 后，才能完成
-生产 provenance 切换。`zterm-relay-dev` digest 不能替代该门禁。
+根路径并通过公网握手。稳定 Release `v0.1.0` 已从全绿提交 `b9cac37` 发布
+production index digest
+`sha256:c3ebd4398814aa7cfe21c145d277645f2e362b67965330500d52d1ce4c9e2da3`；
+匿名拉取、双架构运行、provenance/SBOM manifest 和 `:latest` 同 digest 均已
+验证。服务器已用无 `build` 回退的 Compose 固定该 digest，并实际回滚到
+原 bootstrap immutable image、通过 health/metrics/公网 authenticated
+handshake 后再恢复同一 production digest；恢复后的验收再次通过。

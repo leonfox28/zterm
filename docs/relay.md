@@ -152,12 +152,12 @@ Per [GitHub's package visibility documentation](https://docs.github.com/en/packa
 personal-account packages default to private. The OCI source label links these
 images to the public `leonfox28/zterm` repository so repository access
 permissions can be inherited, but GitHub explicitly states that this does not
-inherit repository visibility. The first development package is now public,
-as verified by an anonymous GHCR bearer pull. Verify the production
-package independently after its first stable-release run; if it is private,
-make it public for the default relay distribution or authenticate the
-deployment host with a read-only package credential. Never claim a channel or
-digest before that channel's workflow has actually succeeded.
+inherit repository visibility. The first development and production
+publications are public, as independently verified by anonymous GHCR bearer
+pulls. Future package names or channels still require their own visibility
+check; if one is deliberately private, authenticate the deployment host with a
+read-only package credential. Never claim a channel or digest before that
+channel's workflow has actually succeeded.
 
 ## Mandatory public-server checkpoint
 
@@ -288,13 +288,17 @@ block above documents the values and invariants, not authorization to overwrite
 an existing `/opt/1panel/docker/compose/zterm-relay` directory. Never silently
 fall back to a server-side build during deployment.
 
-The locally loaded, verified arm64 image used for the initial Phase Zero
-bootstrap is a temporary exception until a stable-release workflow publishes a
-real production GHCR digest. It may keep the running relay available, but all
-subsequent production releases and upgrades must come from the production
-package and use its immutable digest. A successful development-package build
-does not satisfy this gate. Moving the Compose project into the 1Panel root does
-not by itself turn that bootstrap image ID into a registry digest.
+The locally loaded, verified arm64 image served only as the initial Phase Zero
+bootstrap. Release `v0.1.0` completed the provenance switch: the selected
+server now uses
+`ghcr.io/leonfox28/zterm-relay@sha256:c3ebd4398814aa7cfe21c145d277645f2e362b67965330500d52d1ce4c9e2da3`
+through the digest-only Compose contract. The previous Compose, env, local
+image, and archive remain recoverable first-release rollback material. An
+explicit drill successfully switched the running service to that immutable
+bootstrap image, validated loopback health/metrics and the public authenticated
+Iroh handshake, then restored and revalidated the exact production digest. All
+future production upgrades must likewise come from the production package and
+use an immutable digest; a development-package build never satisfies this gate.
 
 Do not change `RELAY_PROXY_PORT=38451` for the selected server unless the
 existing OpenResty upstream is changed in the same maintenance window.
@@ -395,11 +399,31 @@ For upgrades, retain the prior digest and validated non-secret Compose model.
 Rollback never requires changing zterm protocol state because the relay stores
 no zterm sessions or payloads:
 
+The selected server's first production activation also retains its pre-v0.1.0
+Compose/`.env` backup and verified local bootstrap image. Starting with the
+next production release, the ordinary rollback target is the preceding
+production digest shown below. The first-release rollback exception has already
+been exercised end to end: the service ran successfully from the retained
+immutable bootstrap image and was then restored to the production digest.
+
 ```bash
+set -eu
 previous_image='ghcr.io/leonfox28/zterm-relay@sha256:<previous-digest>'
 sh ./validate-image-reference.sh "$previous_image" >/dev/null
 docker pull "$previous_image"
-RELAY_IMAGE="$previous_image" docker compose --env-file .env \
+
+# Persist the selected rollback digest; a one-command environment override
+# would leave `.env` pointing at the image that is being rolled back.
+cp -p .env ".env.pre-rollback-$(date -u +%Y%m%dT%H%M%SZ)"
+umask 077
+rollback_env=$(mktemp ./.env.rollback.XXXXXX)
+sed "s|^RELAY_IMAGE=.*$|RELAY_IMAGE=$previous_image|" .env >"$rollback_env"
+[ "$(grep -c '^RELAY_IMAGE=' "$rollback_env")" -eq 1 ]
+mv "$rollback_env" .env
+sh ./validate-image-reference.sh \
+  "$(sed -n 's/^RELAY_IMAGE=//p' .env)" >/dev/null
+
+docker compose --env-file .env \
   -f compose.reverse-proxy.yaml up -d --no-build --wait
 ```
 

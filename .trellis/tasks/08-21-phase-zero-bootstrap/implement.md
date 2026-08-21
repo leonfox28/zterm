@@ -71,7 +71,9 @@ Relay 的多架构、checksum、健康与暴露面测试以 `tests/relay/` 中�
 
 - 本机工具不自动卸载；停止 Colima 即可释放运行环境，且不删除用户数据。
 - Relay 通过 digest/版本化镜像回滚；Compose 配置保留上一份已验证版本。
-- 首次稳定 release 发布生产 `zterm-relay` digest 前保留已验证本地镜像作为
-  临时 bootstrap 例外；没有真实 workflow 输出时不得编造 registry digest，
-  开发 package digest 也不得用于生产，首次稳定发布后再切换并验证回滚。
+- 首次稳定 `v0.1.0` 已发布并切换到真实 production digest。服务器保留切换前
+  的 Compose/`.env`、本地 arm64 bootstrap image 与 tar 作为首发回滚材料；
+  已实际切回该 immutable bootstrap image、验证本地端点和公网 authenticated
+  handshake，再恢复并验证 production digest。后续升级保留上一生产 digest。
+  开发 package digest 永远不得用于生产回滚。
 - 不删除用户已有 Rust toolchain，不改写全局 shell 配置。

@@ -107,10 +107,10 @@ the remote `docker load` result matched the exact local image ID:
 These local IDs are not registry digests and are not valid references for a new
 production release. The repository now requires future production images to be
 published by `.github/workflows/relay-image.yml` and deployed with the exact
-GHCR multi-platform digest emitted by that run. No production digest has been
-recorded yet because no stable-release publication has completed; it must not
-be inferred from a mutable tag, copied from `zterm-relay-dev`, or invented in
-advance.
+GHCR multi-platform digest emitted by that run. They remain historical
+bootstrap and rollback evidence only; the first real production digest is
+recorded below and was not inferred from a mutable tag or copied from
+`zterm-relay-dev`.
 
 ## GHCR development publication evidence
 
@@ -134,6 +134,29 @@ reported `iroh-relay 1.0.3`. This proves the development publication channel;
 it is not a production deployment reference and is rejected by the production
 preflight.
 
+## GHCR production publication evidence
+
+[Zterm v0.1.0](https://github.com/leonfox28/zterm/releases/tag/v0.1.0) points
+to reviewed commit `b9cac371ad7a91647a7fd1e6690230f4cf1d8c35`. Its complete
+[main CI run](https://github.com/leonfox28/zterm/actions/runs/32461793456)
+passed before the Release was created. Release-triggered workflow
+[`32462016566`](https://github.com/leonfox28/zterm/actions/runs/32462016566)
+published only `ghcr.io/leonfox28/zterm-relay:0.1.0` and `:latest`; both tags
+resolve to immutable OCI index digest:
+
+```text
+sha256:c3ebd4398814aa7cfe21c145d277645f2e362b67965330500d52d1ce4c9e2da3
+```
+
+The index contains linux/amd64 runtime manifest
+`sha256:2495b15529589ed428b73830857dbb5691eb00d66352e487478e795c7c14a901`
+and linux/arm64 runtime manifest
+`sha256:a6d7348b28473967a320b1c20f8cf02145ebb9723aceca03d8282f68c5fcc4df`,
+plus one provenance/SBOM attestation manifest for each runtime platform. An
+anonymous GHCR bearer request returned HTTP 200 for the production index.
+Containers selected from both runtime platforms reported `iroh-relay 1.0.3`,
+and the existing development tag remained at its independent digest.
+
 ## Public reverse-proxy deployment evidence
 
 The selected server already terminates public TLS in same-host OpenResty and
@@ -152,20 +175,49 @@ The runtime Compose project has since been moved into the server's established
 that new working directory/config, and the authenticated public Iroh handshake
 passed again after migration. The previous source directory was recoverably
 renamed to `/opt/zterm-relay.pre-1panel-20260821` for rollback rather than
-deleted. The running image is still the verified local arm64 bootstrap image;
-switching it to GHCR remains pending the first stable production publication.
-The verified development digest is intentionally not accepted for that switch.
+deleted.
+
+Before the first production switch, a read-only preflight found that the live
+bootstrap Compose still contained its temporary local `build` fallback and did
+not yet have `validate-image-reference.sh`. The healthy bootstrap container was
+left running while the repository's digest-only Compose, env template, and
+validator were staged and checksum-verified. The old Compose, `.env`, and env
+template were preserved with suffix `pre-v0.1.0-20260821T0823Z`; the original
+arm64 image and archive were also retained. No other 1Panel Compose project was
+changed.
+
+The server then anonymously pulled the exact production digest above and a
+one-shot activation replaced only the zterm Relay container. The active
+Compose has no `build` section, `.env` pins the production package by digest,
+and Docker records the container's `Config.Image` as that same immutable
+reference. The recreated linux/arm64 container became healthy as UID/GID
+65532. The transient pull and activation jobs both exited successfully and did
+not install a persistent system service.
+
+A final production rollback drill then recreated the same Compose service from
+the retained immutable bootstrap image
+`sha256:26a76c210d87462e88026b31f388c92bcce8a586dafbe6824221b32493a352b5`
+with `--no-build`. That rollback became healthy and passed loopback health,
+private metrics, listener, and public authenticated Iroh-handshake checks. A
+second one-shot job restored the exact production digest, which again passed
+all of those checks. The active `.env` remained pinned to the production
+digest throughout; neither transient job installed a persistent service.
 
 The transferred archive was 4,505,088 bytes with SHA-256
 `b4a3fd2055a2a275ae588ce0486eee66afb4e98418a790b5ff619d9583a7ff5e`.
 After `docker load`, its linux/arm64 image ID exactly matched the locally
 verified `sha256:26a76c210d87462e88026b31f388c92bcce8a586dafbe6824221b32493a352b5`.
-Compose was rendered against that immutable ID and started with `--no-build`.
+The bootstrap Compose was rendered against that immutable ID and started with
+`--no-build`; it is no longer the active production image.
 
-Runtime inspection after both initial deployment and recovery confirmed:
+Evidence collected across the initial bootstrap deployment, its recovery
+drill, and the later production digest activation confirmed:
 
 - Docker health `healthy`, UID/GID 65532, read-only root filesystem, no
   privileges, all Linux capabilities dropped, and `no-new-privileges`;
+- the active container now uses
+  `ghcr.io/leonfox28/zterm-relay@sha256:c3ebd4398814aa7cfe21c145d277645f2e362b67965330500d52d1ce4c9e2da3`
+  with no server-side build fallback;
 - only host `127.0.0.1:38451/tcp` and `127.0.0.1:9090/tcp` are published;
   there is no UDP 7842 listener or firewall rule;
 - `/healthz` reports Iroh 1.0.3, `/generate_204` returns 204, private metrics
@@ -177,14 +229,19 @@ Runtime inspection after both initial deployment and recovery confirmed:
   a `/relay` WebSocket 101 preserving `iroh-relay-v2`;
 - the pinned Iroh 1.0.3 acceptance probe, using an ephemeral endpoint identity
   and `RelayConfig::new(url, None)`, completed the authenticated relay
-  handshake through the public URL;
-- while the same probe process remained active, a controlled relay restart was
-  observed as disconnected and then automatically reconnected with a new
-  authenticated relay connection;
-- a full Compose down/up drill removed only this stateless container and its
-  network, retained the pinned image/config/archive, recreated a healthy
-  service with `--no-build`, and passed the public authenticated handshake
-  again.
+  handshake through the public URL, including after the production digest
+  switch;
+- during bootstrap verification, while the same probe process remained active,
+  a controlled relay restart was observed as disconnected and then
+  automatically reconnected with a new authenticated relay connection;
+- before the production switch, a full bootstrap Compose down/up recovery drill
+  removed only this stateless container and its network, retained the pinned
+  image/config/archive, recreated a healthy service with `--no-build`, and
+  passed the public authenticated handshake again;
+- after the production switch, an explicit immutable-image rollback recreated
+  the service from the retained bootstrap image, passed health, metrics,
+  loopback-listener, and public authenticated-handshake checks, then restored
+  the exact production digest and passed those checks again.
 
 The selected mode deliberately disables QAD and exposes no UDP port. This is a
 complete encrypted relay fallback and is independent of direct NAT traversal.

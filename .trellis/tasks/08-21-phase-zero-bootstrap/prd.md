@@ -16,8 +16,9 @@
 - 公开 GitHub 仓库 `leonfox28/zterm` 已创建，`main` 已推送初始提交
   `43b06ff`。首次 manual 开发发布已生成公开可拉取的
   `ghcr.io/leonfox28/zterm-relay-dev@sha256:8f2bb338ca2d3841ebd8e4cd270b9aba919880dc12e5e5a24050e511442ecb40`；
-  生产 `zterm-relay` package 尚未通过稳定 release 创建，不能从开发 digest
-  推断或预填生产 digest。
+  稳定 Release `v0.1.0` 随后从全绿提交 `b9cac37` 公开发布生产
+  `ghcr.io/leonfox28/zterm-relay@sha256:c3ebd4398814aa7cfe21c145d277645f2e362b67965330500d52d1ce4c9e2da3`。
+  两个 package 的 digest 独立，开发 digest 从未用于生产替换。
 
 ## Requirements
 
@@ -97,10 +98,12 @@
 - [x] 公开 GitHub remote 已建立并推送；manual `phase-zero` 开发工作流实际
   产出可匿名拉取的 `zterm-relay-dev` multi-platform digest，amd64/arm64
   manifest 与两个架构的 Iroh 1.0.3 运行均已验证。
-- [ ] 生产部署必须等稳定 release 产生
-  `ghcr.io/leonfox28/zterm-relay@sha256:<digest>`，将该 package 设为 public
-  （或配置只读拉取认证），再替换公网服务器的临时本地镜像 ID。开发 package
-  的 digest 不能用于生产替换。
+- [x] 稳定 Release `v0.1.0` 已产出公开可匿名拉取的 production
+  multi-platform digest；`:0.1.0` 与 `:latest` 指向同一索引，amd64/arm64
+  均运行 Iroh 1.0.3。公网服务器已从临时本地 image ID 切换到该 production
+  digest，并以 digest-only Compose 重新通过 health、metrics、公开 HTTP 与
+  authenticated Iroh handshake；随后固定 image 回滚与 production 恢复演练
+  均通过相同验收，开发 package digest 未用于该切换或回滚。
 
 ## Out of Scope
 
