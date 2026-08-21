@@ -29,3 +29,26 @@ Completed the Rust 1.98.0 workspace and quality gates, published unified product
 ### Status
 
 [OK] **Completed**
+
+
+## Session 2: Simplify relay release and deployment
+
+**Date**: 2026-08-21
+**Task**: Simplify relay release and deployment
+**Branch**: `main`
+
+### Summary
+
+Simplified Relay version mapping and deployment, released v0.1.1 to GHCR, migrated the default server to the minimal zterm-relay Compose, verified one authenticated handshake, and removed duplicate tag-triggered CI.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `c2b574d` | (see git log) |
+| `92dda0e` | (see git log) |
+| `55563c3` | (see git log) |
+
+### Status
+
+[OK] **Completed**
