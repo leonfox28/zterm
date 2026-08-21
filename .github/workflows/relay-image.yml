@@ -1,0 +1,121 @@
+name: publish relay image
+
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Development tag (published unchanged to zterm-relay-dev; latest is reserved)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: relay-image-${{ github.ref }}-${{ inputs.version || github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build and publish multi-platform relay image
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.publish.outputs.image }}
+      version: ${{ steps.publish.outputs.version }}
+      channel: ${{ steps.publish.outputs.channel }}
+      digest: ${{ steps.build.outputs.digest }}
+      reference: ${{ steps.reference.outputs.reference }}
+    steps:
+      - name: Check out the release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'release' && format('refs/tags/{0}', github.event.release.tag_name) || github.sha }}
+          persist-credentials: false
+
+      - name: Resolve image name and publication tags
+        id: publish
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          MANUAL_VERSION: ${{ inputs.version }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+        run: sh deploy/relay/resolve-publication.sh
+
+      - name: Register cross-architecture emulation
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+
+      - name: Create a BuildKit builder
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate OCI metadata
+        id: metadata
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ steps.publish.outputs.image }}
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=${{ steps.publish.outputs.version }}
+            type=raw,value=latest,enable=${{ steps.publish.outputs.publish_latest }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.publish.outputs.version }}
+
+      - name: Build and publish one multi-platform manifest
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ./deploy/relay
+          file: ./deploy/relay/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          pull: true
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+
+      - name: Record immutable deployment reference
+        id: reference
+        shell: bash
+        env:
+          IMAGE: ${{ steps.publish.outputs.image }}
+          VERSION: ${{ steps.publish.outputs.version }}
+          CHANNEL: ${{ steps.publish.outputs.channel }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "build action returned an invalid manifest digest: $DIGEST" >&2
+            exit 70
+          fi
+          reference="$IMAGE@$DIGEST"
+          if [[ "$CHANNEL" == "stable" ]]; then
+            sh deploy/relay/validate-image-reference.sh "$reference" >/dev/null
+          elif [[ "$IMAGE" != */zterm-relay-dev ]]; then
+            echo "development publication resolved outside zterm-relay-dev: $IMAGE" >&2
+            exit 70
+          fi
+          echo "reference=$reference" >>"$GITHUB_OUTPUT"
+          {
+            echo "### zterm relay image"
+            echo
+            echo "- Channel: \`$CHANNEL\`"
+            echo "- Version tag: \`$IMAGE:$VERSION\`"
+            echo "- Multi-platform digest: \`$DIGEST\`"
+            echo "- Immutable reference: \`$reference\`"
+          } >>"$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,8 @@
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/phase-zero-development-relay.md","reason":"Verify every approved environment and relay acceptance criterion."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/technical-baseline.md","reason":"Check exact Rust/Iroh pins and absence of premature product features."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/cloud-trust-boundary.md","reason":"Check that relay deployment cannot inspect or persist terminal payloads."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/relay-access-policy.md","reason":"Check Everyone policy and absence of custom auth/rate limits."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Review data flow and deployment exposure across boundaries."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Review duplicated constants and architecture-specific logic."}
+{"file": ".trellis/spec/backend/relay-deployment.md", "reason": "Verify reverse-proxy relay exposure and Phase 1 NAT-test boundary."}
+{"file": "docs/phase-zero-verification.md", "reason": "Verify the recorded local and public acceptance evidence."}

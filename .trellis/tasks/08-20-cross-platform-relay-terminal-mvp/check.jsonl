@@ -1,0 +1,15 @@
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/technical-baseline.md","reason":"复核依赖版本、Iroh profile、public relay 排除和 Gate 0 结论未漂移。"}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/per-user-daemon.md","reason":"检查无管理员权限、无服务注册、按需启动和手动升级边界。"}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/distribution-update-channel.md","reason":"检查 installer 不产生运行状态、update 只显式触发、停止前验签校验、原子激活与失败回滚。"}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/terminal-reconnect-state.md","reason":"检查 snapshot/delta、alternate screen、持续排空和黑盒兼容验收。"}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/connection-multiplexing.md","reason":"检查单 connection、多 stream、attachment 隔离与断线恢复。"}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/authorization-scope.md","reason":"防止 review 误把同用户 session ACL 宣称为安全隔离。"}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/device-revocation.md","reason":"重点检查 revoke 的持久化顺序、现有连接关闭和竞态。"}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/cloud-trust-boundary.md","reason":"核查 E2EE、云端最小职责、元数据披露和无业务存储。"}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/relay-access-policy.md","reason":"核查部署与文档确实保持 Everyone、无限速且披露成本风险。"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"逐层检查 protobuf、IPC、数据库、Iroh stream 与 CLI 的字段和错误流。"}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"检查共享 decoder、校验、limits 与状态投影没有被重复实现。"}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/planning-review-2026-08-21.md","reason":"根据历史决定清单、修正项和已收敛边界执行最终规划一致性检查。"}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/install-version-identity-lifecycle.md","reason":"核查默认 stable、精确签名 prerelease、~/.zterm 权限及卸载后重新配对语义。"}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/local-self-attach.md","reason":"核查本机与远端视图共享同一session状态、无self-dial且严格遵守same-UID和takeover语义。"}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/phase-zero-development-relay.md","reason":"核查第零阶段不重复破坏现有环境、首次服务器连接前确实暂停、只使用官方relay数据平面且部署可验证回滚。"}

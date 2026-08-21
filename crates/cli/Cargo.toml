@@ -1,0 +1,17 @@
+[package]
+name = "zterm-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "zterm"
+path = "src/main.rs"
+
+[dependencies]
+zterm-daemon.workspace = true
+
+[lints]
+workspace = true
+

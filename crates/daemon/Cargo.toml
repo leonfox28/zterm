@@ -1,0 +1,15 @@
+[package]
+name = "zterm-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+zterm-core.workspace = true
+zterm-platform.workspace = true
+zterm-proto.workspace = true
+
+[lints]
+workspace = true
+

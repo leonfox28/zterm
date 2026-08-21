@@ -1,0 +1,34 @@
+{
+  "id": "cross-platform-relay-terminal-mvp",
+  "name": "cross-platform-relay-terminal-mvp",
+  "title": "跨平台中继终端 MVP",
+  "description": "规划并分阶段交付基于 Iroh 的跨平台端到端加密远程持久终端；第一阶段覆盖 macOS 与主流 glibc Linux x86_64/arm64 CLI、每用户 daemon 与可自建 relay。",
+  "status": "in_progress",
+  "dev_type": "feature",
+  "scope": "cross-platform-terminal",
+  "package": null,
+  "priority": "P2",
+  "creator": "leon",
+  "assignee": "leon",
+  "createdAt": "2026-08-20",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [
+    "08-21-phase-zero-bootstrap"
+  ],
+  "parent": null,
+  "relatedFiles": [
+    "crates/",
+    "proto/",
+    "install/",
+    "deploy/relay/",
+    "docs/"
+  ],
+  "notes": "2026-08-21 产品与CLI决定已收敛；新增第零阶段：探测后补齐本机开发环境和workspace，封装固定官方iroh-relay 1.0.3，本地smoke后硬停止通知用户并等待公网服务器连接方式，再只读preflight、Docker部署与回滚。用户已自行把现有rustup stable从1.97.1更新至Rust/Cargo 1.98.0；项目改为精确固定1.98.0，不再安装1.91，后续Rust升级必须显式过门禁。尚未安装Docker等剩余工具、未连接服务器、未实现；等待用户批准新的最终规划摘要。",
+  "meta": {}
+}

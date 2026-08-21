@@ -1,0 +1,92 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+          - ubuntu-latest
+          - windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install exact Rust toolchain
+        run: >-
+          rustup toolchain install 1.98.0 --profile minimal
+          --component clippy --component rust-src --component rustfmt
+      - name: Check formatting
+        run: cargo +1.98.0 fmt --all -- --check
+      - name: Run Clippy
+        run: cargo +1.98.0 clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Run tests
+        run: cargo +1.98.0 test --workspace --all-features
+      - name: Build documentation
+        run: cargo +1.98.0 doc --workspace --no-deps
+      - name: Run side-effect-free placeholder
+        run: cargo +1.98.0 run --quiet --package zterm-cli
+
+  dependencies:
+    name: Dependency policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install exact Rust toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal
+      - name: Install cargo-deny 0.20.2
+        run: cargo +1.98.0 install cargo-deny --version 0.20.2 --locked
+      - name: Check dependencies
+        run: |
+          cargo +1.98.0 deny check
+          cargo +1.98.0 deny --manifest-path tests/relay/handshake-probe/Cargo.toml --config tests/relay/handshake-probe/deny.toml check
+
+  relay:
+    name: Official relay bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install exact Rust toolchain
+        run: >-
+          rustup toolchain install 1.98.0 --profile minimal
+          --component clippy --component rustfmt
+      - name: Check authenticated relay handshake probe
+        run: |
+          cargo +1.98.0 fmt --manifest-path tests/relay/handshake-probe/Cargo.toml -- --check
+          cargo +1.98.0 clippy --locked --manifest-path tests/relay/handshake-probe/Cargo.toml -- -D warnings
+      - name: Check POSIX shell syntax
+        run: sh -n deploy/relay/*.sh tests/relay/*.sh
+      - name: Register cross-architecture emulation
+        uses: docker/setup-qemu-action@v3
+      - name: Create a BuildKit builder
+        uses: docker/setup-buildx-action@v3
+      - name: Validate metadata and Compose exposure
+        run: sh tests/relay/static.sh
+      - name: Verify official release checksums
+        run: sh tests/relay/verify-upstream.sh
+      - name: Build and execute both Linux architectures
+        run: sh tests/relay/build-platforms.sh
+      - name: Run local health and metrics smoke test
+        run: sh tests/relay/smoke.sh
+      - name: Validate the production relay schema offline
+        run: sh tests/relay/production-config-smoke.sh
+      - name: Validate same-host reverse-proxy production mode
+        run: sh tests/relay/reverse-proxy-smoke.sh
+      - name: Scan deployment material for secrets
+        run: sh tests/relay/secret-scan.sh

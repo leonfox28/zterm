@@ -1,0 +1,7 @@
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/phase-zero-development-relay.md","reason":"Approved Phase Zero environment and upstream relay baseline."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/technical-baseline.md","reason":"Pinned language, Iroh version, workspace, and architecture decisions."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/cloud-trust-boundary.md","reason":"Relay trust boundary and payload privacy constraints."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/relay-access-policy.md","reason":"Approved Everyone access policy without zterm-specific limits."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Keep infrastructure, protocol, and product boundaries explicit."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Centralize version, checksum, and architecture mappings."}
+{"file": ".trellis/spec/backend/relay-deployment.md", "reason": "Implement the approved direct-path, relay-fallback, and QAD boundary."}

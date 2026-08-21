@@ -1,0 +1,15 @@
+/target/
+/tests/relay/handshake-probe/target/
+/.env
+/deploy/relay/.env
+/deploy/relay/*.local.yaml
+/deploy/relay/verification/*.txt
+/deploy/relay/verification/*.json
+/deploy/relay/verification/*.tar
+.DS_Store
+
+# Relay TLS/ACME state and operator-local material must never enter Git.
+/deploy/relay/certs/
+/deploy/relay/state/
+*.key
+*.pem

@@ -1,0 +1,11 @@
+syntax = "proto3";
+
+package zterm.bootstrap.v1;
+
+// BuildProbe exists only to verify the cross-platform protobuf toolchain in
+// Phase Zero. It is not a terminal wire-protocol commitment.
+message BuildProbe {
+  // Version of this build-only probe schema.
+  uint32 schema_version = 1;
+}
+

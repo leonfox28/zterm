@@ -1,0 +1,17 @@
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/technical-baseline.md","reason":"固定 Iroh 1.0.3、Endpoint profile、relay、PTY 与 TerminalModel 的实现基线。"}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/per-user-daemon.md","reason":"约束每用户非特权安装、按需 detached-spawn、无开机自启和平台生命周期边界。"}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/distribution-update-channel.md","reason":"实现官方 direct installer、显式 zterm update、bootstrap 信任、签名校验、原子激活与回滚边界。"}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/shell-session-startup.md","reason":"定义 login shell、home/--cwd 与不支持任意启动命令的 session 创建语义。"}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/persistent-agent-session.md","reason":"说明 PTY/session 必须与网络 attachment 生命周期分离。"}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/terminal-reconnect-state.md","reason":"提供权威 VT、snapshot/delta、scrollback 以及 tmux/Herdr 兼容依据。"}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/connection-multiplexing.md","reason":"定义每设备对单 connection、多 session 独立 stream 和 cold-tab 恢复模型。"}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/authorization-scope.md","reason":"保持主机级设备信任与当前 OS 用户 Shell 权限模型一致。"}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/device-revocation.md","reason":"落实持久化优先、关闭连接并保留 PTY 的撤销顺序与竞态语义。"}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/cloud-trust-boundary.md","reason":"约束云端只做寻址与密文转发，并披露 dns.iroh.link 元数据边界。"}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/relay-access-policy.md","reason":"固定 Everyone、无 token/名单/限速的公开 relay 决策与风险。"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"实现跨 local IPC、protobuf、transport、session 和 CLI 的单一数据契约。"}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"避免各命令、stream 或平台后端重复定义协议、校验和状态投影。"}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/planning-review-2026-08-21.md","reason":"实施前核对历史决定、已修正的边界缺口、威胁模型和最终收敛状态。"}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/install-version-identity-lifecycle.md","reason":"实现 GitHub Release 稳定/开发版本选择、~/.zterm 持久状态与卸载身份销毁边界。"}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/local-self-attach.md","reason":"实现桌面same-UID local IPC接续手机使用的同一SessionActor、PTY、VT和controller lease。"}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/phase-zero-development-relay.md","reason":"实施第零阶段探测式开发环境bootstrap、官方iroh-relay封装、人工服务器连接检查点、公网Docker部署和回滚门。"}

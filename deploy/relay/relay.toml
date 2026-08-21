@@ -1,0 +1,14 @@
+# Local-only configuration used by compose.yaml and the automated smoke test.
+# Production TLS/ACME configuration is rendered by compose.production.yaml
+# using Docker Compose's `configs.content` interpolation.
+
+enable_relay = true
+http_bind_addr = "0.0.0.0:3340"
+enable_quic_addr_discovery = false
+enable_metrics = true
+metrics_bind_addr = "0.0.0.0:9090"
+access = "everyone"
+
+# Intentionally no [limits] section: Phase Zero preserves upstream unlimited
+# defaults selected for the public zterm relay.
+
