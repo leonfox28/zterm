@@ -1,0 +1,8 @@
+{"file":".trellis/spec/guides/evidence-driven-simplicity.md","reason":"Review for duplicated assertions, speculative fallback, unnecessary monitors and work continuing after a defined Gate stop."}
+{"file":".trellis/spec/guides/cross-platform-thinking-guide.md","reason":"Verify source attributes, shell choice and platform-specific tests across macOS/Linux/Windows CI."}
+{"file":".trellis/spec/backend/relay-deployment.md","reason":"Verify the optional self-hosted deployment remains intact and is not accidentally retained as the current product default."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/technical-baseline.md","reason":"Check exact dependency pins while recognizing that this task's later recorded official-N0 infrastructure decision supersedes the earlier custom-Relay profile."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/terminal-reconnect-state.md","reason":"Check that detach never ends PTY, TerminalModel stays authoritative and tmux/Herdr have no special-case runtime code."}
+{"file":".trellis/tasks/08-21-foundation-gate/research/iroh-nat-lab.md","reason":"Independently verify that injected-address direct evidence cannot substitute for product-profile automatic NAT evidence."}
+{"file":".trellis/tasks/08-21-foundation-gate/research/terminal-gate-candidates.md","reason":"Verify VT callbacks, safe control-sequence handling, snapshot/delta equivalence and resource stop conditions."}
+{"file":".trellis/tasks/08-21-foundation-gate/research/platform-matrix.md","reason":"Verify single-VM cleanup and CI architecture coverage without putting flaky external Gates on every push."}

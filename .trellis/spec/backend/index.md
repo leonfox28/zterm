@@ -19,7 +19,10 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Error Handling](./error-handling.md) | Error types, handling strategies | To fill |
 | [Quality Guidelines](./quality-guidelines.md) | Code standards, forbidden patterns | To fill |
 | [Logging Guidelines](./logging-guidelines.md) | Structured logging, log levels | To fill |
-| [Relay Deployment Contract](./relay-deployment.md) | Reverse-proxy relay, direct-path, fallback, and optional QAD contracts | Active |
+| [Relay Infrastructure and Deployment Contract](./relay-deployment.md) | Official N0 default plus optional self-hosted Relay contracts | Active |
+| [Host-Authoritative Terminal Model Contract](./terminal-model.md) | Parser boundary, terminal state, safe replies, snapshots, and deltas | Active |
+| [PTY Lifecycle Contract](./pty-lifecycle.md) | Account login shell, PTY ownership, validation, and termination authority | Active |
+| [Retained Terminal Driver Contract](./terminal-driver.md) | Bounded PTY drain, latest-only attachments, and transport-independent lifetime | Active |
 
 ---
 

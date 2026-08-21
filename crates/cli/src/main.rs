@@ -1,4 +1,4 @@
-//! Side-effect-free Phase Zero command-line placeholder.
+//! Side-effect-free Foundation command-line placeholder.
 
 fn main() {
     let status = zterm_daemon::bootstrap_status();

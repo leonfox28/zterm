@@ -1,8 +1,8 @@
-//! Minimal platform boundary for the Phase Zero workspace.
-//!
-//! OS integration and daemon lifecycle are deliberately deferred.
+//! Cross-platform operating-system integration for zterm.
 
-/// Platform facts safe to expose from a side-effect-free placeholder.
+pub mod pty;
+
+/// Platform facts safe to expose from the side-effect-free Foundation probe.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PlatformFacts {
     /// Rust's compile-time operating-system identifier.

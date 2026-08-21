@@ -1,12 +1,16 @@
-# Official Iroh Relay
+# Optional self-hosted Iroh Relay
 
 ## Product boundary
 
-zterm does not implement or fork a Relay data plane. Its image downloads the
-official Iroh 1.0.3 Linux musl artifact, selects it from BuildKit's
-`TARGETARCH`, verifies the upstream SHA-256, and copies the binary and Alpine
-CA bundle into a shell-free `scratch` runtime. The process runs as numeric
-UID/GID 65532.
+Phase One endpoints currently use Iroh's official n0 production infrastructure
+by default. This document covers the separately operable, optional self-hosted
+Relay; it is not silently added to that default profile.
+
+zterm does not implement or fork a Relay data plane. Its optional image
+downloads the official Iroh 1.0.3 Linux musl artifact, selects it from
+BuildKit's `TARGETARCH`, verifies the upstream SHA-256, and copies the binary
+and Alpine CA bundle into a shell-free `scratch` runtime. The process runs as
+numeric UID/GID 65532.
 
 Canonical upstream metadata lives in `deploy/relay/artifact.sh`:
 
@@ -28,7 +32,7 @@ endpoint identifiers, timing, and encrypted traffic sizes.
 
 ## Supported deployment
 
-There is one supported configuration:
+There is one supported configuration for the optional self-hosted Relay:
 
 - OpenResty or another same-host reverse proxy owns public TLS;
 - Iroh serves plain HTTP inside the container on TCP 38451;
@@ -187,10 +191,18 @@ establishment fails, encrypted traffic can still use the Relay; forwarding does
 not require QAD.
 
 The current deployment sets `enable_quic_addr_discovery = false` and publishes
-no UDP port because an HTTP reverse proxy cannot forward QAD. Phase One will
-measure real direct/Relay path events on representative networks. Only that
-evidence, or a concrete self-hosting requirement without a reverse proxy, can
-justify a separately reviewed UDP/TLS deployment later.
+no UDP port because an HTTP reverse proxy cannot forward QAD. Phase One's
+[Foundation Gate](foundation-gate.md) instead exercised the product-default
+official Iroh production map: Case A remained relayed in the nested
+Colima/Patchbay/TUN lab and is retained as environment-specific deferred
+address-discovery evidence; the controlled known-candidate Case B selected a
+direct path; and Case C completed three encrypted streams through the official
+WSS/TCP Relay after endpoint non-DNS UDP was blocked. B and C permit Foundation
+work to continue, but Case A neither passes automatic discovery nor establishes
+that official QAD generally fails on ordinary physical networks. Parent M10
+must test the unchanged profile across two real networks. That evidence, or a
+concrete self-hosting requirement without a reverse proxy, can justify a
+separately reviewed UDP/TLS deployment later.
 
 ## Failure handling
 

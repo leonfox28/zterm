@@ -5,7 +5,9 @@ no-default-features = false
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "Informational unmaintained notice for transitive paste 1.0.15; no patched paste release exists, and pinned Iroh/Patchbay require it." },
+]
 
 [licenses]
 version = 2
@@ -20,7 +22,16 @@ allow = [
     "Zlib",
 ]
 confidence-threshold = 0.8
-exceptions = []
+# Keep non-baseline licenses scoped to the exact transitive crates introduced by
+# pinned Iroh 1.0.3 instead of allowing them for future dependencies globally.
+exceptions = [
+    { crate = "async_io_stream@0.3.3", allow = ["Unlicense"] },
+    { crate = "attohttpc@0.30.1", allow = ["MPL-2.0"] },
+    { crate = "pharos@0.5.3", allow = ["Unlicense"] },
+    { crate = "webpki-root-certs@1.0.9", allow = ["CDLA-Permissive-2.0"] },
+    { crate = "webpki-roots@1.0.9", allow = ["CDLA-Permissive-2.0"] },
+    { crate = "ws_stream_wasm@0.7.5", allow = ["Unlicense"] },
+]
 
 [licenses.private]
 # The project license is intentionally not selected during requirements work.

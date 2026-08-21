@@ -6,10 +6,33 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+iroh.workspace = true
 zterm-core.workspace = true
 zterm-platform.workspace = true
 zterm-proto.workspace = true
 
+[dev-dependencies]
+anyhow.workspace = true
+futures-util.workspace = true
+tokio.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+patchbay.workspace = true
+
+[[test]]
+name = "terminal_drain"
+path = "tests/terminal_drain.rs"
+harness = false
+
+[[test]]
+name = "attachment_resync"
+path = "tests/attachment_resync.rs"
+harness = false
+
+[[test]]
+name = "terminal_blackbox"
+path = "tests/terminal_blackbox.rs"
+harness = false
+
 [lints]
 workspace = true
-

@@ -20,7 +20,8 @@
   "subtasks": [],
   "children": [
     "08-21-phase-zero-bootstrap",
-    "08-21-simplify-relay-release-deployment"
+    "08-21-simplify-relay-release-deployment",
+    "08-21-foundation-gate"
   ],
   "parent": null,
   "relatedFiles": [

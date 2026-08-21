@@ -1,9 +1,9 @@
-//! Shared Phase Zero build identity.
-//!
-//! Product-domain types intentionally begin in a later milestone.
+//! Shared zterm domain types and build identity.
+
+pub mod terminal;
 
 /// Human-readable name of the active implementation phase.
-pub const PHASE_NAME: &str = "phase-zero-bootstrap";
+pub const PHASE_NAME: &str = "phase-one-foundation-gate";
 
 /// Version of the build-only protobuf probe schema.
 pub const BOOTSTRAP_SCHEMA_VERSION: u32 = 1;
@@ -33,7 +33,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn current_identity_is_phase_zero() {
+    fn current_identity_matches_workspace_constants() {
         let identity = BuildIdentity::current();
         assert_eq!(identity.phase, PHASE_NAME);
         assert_eq!(identity.version, env!("CARGO_PKG_VERSION"));

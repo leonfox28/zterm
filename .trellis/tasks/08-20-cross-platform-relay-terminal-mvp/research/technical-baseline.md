@@ -1,5 +1,7 @@
 # 第一阶段技术基线（首次调查 2026-08-20，复核 2026-08-21）
 
+> **2026-08-21 后续决策：** 下文“官方 DNS/Pkarr + 自建默认 Relay”是早期调查结论，已由 `08-21-foundation-gate` 覆盖。当前产品 profile 固定使用 Iroh 1.0.3 官方 n0 生产 Relay/QAD 与生产 DNS/Pkarr；自建 Relay 保留为可选部署。
+
 ## 2026-08-21 复核结论
 
 - 截至 2026-08-21，官方 Releases 仍将 `v1.0.3`（2026-07-20）标记为 Latest，本阶段暂无需改变版本基线。发布页同时提供 Linux `iroh-relay` 二进制与 SHA-256，因此 zterm 可以校验上游 artifact 后构建并固定自己的容器 digest，不假设上游已提供所需的 Docker image。来源：[Iroh 官方 Releases](https://github.com/n0-computer/iroh/releases)。

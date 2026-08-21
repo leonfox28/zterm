@@ -26,7 +26,9 @@ jobs:
       matrix:
         os:
           - macos-latest
-          - ubuntu-latest
+          - macos-15-intel
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
           - windows-latest
     steps:
       - uses: actions/checkout@v5
@@ -44,11 +46,11 @@ jobs:
         run: cargo +1.98.0 fmt --all -- --check
       - name: Run Clippy
         run: cargo +1.98.0 clippy --workspace --all-targets --all-features -- -D warnings
-      - name: Run tests
+      - name: Run tests (Unix includes PTY lifecycle)
         run: cargo +1.98.0 test --workspace --all-features
       - name: Build documentation
         run: cargo +1.98.0 doc --workspace --no-deps
-      - name: Run side-effect-free placeholder
+      - name: Run side-effect-free Foundation placeholder
         run: cargo +1.98.0 run --quiet --package zterm-cli
 
   dependencies:

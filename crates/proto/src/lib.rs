@@ -1,7 +1,7 @@
 //! Reproducibly generated protobuf types.
 //!
-//! Phase Zero contains only a build probe. Terminal protocol messages are
-//! intentionally out of scope.
+//! Foundation still retains only the build probe. Terminal protocol messages
+//! remain intentionally out of scope until the protocol milestone.
 
 /// Build-only protobuf messages.
 pub mod bootstrap {

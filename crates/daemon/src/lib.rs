@@ -1,9 +1,13 @@
-//! Side-effect-free daemon placeholder.
+//! Daemon foundations.
 //!
-//! This crate proves workspace dependency direction only. It does not start a
-//! process, open a socket, read configuration, or create a terminal session.
+//! The crate still does not start a process or bind sockets by itself. It owns
+//! the infrastructure profile used when a caller explicitly creates an Iroh
+//! endpoint.
 
-/// Information printed by the Phase Zero CLI placeholder.
+pub mod terminal_driver;
+pub mod transport;
+
+/// Information printed by the Foundation CLI placeholder.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BootstrapStatus {
     /// Cargo package version.

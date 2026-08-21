@@ -1,5 +1,7 @@
 # zterm 第零与第一阶段实施计划
 
+> **2026-08-21 后续决策（覆盖本文旧的默认自建 Relay 步骤）：** 第一阶段产品默认改用 Iroh 1.0.3 官方 n0 生产 Relay/QAD 与生产 DNS/Pkarr；现有自建镜像、Compose 和公网部署仍是可选能力。Foundation Step 1 的实际实施、验证和 no-go 停止线由 `08-21-foundation-gate` 管理。
+
 ## 1. 执行目标
 
 本计划把 PRD 与技术设计转换为可验证的实施顺序。第零阶段先交付可重复的本机开发环境、Rust workspace和已经在用户公网服务器运行的固定上游relay；第一阶段最终交付：

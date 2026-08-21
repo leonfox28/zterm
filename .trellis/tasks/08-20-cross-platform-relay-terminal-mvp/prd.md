@@ -1,5 +1,7 @@
 # zterm 跨平台中继终端：第零与第一阶段 PRD
 
+> **2026-08-21 后续决策（覆盖本文旧的默认 Relay 描述）：** 第一阶段产品默认使用 Iroh 1.0.3 官方 n0 生产 Relay、官方 QAD 与生产 DNS/Pkarr；Phase Zero 已完成的 `relay.zenithconsulting.cn` 镜像和部署保留为可选自建能力，不加入默认 Relay map。具体实现与当前网络证据以子任务 `08-21-foundation-gate` 和 `.trellis/spec/backend/relay-deployment.md` 为准。
+
 ## 1. 目标
 
 zterm 是一个面向长时间远程终端任务的跨网络连接工具。用户可以在远端 Linux 或 macOS 主机上运行 Codex、OpenCode、tmux、Herdr 或其他交互式程序；控制端断网、退出或切换网络后，远端 PTY 与其中的进程仍继续运行，重新连接后回到同一个会话并恢复当前终端画面。用户从手机回到项目宿主电脑时，也能通过本机 daemon 接续完全相同的 session，而不依赖第三方终端复用器。

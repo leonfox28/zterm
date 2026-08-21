@@ -1,5 +1,7 @@
 # zterm 第零与第一阶段技术设计
 
+> **2026-08-21 后续决策（覆盖本文旧的 `Minimal + Custom relay` 默认设计）：** 第一阶段产品 profile 使用 Iroh 1.0.3 官方 n0 生产 Relay/QAD 和生产 DNS/Pkarr；自建 Relay 只保留为显式可选部署。当前代码边界、A/B/C 结果与停止线见 `08-21-foundation-gate` 和 `.trellis/spec/backend/relay-deployment.md`。
+
 ## 1. 设计目标与不变量
 
 本设计先覆盖第零阶段的开发机 bootstrap 与单节点上游 relay 公网部署，再覆盖第一阶段 macOS x86_64/arm64、主流 glibc Linux x86_64/arm64 daemon + CLI；从第一天保留 Android、Windows、桌面 GUI、iOS、多观察端和 2.0 Agent 事件的兼容边界。
