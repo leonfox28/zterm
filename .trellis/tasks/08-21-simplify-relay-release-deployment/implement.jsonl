@@ -1,0 +1,4 @@
+{"file":".trellis/spec/backend/relay-deployment.md","reason":"Current Relay publication, deployment, NAT/QAD, and acceptance contract; task PRD explicitly supersedes its digest/metrics/rollback requirements and implementation must update it."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Publication and deployment validation currently repeat the same invariants; use the guide to consolidate ownership rather than replace one duplicated mechanism with another."}
+{"file":".trellis/spec/guides/cross-platform-thinking-guide.md","reason":"Release resolver and tests are POSIX shell used from macOS/Linux/CI and must remain byte- and shell-portable while being simplified."}
+{"file":".trellis/tasks/08-21-simplify-relay-release-deployment/research/simplification-evidence.md","reason":"Evidence inventory distinguishes real trust boundaries and server constraints from the redundant digest, metrics, health, and rollback loops being removed."}

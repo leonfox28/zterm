@@ -1,0 +1,4 @@
+{"file":".trellis/spec/backend/relay-deployment.md","reason":"Review the final repository and updated spec as one contract, while treating the task PRD as authoritative over the old digest/metrics/rollback text."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Check that each invariant has one test/validation owner and that obsolete helpers and duplicated assertions were actually removed."}
+{"file":".trellis/spec/guides/cross-platform-thinking-guide.md","reason":"Verify the smaller resolver and test scripts still behave under supported shells and checkout policies without rebuilding a combinatorial test suite."}
+{"file":".trellis/tasks/08-21-simplify-relay-release-deployment/research/simplification-evidence.md","reason":"Use the evidence list to challenge remaining complexity and to retain the few mechanisms justified by real server or trust-boundary constraints."}

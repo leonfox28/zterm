@@ -2,52 +2,54 @@
 set -eu
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
-compose_file="$repo_root/deploy/relay/compose.yaml"
-project_name="zterm-relay-phase-zero-smoke"
-image="zterm/iroh-relay:1.0.3-local"
+relay_config="$repo_root/deploy/relay/relay.toml"
+container_name="zterm-relay-smoke-$$"
+
+relay_arch=$(docker version --format '{{.Server.Arch}}')
+case "$relay_arch" in
+    amd64 | arm64) ;;
+    x86_64) relay_arch=amd64 ;;
+    aarch64) relay_arch=arm64 ;;
+    *)
+        echo "unsupported Docker architecture: $relay_arch" >&2
+        exit 64
+        ;;
+esac
+image="zterm/iroh-relay:test-$relay_arch"
+if ! docker image inspect "$image" >/dev/null 2>&1; then
+    echo "missing $image; run tests/relay/build-platforms.sh first" >&2
+    exit 1
+fi
 
 cleanup() {
-    docker compose --project-name "$project_name" --file "$compose_file" down \
-        --volumes --remove-orphans >/dev/null 2>&1 || true
+    docker rm --force "$container_name" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT HUP INT TERM
 
-docker buildx build --load --provenance=false --tag "$image" \
-    "$repo_root/deploy/relay"
-docker compose --project-name "$project_name" --file "$compose_file" up \
-    --detach --no-build --wait --wait-timeout 180
+docker run --detach --name "$container_name" \
+    --publish 127.0.0.1::38451 \
+    --mount "type=bind,src=$relay_config,dst=/etc/iroh-relay/relay.toml,readonly" \
+    "$image" >/dev/null
+
+relay_binding=$(docker port "$container_name" 38451/tcp)
+[ "${relay_binding%:*}" = "127.0.0.1" ]
+relay_port=${relay_binding##*:}
 
 attempt=0
-until health=$(curl --fail --silent --show-error http://127.0.0.1:3340/healthz 2>/dev/null); do
+until health=$(curl --fail --silent --show-error \
+    "http://127.0.0.1:$relay_port/healthz" 2>/dev/null); do
     attempt=$((attempt + 1))
     if [ "$attempt" -ge 30 ]; then
+        docker logs "$container_name" >&2
         echo "relay /healthz did not become ready" >&2
         exit 1
     fi
     sleep 1
 done
+
 printf '%s\n' "$health" | grep -Fq '"status":"ok"'
 printf '%s\n' "$health" | grep -Fq '"version":"1.0.3"'
+curl --fail --silent --show-error --output /dev/null \
+    "http://127.0.0.1:$relay_port/generate_204"
 
-metrics=$(curl --fail --silent --show-error http://127.0.0.1:9090/metrics)
-[ -n "$metrics" ]
-printf '%s\n' "$metrics" | grep -Eq 'relay(server)?_'
-
-container_id=$(docker compose --project-name "$project_name" --file "$compose_file" ps -q relay)
-[ "$(docker inspect --format '{{.State.Health.Status}}' "$container_id")" = "healthy" ]
-[ "$(docker inspect --format '{{.Config.User}}' "$container_id")" = "65532:65532" ]
-[ "$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "$container_id")" = "true" ]
-[ "$(docker inspect --format '{{.HostConfig.LogConfig.Type}}' "$container_id")" = "json-file" ]
-[ "$(docker inspect --format '{{index .HostConfig.LogConfig.Config "max-size"}}' "$container_id")" = "10m" ]
-[ "$(docker inspect --format '{{index .HostConfig.LogConfig.Config "max-file"}}' "$container_id")" = "5" ]
-[ "$(docker inspect --format '{{.Config.StopSignal}}' "$container_id")" = "SIGINT" ]
-
-image_id=$(docker image inspect "$image" --format '{{.Id}}')
-echo "local relay image id: $image_id"
-
-docker compose --project-name "$project_name" --file "$compose_file" stop \
-    --timeout 20 relay >/dev/null
-[ "$(docker inspect --format '{{.State.Status}}' "$container_id")" = "exited" ]
-[ "$(docker inspect --format '{{.State.ExitCode}}' "$container_id")" = "0" ]
-
-echo "relay Compose smoke test passed"
+echo "relay runtime health smoke test passed"

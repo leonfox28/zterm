@@ -15,7 +15,7 @@
 
 ## 2. 实施原则与停止条件
 
-1. 先完成第零阶段本机环境、relay本地smoke、人工服务器连接检查点、公网部署与回滚，再进入M1 Gate 0；Gate 0 未证明 Iroh profile、PTY 生命周期和权威 VT 模型可行时，不进入 M2 之后的产品实现。
+1. 先完成第零阶段本机环境、relay本地smoke、人工服务器连接检查点、公网部署与一次health/authenticated-handshake验收，再进入M1 Gate 0；Gate 0 未证明 Iroh profile、PTY 生命周期和权威 VT 模型可行时，不进入 M2 之后的产品实现。
 2. 协议与安全边界优先于 CLI 表面。设备身份、授权 generation、session/revision 标识和 frame limits 必须由共享 core/proto 定义，禁止在各命令中各自解释。
 3. 每个里程碑都必须同时交付测试和诊断能力；不能把安全、资源限制或平台测试全部留到最后。
 4. 第一阶段不创建 systemd、launchd、Login Item、crontab、自研 supervisor、后台更新检查或自动安装代码；只实现用户显式执行的 `zterm update`。
@@ -39,7 +39,7 @@ Gate 0 的硬停止条件：
 
 | 子任务 | 包含里程碑 | 依赖 | 主要成果 |
 | --- | --- | --- | --- |
-| phase-zero-bootstrap | Z0-A、Z0-B | 无 | 本机环境、workspace、上游relay部署物、人工连接检查点、公网部署与回滚证据 |
+| phase-zero-bootstrap | Z0-A、Z0-B | 无 | 本机环境、workspace、上游relay部署物、人工连接检查点与公网一次验收证据 |
 | foundation-gate | M1 | phase-zero-bootstrap | Iroh/PTY/VT 可行性结论 |
 | core-local-daemon | M2-M3 | foundation-gate | core/proto/platform、持久状态、本地 IPC 与 daemon 生命周期 |
 | session-engine | M4 | core-local-daemon | 持久 PTY、权威 VT、snapshot/delta、controller lease |
@@ -51,7 +51,7 @@ Gate 0 的硬停止条件：
 依赖主线：
 
     Z0-A → Z0-B(本地) → [通知用户并等待服务器连接方式]
-                         → Z0-B(公网部署+回滚) → M1 → M2 → M3 ─┬→ M4 ─┐
+                         → Z0-B(公网部署+一次验收) → M1 → M2 → M3 ─┬→ M4 ─┐
                                                                └→ M5 → M6 ─┴→ M7 → M8 → M9 → M10
 
 M4 与 M5/M6 在 M3 契约冻结后可以独立推进；M7 负责把两条路径合并。Z0-B 部署的relay直接提供给M1和后续网络测试使用，不能把公网部署拖回第一阶段末尾。
@@ -106,32 +106,33 @@ M4 与 M5/M6 在 M3 契约冻结后可以独立推进；M7 负责把两条路径
 工作内容：
 
 - 从Iroh官方v1.0.3 GitHub Release下载匹配Linux服务器架构的`iroh-relay`预编译artifact，校验官方SHA-256；不fork源码、不写自有转发服务，也不在服务器安装Rust或现场编译。
-- 建立最小非root镜像、`relay.toml`、Docker Compose、示例环境文件和部署/回滚脚本；固定上游版本/checksum与最终镜像digest。
-- 为当前默认服务器配置同机OpenResty/Cloudflare TLS反代模式：容器仅绑定宿主回环38451与9090，不使用`--dev`、ACME或UDP/QAD；同时保留direct TLS/ACME/QAD自建模板。两者都明确Everyone，省略limits、token、名单、外部auth和自定义monitor sidecar。
-- 在本机完成artifact篡改负向测试、Compose config、容器启动/健康/停止和旧digest回滚smoke。
+- 建立scratch、shell-free、UID/GID 65532镜像、单一`relay.toml`与最小`compose.yaml`；固定上游版本/checksum，镜像默认command指向config，Compose project与容器均名为`zterm-relay`。
+- 为当前默认服务器和现阶段自建文档只保留同机TLS反代模式：容器仅绑定宿主回环38451，不使用`--dev`、ACME、metrics或UDP/QAD。配置明确Everyone，省略limits、token、名单和外部auth。
+- GitHub stable Release使用原样`vX.Y.Z`镜像tag并更新`latest`；服务器只通过人工`docker compose pull`和`up -d`更新，普通重启不自动拉取。
+- 在本机完成artifact checksum/篡改负向测试、双架构运行、最小Compose config与直接HTTP smoke；每项契约只由一个测试边界负责。
 - 本地验证通过后硬停止，向用户明确报告“已到公网relay部署步骤”，并只在此时索取SSH入口/登录认证方式、relay域名与DNS状态；用户提供前不发起连接，秘密不写入Git、task artifact或命令输出。
 - 获得连接方式后先只读检查服务器OS/架构、Docker/Compose、DNS、端口占用、防火墙和磁盘。已有条件满足时部署；需要安装Docker、修改防火墙或处理冲突时先报告精确影响，再执行获准的系统变更。
-- 部署后从外部验证DNS/TLS、health与真实relay握手；若启用Cloudflare代理，检查WebSockets/WAF/Argo边界并验证一次连接中断后的Iroh重连。在服务器验证仅有回环38451/9090、metrics非公网、没有UDP/QAD或防火墙变更、日志轮转、Everyone/no-limits和无业务数据卷，最后演练旧digest回滚并恢复目标版本。
+- 部署后只验证宿主health、公开HTTP与一次真实authenticated Iroh Relay握手。在服务器确认只有回环38451、Docker `local`日志、没有metrics/UDP/QAD或防火墙变更、Everyone/no-limits和无业务数据卷；通过即停止，不重复restart/reconnect或回滚演练。
 
 完成标准：
 
 - zterm仓库不存在relay协议/转发实现；镜像中的服务端二进制与官方v1.0.3 artifact checksum一致。
 - 人工检查点确实发生在第一次服务器连接之前；连接凭据与真实`.env`不出现在仓库、文档或日志。
-- 一台用户指定的公网Linux服务器以Docker运行固定digest relay，通过外部TLS、真实Iroh握手、回环38451/9090、health、私有metrics、日志轮转和回滚smoke；QAD/UDP明确未部署且不影响密文relay回退。
-- 旧digest回滚可用；relay没有zterm业务数据库，不保存终端明文、PairTicket或设备私钥。
+- 一台用户指定的公网Linux服务器以Docker运行`ghcr.io/leonfox28/zterm-relay:latest`，通过外部TLS、真实Iroh握手、回环38451、health与Docker `local`日志验收；metrics/QAD/UDP明确未部署且不影响密文relay回退。
+- relay没有zterm业务数据库，不保存终端明文、PairTicket或设备私钥；运行异常直接recreate，只有实际镜像缺陷才人工选择上一版本tag。
 
 验证：
 
-    ./tests/relay/upstream-artifact.sh
-    docker compose -f deploy/relay/docker-compose.yml config
-    ./tests/relay/local-smoke.sh
-    ./tests/relay/rollback.sh
-    ./tests/relay/public-smoke.sh
+    sh tests/relay/verify-upstream.sh
+    sh tests/relay/build-platforms.sh
+    docker compose -f deploy/relay/compose.yaml config --quiet
+    sh tests/relay/smoke.sh
+    sh tests/relay/public-handshake.sh https://relay.zenithconsulting.cn
 
 检查点与回退：
 
 - 服务器连接信息缺失不是失败：Z0-B在明确人工检查点暂停，收到用户信息后继续同一阶段。
-- 公网变更前保留当前容器/端口状态；部署失败先停止新Compose并恢复旧digest/config，不删除服务器上不属于zterm的资源。
+- 公网变更前只读记录当前容器/端口状态；部署失败时报告实际状态并停止扩展操作，不运行自动fallback，也不删除服务器上不属于zterm的资源。
 - 若官方binary与目标服务器不兼容，允许改为从固定官方tag可复现构建镜像，但必须记录原因与源码commit；仍不得fork转发逻辑。
 
 ### M1. Gate 0 技术可行性
@@ -449,7 +450,7 @@ M4 与 M5/M6 在 M3 契约冻结后可以独立推进；M7 负责把两条路径
 
 | PRD 范围 | 实施里程碑 | 主要验收证据 |
 | --- | --- | --- |
-| R0 第零阶段环境与基础设施门 | Z0-A、Z0-B | 工具链探测/bootstrap、本地relay smoke、人工连接检查点、公网部署与回滚证据 |
+| R0 第零阶段环境与基础设施门 | Z0-A、Z0-B | 工具链探测/bootstrap、本地relay smoke、人工连接检查点与公网一次验收证据 |
 | R1 每用户非特权 daemon | M2、M3、M9 | 权限测试、clean-user direct install、本地 IPC peer UID |
 | R2 daemon 生命周期 | M3、M4、M9 | 按需拉起、无启动项扫描、手动升级中断测试 |
 | R3-R4 云端、直连、relay、地址查询 | Z0-B、M1、M5、M10 | path events、network matrix、relay 配置与抓包 |
@@ -466,7 +467,7 @@ M4 与 M5/M6 在 M3 契约冻结后可以独立推进；M7 负责把两条路径
 - 每次 SQLite schema 变更先备份并在单事务迁移；失败保持旧 schema。不可逆迁移必须有恢复备份的演练。
 - wire v1 仅做向后兼容字段新增；不兼容变更使用新 ALPN major。任何一端不支持时明确报错。
 - identity key 与授权数据不随二进制回滚隐式删除或重建。
-- relay 无 session 业务状态；保留上一镜像 digest 与配置即可回滚。
+- relay 无 session 业务状态；运行异常直接recreate，只有实际镜像缺陷才由运维人员手动选择上一版本tag。
 - profile 更新采用校验后原子替换；错误配置不能覆盖上一份已知可用配置。
 - 每个子任务在进入下一个依赖里程碑前形成可运行检查点；回退只撤销该子任务新增行为，不破坏已验证的协议和持久状态。
 
@@ -476,7 +477,7 @@ M4 与 M5/M6 在 M3 契约冻结后可以独立推进；M7 负责把两条路径
 
 - Z0-A/Z0-B 已在第一阶段前完成；M1-M10 的完成标准全部满足，Gate 0 结论仍适用于最终依赖版本；
 - PRD A-E 无遗漏，并有 CI、测试日志或真实平台验收记录；
-- 默认 relay 已以固定版本部署并完成回滚演练，self-host 文档可从零复现；
+- 默认 relay 已通过手动`pull`/`up -d`部署`latest`并完成一次health/authenticated-handshake验收，self-host反代文档可从零复现；
 - macOS x86_64/arm64 与主流 glibc Linux x86_64/arm64 四个目标的原生 artifact 可由官方 installer 安装，显式 `zterm update` 与失败回滚通过验收，且安装/运行不要求管理员权限；
 - 断线持久、终端恢复、远端桌面CLI↔宿主本机接续同一session、单connection多session、revoke和E2EE的关键主张均有端到端证据；第二阶段Android沿用该接续契约；
 - 文档没有把 1.0 描述成开机自动启动、daemon crash 自动恢复、完整 transcript 保存或专有 Agent 平台；

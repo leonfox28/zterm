@@ -8,7 +8,6 @@ use std::{
 use iroh::{Endpoint, RelayConfig, RelayMap, RelayMode, RelayUrl, Watcher, endpoint::presets};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(45);
-const RECONNECT_TIMEOUT: Duration = Duration::from_secs(90);
 
 type ProbeResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -18,20 +17,9 @@ async fn main() -> ProbeResult<()> {
     let raw_url = args.next().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: zterm-relay-handshake-probe <relay-url> [--expect-reconnect]",
+            "usage: zterm-relay-handshake-probe <relay-url>",
         )
     })?;
-    let expect_reconnect = match args.next().as_deref() {
-        None => false,
-        Some("--expect-reconnect") => true,
-        Some(other) => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("unknown argument: {other}"),
-            )
-            .into());
-        }
-    };
     if args.next().is_some() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "too many arguments").into());
     }
@@ -63,13 +51,8 @@ async fn main() -> ProbeResult<()> {
     println!("authenticated Iroh relay connection established: {relay_url} (QAD disabled)");
     io::stdout().flush()?;
 
-    let reconnect_result = if expect_reconnect {
-        wait_for_reconnect(&endpoint, &relay_url).await
-    } else {
-        Ok(())
-    };
     endpoint.close().await;
-    reconnect_result
+    Ok(())
 }
 
 async fn wait_for_initial_connection(endpoint: &Endpoint) -> ProbeResult<()> {
@@ -86,42 +69,6 @@ async fn wait_for_initial_connection(endpoint: &Endpoint) -> ProbeResult<()> {
         .into());
     }
     Ok(())
-}
-
-async fn wait_for_reconnect(endpoint: &Endpoint, relay_url: &RelayUrl) -> ProbeResult<()> {
-    let mut watcher = endpoint.home_relay_status();
-    let result: ProbeResult<()> = tokio::time::timeout(RECONNECT_TIMEOUT, async {
-        let mut saw_disconnect = false;
-        loop {
-            let statuses = watcher.updated().await.map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "home relay status watcher disconnected",
-                )
-            })?;
-            let connected = statuses
-                .iter()
-                .any(|status| status.url() == relay_url && status.is_connected());
-
-            if !connected && !saw_disconnect {
-                saw_disconnect = true;
-                println!("relay disconnect observed: {relay_url}");
-                io::stdout().flush()?;
-            } else if connected && saw_disconnect {
-                println!("authenticated Iroh relay reconnection established: {relay_url}");
-                io::stdout().flush()?;
-                return Ok(());
-            }
-        }
-    })
-    .await
-    .map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::TimedOut,
-            "relay disconnect and authenticated reconnection were not both observed within 90 seconds",
-        )
-    })?;
-    result
 }
 
 fn relay_status_detail(endpoint: &Endpoint) -> String {

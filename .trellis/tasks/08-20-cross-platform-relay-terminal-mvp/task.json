@@ -19,7 +19,8 @@
   "pr_url": null,
   "subtasks": [],
   "children": [
-    "08-21-phase-zero-bootstrap"
+    "08-21-phase-zero-bootstrap",
+    "08-21-simplify-relay-release-deployment"
   ],
   "parent": null,
   "relatedFiles": [

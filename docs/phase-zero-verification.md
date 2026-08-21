@@ -2,7 +2,23 @@
 
 Date: 2026-08-21  
 Host: macOS 26.6.2 arm64, Colima 0.10.3 (`vz`, Docker runtime)  
-Scope: local bootstrap plus the approved public reverse-proxy relay deployment.
+Scope: historical local bootstrap plus the first approved public reverse-proxy
+relay deployment.
+
+## Current contract after Phase Zero
+
+This document preserves what was actually tested and deployed during the
+initial `v0.1.0` bootstrap. References below to the old digest-only Compose,
+port 9090 metrics, custom health probe, direct TLS template, reconnect test, and
+rollback drills are historical evidence, not current requirements.
+
+Starting with `v0.1.1`, the supported deployment is only
+`deploy/relay/compose.yaml` plus `relay.toml`. It uses
+`ghcr.io/leonfox28/zterm-relay:latest`, publishes only
+`127.0.0.1:38451`, disables metrics and QAD, and updates manually with
+`docker compose pull` followed by `docker compose up -d`. A release is accepted
+once through host/public health and one authenticated Iroh handshake; successful
+deployments are not restarted or rolled back again for rehearsal.
 
 ## Environment
 
@@ -104,13 +120,12 @@ the remote `docker load` result matched the exact local image ID:
 | `zterm/iroh-relay:phase-zero-arm64` | linux/arm64 | `sha256:26a76c210d87462e88026b31f388c92bcce8a586dafbe6824221b32493a352b5` |
 | `zterm/iroh-relay:1.0.3-local` | linux/arm64 | `sha256:26a76c210d87462e88026b31f388c92bcce8a586dafbe6824221b32493a352b5` |
 
-These local IDs are not registry digests and are not valid references for a new
-production release. The repository now requires future production images to be
-published by `.github/workflows/relay-image.yml` and deployed with the exact
-GHCR multi-platform digest emitted by that run. They remain historical
-bootstrap and rollback evidence only; the first real production digest is
-recorded below and was not inferred from a mutable tag or copied from
-`zterm-relay-dev`.
+These local IDs are not registry digests. During the `v0.1.0` bootstrap, the
+repository required the production image to be published by
+`.github/workflows/relay-image.yml` and deployed with that run's exact GHCR
+multi-platform digest. Those requirements and IDs are historical bootstrap and
+rollback evidence only; the first real production digest is recorded below and
+was not inferred from `zterm-relay-dev`.
 
 ## GHCR development publication evidence
 
@@ -159,10 +174,10 @@ and the existing development tag remained at its independent digest.
 
 ## Public reverse-proxy deployment evidence
 
-The selected server already terminates public TLS in same-host OpenResty and
-routes `relay.zenithconsulting.cn` to `http://127.0.0.1:38451`. The repository
-therefore now includes `compose.reverse-proxy.yaml`; its default host bindings
-are exactly `127.0.0.1:38451` for Relay HTTP and `127.0.0.1:9090` for metrics.
+The selected server already terminated public TLS in same-host OpenResty and
+routed `relay.zenithconsulting.cn` to `http://127.0.0.1:38451`. The repository
+therefore included `compose.reverse-proxy.yaml`; its default host bindings were
+exactly `127.0.0.1:38451` for Relay HTTP and `127.0.0.1:9090` for metrics.
 
 The user-authorized read-only preflight found Ubuntu 24.04.4 on linux/arm64,
 Docker 29.3.0, Compose 5.1.0, and no initial `/opt/zterm-relay` directory or
@@ -187,12 +202,12 @@ arm64 image and archive were also retained. No other 1Panel Compose project was
 changed.
 
 The server then anonymously pulled the exact production digest above and a
-one-shot activation replaced only the zterm Relay container. The active
-Compose has no `build` section, `.env` pins the production package by digest,
-and Docker records the container's `Config.Image` as that same immutable
-reference. The recreated linux/arm64 container became healthy as UID/GID
-65532. The transient pull and activation jobs both exited successfully and did
-not install a persistent system service.
+one-shot activation replaced only the zterm Relay container. That Compose had
+no `build` section, its `.env` pinned the production package by digest, and
+Docker recorded the container's `Config.Image` as that same immutable
+reference. The recreated linux/arm64 container became healthy as UID/GID 65532.
+The transient pull and activation jobs both exited successfully and did not
+install a persistent system service.
 
 A final production rollback drill then recreated the same Compose service from
 the retained immutable bootstrap image
@@ -215,7 +230,7 @@ drill, and the later production digest activation confirmed:
 
 - Docker health `healthy`, UID/GID 65532, read-only root filesystem, no
   privileges, all Linux capabilities dropped, and `no-new-privileges`;
-- the active container now uses
+- the activated container used
   `ghcr.io/leonfox28/zterm-relay@sha256:c3ebd4398814aa7cfe21c145d277645f2e362b67965330500d52d1ce4c9e2da3`
   with no server-side build fallback;
 - only host `127.0.0.1:38451/tcp` and `127.0.0.1:9090/tcp` are published;

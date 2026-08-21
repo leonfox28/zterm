@@ -1,47 +1,13 @@
-name: zterm-relay-local
+name: zterm-relay
 
 services:
   relay:
-    image: zterm/iroh-relay:1.0.3-local
-    build:
-      context: .
-      dockerfile: Dockerfile
-    command:
-      - --dev
-      - --config-path
-      - /etc/iroh-relay/relay.toml
-    configs:
-      - source: relay_config
-        target: /etc/iroh-relay/relay.toml
+    container_name: zterm-relay
+    image: ghcr.io/leonfox28/zterm-relay:latest
+    volumes:
+      - ./relay.toml:/etc/iroh-relay/relay.toml:ro
     ports:
-      - "127.0.0.1:${RELAY_HTTP_PORT:-3340}:3340/tcp"
-      - "127.0.0.1:${RELAY_METRICS_PORT:-9090}:9090/tcp"
-    read_only: true
-    tmpfs:
-      - /tmp:mode=1777,noexec,nosuid,size=16m
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    healthcheck:
-      test:
-        - CMD
-        - /usr/local/bin/zterm-relay-healthcheck
-        - 127.0.0.1:3340
-        - /healthz
-        - "200"
-        - '"status":"ok"'
-      interval: 5s
-      timeout: 3s
-      retries: 12
-      start_period: 5s
-    stop_grace_period: 20s
+      - "127.0.0.1:38451:38451"
+    restart: unless-stopped
     logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "5"
-
-configs:
-  relay_config:
-    file: ./relay.toml
+      driver: local

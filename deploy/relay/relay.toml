@@ -1,14 +1,9 @@
-# Local-only configuration used by compose.yaml and the automated smoke test.
-# Production TLS/ACME configuration is rendered by compose.production.yaml
-# using Docker Compose's `configs.content` interpolation.
+# OpenResty owns public TLS and proxies this loopback-published HTTP listener.
 
-enable_relay = true
-http_bind_addr = "0.0.0.0:3340"
+http_bind_addr = "0.0.0.0:38451"
 enable_quic_addr_discovery = false
-enable_metrics = true
-metrics_bind_addr = "0.0.0.0:9090"
+enable_metrics = false
 access = "everyone"
 
-# Intentionally no [limits] section: Phase Zero preserves upstream unlimited
-# defaults selected for the public zterm relay.
-
+# No [tls] or [limits] section: the host proxy owns TLS and upstream unlimited
+# defaults remain in effect.

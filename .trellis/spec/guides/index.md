@@ -24,6 +24,7 @@ These guides help you **ask the right questions before coding**.
 | [Code Reuse Thinking Guide](./code-reuse-thinking-guide.md) | Identify patterns and reduce duplication | When you notice repeated patterns |
 | [Cross-Layer Thinking Guide](./cross-layer-thinking-guide.md) | Think through data flow across layers | Features spanning multiple layers |
 | [Cross-Platform Thinking Guide](./cross-platform-thinking-guide.md) | Verify checkout bytes and command behavior across operating systems | Source attributes, CI matrices, or platform tooling changes |
+| [Evidence-Driven Simplicity Guide](./evidence-driven-simplicity.md) | Require a real failure model and one validation owner before adding machinery | Validation, fallback, recovery, monitoring, deployment, or test expansion |
 
 ---
 
@@ -65,6 +66,16 @@ These guides help you **ask the right questions before coding**.
 3. **Variable misreading**: Not tracing a variable to its actual definition (e.g., Map keyed by path vs name)
 
 **Verification rule**: Every CRITICAL/WARNING finding must be verified against the actual code before prioritizing. Budget ~35% false-positive rate for AI reviews.
+
+### When Adding Safety or Deployment Machinery
+
+- [ ] A new validator, fallback, rollback, monitor, metric, or deployment layer is proposed
+- [ ] The same invariant is already checked elsewhere
+- [ ] A test matrix is growing faster than observable behavior
+- [ ] A stateless service is gaining recovery state or rollback automation
+- [ ] An artifact or metric has no current consumer
+
+→ Read [Evidence-Driven Simplicity Guide](./evidence-driven-simplicity.md)
 
 ### When to Think About Cross-Platform Issues
 

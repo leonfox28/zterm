@@ -5,7 +5,7 @@ repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 relay_context="$repo_root/deploy/relay"
 
 for relay_arch in amd64 arm64; do
-    image="zterm/iroh-relay:phase-zero-$relay_arch"
+    image="zterm/iroh-relay:test-$relay_arch"
     docker buildx build --load --provenance=false --platform "linux/$relay_arch" \
         --build-arg "TARGETARCH=$relay_arch" --tag "$image" "$relay_context"
 
@@ -17,9 +17,4 @@ for relay_arch in amd64 arm64; do
 
     docker run --rm --platform "linux/$relay_arch" "$image" --version \
         | grep -F 'iroh-relay 1.0.3'
-
-    probe_output=$(docker run --rm --platform "linux/$relay_arch" \
-        --entrypoint /usr/local/bin/zterm-relay-healthcheck \
-        "$image" 127.0.0.1:1 /healthz 200 2>&1 || true)
-    printf '%s\n' "$probe_output" | grep -F 'failed to connect'
 done

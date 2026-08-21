@@ -23,18 +23,15 @@ jobs:
   publish:
     name: Build and publish multi-platform relay image
     runs-on: ubuntu-latest
-    outputs:
-      image: ${{ steps.publish.outputs.image }}
-      version: ${{ steps.publish.outputs.version }}
-      channel: ${{ steps.publish.outputs.channel }}
-      digest: ${{ steps.build.outputs.digest }}
-      reference: ${{ steps.reference.outputs.reference }}
     steps:
       - name: Check out the original Git release tag source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event_name == 'release' && format('refs/tags/{0}', github.event.release.tag_name) || github.sha }}
           persist-credentials: false
+
+      - name: Install exact Rust toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal
 
       - name: Resolve image name and publication tags
         id: publish
@@ -76,7 +73,6 @@ jobs:
             org.opencontainers.image.version=${{ steps.publish.outputs.version }}
 
       - name: Build and publish one multi-platform manifest
-        id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: ./deploy/relay
@@ -84,38 +80,6 @@ jobs:
           platforms: linux/amd64,linux/arm64
           pull: true
           push: true
-          provenance: mode=max
-          sbom: true
+          provenance: false
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
-
-      - name: Record immutable deployment reference
-        id: reference
-        shell: bash
-        env:
-          IMAGE: ${{ steps.publish.outputs.image }}
-          VERSION: ${{ steps.publish.outputs.version }}
-          CHANNEL: ${{ steps.publish.outputs.channel }}
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: |
-          set -euo pipefail
-          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "build action returned an invalid manifest digest: $DIGEST" >&2
-            exit 70
-          fi
-          reference="$IMAGE@$DIGEST"
-          if [[ "$CHANNEL" == "stable" ]]; then
-            sh deploy/relay/validate-image-reference.sh "$reference" >/dev/null
-          elif [[ "$IMAGE" != */zterm-relay-dev ]]; then
-            echo "development publication resolved outside zterm-relay-dev: $IMAGE" >&2
-            exit 70
-          fi
-          echo "reference=$reference" >>"$GITHUB_OUTPUT"
-          {
-            echo "### zterm relay image"
-            echo
-            echo "- Channel: \`$CHANNEL\`"
-            echo "- Version tag: \`$IMAGE:$VERSION\`"
-            echo "- Multi-platform digest: \`$DIGEST\`"
-            echo "- Immutable reference: \`$reference\`"
-          } >>"$GITHUB_STEP_SUMMARY"

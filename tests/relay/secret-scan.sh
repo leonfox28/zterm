@@ -15,4 +15,4 @@ if grep -rIE \
     exit 1
 fi
 
-echo "Phase Zero repository secret scan passed"
+echo "relay repository secret scan passed"

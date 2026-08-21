@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
-    echo "usage: $0 <relay-url> [--expect-reconnect]" >&2
+if [ "$#" -ne 1 ]; then
+    echo "usage: $0 <relay-url>" >&2
     exit 64
 fi
 

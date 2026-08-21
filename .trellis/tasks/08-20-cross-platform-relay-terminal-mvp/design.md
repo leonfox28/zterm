@@ -55,7 +55,7 @@ zterm/default or self-host relay: address discovery + opaque E2E ciphertext forw
 
 第零阶段先在本机构建并验证`deploy/relay`，然后硬停止并向用户报告已经到达公网部署步骤。此时才接收SSH入口、登录/认证方式、relay域名与DNS状态；不要求用户把私钥或token复制进仓库。获得方式后先执行只读preflight，确认服务器OS/架构、Docker/Compose、DNS、端口占用与防火墙可达性。已有Docker和网络条件满足时可部署；若需要安装系统软件、修改防火墙或处理端口冲突，先展示精确变更影响。
 
-第零阶段完成条件是固定digest的公网relay通过外部TLS与真实Iroh握手、宿主回环38451/9090、health、私有metrics、Everyone/no-limits、日志轮转与回滚smoke。当前反代模式不开放UDP/QAD；第一阶段Gate 0必须使用这套relay，不临时依赖公共Iroh relay，并单独验证真实NAT直连。
+当前完成条件是 GitHub Release `vX.Y.Z` 直接发布同名 GHCR tag 与 `latest`，默认服务器通过显式 `docker compose pull` / `up -d` 更新后，只执行一次宿主 health、公开 HTTP 与 authenticated Iroh Relay 握手验收。Compose只监听宿主回环38451，使用Docker `local`日志驱动，不开放metrics、UDP/QAD，也不把digest或回滚演练作为Gate；第一阶段Gate 0必须使用这套relay，不临时依赖公共Iroh relay，并单独验证真实NAT直连。
 
 ### 3.3 仓库结构
 
@@ -473,17 +473,16 @@ zterm reset --identity
 
 `deploy/relay` 只封装官方 `iroh-relay` 1.0.3，不实现或fork转发核心。Iroh官方v1.0.3 Release已经提供Linux x86_64/aarch64预编译产物与SHA-256，因此优先下载匹配服务器架构的官方binary并校验，而不是在服务器安装Rust或现场编译：
 
-- Dockerfile 使用固定 tag/commit 的可复现构建，或下载官方 release binary并校验 SHA-256；最终镜像以非 root 用户运行。
-- 当前默认服务器使用同机 OpenResty/Cloudflare 终止TLS，Compose只发布宿主回环 `127.0.0.1:38451` 的纯HTTP Relay与`127.0.0.1:9090` metrics，不开放80/443/UDP、不修改防火墙；direct TLS/ACME/QAD Compose仅作为其他自建者的独立模板。
-- Cloudflare代理模式必须开启WebSockets并避免Argo/WAF/限速阻断初始101；Cloudflare可能在边缘发布或空闲时终止WebSocket，因此公网验收包含完整Iroh认证握手和断开重连，PTY仍由daemon独立存活。
-- `relay.toml` 明确 `access = "everyone"`，省略 `limits`、token、名单与外部 auth。
-- metrics 只绑定容器私网/localhost，不直接发布公网；health check 只验证服务能力，不读取 zterm 内容。
-- Docker log rotation 有大小/文件数上限；默认 tracing level 不记录 payload。TLS/ACME cache可持久化，但 relay 不挂载任何 zterm 业务数据库。
-- 运维文档包含 DNS、firewall、端口、启动、健康、备份范围、镜像升级、旧镜像回滚和客户端 profile 切换。
-- 第零阶段不复制 Zedra 的自定义 monitor sidecar；只使用 `iroh-relay` 自带health/metrics、Docker健康检查和服务器/云厂商已有监控。以后若真实运维证据需要告警服务，再作为独立运维增量评估。
-- 本地smoke通过后执行第3.2节的人工检查点；真实SSH入口、私钥、token与`.env`只存在于用户指定的安全位置，不提交到Git。服务器只读preflight与部署/回滚证据分别留痕。
+- Dockerfile下载官方 release binary并校验 SHA-256；scratch runtime无shell，以 UID/GID 65532运行，并提供默认config command。
+- 当前只支持同机 OpenResty/Cloudflare 终止TLS的反代模式。唯一Compose project与容器均名为`zterm-relay`，镜像直接使用`ghcr.io/leonfox28/zterm-relay:latest`，只发布宿主回环 `127.0.0.1:38451`，不开放80/443/9090/UDP、不修改防火墙。
+- Cloudflare代理必须保留WebSocket Upgrade/Connection/subprotocol；公网验收只做一次完整Iroh认证握手，transport中断时PTY仍由daemon独立存活，但不在每次Relay发布中重复reconnect演练。
+- `relay.toml` 明确 `access = "everyone"`、`enable_metrics = false`、`enable_quic_addr_discovery = false`，省略 `limits`、token、名单、外部 auth与TLS。
+- Compose只保留literal `:latest` image、只读config bind mount、回环38451、`restart: unless-stopped`和`logging.driver: local`。更新必须由人显式执行`pull`后`up -d`；普通重启不自动拉取。
+- 运维验收只检查宿主`/healthz`、公开HTTP路径和一次authenticated Iroh Relay握手。无状态运行异常直接recreate；只有实际确认镜像缺陷时才人工选择上一版本tag，不提供自动回滚或常规演练。
+- direct TLS/ACME/QAD模板、metrics、Docker health state、自研health probe和monitor sidecar均不预建；真实消费者或Phase 1网络证据出现后再作为独立需求设计。
+- 本地smoke通过后执行第3.2节的人工检查点；真实SSH入口、私钥或token只存在于用户指定的安全位置，不提交到Git。服务器只读preflight与一次部署验收分别留痕。
 
-项目默认 relay 与自建模板使用相同配置形状。默认 relay 的真实域名通过 release profile 注入，不散落在协议代码。第一阶段单节点 best-effort；客户端配置接受多个 URL，但不宣称已经实现多地域 SLA。
+项目默认 relay 与当前自建文档使用相同的反代配置形状。第一阶段单节点 best-effort；客户端配置接受多个 URL，但不宣称已经实现多地域 SLA。
 
 ## 14. 安全与可观察性
 
@@ -509,13 +508,13 @@ zterm reset --identity
 - `zterm status --json`：daemon/build/protocol版本、EndpointId、home relay、发布/查询状态、每个 remote connection path、session资源和授权设备摘要。
 - `zterm doctor`：目录权限、single-instance、受管理 binary/daemon build 与 protocol 版本、release/install metadata、login shell、PTY、DNS/Pkarr、relay reachability、public-relay禁用、logind session清理风险。
 - 本地 metrics：PTY bytes、VT parse latency、snapshot/diff大小、resync次数、queue saturation、connection/path/reconnect、session/attachment数；无内容标签。
-- relay metrics：连接数、收发密文字节、错误和容量。上游 1.0.3 日志在部分连接事件中会记录缩短后的 EndpointId，并可能记录 remote IP；生产使用受控日志级别、轮转和明确保留期，不声称 relay 完全看不到这些元数据。
+- relay 当前没有metrics消费者，因此服务端显式关闭metrics。上游 1.0.3 日志在部分连接事件中会记录缩短后的 EndpointId，并可能记录 remote IP；生产使用Docker `local`日志轮转，不声称 relay 完全看不到这些元数据。
 
 ## 15. 验证策略与技术门
 
 ### Gate 0：依赖与 VT 可行性（必须先过）
 
-只有第零阶段开发环境、上游relay公网部署和回滚smoke全部完成后，才在搭建完整产品前做有限时 vertical spike；产物仍按正式 crate边界和测试保留：
+只有第零阶段开发环境、上游relay公网部署与一次health/authenticated-handshake验收完成后，才在搭建完整产品前做有限时 vertical spike；产物仍按正式 crate边界和测试保留：
 
 1. Iroh 1.0.3 `Minimal + Custom relay + n0 DNS/Pkarr` 两 endpoint连接，确认没有 public relay候选并能读取 path events。
 2. portable-pty启动账户 login shell，验证 reader、input、resize、root child exit及断开 reader不会给 child发送 HUP。
@@ -533,7 +532,7 @@ Gate 0通过条件不是“能显示 hello world”，而是候选 VT 达到 PRD
 - **multi-process integration**：两个 daemon + 多个 CLI，证明同 remote只有一条 Iroh connection、多 session独立 stream、revoke竞态与版本不匹配。
 - **network lab**：Linux network namespace/容器构造双 NAT；先用当前 `RelayConfig::new(url, None)`、QAD关闭的真实部署记录path events、打洞时延与direct成功率，允许direct时观察direct，阻断后观察自建relay，停止relay后PTY继续。测试配置断言public Iroh relay map为空。只有这些结果显示QAD缺失是实际瓶颈时，才提出另行批准的QAD-only对照实验与服务设计。
 - **platform matrix**：macOS arm64/x64、主流 glibc Linux x64/arm64 compile/test；在真实受支持的 macOS/Linux 做 direct-installer clean-account、手动 update/rollback、SSH detach、tmux/Herdr 验收，并对 Alpine/NixOS 做 installer unsupported-platform 负向验收。
-- **relay smoke**：干净Linux VM + 公网域名启动所选反代Compose，检查外部TLS、真实Iroh WebSocket握手、宿主回环38451/9090、private metrics、Everyone/no-limits和回滚，并断言没有UDP/QAD或防火墙变更；direct TLS/QAD模板单独验证。
+- **relay smoke**：干净Linux VM + 公网域名启动唯一反代Compose，检查外部TLS、真实Iroh WebSocket握手、宿主回环38451、Docker `local`日志、Everyone/no-limits，并断言没有9090/metrics、UDP/QAD或防火墙变更；通过即停止，不做回滚/restart/reconnect演练。
 - **security acceptance**：tcpdump/relay side观察不到明文、未授权 EndpointId被拒绝、文件/socket mode、过大 frame/stream flood隔离、revoke持久先行。
 
 真实 Codex或OpenCode只作为普通全屏 TUI做最终人工 smoke，不对其输出写断言；自动化以自有 deterministic fixture和 tmux/Herdr黑盒为主。
@@ -554,7 +553,7 @@ Gate 0通过条件不是“能显示 hello world”，而是候选 VT 达到 PRD
 - SQLite schema带版本；迁移在单事务中进行，破坏性迁移前复制数据库备份。旧 daemon不读取已升级的不兼容 schema，而是明确拒绝。
 - wire v1的兼容字段只新增；不兼容变更使用新 ALPN major并在至少一个手动升级窗口内给出明确版本错误。
 - `zterm update` 由用户触发，先验证 artifact再确认 session终止；安装激活失败自动恢复旧二进制。identity与auth表不随二进制回滚改变；若新 daemon 已执行不可降级 schema migration，回滚步骤恢复升级前数据库备份并明确可能丢失升级后的非终端元数据。
-- relay无 zterm业务状态；升级先保留旧镜像与 config，失败时 Compose回滚旧 digest。TLS cache可沿用，终端/session无需迁移。
+- relay无 zterm业务状态；运行异常直接recreate。只有实际确认新镜像缺陷时，运维人员才手动改用上一版本tag；不建立自动回滚或常规演练，终端/session无需迁移。
 - profile切换不重建 EndpointId。配置验证失败时保留上一份已知可用 config，并拒绝启动错误 profile。
 
 ## 18. 关键取舍与剩余风险
@@ -565,7 +564,7 @@ Gate 0通过条件不是“能显示 hello world”，而是候选 VT 达到 PRD
 | 单 daemon直接持有 PTY | 进程模型与升级简单 | daemon crash/restart会结束任务，1.0明确接受 |
 | 本地命令按需 detached-spawn | 无管理员权限、无额外 supervisor | 宿主重启后首次本地命令前不可达；某些 logind策略会清理进程 |
 | Iroh官方 DNS/Pkarr + 自建 relay | 少部署一个后端，路由可更新 | 地址查询元数据暴露给官方服务，受限速与无 SLA影响 |
-| 固定官方 `iroh-relay` binary + 自有部署外壳 | 不承担转发协议实现与维护，可直接跟随Iroh安全修复 | 项目仍需负责checksum、镜像、配置、服务器安全、监控和版本回滚 |
+| 固定官方 `iroh-relay` binary + 最小部署外壳 | 不承担转发协议实现与维护，可直接跟随Iroh安全修复 | 项目仍需负责checksum、镜像、配置、服务器暴露面与一次上线验收 |
 | Pkarr不发布 direct IP | 减少公开网络元数据 | relay完全故障时可能无法启动本来可直连的新连接 |
 | Everyone且无 limits | 无账号/凭据即可开箱使用 | 非 zterm滥用、容量与带宽成本不可预测 |
 | 主机级设备信任 | 与同 OS用户任意 Shell权限一致，模型诚实 | 配对设备可管理全部 session和本地 zterm CLI，不能宣称细粒度隔离 |

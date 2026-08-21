@@ -17,7 +17,7 @@ zterm 是一个面向长时间远程终端任务的跨网络连接工具。用�
 
 ## 3. 平台角色与路线图
 
-0. 第零阶段：完成当前开发机的 Rust/Docker/质量工具环境、空 workspace 与固定上游 `iroh-relay` 的 Docker/Compose 部署物；本地验证后设置人工检查点，等待用户提供公网服务器连接方式，再完成单区域默认 relay 公网部署与回滚 smoke。
+0. 第零阶段：完成当前开发机的 Rust/Docker/质量工具环境、空 workspace 与固定上游 `iroh-relay` 的 Docker/Compose 部署物；本地验证后设置人工检查点，等待用户提供公网服务器连接方式，再完成单区域默认 relay 公网部署与一次真实握手验收。
 1. 第一阶段：macOS x86_64/arm64 与主流 glibc Linux x86_64/arm64 的 Rust daemon + CLI，并使用第零阶段已经部署的 relay 完成 direct/relay 网络验收。
 2. 第二阶段：Android 控制端 App；不托管 Android 本机通用 Shell。
 3. 第三阶段：Windows daemon + CLI；桌面端既可托管也可控制。
@@ -32,9 +32,9 @@ zterm 是一个面向长时间远程终端任务的跨网络连接工具。用�
 
 1. 只读检查当前开发机的 OS/架构、Xcode、Homebrew、Rust、Docker 与构建工具；已经满足要求的工具不重复安装。当前 Apple Silicon Mac 已有 rustup、Rust/Cargo 1.98.0、rustfmt、Clippy、rust-analyzer、Xcode/clang、Homebrew、Git 和 CMake，缺少 Docker、`protoc` 与 `pkg-config`；iOS/Android Rust targets仍在。
 2. 项目在`rust-toolchain.toml`精确固定当前最新版Rust 1.98.0，不再额外安装或验证Rust 1.91。以后只通过显式版本变更和全量质量门升级编译器，不让浮动`stable`静默改变构建。补齐固定质量工具，并用仓库固定的 Protobuf 生成方案避免把系统 `protoc` 变成最终用户依赖。当前 Mac 默认使用 Homebrew 管理 Docker CLI/Compose 与 Colima，除非用户在实际安装前指定 Docker Desktop。
-3. 建立空 Rust workspace、CI/质量命令和 `deploy/relay`，从 Iroh 官方 v1.0.3 Release 下载匹配服务器架构的 `iroh-relay` 预编译产物并验证官方 SHA-256，封装成固定 digest 的最小镜像；不 fork、不修改、不重写 relay 数据平面。
-4. 在本地完成 Compose 配置、容器健康、端口、私有 metrics、日志轮转和启停 smoke 后，必须停止并明确告知用户已经到达公网部署步骤，同时索取 SSH 入口/登录方式、relay 域名和 DNS 状态。用户提供之前不得连接服务器，连接秘密不得进入仓库或任务文档。
-5. 获得连接方式后先做只读服务器 preflight；若 Docker 已存在且端口/DNS满足要求，则部署上游 relay。若需要安装 Docker、修改系统防火墙或处理端口冲突，先报告具体变更再执行。当前默认服务器使用既有 OpenResty/Cloudflare TLS 反代到宿主 `127.0.0.1:38451`；公网 TLS、真实 relay 握手、回环 38451/9090、health、Everyone/no-limits、私有 metrics和镜像回滚全部通过后，第零阶段才完成，不开放 UDP 7842或修改防火墙。
+3. 建立空 Rust workspace、CI/质量命令和 `deploy/relay`，从 Iroh 官方 v1.0.3 Release 下载匹配服务器架构的 `iroh-relay` 预编译产物并验证官方 SHA-256，封装成 scratch、非 root 的最小多架构镜像；不 fork、不修改、不重写 relay 数据平面。
+4. 在本地完成上游 checksum、双架构镜像运行、最小 Compose 渲染和 HTTP smoke 后，必须停止并明确告知用户已经到达公网部署步骤，同时索取 SSH 入口/登录方式、relay 域名和 DNS 状态。用户提供之前不得连接服务器，连接秘密不得进入仓库或任务文档。
+5. 获得连接方式后先做只读服务器 preflight；若 Docker 已存在且端口/DNS满足要求，则部署上游 relay。若需要安装 Docker、修改系统防火墙或处理端口冲突，先报告具体变更再执行。当前默认服务器使用既有 OpenResty/Cloudflare TLS 反代到宿主 `127.0.0.1:38451`；完成一次宿主 health、公开 HTTP 与真实 authenticated Iroh Relay 握手验收即结束，不开放 metrics、UDP 7842或修改防火墙。
 
 ### 4.1 安装与初始化
 
@@ -74,9 +74,9 @@ zterm 是一个面向长时间远程终端任务的跨网络连接工具。用�
 - 第零阶段属于项目研发交付，不是最终用户安装流程；允许为开发机安装经确认的构建/Docker工具，但不得改变 zterm 1.0“最终用户无需 Rust、Docker、Node/npm 或管理员权限”的要求。
 - 环境 bootstrap 必须先探测再补齐，能重复运行且不破坏现有 rustup toolchain、Xcode、Homebrew或用户配置；安装后记录实际版本和验证命令，不把个人绝对路径或秘密固化进产品配置。
 - 项目当前开发与release工具链精确固定为Rust 1.98.0；Iroh的更低MSRV只表示依赖兼容下限，不是zterm需要维护的第二套编译器。升级Rust必须由显式变更触发并重跑format、Clippy、test、依赖和artifact门禁。
-- relay 转发核心完全采用固定版本的官方上游 `iroh-relay`。zterm 只拥有 Dockerfile/下载校验、`relay.toml`、Compose、health、内置私有 metrics、日志轮转和运维脚本/文档；不写自有 relay协议、数据平面、业务认证服务或自定义监控 sidecar。
+- relay 转发核心完全采用固定版本的官方上游 `iroh-relay`。zterm 只拥有 Dockerfile/下载校验、`relay.toml`、单一反代 Compose、日志轮转选择和最小运维文档；不写自有 relay协议、数据平面、业务认证服务、自定义 health 二进制或监控 sidecar。
 - 本地 relay bundle 验证完成后设不可跳过的人工检查点。用户按约定在该点提供公网服务器连接方法；提供之前不发起连接。服务器部署先只读 preflight，发现需要额外系统级变更时必须先报告影响。
-- 第零阶段部署的 relay 是第一阶段 Gate 0 和后续默认 profile 的基础设施。其版本、上游 checksum、镜像 digest、非秘密配置、验证结果和回滚步骤必须可追溯；服务器不安装 Rust、不编译 zterm，也不持有终端内容、PairTicket或设备私钥。
+- 第零阶段部署的 relay 是第一阶段 Gate 0 和后续默认 profile 的基础设施。其 workspace/Release/GHCR版本映射、上游 checksum、非秘密配置和一次验收结果必须可追溯；服务器不安装 Rust、不编译 zterm，也不持有终端内容、PairTicket或设备私钥。
 
 ### R1. 每用户、非特权 daemon
 
@@ -112,9 +112,9 @@ zterm 是一个面向长时间远程终端任务的跨网络连接工具。用�
 ### R4. 默认 relay 与地址查询
 
 - 第零阶段先部署项目方默认 relay，第一阶段使用并发布同一部署物，同时允许用户自建。两者均直接封装固定版本的上游 Iroh 1.x `iroh-relay`，不重写 relay 协议或转发实现。
-- relay 可在一台具有公网 IP 与域名的 Linux 服务器上通过 Docker Compose 重复部署，包含版本固定或可复现构建、TLS、域名、端口说明、健康检查、私有 metrics、日志轮转、升级与回滚说明；密钥和凭据不得提交到仓库或镜像。
-- 第零阶段部署并在第一阶段使用的 relay 采用开放 beta 策略：`access = Everyone`，不要求 token，不配置 allowlist/denylist、连接限额、带宽限速、外部准入回调或自动封禁。监控只用于容量、故障和成本观察。
-- 项目默认部署通过现有 TLS 反代只向宿主回环暴露纯 HTTP Relay 38451 与 metrics 9090，QAD/UDP 不在该部署中；保留的 direct TLS/ACME Compose 仅是自建模板，不改变默认服务器的暴露面。
+- relay 可在一台具有公网 IP、域名和现有 TLS 反代的 Linux 服务器上通过 Docker Compose 重复部署，包含版本映射、域名、回环端口、手动更新、一次健康/握手验收和有界日志说明；密钥和凭据不得提交到仓库或镜像。
+- 第零阶段部署并在第一阶段使用的 relay 采用开放 beta 策略：`access = Everyone`，不要求 token，不配置 allowlist/denylist、连接限额、带宽限速、外部准入回调、自动封禁或无人消费的 metrics。
+- 项目当前只支持现有 TLS 反代模式：Compose 只向宿主回环暴露纯 HTTP Relay 38451，QAD/UDP、metrics和 direct TLS/ACME 模板均不在当前部署中；出现真实需求后再独立设计。
 - 若默认域名启用Cloudflare代理，WebSockets必须开启，初始101不得被WAF/限速挑战，Argo不得用于该流量；Cloudflare或OpenResty终止长连接后，Iroh重连只影响transport，不得终止宿主PTY。
 - 文档必须明确：公开且无限制的 relay 可能被非 zterm Iroh 客户端使用并产生资源成本；能够使用 relay 不等于获得任何 zterm 终端权限。
 - 第一阶段默认地址查询使用 Iroh 官方免费 DNS/Pkarr 服务 `dns.iroh.link`，不部署 `iroh-dns-server`。relay 与地址查询必须是独立可配置的 profile 字段。
@@ -184,6 +184,8 @@ zterm 是一个面向长时间远程终端任务的跨网络连接工具。用�
 
 ### Z. 第零阶段环境与公网 Relay
 
+以下勾选项保留 2026-08-21 第零阶段当时实际执行过的历史证据；其中 digest、metrics与回滚 smoke 不再是当前或后续发布 Gate。现行 Relay 运维契约由子任务 `08-21-simplify-relay-release-deployment` 与 `.trellis/spec/backend/relay-deployment.md` 取代。
+
 - [x] 当前开发机经“探测后补齐”具备精确固定的Rust/Cargo 1.98.0、rustfmt、Clippy、Cargo质量检查、Docker Engine/Compose和仓库固定Protobuf生成环境；已有Rust/Xcode/Homebrew配置未被无故覆盖，空workspace的check/fmt/clippy/test/deny命令通过，浮动stable升级不会绕过版本变更与质量门。
 - [x] `deploy/relay` 只下载并校验官方 Iroh v1.0.3 `iroh-relay` release artifact，不包含自有转发实现；本地镜像固定上游版本/checksum和最终digest，Compose config、启动、health、私有metrics、日志轮转、停止与回滚smoke通过。
 - [x] 本地验证通过后助手明确暂停并通知用户提供公网服务器连接方式；提供之前没有服务器连接尝试，SSH私钥、token、真实`.env`等秘密没有写入仓库、任务产物或日志。
@@ -214,7 +216,7 @@ zterm 是一个面向长时间远程终端任务的跨网络连接工具。用�
 
 - [ ] macOS 与 Linux 之间可以完成 CLI 连接与终端交互；在可直连网络中能观测 direct path，在阻断直连时自动使用配置的自建 relay，切换期间 PTY 不变。
 - [ ] 抓取 direct 与 relay 路径以及检查 relay 日志，都不能得到终端或 zterm 应用协议明文；relay 不持有可解密业务载荷的密钥，也不落盘应用载荷。
-- [ ] 一台干净公网 Linux 服务器可按文档通过 Docker Compose 启动固定版本 relay；TLS、健康检查、私有 metrics、日志轮转与回滚流程可验证，配置为 Everyone 且无 token、名单或限速。
+- [ ] 一台干净公网 Linux 服务器可按文档通过现有 TLS 反代和最小 Docker Compose 启动 relay；只发布宿主回环 38451，配置为 Everyone 且无 token、名单、限速、QAD或metrics，手动 `pull`/`up -d` 后一次 health 与 authenticated Relay handshake 通过。
 - [ ] 项目默认 relay 与一套独立自建 relay 均通过端到端验收；网络观测证明测试没有把 Iroh 公共 relay 当作业务流量回退路径。
 - [ ] relay 与地址查询可以分别替换而不改变 EndpointId、配对授权或终端协议；诊断能显示实际 profile、home relay、地址来源和当前 direct/relay path。
 - [ ] 公开 Pkarr 记录只含签名的 home relay 路由，不含宿主 direct IP。阻断 `dns.iroh.link` 后，只要缓存 relay 可用，已配对设备仍能重连；缓存也失效时给出明确错误且 session 继续。

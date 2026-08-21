@@ -1,205 +1,171 @@
 # Relay Deployment Contract
 
-## Scenario: Reverse-proxied relay fallback and optional QAD
+## Scenario: one manually updated reverse-proxy Relay
 
 ### 1. Scope / Trigger
 
-Apply this contract whenever code or infrastructure changes any of the following:
+Apply this contract when changing:
 
-- the public zterm relay URL or its reverse-proxy deployment;
-- Iroh `RelayConfig` / `RelayMode` construction;
-- NAT traversal, path selection, or relay-only tests;
-- any proposal to expose UDP QUIC address discovery (QAD).
+- the official Relay image or GitHub publication workflow;
+- `deploy/relay/Dockerfile`, `relay.toml`, or `compose.yaml`;
+- the selected 1Panel Relay deployment;
+- Iroh client Relay/QAD construction or Relay acceptance tests.
 
-Direct NAT-traversed traffic and relay fallback are independent data paths. QAD is an optional address-discovery aid that can improve direct-path establishment; it is not part of relay forwarding and is not required for encrypted fallback traffic.
+The supported deployment is a single stateless Iroh Relay behind an existing
+same-host TLS reverse proxy. Direct TLS/ACME/QAD deployment, automatic update,
+metrics infrastructure, and rollback automation are not current capabilities.
+Read the [Evidence-Driven Simplicity Guide](../guides/evidence-driven-simplicity.md)
+before adding another deployment or validation layer.
 
 ### 2. Signatures
 
-- Public relay URL: `https://relay.zenithconsulting.cn`
-- Same-host upstream: `http://127.0.0.1:38451`
-- Private metrics: `http://127.0.0.1:9090/metrics` (Prometheus
-  observability only, never Relay client traffic)
-- Default Compose root: `/opt/1panel/docker/compose/zterm-relay`
-- Official production package: `ghcr.io/leonfox28/zterm-relay`
-- Official development package: `ghcr.io/leonfox28/zterm-relay-dev`
-- Product version source: root `Cargo.toml` `[workspace.package].version`
-- Stable release mapping: Git tag `vMAJOR.MINOR.PATCH` -> production image
-  tag `MAJOR.MINOR.PATCH` plus `latest`
-- Prerelease mapping: Git tag `vMAJOR.MINOR.PATCH-PRERELEASE` -> development
-  image tag `MAJOR.MINOR.PATCH-PRERELEASE`, without `latest`
-- Production deployment image:
-  `ghcr.io/leonfox28/zterm-relay@sha256:<published-digest>` (fork workflows
-  resolve the same package names under their own repository owner)
-- Image publisher: `.github/workflows/relay-image.yml`
-- Preflight validator: `deploy/relay/validate-image-reference.sh "$RELAY_IMAGE"`
-- Deployment command:
+- Product version source: root `Cargo.toml` `[workspace.package].version`.
+- Stable Release/image example:
 
-  ```bash
-  docker compose --env-file .env -f compose.reverse-proxy.yaml up -d --no-build --wait
+  ```text
+  workspace:      0.1.1
+  GitHub Release: v0.1.1
+  version image:  ghcr.io/leonfox28/zterm-relay:v0.1.1
+  server image:   ghcr.io/leonfox28/zterm-relay:latest
   ```
 
-- Phase 1 client construction for this relay-only deployment:
+- Development package: `ghcr.io/leonfox28/zterm-relay-dev`.
+- Public URL: `https://relay.zenithconsulting.cn`.
+- Reverse-proxy upstream: `http://127.0.0.1:38451`.
+- Server Compose root: `/opt/1panel/docker/compose/zterm-relay`.
+- Compose project and container: `zterm-relay`.
+- Manual update:
+
+  ```bash
+  docker compose pull
+  docker compose up -d
+  ```
+
+- Phase 1 client construction:
 
   ```rust
   let relay = RelayConfig::new(relay_url, None);
-  // Insert `relay` into the endpoint's custom RelayMode.
   ```
 
-  The second argument is deliberately `None`: this server does not expose a QAD endpoint. Do not construct the selected relay from a bare `RelayUrl`, because Iroh 1.0.3 then assumes default UDP QAD on port 7842.
+  `None` is required because this server exposes Relay forwarding but no QAD
+  endpoint.
 
 ### 3. Contracts
 
-Reverse-proxy environment keys:
+#### Publication
 
-| Key | Required | Contract |
-| --- | --- | --- |
-| `RELAY_IMAGE` | Yes | Must be the GHCR wrapper image at the exact multi-platform digest emitted by the publication workflow. Production tags and local image IDs are invalid. |
-| `RELAY_PROXY_PORT` | Optional | Defaults to `38451`; Docker must publish it only on `127.0.0.1`. |
-| `RELAY_METRICS_PORT` | Optional | Defaults to `9090`; Docker must publish it only on `127.0.0.1`. |
-| `RELAY_LOG_LEVEL` | Optional | Defaults to `info`; upstream metadata logs remain rotated. |
+- A GitHub Release tag must equal the literal `v` prefix plus the Cargo-resolved
+  workspace product version. The same Release tag is used unchanged as the OCI
+  image tag.
+- Stable releases publish only to `zterm-relay` and also update `latest`.
+  GitHub prereleases and manual runs publish only to `zterm-relay-dev` and never
+  update `latest`.
+- Manual development input is rejected only when empty, equal to `latest`, or
+  not a legal OCI tag. Do not reimplement Cargo SemVer or validate trusted
+  GitHub owner syntax.
+- The workflow builds one linux/amd64 + linux/arm64 image with minimal
+  `contents: read` / `packages: write` permissions and full-commit Action pins.
+- The image build verifies the official Iroh 1.0.3 artifact SHA-256 once. Do
+  not add deployment-time digest validation, immutable-reference requirements,
+  or attestations without a current verifier/consumer.
 
-Runtime contracts:
+#### Image and Iroh configuration
 
-- OpenResty/Cloudflare owns public TLS and forwards HTTP/1.1 WebSocket traffic to loopback port 38451.
-- Production Compose files contain no `build` section. They pull the published
-  multi-platform GHCR image and start with `--no-build`; local builds are only
-  for development and CI verification.
-- The root workspace version is the lockstep zterm product version. Product
-  crates inherit it with `version.workspace = true`; the isolated handshake
-  probe is an internal acceptance tool and is not a product release component.
-- Stable GitHub releases require canonical `vMAJOR.MINOR.PATCH`. Removing the
-  leading `v` must exactly match `[workspace.package].version`; the v-less tag
-  and `latest` are published only in `zterm-relay`. For example, workspace
-  `0.1.0` plus Git tag `v0.1.0` publishes `zterm-relay:0.1.0` and `:latest`.
-- GitHub prereleases require canonical
-  `vMAJOR.MINOR.PATCH-PRERELEASE`. The complete v-less SemVer must exactly
-  match the workspace version and is published only in `zterm-relay-dev`,
-  never in the production package or `latest`.
-- SemVer build metadata is rejected. OCI tags do not portably accept `+`, and
-  silently dropping metadata would make two Git release identities map to the
-  same image tag.
-- Manual publications target only `zterm-relay-dev`. Any non-empty valid OCI
-  tag except reserved `latest` is used unchanged (`phase-zero` remains
-  `phase-zero`). These development aliases may be overwritten; the emitted
-  digest is authoritative. Operators should not reuse a prerelease release tag.
-  Package separation prevents a manual tag from colliding with or updating a
-  stable production release.
-- Both packages are multi-platform manifests with provenance/SBOM and an exact
-  image-plus-digest workflow output. Production deployments accept only the
-  production package by digest and never consume `latest`, another mutable
-  tag, or the development package.
-- The literal release/manual tag `latest` is reserved for the workflow-managed
-  stable alias and must be rejected at channel resolution.
-- `deploy/relay/resolve-publication.sh` is the single owner of the release/
-  prerelease/manual matrix. For release events it must parse exactly one
-  `[workspace.package].version`, validate canonical SemVer and release type,
-  and enforce lockstep equality before writing outputs. It must also validate
-  the original repository owner and version as single-line ASCII values; a
-  line-oriented regex that accepts one valid line inside a multiline value is
-  unsafe because it permits workflow-output injection.
-- The upstream relay uses official Iroh 1.0.3, `access = "everyone"`, no `[limits]`, no `--dev`, no custom data plane, and no monitor sidecar.
-- Port 9090 is hard-bound to host loopback for Prometheus connection/traffic
-  metrics. It is not proxied or exposed as a relay transport listener.
-- The container publishes no TCP 80/443 and no UDP socket. UFW is unchanged for this deployment.
-- Successful NAT traversal selects a direct end-to-end QUIC path and bypasses the relay.
-- Failed NAT traversal remains on the relay path; the relay forwards end-to-end encrypted packets and does not need QAD to do so.
-- Whether QAD materially improves direct-path success is an empirical Phase 1 decision based on real networks and Iroh path events, not a Phase Zero assumption.
+- The runtime is scratch-based, shell-free, and runs as UID/GID 65532.
+- The image default command is
+  `--config-path /etc/iroh-relay/relay.toml`; Compose does not repeat it.
+- The only supported `relay.toml` binds Relay HTTP to container TCP 38451,
+  explicitly disables QAD and metrics, uses `access = "everyone"`, and omits
+  limits/TLS.
+- Relay forwarding is a valid encrypted fallback without QAD. Successful NAT
+  traversal uses a direct end-to-end path and bypasses the Relay; Phase 1 tests
+  direct and fallback paths separately.
+
+#### Compose and operation
+
+- The only supported Compose file is `deploy/relay/compose.yaml`.
+- Its project and explicit single container are both named `zterm-relay`.
+- It uses the literal production `:latest` image, a read-only bind mount for
+  `relay.toml`, host-loopback TCP 38451, `restart: unless-stopped`, and Docker
+  `logging.driver: local`.
+- It has no `build`, `.env` image indirection, automatic pull policy, metrics
+  port, command/environment/configs abstraction, container healthcheck,
+  custom health binary, stop timeout, or additional runtime hardening.
+- `logging.driver: local` remains because the selected server has no global
+  Docker log rotation. Docker documents the driver as bounded and rotating by
+  default: https://docs.docker.com/engine/logging/drivers/local/.
+- Updates are manual. A host or Docker restart uses the already pulled local
+  image; only an explicit `docker compose pull` changes `latest` locally.
+- After one successful post-update health/handshake acceptance, stop. Do not
+  switch to an old image, restart again, or run a recovery drill.
 
 ### 4. Validation & Error Matrix
 
 | Condition | Required result |
 | --- | --- |
-| `deploy/relay/validate-image-reference.sh "$RELAY_IMAGE"` fails | Reject production deployment; missing values, mutable tags, local image IDs, wrong paths, `zterm-relay-dev`, and malformed digests are invalid. |
-| Production Compose contains `build` or deployment omits `--no-build` | Reject deployment; production images are built only by GitHub Actions. |
-| Stable tag is not canonical `vMAJOR.MINOR.PATCH`, contains build metadata, or differs from the workspace version after removing `v` | Reject publication before writing any workflow output. |
-| Prerelease tag lacks a prerelease suffix, is non-canonical, contains build metadata, or differs from the workspace version | Reject publication before writing any workflow output. |
-| Release `prerelease` flag disagrees with the tag shape | Reject publication; stable and development channels must not be inferred from a mismatched tag. |
-| Manual tag is `latest`, malformed, empty, overlength, multiline, or contains a control character | Reject publication without writing partial output; valid manual tags remain development-only and unchanged. |
-| Host port 38451 or 9090 is not bound to `127.0.0.1` | Reject deployment. |
-| Public `/healthz` is not HTTP 200 with Iroh 1.0.3 | Deployment is unhealthy. |
-| `/relay` does not preserve WebSocket upgrade/subprotocol | Relay fallback is not accepted even if `/healthz` passes. |
-| Authenticated Iroh relay handshake fails | Phase Zero public gate remains incomplete. |
-| Client config enables QAD for this server | Configuration error; use `RelayConfig::new(url, None)`. |
-| Direct path fails but relay path succeeds | Valid fallback behavior; do not classify as relay failure. |
-| Relay path fails after direct-path failure | Connection failure; diagnose reverse proxy, relay, or network. |
-| NAT tests show materially worse direct success without QAD | Propose QAD-only infrastructure separately; require explicit approval before UDP/firewall/certificate changes. |
+| Release tag differs from `v${workspace_version}` | Stop publication before image build |
+| Stable release resolves outside `zterm-relay` or does not own `latest` | Stop publication |
+| Prerelease/manual run resolves outside `zterm-relay-dev` or updates `latest` | Stop publication |
+| Manual tag is empty, `latest`, or illegal for OCI | Reject before writing workflow outputs |
+| Official artifact checksum differs | Stop image build |
+| Compose publishes anything except host-loopback TCP 38451 | Reject the deployment model |
+| Compose project/container is not `zterm-relay` | Reject the deployment model |
+| Compose adds automatic pull, metrics, direct TLS/QAD, health, digest, or rollback machinery without a new approved requirement | Treat as specification drift |
+| Host `/healthz`, public HTTP, or authenticated Iroh handshake fails after update | Deployment is not accepted; report the observed failure |
+| All post-update checks pass | End validation without rollback/restart/reconnect exercises |
+| Direct path fails while Relay path succeeds | Valid fallback behavior, not a Relay failure |
 
 ### 5. Good / Base / Bad Cases
 
-- Good release: workspace `0.1.0` and stable Git tag `v0.1.0` produce only
-  `zterm-relay:0.1.0`, `zterm-relay:latest`, and one immutable digest.
-- Base publication: manual tag `phase-zero` remains unchanged but is written
-  only to `zterm-relay-dev`; its digest cannot pass production preflight.
-- Bad release: workspace `0.1.0` is published from `v0.1.1`, a Git tag keeps
-  its leading `v` in the OCI tag, or build metadata is silently discarded.
-- Good network path: two devices discover a direct path; `path_events()` shows direct selection and application traffic bypasses the relay.
-- Base network path: direct attempts fail; the same encrypted connection remains usable through `relay.zenithconsulting.cn`.
-- Bad network claim: a test treats missing UDP 7842 as proof that relay fallback cannot work, or reports a healthy relay as proof that NAT traversal works.
+- **Good release:** workspace `0.1.1` plus Release `v0.1.1` publishes
+  `zterm-relay:v0.1.1` and `zterm-relay:latest`.
+- **Base development build:** manual `phase-one` publishes only
+  `zterm-relay-dev:phase-one`; it never changes production `latest`.
+- **Bad release:** workspace `0.1.1` plus Release `v0.1.2`, or converting
+  `v0.1.1` into image tag `0.1.1`.
+- **Good deployment:** an explicit pull/up recreates the stateless single
+  container; loopback health and one public authenticated handshake pass.
+- **Bad deployment:** a successful new container is deliberately replaced with
+  an old image to prove rollback, or an unused metrics/QAD/direct template is
+  kept “just in case.”
 
 ### 6. Tests Required
 
-- Local: `tests/relay/reverse-proxy-smoke.sh` must assert loopback bindings, `/healthz`, `/generate_204`, private metrics, WebSocket `101`, non-root/read-only runtime, and graceful stop.
-- Publication: `tests/relay/static.sh` and
-  `tests/relay/publication-channels.sh` must assert least-privilege workflow
-  permissions, full-SHA Action pins, dynamic GHCR ownership, the
-  `deploy/relay` context, one `linux/amd64,linux/arm64` manifest per run,
-  production/development package isolation, stable/prerelease/manual tag
-  behavior, `v0.1.0` -> `0.1.0` mapping, workspace lockstep equality,
-  build-metadata rejection, provenance/SBOM, exact digest-reference output,
-  production rejection of the development package, digest-only Compose, and
-  the 1Panel root. The channel matrix must include malformed/empty/overlength
-  tags, SemVer leading-zero and empty-identifier cases, release-flag mismatch,
-  and multiline/control-character owner or tag inputs. Every rejection must
-  assert its expected error and that no output record was written; successful
-  cases must assert the exact output record count.
-- Product version: `tests/workspace-version.sh` must use locked Cargo metadata
-  to prove that every `crates/*` product manifest inherits one workspace
-  version, all resolved product package versions agree, and `Cargo.lock` is
-  current. CI must run it on Linux, macOS, and Windows.
-- Public Phase Zero: verify DNS/TLS, public health, OpenResty WebSocket forwarding, a complete authenticated Iroh relay handshake, loopback-only host bindings, image identity, logs, and rollback/recreate.
-- Phase 1 NAT gate: test devices on genuinely different networks, observe `Connection::path_events()`, distinguish direct and relay paths, force relay fallback, then repeat enough trials to decide whether QAD is needed.
-- Any future QAD proposal: add a separate QAD-only test matrix for UDP reachability, trusted manual certificate reload, client `RelayQuicConfig`, and before/after direct-path success rates.
+- `tests/workspace-version.sh`: all product crates inherit one Cargo version.
+- Publication test: one stable, one prerelease, one manual, one version
+  mismatch, and invalid manual input; assert direct `v...` tag reuse and package
+  separation.
+- Static Compose test: assert exact project/container name, literal `:latest`,
+  one read-only config mount, loopback 38451, restart policy, and local logging;
+  assert obsolete deployment files are absent.
+- Upstream/image tests: checksum/tamper, amd64/arm64 execution, scratch/non-root,
+  and Iroh 1.0.3 version.
+- Runtime smoke: directly start the built image and assert `/healthz` and
+  `/generate_204`; do not duplicate this with Docker health state or metrics.
+- Public acceptance after a real manual update: public health/204 plus one
+  authenticated Iroh Relay handshake with QAD disabled.
+- Repository secret scan and the ordinary Rust/dependency/cross-platform CI
+  remain required.
 
 ### 7. Wrong vs Correct
 
 #### Wrong
 
 ```text
-workspace version: 0.1.0
-Git release tag:    v0.1.0
-published image:    ghcr.io/leonfox28/zterm-relay:v0.1.0
+Release v0.1.1 -> strip v -> image :0.1.1 -> validate returned digest ->
+require @sha256 in .env -> run health + metrics + handshake -> switch to an old
+image -> restore the new image
 ```
 
-Keeping the Git-only `v` prefix in the OCI tag breaks the unified public
-version convention. Publishing when the workspace version differs is also
-invalid.
+This validates the same identity repeatedly and interrupts a stateless service
+after it already passed acceptance.
 
 #### Correct
 
 ```text
-workspace version: 0.1.0
-Git release tag:    v0.1.0
-convenience tags:   ghcr.io/leonfox28/zterm-relay:0.1.0, :latest
-deployment:         ghcr.io/leonfox28/zterm-relay@sha256:<published-digest>
+Release v0.1.1 -> image :v0.1.1 + :latest -> manual compose pull/up ->
+health + one authenticated handshake -> stop
 ```
 
-The release workflow verifies the lockstep version, strips only the leading
-`v` for the OCI convenience tag, and records the immutable deployment digest.
-
-#### Wrong QAD construction
-
-```rust
-// A bare RelayUrl implicitly enables default QAD expectations in Iroh 1.0.3.
-let relay_mode = RelayMode::Custom(vec![relay_url.into()]);
-```
-
-This also leads to the incorrect architectural claim that relay fallback depends on UDP 7842.
-
-#### Correct QAD construction
-
-```rust
-// Current server provides HTTPS/WebSocket relay fallback, with QAD disabled.
-let relay = RelayConfig::new(relay_url, None);
-```
-
-Test direct NAT traversal and relay fallback separately. Add QAD only if the Phase 1 evidence justifies its additional UDP, certificate, and firewall surface.
+The artifact checksum, product version, registry image, and live service are
+each validated once by the boundary that owns them.
