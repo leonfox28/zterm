@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Development tag (published unchanged to zterm-relay-dev; latest is reserved)
+        description: Manual development tag (published unchanged to zterm-relay-dev; latest is reserved)
         required: true
         type: string
 
@@ -30,7 +30,7 @@ jobs:
       digest: ${{ steps.build.outputs.digest }}
       reference: ${{ steps.reference.outputs.reference }}
     steps:
-      - name: Check out the release source
+      - name: Check out the original Git release tag source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event_name == 'release' && format('refs/tags/{0}', github.event.release.tag_name) || github.sha }}

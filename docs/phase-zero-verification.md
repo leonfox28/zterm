@@ -19,6 +19,7 @@ Scope: local bootstrap plus the approved public reverse-proxy relay deployment.
 
 ```text
 sh tests/source-policy.sh
+sh tests/workspace-version.sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
@@ -44,8 +45,9 @@ sh tests/relay/public-handshake.sh https://relay.zenithconsulting.cn
 
 Results:
 
-- all five workspace crates compiled; four unit tests and all doc tests passed;
-- the CLI printed only static Phase Zero metadata;
+- all five workspace crates compiled at the shared product version `0.1.0`;
+  four unit tests and all doc tests passed;
+- the CLI printed only static Phase Zero metadata and reported version `0.1.0`;
 - cargo-deny reported advisories, bans, licenses, and sources as passing (with
   one allowed duplicate-version warning in the `prost-build` dependency tree);
 - the isolated public-handshake probe also passed its native macOS/Linux/Windows
@@ -77,8 +79,10 @@ Results:
 - the relay publication workflow passed actionlint 1.7.12 and repository static
   checks for exact current Action SHAs, least privileges, separate production
   (`zterm-relay`) and development (`zterm-relay-dev`) packages, the stable/
-  prerelease/manual tag matrix, provenance/SBOM, the `deploy/relay` context,
-  and one linux/amd64 + linux/arm64 manifest per run; both production Compose
+  prerelease/manual tag matrix, lockstep workspace/release SemVer matching,
+  v-prefixed Git tag to v-less OCI tag mapping, build-metadata rejection,
+  provenance/SBOM, the `deploy/relay` context, and one linux/amd64 + linux/arm64
+  manifest per run; both production Compose
   files require an image and contain no server-side `build` fallback, while
   the mandatory production preflight rejects the development package. The
   resolver also rejected empty, malformed,

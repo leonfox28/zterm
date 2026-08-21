@@ -37,6 +37,12 @@ proto   platform
 
 第零阶段中的各 crate 只包含能证明边界、编译链和 protobuf 生成可用的最小代码。CLI 占位命令只输出版本/阶段信息，不读写用户配置或启动后台进程。
 
+根 `[workspace.package].version` 是所有 zterm 产品组件的 lockstep 版本源，
+首个版本为 `0.1.0`，五个产品 crate 均通过 `version.workspace = true` 继承。
+以后 CLI、daemon、协议、平台库、App 和 Relay wrapper 一起升级，不为 monorepo
+组件维护独立版本。隔离在 workspace 外的 handshake probe 只是验收工具，不是
+产品发布物，因此保留自己的非产品版本。
+
 ## Relay Image Model
 
 - 将 `IROH_VERSION=1.0.3`、官方 release URL、架构映射和 SHA-256 清单集中到构建上下文。
@@ -48,10 +54,13 @@ proto   platform
 - `.github/workflows/relay-image.yml` 是 Relay registry 镜像的唯一构建入口；
   单次运行构建一个 linux/amd64 + linux/arm64 manifest，所有 Action 固定完整
   commit SHA，工作流只授予 contents read/packages write，并生成 provenance
-  与 SBOM。稳定非 prerelease GitHub release 发布到
-  `ghcr.io/leonfox28/zterm-relay`，保留 release tag 并更新 `latest`；GitHub
-  prerelease 只用其 release tag 发布到
-  `ghcr.io/leonfox28/zterm-relay-dev`；manual dispatch 也只进开发 package，
+  与 SBOM。稳定 GitHub Release tag 必须是 canonical
+  `vMAJOR.MINOR.PATCH`，去 `v` 后与 workspace SemVer 完全一致；workflow 检出
+  原始 Git tag，但以去 `v` 的标签发布到 `ghcr.io/leonfox28/zterm-relay` 并
+  更新 `latest`。prerelease 必须是 canonical
+  `vMAJOR.MINOR.PATCH-PRERELEASE`，完整去 `v` SemVer 同样与 workspace 精确
+  一致，只发布到 `ghcr.io/leonfox28/zterm-relay-dev` 且不更新 `latest`。
+  build metadata 因无法无歧义映射到 OCI tag 而拒绝。manual dispatch 也只进开发 package，
   用户输入的非空合法 OCI tag 原样使用（例如 `phase-zero`），只禁用保留值
   `latest`。manual tag 是可重复发布的开发 alias，调用方应避免复用 prerelease
   tag，工作流输出的 image+manifest digest 才是不可变交付标识。生产 package
@@ -106,8 +115,9 @@ path events 和直连成功率，再依据证据决定是否需要 QAD-only 服�
    38451/9090 映射、没有 80/443/UDP 映射，并验证 `/relay` 返回合法
    WebSocket `101` upgrade。
 5. 静态验证发布工作流权限、Action SHA、GHCR 动态 owner、双平台 manifest、
-   生产/开发 package 隔离、stable/prerelease/manual 标签矩阵、provenance/
-   SBOM 和完整 image+digest 输出；记录本地 image ID、开发 digest 与生产
+   生产/开发 package 隔离、stable/prerelease/manual 标签矩阵、Git tag 去
+   `v` 映射、workspace 版本相等门禁、build metadata 拒绝、provenance/SBOM
+   和完整 image+digest 输出；记录本地 image ID、开发 digest 与生产
    GHCR digest 的不同用途，再执行 secret scan。
 6. 本地检查全部通过后硬停止；不得自行读取 SSH 配置并尝试服务器连接。
 

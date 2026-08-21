@@ -9,7 +9,8 @@
 
 ## 2. Z0-B — Rust Workspace
 
-- 添加精确 toolchain、workspace、统一 lint/profile/dependency 配置。
+- 添加精确 toolchain、workspace、统一 lint/profile/dependency 配置；根
+  workspace 以 `0.1.0` 作为首个 lockstep 产品版本，五个产品 crate 全部继承。
 - 创建五个最小 crate、固定 protobuf schema/build pipeline 和无副作用 CLI 占位入口。
 - 添加 README、开发文档、deny 配置与跨平台 CI。
 - 运行 fmt、Clippy、test、doc 和 dependency checks。
@@ -23,8 +24,9 @@
   产出 linux/amd64 + linux/arm64 manifest：稳定 release 使用
   `ghcr.io/leonfox28/zterm-relay`，prerelease 与 manual 使用独立的
   `ghcr.io/leonfox28/zterm-relay-dev`；输出完整 image+digest，并验证两个
-  package 的 tag/channel 隔离、manual tag 原样映射/`latest` 拒绝以及
-  provenance/SBOM。
+  package 的 tag/channel 隔离、stable/prerelease canonical SemVer、Git tag
+  去 `v` 映射、workspace 完整版本相等、build metadata 拒绝、manual tag
+  原样映射/`latest` 拒绝以及 provenance/SBOM。
 - 生产 Compose 移除本地 `build` 回退并强制 GHCR digest；保留本地
   Compose/Buildx 作为开发与 CI 质量门禁。
 - 保留 direct TLS/ACME 模式，并添加同机 OpenResty 反代模式：只绑定宿主

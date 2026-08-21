@@ -26,6 +26,19 @@ verified on 2026-08-21 with:
 Rust 1.95.0 is user-owned and must not be removed. A future Rust or cargo-deny
 upgrade is an explicit repository change and must rerun every quality gate.
 
+## Product version
+
+The root `[workspace.package].version` is the single lockstep product version,
+initially `0.1.0`. All five zterm product crates inherit it with
+`version.workspace = true`; do not assign a component-specific version to a
+crate. A release changes this one value, refreshes `Cargo.lock`, and advances
+the CLI, daemon, protocol, platform libraries, apps, and Relay wrapper as one
+product.
+
+`tests/relay/handshake-probe` is deliberately outside the root workspace. It is
+an internal acceptance tool rather than a shipped zterm component, so its
+`0.0.0` package version is not part of the lockstep release contract.
+
 ## Install missing tools on macOS
 
 Always inspect installed versions before installing. Phase Zero used Homebrew's
@@ -102,6 +115,7 @@ identity, pairing, networking, or persistent session behavior.
 
 ```bash
 sh tests/source-policy.sh
+sh tests/workspace-version.sh
 cargo +1.98.0 fmt --all -- --check
 cargo +1.98.0 clippy --workspace --all-targets --all-features -- -D warnings
 cargo +1.98.0 test --workspace --all-features

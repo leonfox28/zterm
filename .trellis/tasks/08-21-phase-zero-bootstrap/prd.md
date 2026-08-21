@@ -31,6 +31,8 @@
 ### R0-B：最小 Rust workspace
 
 - 创建 `zterm-core`、`zterm-proto`、`zterm-platform`、`zterm-daemon`、`zterm-cli` 五个最小 crate，并明确依赖方向。
+- 项目首个统一版本为 `0.1.0`；五个产品 crate 从根
+  `[workspace.package].version` 继承同一 SemVer，不维护组件独立版本。
 - 创建 `proto/`、`install/`、`deploy/relay/`、`tests/e2e/`、`tests/relay/`、`docs/` 与 CI 目录。
 - protobuf 生成可复现；CLI 只提供无副作用的占位入口，不提前实现 M1+ 的终端、会话、连接或 daemon 行为。
 - 建立 fmt、Clippy、单元测试、文档、依赖审计和 CI 基线。
@@ -45,13 +47,17 @@
   package `ghcr.io/leonfox28/zterm-relay-dev`；每次只生成一个覆盖
   linux/amd64 + linux/arm64 的 manifest。Action 固定完整 commit SHA，权限
   限于 contents read/packages write。
-- 稳定 release 保留 release tag 并更新生产 package 的 `latest`；prerelease
-  只在开发 package 保留 release tag，不得接触生产 package 或 `latest`；手动
-  发布将用户给出的非空合法 OCI tag 原样写入开发 package，只禁止保留值
-  `latest`。开发 tag 可以作为 mutable alias 重复发布，真实交付以工作流输出
-  digest 为准；package 隔离保证它不能覆盖稳定生产 release。
-- `latest` 是工作流管理的稳定 alias，不允许作为 GitHub release tag 或手动
-  输入。
+- 稳定 GitHub Release 只接受 canonical `vMAJOR.MINOR.PATCH`，其去 `v`
+  SemVer 必须与 workspace 版本完全一致；工作流仍检出原始 Git tag，但只把
+  去 `v` 的版本和 `latest` 写入生产 package，例如 `v0.1.0` 映射到
+  `zterm-relay:0.1.0` 与 `:latest`。
+- prerelease 只接受 canonical `vMAJOR.MINOR.PATCH-PRERELEASE`，完整去 `v`
+  SemVer 同样必须与 workspace 版本完全一致；只把去 `v` 标签写入开发
+  package，不得接触生产 package 或 `latest`。SemVer build metadata 因 OCI
+  tag 不支持 `+` 且去除会产生身份歧义而明确拒绝。
+- 手动发布继续将用户给出的非空合法 OCI tag 原样写入开发 package，只禁止
+  保留值 `latest`。开发 tag 可以作为 mutable alias 重复发布，真实交付以
+  工作流输出 digest 为准；package 隔离保证它不能覆盖稳定生产 release。
 - 两份生产 Compose 不提供 `build` 回退，必须消费工作流实际产出的 GHCR
   immutable digest；本地构建只保留作开发与 CI 验证。
 - 提供与 Iroh 1.0.3 实际配置 schema 一致的 `relay.toml`、Compose、环境变量示例、健康检查、仅私网可见的 metrics、日志轮转、部署与回滚文档。
@@ -73,13 +79,17 @@
 - [x] 项目精确使用 Rust 1.98.0，且用户已有 Rust 1.95.0 工具链未被删除或修改。
 - [x] Docker CLI、Compose 与 Colima 可工作并可按文档重复启动；所有本机质量门禁通过。
 - [x] 五个最小 crate 能构建与测试，且没有提前实现 M1+ 产品功能。
+- [x] 五个产品 crate 统一继承 workspace `0.1.0`，Cargo.lock 与之同步且有
+  独立门禁防止组件版本漂移；内部 handshake probe 是不交付的隔离测试工具，
+  不属于产品统一版本。
 - [x] 官方 1.0.3 relay 二进制通过 checksum；多架构与篡改失败路径有自动化验证。
 - [x] Compose、健康检查、私有 metrics、Everyone 策略、日志轮转和回滚流程通过本地 smoke test；不存在自定义 relay 或 monitor 服务。
 - [x] 第一次公网服务器连接前已暂停通知用户，并完成仓库 secret scan。
 - [x] 获得用户授权后，所选同机反代模式的公网 DNS/TLS、真实 relay 握手、宿主回环 TCP 38451/9090、私有 metrics 与回滚能力均验证通过；确认未发布 UDP/QAD 端口且未修改防火墙，子任务才可完成。
 - [x] 文档和第一阶段计划明确区分 direct/NAT 打洞与 relay 回退：QAD 只是可选地址发现辅助，不参与 relay 转发；是否增加 QAD-only 服务必须等第一阶段真实 NAT 路径测试后再决定。
 - [x] GHCR 发布工作流、生产/开发 package 隔离、双架构 manifest、稳定/
-  prerelease/手动标签规则、完整 SHA 固定、最小权限、provenance/SBOM、完整
+  prerelease/手动标签规则、Git tag 去 `v` 映射、workspace 精确版本匹配、
+  build metadata 拒绝、完整 SHA 固定、最小权限、provenance/SBOM、完整
   image+digest 输出、digest-only Compose 与 1Panel 路径已有静态门禁。
 - [x] 公网服务器运行时 Compose 已迁移到
   `/opt/1panel/docker/compose/zterm-relay` 并重新通过 authenticated relay

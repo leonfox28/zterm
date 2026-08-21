@@ -387,18 +387,18 @@ dependencies = [
 
 [[package]]
 name = "zterm-cli"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "zterm-daemon",
 ]
 
 [[package]]
 name = "zterm-core"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "zterm-daemon"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "zterm-core",
  "zterm-platform",
@@ -407,14 +407,14 @@ dependencies = [
 
 [[package]]
 name = "zterm-platform"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "zterm-core",
 ]
 
 [[package]]
 name = "zterm-proto"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "prost",
  "prost-build",

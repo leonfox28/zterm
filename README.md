@@ -11,6 +11,23 @@ the official `iroh-relay` 1.0.3 binary. There is no usable terminal, daemon,
 pairing, transport, or session behavior yet; the `zterm` binary is deliberately
 a side-effect-free placeholder.
 
+## Version policy
+
+zterm uses one lockstep SemVer for the product rather than independent
+component versions. The root `[workspace.package].version` is the source for
+all product crates and is currently `0.1.0`; future CLI, daemon, desktop/mobile
+apps, protocol artifacts, and the zterm Relay wrapper advance together.
+
+A stable GitHub Release tag must be canonical `vMAJOR.MINOR.PATCH`, exactly
+match the workspace version after removing `v`, and publishes Relay image tags
+`MAJOR.MINOR.PATCH` plus `latest`. A prerelease uses
+`vMAJOR.MINOR.PATCH-PRERELEASE`, must exactly match a prerelease workspace
+version after removing `v`, and publishes only the corresponding v-less tag to
+the development package. SemVer build metadata is rejected because `+` is not
+a portable OCI tag character and dropping it would make release identities
+ambiguous. Internal validation tools such as the isolated Relay handshake
+probe are not product deliverables and keep their own non-product version.
+
 ## Repository boundaries
 
 - `crates/` — five minimal Rust crates proving the planned dependency direction.
@@ -28,6 +45,7 @@ a side-effect-free placeholder.
 
 ```bash
 sh tests/source-policy.sh
+sh tests/workspace-version.sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features

@@ -111,10 +111,17 @@ repository-scoped `GITHUB_TOKEN`.
 
 Publishing has two deliberate entry points:
 
-- publishing a non-prerelease GitHub release writes its release tag and the
-  mutable `latest` convenience tag only to `zterm-relay`;
-- publishing a GitHub prerelease writes its exact release tag only to
-  `zterm-relay-dev` and never touches the production package or `latest`;
+- publishing a non-prerelease GitHub release requires a canonical
+  `vMAJOR.MINOR.PATCH` Git tag whose v-less SemVer exactly matches
+  `[workspace.package].version`. The workflow checks out that original Git tag,
+  then writes the v-less version and the mutable `latest` convenience tag only
+  to `zterm-relay`; for example, `v0.1.0` publishes `:0.1.0` and `:latest`;
+- publishing a GitHub prerelease requires a canonical
+  `vMAJOR.MINOR.PATCH-PRERELEASE` tag whose entire v-less SemVer exactly matches
+  the workspace version. It writes only that v-less tag to `zterm-relay-dev`
+  and never touches the production package or `latest`; for example,
+  `v0.2.0-rc.1` requires workspace version `0.2.0-rc.1` and publishes
+  `zterm-relay-dev:0.2.0-rc.1`;
 - a manual workflow dispatch writes only to `zterm-relay-dev`. Its non-empty,
   valid OCI tag input is used unchanged, so input `phase-zero` produces
   `ghcr.io/leonfox28/zterm-relay-dev:phase-zero`; only the reserved `latest`
@@ -124,8 +131,14 @@ Publishing has two deliberate entry points:
   The separate package prevents any manual tag from colliding with or updating
   a stable production release.
 
-The literal tag `latest` is workflow-managed and is rejected both as a GitHub
-release tag and as a manual input.
+Stable and prerelease releases therefore share the product's lockstep version
+with the CLI, daemon, protocol, platform libraries, and future apps. A mismatch
+with Cargo.toml, a non-canonical SemVer, a release/prerelease flag mismatch, or
+SemVer build metadata is rejected before any workflow outputs are written.
+Build metadata is deliberately unsupported because `+` is not a portable OCI
+tag character and silently dropping it would make release identities
+ambiguous. The literal tag `latest` is workflow-managed and is rejected both as
+a GitHub release tag and as a manual input.
 
 Both channels enable provenance and SBOM attestations and expose the selected
 package, channel, version, multi-platform digest, and full immutable reference

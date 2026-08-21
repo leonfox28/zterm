@@ -118,6 +118,15 @@ grep -Fq 'image_suffix=-dev' "$publication_resolver" \
     || fail "development GHCR package is not selected"
 grep -Fq 'publish_latest=true' "$publication_resolver" \
     || fail "stable release latest alias is missing"
+grep -Fq 'v*) version=${release_tag#v}' "$publication_resolver" \
+    || fail "release Git tag is not mapped to a v-less OCI version"
+grep -Fq 'is_canonical_semver "$version"' "$publication_resolver" \
+    || fail "release versions bypass canonical SemVer validation"
+grep -Fq 'workspace_version=$(read_workspace_version "$workspace_manifest")' \
+    "$publication_resolver" \
+    || fail "release publication does not read the workspace product version"
+grep -Fq '[ "$version" = "$workspace_version" ]' "$publication_resolver" \
+    || fail "release publication does not enforce lockstep workspace versioning"
 grep -Fq 'type=raw,value=${{ steps.publish.outputs.version }}' "$publish_workflow" \
     || fail "resolved publication version does not drive the image tag"
 grep -Fq 'type=raw,value=latest,enable=${{ steps.publish.outputs.publish_latest }}' \

@@ -19,9 +19,12 @@ This directory packages the unmodified official `iroh-relay` 1.0.3 binary.
 - `validate-image-reference.sh` is the production preflight that rejects
   mutable tags, local image IDs, wrong registry paths, and malformed digests.
 - `.github/workflows/relay-image.yml` is the only production image publisher.
-  Stable releases build `ghcr.io/leonfox28/zterm-relay`; prereleases and manual
-  runs build the separate `ghcr.io/leonfox28/zterm-relay-dev` package. Manual
-  tags are used verbatim except that `latest` is reserved.
+  A canonical stable Git tag such as `v0.1.0`, matching the root workspace
+  version, publishes `ghcr.io/leonfox28/zterm-relay:0.1.0` and `:latest`.
+  Matching canonical prereleases strip only the leading `v` and publish to
+  `ghcr.io/leonfox28/zterm-relay-dev` without `latest`; manual runs also target
+  that development package and use their tags verbatim except that `latest` is
+  reserved. SemVer build metadata is not accepted.
   Each publication is one `linux/amd64` + `linux/arm64` manifest and reports its
   immutable digest. Production Compose accepts only the production package by
   digest and deliberately contains no `build` section; local builds remain
