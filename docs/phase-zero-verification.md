@@ -20,6 +20,30 @@ Starting with `v0.1.1`, the supported deployment is only
 once through host/public health and one authenticated Iroh handshake; successful
 deployments are not restarted or rolled back again for rehearsal.
 
+## v0.1.1 simplification verification
+
+The simplified contract was released and deployed on 2026-08-21:
+
+- commit `c2b574d` passed the complete [cross-platform and Relay CI run](https://github.com/leonfox28/zterm/actions/runs/32470094911);
+- [GitHub Release v0.1.1](https://github.com/leonfox28/zterm/releases/tag/v0.1.1) completed the [production image workflow](https://github.com/leonfox28/zterm/actions/runs/32470318480);
+- `ghcr.io/leonfox28/zterm-relay:v0.1.1` and `:latest` resolved to the same
+  two-platform `linux/amd64` + `linux/arm64` image, with no extra attestation
+  manifests;
+- the selected server migrated once from the old reverse-proxy project to a
+  single project/container named `zterm-relay`; the old active files were moved
+  into `legacy-v0.1.0/` rather than deleted;
+- the live container uses literal `:latest`, UID/GID 65532, Docker's `local`
+  log driver, `restart: unless-stopped`, and only host
+  `127.0.0.1:38451`; the old 9090 listener is absent;
+- host health, public health, public `/generate_204`, and one authenticated
+  Iroh Relay handshake passed. Validation then stopped without a restart,
+  reconnect loop, image switch, or rollback drill.
+
+Creating the release tag also exposed that the generic CI workflow responded
+to tag pushes after the same commit had already passed on `main`. The duplicate
+run was cancelled, and commit `92dda0e` restricted that workflow to branch
+pushes while preserving pull-request and manual triggers; its [CI run](https://github.com/leonfox28/zterm/actions/runs/32471101894) passed.
+
 ## Environment
 
 - Rust/Cargo 1.98.0 selected exactly; rustfmt, Clippy, rust-src and the macOS,

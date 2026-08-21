@@ -58,14 +58,14 @@
 
 ## Acceptance Criteria
 
-- [ ] workspace `0.1.1`、GitHub Release `v0.1.1` 与 GHCR `:v0.1.1` 形成直接映射；`:v0.1.1` 和 `:latest` 指向同一 multi-platform image。
-- [ ] 发布路径没有去 `v` 转换、自研完整 SemVer parser、digest reference validator 或无人消费的 provenance/SBOM manifest；只保留 workspace/tag 精确相等、stable/dev package 隔离、full-SHA Action pin、上游 checksum 和必要输入合法性检查。
-- [ ] 默认反代 Compose 不再包含 image env/digest validator、metrics/9090、command/environment/configs/healthcheck/stop grace/runtime hardening 或自研 health probe，只保留 R2 明确列出的字段；Compose project 与单实例容器均命名为 `zterm-relay`；未使用的 direct TLS/ACME/QAD 模板已删除。
-- [ ] 默认服务器完成一次旧 project 到 `zterm-relay` 的无状态命名迁移；此后通过显式 `pull` + `up -d` 更新，普通重启不会自动拉取。运行时只有名为 `zterm-relay` 的 Relay 容器、`127.0.0.1:38451` listener，日志使用自动轮转的 Docker `local` driver。
-- [ ] 发布后一次性 `/healthz`、公开 HTTP 和 authenticated Iroh handshake 全部通过；没有执行回滚演练或重复 restart/reconnect 测试。
-- [ ] 父任务、Relay 文档、测试与 `.trellis/spec/` 不再把 digest-only、9090 metrics 或回滚演练作为当前默认部署契约，同时准确保留 `v0.1.0` 历史证据。
-- [ ] 项目规范包含 R4 的证据驱动简洁性原则，后续 implement/check agent 可以据此拒绝无现实故障模型的复杂度。
-- [ ] 本地质量门和 GitHub CI 全绿，仓库与服务器未写入凭据，其他 1Panel 服务未改变。
+- [x] workspace `0.1.1`、GitHub Release `v0.1.1` 与 GHCR `:v0.1.1` 形成直接映射；`:v0.1.1` 和 `:latest` 指向同一 multi-platform image。
+- [x] 发布路径没有去 `v` 转换、自研完整 SemVer parser、digest reference validator 或无人消费的 provenance/SBOM manifest；只保留 workspace/tag 精确相等、stable/dev package 隔离、full-SHA Action pin、上游 checksum 和必要输入合法性检查。
+- [x] 默认反代 Compose 不再包含 image env/digest validator、metrics/9090、command/environment/configs/healthcheck/stop grace/runtime hardening 或自研 health probe，只保留 R2 明确列出的字段；Compose project 与单实例容器均命名为 `zterm-relay`；未使用的 direct TLS/ACME/QAD 模板已删除。
+- [x] 默认服务器完成一次旧 project 到 `zterm-relay` 的无状态命名迁移；此后通过显式 `pull` + `up -d` 更新，普通重启不会自动拉取。运行时只有名为 `zterm-relay` 的 Relay 容器、`127.0.0.1:38451` listener，日志使用自动轮转的 Docker `local` driver。
+- [x] 发布后一次性 `/healthz`、公开 HTTP 和 authenticated Iroh handshake 全部通过；没有执行回滚演练或重复 restart/reconnect 测试。
+- [x] 父任务、Relay 文档、测试与 `.trellis/spec/` 不再把 digest-only、9090 metrics 或回滚演练作为当前默认部署契约，同时准确保留 `v0.1.0` 历史证据。
+- [x] 项目规范包含 R4 的证据驱动简洁性原则，后续 implement/check agent 可以据此拒绝无现实故障模型的复杂度。
+- [x] 本地质量门和 GitHub CI 全绿，仓库与服务器未写入凭据，其他 1Panel 服务未改变。
 
 ## Out of Scope
 
