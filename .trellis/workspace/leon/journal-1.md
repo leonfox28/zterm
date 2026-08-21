@@ -52,3 +52,25 @@ Simplified Relay version mapping and deployment, released v0.1.1 to GHCR, migrat
 ### Status
 
 [OK] **Completed**
+
+
+## Session 3: Complete Phase One Foundation Gate
+
+**Date**: 2026-08-22
+**Task**: Complete Phase One Foundation Gate
+**Branch**: `main`
+
+### Summary
+
+Completed and verified the Iroh profile, terminal model, PTY lifecycle, retained terminal driver, black-box compatibility, resource budgets, five-platform CI matrix, and fixed the PTY wait-lock starvation exposed by hosted CI.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `0026c4b` | (see git log) |
+| `1b1fb8c` | (see git log) |
+
+### Status
+
+[OK] **Completed**
