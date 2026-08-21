@@ -27,6 +27,7 @@ a side-effect-free placeholder.
 ## Local checks
 
 ```bash
+sh tests/source-policy.sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features

@@ -28,6 +28,9 @@ jobs:
           - windows-latest
     steps:
       - uses: actions/checkout@v5
+      - name: Check source checkout policy
+        shell: bash
+        run: sh tests/source-policy.sh
       - name: Install exact Rust toolchain
         run: >-
           rustup toolchain install 1.98.0 --profile minimal

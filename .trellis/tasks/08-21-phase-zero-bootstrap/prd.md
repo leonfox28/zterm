@@ -13,9 +13,11 @@
 - 现有 Rust 1.95 工具链属于用户资产，必须保留。
 - 开始时缺少 Docker CLI/Compose、Colima、pkg-config 与 cargo-deny；项目不依赖系统级 `protoc`。
 - Iroh v1.0.3 官方 release 提供 Linux x86_64/aarch64 relay 构建产物及校验和。
-- GitHub 目标仓库已确定为 `leonfox28/zterm`；在仓库实际推送且对应 GHCR
-  channel 首次成功前，可以完成发布工作流与部署契约，但不能虚构尚未发布的
-  package 或 registry digest。
+- 公开 GitHub 仓库 `leonfox28/zterm` 已创建，`main` 已推送初始提交
+  `43b06ff`。首次 manual 开发发布已生成公开可拉取的
+  `ghcr.io/leonfox28/zterm-relay-dev@sha256:8f2bb338ca2d3841ebd8e4cd270b9aba919880dc12e5e5a24050e511442ecb40`；
+  生产 `zterm-relay` package 尚未通过稳定 release 创建，不能从开发 digest
+  推断或预填生产 digest。
 
 ## Requirements
 
@@ -82,8 +84,10 @@
 - [x] 公网服务器运行时 Compose 已迁移到
   `/opt/1panel/docker/compose/zterm-relay` 并重新通过 authenticated relay
   handshake；旧目录可恢复地改名保留，而非直接删除。
-- [ ] GitHub remote 建立并推送后，分别按需实际运行开发或稳定发布工作流并
-  记录真实 GHCR multi-platform digest；生产部署必须等稳定 release 产生
+- [x] 公开 GitHub remote 已建立并推送；manual `phase-zero` 开发工作流实际
+  产出可匿名拉取的 `zterm-relay-dev` multi-platform digest，amd64/arm64
+  manifest 与两个架构的 Iroh 1.0.3 运行均已验证。
+- [ ] 生产部署必须等稳定 release 产生
   `ghcr.io/leonfox28/zterm-relay@sha256:<digest>`，将该 package 设为 public
   （或配置只读拉取认证），再替换公网服务器的临时本地镜像 ID。开发 package
   的 digest 不能用于生产替换。

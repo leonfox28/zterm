@@ -18,6 +18,7 @@ Scope: local bootstrap plus the approved public reverse-proxy relay deployment.
 ## Commands passed
 
 ```text
+sh tests/source-policy.sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
@@ -107,6 +108,28 @@ recorded yet because no stable-release publication has completed; it must not
 be inferred from a mutable tag, copied from `zterm-relay-dev`, or invented in
 advance.
 
+## GHCR development publication evidence
+
+The public repository `leonfox28/zterm` was initialized at commit `43b06ff`.
+Manual workflow run
+[`32456229109`](https://github.com/leonfox28/zterm/actions/runs/32456229109)
+published `ghcr.io/leonfox28/zterm-relay-dev:phase-zero` with immutable index
+digest:
+
+```text
+sha256:8f2bb338ca2d3841ebd8e4cd270b9aba919880dc12e5e5a24050e511442ecb40
+```
+
+The OCI index contains linux/amd64 manifest
+`sha256:2905164843eca0993d00aa4fc310413149dccedfb324756113f8bd16cd31c7dc`
+and linux/arm64 manifest
+`sha256:5a468ca66d333d4536721e10a2ef285589f5c716c2bcda756b0231409f5ffed4`,
+plus provenance/SBOM attestation manifests. An anonymous GHCR bearer request
+returned HTTP 200 for the index, and containers from both runtime platforms
+reported `iroh-relay 1.0.3`. This proves the development publication channel;
+it is not a production deployment reference and is rejected by the production
+preflight.
+
 ## Public reverse-proxy deployment evidence
 
 The selected server already terminates public TLS in same-host OpenResty and
@@ -126,7 +149,8 @@ that new working directory/config, and the authenticated public Iroh handshake
 passed again after migration. The previous source directory was recoverably
 renamed to `/opt/zterm-relay.pre-1panel-20260821` for rollback rather than
 deleted. The running image is still the verified local arm64 bootstrap image;
-switching it to GHCR remains pending the first real workflow publication.
+switching it to GHCR remains pending the first stable production publication.
+The verified development digest is intentionally not accepted for that switch.
 
 The transferred archive was 4,505,088 bytes with SHA-256
 `b4a3fd2055a2a275ae588ce0486eee66afb4e98418a790b5ff619d9583a7ff5e`.

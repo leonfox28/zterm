@@ -1,3 +1,7 @@
+# Keep repository text deterministic across macOS, Linux, and Windows. In
+# particular, rustfmt.toml requires Unix newlines for Rust sources.
+* text=auto eol=lf
+
 # Trellis: append-only developer journals should merge cleanly across
 # parallel sessions/worktrees — each session only appends a new block, so
 # there is nothing to actually conflict on.

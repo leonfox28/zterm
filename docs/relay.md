@@ -135,14 +135,16 @@ exact `ghcr.io/leonfox28/zterm-relay@sha256:<published-digest>` reference into
 A deployment must never infer a digest from a tag or reuse one of the local
 image IDs in the Phase Zero evidence record.
 
-Per [GitHub's Container registry documentation](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry),
-each GHCR package is private when first published. Set the production package
-public after its first successful stable-release run for the default relay
-distribution. Set the development package visibility independently. If an
-operator deliberately keeps either package private, authenticate the pulling
-host to GHCR with a read-only package credential. Until the repository is
-pushed and the corresponding workflow channel succeeds, that package and its
-digest must not be claimed to exist or filled in ahead of time.
+Per [GitHub's package visibility documentation](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility),
+personal-account packages default to private. The OCI source label links these
+images to the public `leonfox28/zterm` repository so repository access
+permissions can be inherited, but GitHub explicitly states that this does not
+inherit repository visibility. The first development package is now public,
+as verified by an anonymous GHCR bearer pull. Verify the production
+package independently after its first stable-release run; if it is private,
+make it public for the default relay distribution or authenticate the
+deployment host with a read-only package credential. Never claim a channel or
+digest before that channel's workflow has actually succeeded.
 
 ## Mandatory public-server checkpoint
 

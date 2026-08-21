@@ -23,6 +23,7 @@ These guides help you **ask the right questions before coding**.
 |-------|---------|-------------|
 | [Code Reuse Thinking Guide](./code-reuse-thinking-guide.md) | Identify patterns and reduce duplication | When you notice repeated patterns |
 | [Cross-Layer Thinking Guide](./cross-layer-thinking-guide.md) | Think through data flow across layers | Features spanning multiple layers |
+| [Cross-Platform Thinking Guide](./cross-platform-thinking-guide.md) | Verify checkout bytes and command behavior across operating systems | Source attributes, CI matrices, or platform tooling changes |
 
 ---
 
@@ -64,6 +65,15 @@ These guides help you **ask the right questions before coding**.
 3. **Variable misreading**: Not tracing a variable to its actual definition (e.g., Map keyed by path vs name)
 
 **Verification rule**: Every CRITICAL/WARNING finding must be verified against the actual code before prioritizing. Budget ~35% false-positive rate for AI reviews.
+
+### When to Think About Cross-Platform Issues
+
+- [ ] A workflow runs on more than one operating system
+- [ ] Source attributes, line endings, executable bits, or shell selection change
+- [ ] A local formatter or compiler result is being used as evidence for Windows
+- [ ] Paths, case sensitivity, symlinks, or platform defaults affect the command
+
+→ Read [Cross-Platform Thinking Guide](./cross-platform-thinking-guide.md)
 
 ---
 

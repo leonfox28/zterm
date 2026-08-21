@@ -119,8 +119,9 @@ path events 和直连成功率，再依据证据决定是否需要 QAD-only 服�
 隔离和回滚，并明确记录 QAD/UDP 未部署；不得开放 UDP 7842 或修改防火墙，
 也不能把 UDP 项伪报为已通过。
 
-目标 GitHub 仓库已创建并配置 origin，但在代码推送并完成首次稳定 release
-之前，已部署的本地校验 arm64 image ID 仍只是启动阶段的显式临时例外。
-Compose 项目已迁移到 1Panel 根路径并通过公网握手；只有生产
-`zterm-relay` package 产生真实 digest 后，才能完成生产 provenance 切换。
-`zterm-relay-dev` digest 不能替代该门禁，也不得预填任何 digest。
+目标公开 GitHub 仓库已创建，`main` 已推送。首次 manual 开发工作流已从
+`43b06ff` 构建并公开发布 `zterm-relay-dev:phase-zero`，其 multi-platform
+digest、匿名拉取和 amd64/arm64 运行均已验证。Compose 项目已迁移到 1Panel
+根路径并通过公网握手；已部署的本地校验 arm64 image ID 仍是显式临时例外，
+只有生产 `zterm-relay` package 经稳定 release 产生真实 digest 后，才能完成
+生产 provenance 切换。`zterm-relay-dev` digest 不能替代该门禁。

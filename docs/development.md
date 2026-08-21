@@ -101,6 +101,7 @@ identity, pairing, networking, or persistent session behavior.
 ## Quality gate
 
 ```bash
+sh tests/source-policy.sh
 cargo +1.98.0 fmt --all -- --check
 cargo +1.98.0 clippy --workspace --all-targets --all-features -- -D warnings
 cargo +1.98.0 test --workspace --all-features
