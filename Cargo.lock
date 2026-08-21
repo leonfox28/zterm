@@ -4395,6 +4395,7 @@ dependencies = [
  "anyhow",
  "futures-util",
  "iroh",
+ "nix 0.28.0",
  "patchbay",
  "tokio",
  "zterm-core",

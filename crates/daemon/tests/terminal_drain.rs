@@ -118,7 +118,13 @@ fn run() -> Result<(), String> {
     });
     let status = receiver
         .recv_timeout(DEADLINE)
-        .map_err(|error| format!("wait held the PTY reply lock: {error}"))?
+        .map_err(|error| {
+            format!(
+                "wait held the PTY reply lock: {error}; stats={:?}, revision={}",
+                driver.stats(),
+                driver.latest_revision()
+            )
+        })?
         .map_err(support::display_error)?;
     if !status.success() {
         return Err(format!("query fixture did not exit cleanly: {status:?}"));

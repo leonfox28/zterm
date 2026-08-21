@@ -225,7 +225,11 @@ impl TerminalDriver {
     /// Waits for natural root-child exit without invoking the child killer.
     pub fn wait(&self) -> Result<PtyExitStatus, TerminalDriverError> {
         loop {
-            match lock(&self.session, "PTY session")?.try_wait()? {
+            let child_state = {
+                let mut session = lock(&self.session, "PTY session")?;
+                session.try_wait()?
+            };
+            match child_state {
                 PtyChildState::Running => thread::sleep(Duration::from_millis(5)),
                 PtyChildState::Exited(status) => return Ok(status),
             }

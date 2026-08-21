@@ -54,7 +54,11 @@ blocking PtyReader
 - Zero attachments do not stop the reader, model owner, or root child.
 - Dropping an attachment or transport guard changes only subscription count.
 - `wait()` must poll root-child state while releasing the PTY mutex between
-  polls. It must not block model-generated DA/DSR/CPR replies or user input.
+  polls. The mutex guard must end in an explicit lexical scope before any
+  sleep, yield, retry, channel wait, or other blocking operation; do not rely
+  on a temporary guard in a `match`/`if let` scrutinee because its lifetime can
+  extend through the selected branch. `wait()` must not block model-generated
+  DA/DSR/CPR replies or user input.
 - Failure and latest revision share the condition variable's mutex predicate,
   so a waiter cannot miss a failure notification and misreport a deadline.
 - Thread creation is ordered so a later spawn failure can finish the queue and
@@ -99,6 +103,9 @@ No environment variable or network object participates in this data path.
   chunks exceed one complete queue window.
 - Query/wait regression: a raw-mode child sends DSR and exits only after
   receiving `CSI 0n`; a concurrent `TerminalDriver::wait()` must complete.
+  The fixture configures its own PTY with the termios API rather than spawning
+  `stty`, so the assertion measures lock ownership rather than helper-process
+  scheduling or executable availability.
 - All waits have deadlines and fixtures remove only their own marker/process.
 
 ### 7. Wrong vs Correct
@@ -120,6 +127,21 @@ for bytes in pty_reader {
 byte_queue.push(bytes); // bounded, blocking, no-drop
 let update = terminal_model.ingest(bytes)?;
 latest_revision.publish(update.revision);
+```
+
+For polling a child behind a shared PTY mutex, first copy the nonblocking state
+out of a lexical guard scope, then sleep:
+
+```rust
+let child_state = {
+    let mut session = pty_session.lock()?;
+    session.try_wait()?
+}; // guard is definitely dropped here
+
+match child_state {
+    Running => thread::sleep(POLL_INTERVAL),
+    Exited(status) => return Ok(status),
+}
 ```
 
 ## Design Decision: Latest State, Not Output Replay

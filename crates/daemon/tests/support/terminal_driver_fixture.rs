@@ -2,7 +2,6 @@ use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -238,31 +237,19 @@ fn command_child(ready: &str) -> Result<i32, String> {
 }
 
 fn query_child() -> Result<i32, String> {
-    let stty = [PathBuf::from("/bin/stty"), PathBuf::from("/usr/bin/stty")]
-        .into_iter()
-        .find(|candidate| candidate.is_file())
-        .ok_or_else(|| "query fixture could not find stty".to_owned())?;
-    let status = Command::new(stty)
-        .args(["raw", "-echo"])
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .status()
-        .map_err(display_error)?;
-    if !status.success() {
-        return Err(format!("stty raw failed: {status}"));
-    }
+    use nix::sys::termios::{self, SetArg};
 
-    io::stdout()
-        .lock()
-        .write_all(b"\x1b[5n")
-        .map_err(display_error)?;
-    io::stdout().flush().map_err(display_error)?;
+    let stdin = io::stdin();
+    let mut attributes = termios::tcgetattr(&stdin).map_err(display_error)?;
+    termios::cfmakeraw(&mut attributes);
+    termios::tcsetattr(&stdin, SetArg::TCSANOW, &attributes).map_err(display_error)?;
+
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    output.write_all(b"\x1b[5n").map_err(display_error)?;
+    output.flush().map_err(display_error)?;
     let mut reply = [0_u8; 4];
-    io::stdin()
-        .lock()
-        .read_exact(&mut reply)
-        .map_err(display_error)?;
+    stdin.lock().read_exact(&mut reply).map_err(display_error)?;
     if reply != *b"\x1b[0n" {
         return Err(format!("unexpected DSR reply: {reply:?}"));
     }
