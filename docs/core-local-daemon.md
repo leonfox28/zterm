@@ -101,7 +101,8 @@ lost replays on a new socket without repeating its side effect.
 Recoverable listener accept errors stay inside the serve loop. On fatal server
 exit the daemon removes its socket only after all live and provisional session
 owners are released. Failed cleanup retains the process, daemon lock, store,
-service, and children; it compare-rebinds the exact device/inode socket token it
+service, and children; it compare-rebinds the exact device/inode/change-time
+socket token it
 published and restores status/stop retry. A replaced same-UID socket path is
 never unlinked by that recovery loop.
 

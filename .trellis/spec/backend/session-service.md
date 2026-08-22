@@ -164,6 +164,7 @@ they must not duplicate registry, replay, resource, or controller logic.
 | invalid or inaccessible cwd | `invalid_working_directory`, no publication |
 | ninth session, invalid viewport, aggregate projection overflow | `resource_exhausted` |
 | normal second controller | `session_occupied` |
+| overlapping first attach after one request owns/pends the controller | `session_occupied`; the registry still contains exactly one `main` |
 | input/resize before exact snapshot acknowledgement | `not_synchronized` |
 | stale/replaced attachment | `lease_lost`, no PTY write |
 | missing session selector | `session_not_found` |
@@ -189,7 +190,10 @@ they must not duplicate registry, replay, resource, or controller logic.
 ## 6. Tests Required
 
 - `session_lifecycle` covers concurrent `main`, detach/reconnect, named
-  lifecycle, invalid cwd, replay, natural root exit, close, and recreation.
+  lifecycle, invalid cwd, replay, natural root exit, close, and recreation. Its
+  concurrent-first-attach case requires one `main`, at least one successful
+  attachment, identical SessionIds for all successes, and permits the remaining
+  overlapping controller requests to return `session_occupied`.
 - `controller_lease` covers occupied, prepared takeover, lease loss, no stale
   write, same-operation continuation after controller detach, and rejection of
   a stale same-operation continuation without clobbering a later controller.

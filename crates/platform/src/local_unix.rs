@@ -12,11 +12,15 @@ pub struct DaemonLock(FileLock);
 
 /// Filesystem identity of the socket created while one daemon lock is held.
 /// Fatal-listener recovery uses this token to avoid unlinking a replaced path.
+/// Change time is part of the identity because Linux may immediately reuse an
+/// inode after the original socket path is unlinked.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DaemonSocketOwnership {
     device: u64,
     inode: u64,
+    change_time_seconds: i64,
+    change_time_nanoseconds: i64,
 }
 
 impl DaemonLock {
@@ -257,6 +261,8 @@ fn socket_ownership(
     Ok(Some(DaemonSocketOwnership {
         device: metadata.dev(),
         inode: metadata.ino(),
+        change_time_seconds: metadata.ctime(),
+        change_time_nanoseconds: metadata.ctime_nsec(),
     }))
 }
 

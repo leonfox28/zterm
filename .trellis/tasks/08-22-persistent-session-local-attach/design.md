@@ -304,7 +304,8 @@ accept error 留在 listener loop 并继续服务，不以 accept 抖动释放 S
   只有所有 ownership 释放后才 flush success 并退出 listener。
 - recoverable accept error 不退出 serve loop。actual fatal server termination 也必须 cleanup 所有
   Session；若 cleanup 失败，`run_daemon` 保留 process/daemon lock/store/service/children，以之前绑定
-  socket 的 dev+inode token compare-rebind（temporary failure backoff retry），恢复 status/stop；只有
+  socket 的 dev+inode+ctime token compare-rebind（Linux 可立即复用已 unlink 的 inode；temporary
+  failure backoff retry），恢复 status/stop；只有
   ownership 全释放后才 compare-unlink/退出。
 - restart 复用 stop 后的既有 detached spawn。新 daemon 创建空 registry，但读取同一持久
   DeviceId/config/authorization state。

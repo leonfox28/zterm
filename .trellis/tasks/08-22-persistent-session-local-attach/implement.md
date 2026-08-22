@@ -118,8 +118,9 @@ cargo test -p zterm-daemon --test session_limits
       input/resize、sync、detach、lease/session terminal event 和 deadline/cancellation。
 - [x] 任一 half/协议错误只 detach 一次；socket writer 慢时 actor/PTY 不等待。
 - [x] recoverable accept error 留在 listener loop；fatal serve exit 仅在 Session ownership cleanup
-      成功后 unlink socket。失败时保留 process/daemon lock/store/service/child，以 dev+inode token
-      compare-rebind 自己的 socket 并恢复 status/stop；replacement socket 不会被删除。
+      成功后 unlink socket。失败时保留 process/daemon lock/store/service/child，以
+      dev+inode+ctime token（防 Linux 立即复用 inode）compare-rebind 自己的 socket 并恢复
+      status/stop；replacement socket 不会被删除。
 - [x] 新增真实 socket test client/harness；它不进入 CLI 命令树，也不实现 raw terminal。
 
 Gate：

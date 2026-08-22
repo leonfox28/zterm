@@ -34,7 +34,8 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   lifecycle lock.
 - The daemon alone may remove a stale socket, and only after holding
   `daemon.lock`, observing connect failure, and validating an owned real socket.
-  Each bound listener also carries the socket path's device/inode token;
+  Each bound listener also carries the socket path's device/inode/change-time
+  token (Linux may immediately reuse an unlinked inode);
   fatal-listener rebind and final removal compare that exact token and refuse to
   unlink a same-UID path which was replaced after publication.
 - Linux uses `SO_PEERCRED`; macOS uses `getpeereid`. Wrong UID is rejected
@@ -132,7 +133,7 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   creating paths, allocating mutation leases, or starting a process.
 - **Bad:** trust socket permissions without peer credentials, decode before the
   UID gate, block the current-thread runtime on PTY work, or remove a socket by
-  pathname without comparing the listener's device/inode token.
+  pathname without comparing the listener's device/inode/change-time token.
 
 ## 6. Tests Required
 
@@ -197,6 +198,6 @@ state plus latest-only watches instead of a per-revision queue.
 - Calling a blocking `SessionService`/PTY operation inline on the current-thread
   Tokio runtime.
 - Removing or rebinding a socket without the held daemon lock and exact
-  device/inode ownership token.
+  device/inode/change-time ownership token.
 - Reporting successful stop before every registry-owned child/thread/reservation
   is released.

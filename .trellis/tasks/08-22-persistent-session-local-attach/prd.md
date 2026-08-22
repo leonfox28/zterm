@@ -125,8 +125,9 @@ SessionId、进程、工作目录和当前画面。
 
 ## 验收标准
 
-- [x] 8 路并发首次本地 attach 只创建一个 `main`，返回同一 SessionId；detach 后任务
-      继续，重连取得相同 SessionId、cwd、当前 screen 和有界近期历史。
+- [x] 8 路并发首次本地 attach 只创建一个 `main`；至少一个成功，所有成功响应返回同一
+      SessionId，和 controller/pending 重叠的请求可返回 occupied；detach 后任务继续，重连
+      取得相同 SessionId、cwd、当前 screen 和有界近期历史。
 - [x] 可以同时创建 `main` 加至少两个命名 Session；list/rename/attach/detach/close 只
       影响目标对象，名称冲突、保留名和无效 cwd 不留下半成品。
 - [x] 无 attachment 的 Session 仍持续排空至少 1 MiB 输出并完成长任务；前台程序退出

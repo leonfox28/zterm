@@ -132,7 +132,8 @@ interrupt/abort and transfer exclusively owned thread handles to a background
 reaper; the registry token remains until child and thread completion is proven.
 Recoverable listener accept failures leave ownership intact and listening. On
 a fatal listener exit with unreleased ownership, the daemon retains its process
-and lock, compare-rebinds the exact device/inode socket it published, and keeps
+and lock, compare-rebinds the exact device/inode/change-time socket it
+published, and keeps
 status/stop retryable; it cannot remove that socket until cleanup succeeds.
 
 On natural exit, the driver may finish and close its latest-revision watch

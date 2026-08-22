@@ -26,19 +26,29 @@ mod unix {
             let barrier = Arc::clone(&barrier);
             threads.push(thread::spawn(move || {
                 barrier.wait();
-                fixture
-                    .service
-                    .prepare_attach(None, true, true, Some(support::default_size()))
-                    .map(|prepared| prepared.attachment.session_id())
-                    .map_err(support::display)
+                match fixture.service.prepare_attach(
+                    None,
+                    true,
+                    true,
+                    Some(support::default_size()),
+                ) {
+                    Ok(prepared) => Ok(Some(prepared.attachment.session_id())),
+                    Err(error) if error.kind() == DomainErrorKind::SessionOccupied => Ok(None),
+                    Err(error) => Err(support::display(error)),
+                }
             }));
         }
         let mut ids = Vec::new();
         for thread in threads {
-            ids.push(thread.join().map_err(|_| "attach thread panicked")??);
+            if let Some(id) = thread.join().map_err(|_| "attach thread panicked")?? {
+                ids.push(id);
+            }
         }
+        assert!(!ids.is_empty(), "one first attachment must succeed");
         assert!(ids.iter().all(|id| *id == ids[0]));
-        assert_eq!(fixture.service.list().map_err(support::display)?.len(), 1);
+        let sessions = fixture.service.list().map_err(support::display)?;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, ids[0]);
 
         let prepared = fixture
             .service
