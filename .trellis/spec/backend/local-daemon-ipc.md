@@ -48,7 +48,13 @@ locks.
 ## Required evidence
 
 - Real same-UID request tests run on macOS/Linux; Linux CI includes a reachable
-  cross-UID rejection harness.
+  cross-UID rejection harness. A helper executed as the foreign UID must live
+  below one test-private directory whose parents are searchable by that UID;
+  the copied executable is execute-only, `sudo` is noninteractive, and the test
+  requires both zero response bytes for the rejected peer and a successful
+  owner request afterward. Running a binary directly from a CI workspace whose
+  parent directories are not searchable is fixture failure, not peer-gate
+  evidence.
 - Multi-process tests prove concurrent launch singleflight, live/stale socket
   behavior, detach, bounded stop, restart identity preservation, and no
   spontaneous post-crash restart.

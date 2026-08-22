@@ -82,11 +82,11 @@ Phase 1 Foundation Gate 已证明并保留：
 - [x] symlink、wrong owner/mode、identity 长度错误、metadata/key 不一致、过新 schema 和非法/mixed infrastructure profile 被明确拒绝，且不改写原状态。
 - [x] SQLite migration/authorization transaction 的成功与注入失败测试证明不存在半写状态；数据库不包含 terminal/session/pair-offer/audit-event 数据。
 - [x] 多进程并发 `ensure_daemon()` 只产生一个持有 `daemon.lock` 的实例；stale socket 仅由 lock owner 安全清理，live socket 不被删除。
-- [ ] same-UID 真实 Unix socket 请求成功；Linux CI 以独立 UID 实际连接测试证明 peer credential gate 拒绝非 owner，macOS 覆盖真实 `getpeereid` same-UID 路径与纯决策负例。
+- [x] same-UID 真实 Unix socket 请求成功；Linux CI 以独立 UID 实际连接测试证明 peer credential gate 拒绝非 owner，macOS 覆盖真实 `getpeereid` same-UID 路径与纯决策负例。
 - [x] detached daemon 在启动它的 CLI/终端退出后继续响应；stop 有界退出并清理自己的 socket，restart 复用原 identity。没有 OS 启动项或 supervisor。
 - [x] setup 后 status、JSON status、doctor、logs、daemon status/stop/restart 行为与副作用表一致；检查类命令在 daemon 停止时不悄悄拉起。
 - [x] local readiness/status/stop 在外网、DNS/Pkarr 和 Relay 完全不可用时仍通过；产品代码没有 self-dial 本机的 Iroh 路径。
-- [ ] source policy、workspace version、fmt、Clippy `-D warnings`、workspace tests、docs、cargo-deny、macOS/Linux/Windows CI 与任务校验全部通过；文档准确写明 M3 尚未提供 session/connect。
+- [x] source policy、workspace version、fmt、Clippy `-D warnings`、workspace tests、docs、cargo-deny、macOS/Linux/Windows CI 与任务校验全部通过；文档准确写明 M3 尚未提供 session/connect。
 
 ## Out of Scope
 

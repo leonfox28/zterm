@@ -39,6 +39,13 @@ Before changing source attributes or cross-platform workflows:
 - [ ] Consider adjacent platform assumptions: executable bits, case-sensitive
       paths, path separators, symlinks, and default shells.
 
+For platform-specific Rust modules, gate the private implementation at the
+complete boundary: imports, fields, helper types, helper functions, and impl
+methods. Keep only the intentionally shared public API unconditional. Do not
+hide native-runner failures with `allow` attributes or fake references. A
+cross-compile that stops inside a native dependency is useful diagnostics, but
+only the hosted target runner is acceptance evidence.
+
 ## Incident: Windows Rust Formatting Failure
 
 - **Root cause categories**: implicit assumption plus test coverage gap. The
@@ -52,3 +59,15 @@ Before changing source attributes or cross-platform workflows:
   actual carriage returns close to checkout.
 - **Expansion**: future platform-specific behavior must be validated at the
   earliest shared boundary rather than inferred from one developer machine.
+
+## Incident: Unix Private Service State Reached Windows
+
+- **Root cause categories**: change-propagation failure plus test coverage gap.
+  Unix listener dispatch was gated, but its private service fields, helpers,
+  and imports remained visible to the Windows target and failed `-D warnings`.
+- **Evidence**: macOS/Linux were green while the hosted Windows compile reported
+  dead private state; a local macOS cross-build stopped earlier in `ring`
+  because the Windows SDK was unavailable and could not validate this layer.
+- **Prevention**: keep the public unsupported-platform boundary constructible,
+  gate the entire private native implementation, and require the hosted Windows
+  shared-contract job before completing a cross-platform milestone.

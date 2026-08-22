@@ -173,7 +173,7 @@ Stop on any setup path that overwrites an existing key or silently recreates an 
 
 - [x] local IPC same-UID readiness/status/stop.
 - [x] wrong major/kind/oversize/deadline/client-close affect one request only.
-- [ ] Linux CI cross-UID harness reaches the socket and is rejected by `SO_PEERCRED`.
+- [x] Linux CI cross-UID harness reaches the socket and is rejected by `SO_PEERCRED`.
 - [x] N concurrent launchers yield one daemon; all receive readiness.
 - [x] live socket is never removed; stale owned socket is cleaned only by new daemon lock owner; symlink/non-socket refuses.
 - [x] launcher exit/closed terminal does not end child; explicit stop does and removes its socket.
@@ -236,7 +236,7 @@ Stop if a display/inspection command causes daemon spawn or if CLI gains direct 
 - [x] Update backend specs from implementation evidence and verify no source/template mirror exists.
 - [x] Update `PHASE_NAME` and remove bootstrap-placeholder wording only after all behavior is real.
 - [x] Run secret scan and check logs/errors/fixtures contain no identity private bytes or real user state.
-- [ ] Run hosted CI; inspect every matrix job, not only aggregate status.
+- [x] Run hosted CI; inspect every matrix job, not only aggregate status.
 
 ### Full gate
 
@@ -255,6 +255,10 @@ git diff --check
 ```
 
 Hosted CI must pass macOS latest ARM, macOS Intel, Ubuntu x64, Ubuntu ARM64, Windows and dependency/Relay jobs. Windows is compile/shared-contract evidence only for M2–M3 Unix lifecycle.
+
+Hosted evidence: GitHub Actions run `32544876320` for commit `38f9e78` passed all
+seven jobs. Both Ubuntu jobs executed `tests/cross_uid.rs` (not a skip), and the
+Windows job passed the shared/unsupported-boundary compile and contract tests.
 
 ## Completion checklist
 
