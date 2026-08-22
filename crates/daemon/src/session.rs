@@ -115,6 +115,7 @@ pub struct SessionAttachment {
     detached: Arc<AtomicBool>,
     revisions: watch::Receiver<Revision>,
     lifecycle: watch::Receiver<AttachmentLifecycle>,
+    #[cfg(unix)]
     final_update: FinalAttachmentUpdateSlot,
 }
 
@@ -181,6 +182,7 @@ impl SessionAttachment {
     }
 
     /// Produces the final drained terminal update before a terminal lifecycle event.
+    #[cfg(unix)]
     pub(crate) fn final_update(&self) -> Result<Option<AttachmentUpdate>, DaemonError> {
         if let Some(update) = lock(&self.final_update, "attachment final update")?.take() {
             return update;
@@ -2224,6 +2226,7 @@ enum SessionCommand {
         attachment_id: AttachmentId,
         reply: SyncSender<Result<Option<AttachmentUpdate>, DaemonError>>,
     },
+    #[cfg(unix)]
     FinalUpdate {
         meta: CommandMeta,
         attachment_id: AttachmentId,
@@ -2806,6 +2809,7 @@ fn dispatch_command(
             attachment_id,
             reply,
         } => respond(actor, meta, reply, || next_update(runtime, attachment_id)),
+        #[cfg(unix)]
         SessionCommand::FinalUpdate {
             meta,
             attachment_id,
@@ -2957,6 +2961,7 @@ fn prepare_attach(
             detached,
             revisions,
             lifecycle: lifecycle_receiver,
+            #[cfg(unix)]
             final_update,
         }),
         snapshot,
@@ -3049,6 +3054,7 @@ fn next_update(
     }
 }
 
+#[cfg(unix)]
 fn final_update(
     runtime: &mut SessionRuntime,
     attachment_id: AttachmentId,

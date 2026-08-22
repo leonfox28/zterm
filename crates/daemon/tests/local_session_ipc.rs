@@ -174,12 +174,28 @@ async fn unary_mutations_and_duplex_reconnect_share_one_live_registry() -> Resul
     let stopped = client.stop(false).await.map_err(session_fixture::display)?;
     assert_eq!(stopped.active_session_count, 1);
     assert_eq!(stopped.active_session_names, ["main"]);
-    let LocalAttachmentEvent::SessionEnded(ended) = stop_attachment
-        .read_event(EVENT_DEADLINE)
-        .await
-        .map_err(|error| format!("daemon-stop attachment event failed: {error}"))?
-    else {
-        return Err("daemon stop did not terminate the attached session explicitly".into());
+    let stop_deadline = Instant::now() + EVENT_DEADLINE;
+    let ended = loop {
+        let remaining = stop_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("daemon stop did not terminate the attached session explicitly".into());
+        }
+        match stop_attachment
+            .read_event(remaining)
+            .await
+            .map_err(|error| format!("daemon-stop attachment event failed: {error}"))?
+        {
+            LocalAttachmentEvent::Snapshot(_)
+            | LocalAttachmentEvent::Delta(_)
+            | LocalAttachmentEvent::SyncRequired(_) => {}
+            LocalAttachmentEvent::SessionEnded(ended) => break ended,
+            LocalAttachmentEvent::LeaseLost(_) => {
+                return Err("controller lease was lost during daemon stop".into());
+            }
+            LocalAttachmentEvent::Takeover(_) => {
+                return Err("unexpected takeover response during daemon stop".into());
+            }
+        }
     };
     assert_eq!(
         ended.reason,
