@@ -231,6 +231,11 @@ M4 与 M5/M6 在 M3 契约冻结后可以独立推进；M7 负责把两条路径
 
 ### M4. 持久 Session、PTY 与权威 VT 引擎
 
+状态：**已完成**。子任务 `08-22-persistent-session-local-attach` 的本地完整门禁、独立 checker
+和 GitHub Actions run `32570831589`（macOS arm64/Intel、Linux x86_64/arm64、Windows
+shared/unsupported boundary）均绿色；这里只完成 transport-independent SessionService 与
+same-UID local attachment，M5–M8 的远端 transport 和最终 CLI 仍保持未完成。
+
 工作内容：
 
 - 实现每个 session 一个 SessionActor，串行拥有 PTY、TerminalModel、revision、attachments、controller lease 和资源计数。
