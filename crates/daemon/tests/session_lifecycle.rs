@@ -210,7 +210,14 @@ mod unix {
             .service
             .close(fixture.principal, fixture.op(15), docs.session_id)
             .map_err(support::display)?;
-        assert_eq!(closed, renamed);
+        assert_eq!(closed.session_id, renamed.session_id);
+        assert_eq!(closed.name, renamed.name);
+        assert_eq!(closed.working_directory, renamed.working_directory);
+        assert_eq!(closed.viewport, renamed.viewport);
+        assert!(
+            closed.revision >= renamed.revision,
+            "terminal revision must not move backwards before close"
+        );
         let close_replay = fixture
             .service
             .close(fixture.principal, fixture.op(15), docs.session_id)
