@@ -71,3 +71,20 @@ only the hosted target runner is acceptance evidence.
 - **Prevention**: keep the public unsupported-platform boundary constructible,
   gate the entire private native implementation, and require the hosted Windows
   shared-contract job before completing a cross-platform milestone.
+
+## Incident: Process-Reap Latency Was Used as Concurrency Evidence
+
+- **Root cause categories**: implicit assumption plus test-evidence mismatch. A
+  shutdown test treated successful child scheduling, signal handling, exit, and
+  reap within 100 milliseconds as proof that two close operations started
+  concurrently.
+- **Evidence**: the same production path passed Linux x86_64/arm64, macOS
+  Intel, and repeated local macOS runs, while a loaded macOS ARM runner missed
+  only the fixed reap window. The underlying PTY library itself permits a
+  longer Unix signal grace period before escalation.
+- **Prevention**: prove concurrency at the ownership boundary with an explicit
+  state transition, barrier, or notification showing that every independent
+  owner received the operation before waiting. Verify eventual process/thread
+  cleanup separately under one realistic absolute deadline. Do not use a
+  sub-grace-period wall-clock bound on OS scheduling, signal delivery, or reap
+  as a proxy for concurrency.

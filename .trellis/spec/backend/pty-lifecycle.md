@@ -116,9 +116,10 @@ All path and size validation must finish before any PTY is opened.
 - Unix integration: real PTY input/output, child-observed resize, natural exit
   status, reader single transfer, and explicit close with a bounded deadline.
 - Daemon integration: a HUP-resistant root child makes a short shutdown fail
-  truthfully while it is still owned, an unrelated root child closes
-  concurrently, and the original/retried cleanup eventually observes both PIDs
-  reaped.
+  truthfully while it is still owned; all independent actors must already have
+  received their close request before that wait returns. The original/retried
+  cleanup then observes both PIDs reaped under its final absolute deadline,
+  without treating a sub-grace-period reap time as concurrency evidence.
 - Drain integration: emit more than the kernel PTY buffer and write an
   independent control marker after all writes; the marker must appear even with
   zero attachments.

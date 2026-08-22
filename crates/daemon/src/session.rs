@@ -3995,7 +3995,7 @@ mod tests {
                 None,
             )
             .expect("stuck fixture creates");
-        service
+        let fast = service
             .create(
                 principal,
                 OperationId {
@@ -4007,6 +4007,14 @@ mod tests {
                 None,
             )
             .expect("fast fixture creates");
+        let stuck_actor = service
+            .inner
+            .resolve(&SessionSelector::Id(stuck.session_id))
+            .expect("stuck actor remains addressable");
+        let fast_actor = service
+            .inner
+            .resolve(&SessionSelector::Id(fast.session_id))
+            .expect("fast actor remains addressable");
         let prepared = service
             .prepare_attach(
                 Some(SessionSelector::Id(stuck.session_id)),
@@ -4053,25 +4061,21 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(150));
         assert!(error.detail().contains("stuck-a"));
         assert!(process_exists(stuck_pid));
+        assert_eq!(
+            stuck_actor.requested_end_reason(),
+            Some(SessionEndReason::DaemonStop)
+        );
+        assert_eq!(
+            fast_actor.requested_end_reason(),
+            Some(SessionEndReason::DaemonStop),
+            "shutdown must request every owner before waiting for cleanup"
+        );
         assert!(
             service
                 .list()
                 .expect("status remains available after failed shutdown")
                 .iter()
                 .any(|summary| summary.session_id == stuck.session_id)
-        );
-
-        let fast_deadline = Instant::now() + Duration::from_millis(100);
-        while process_exists(fast_pid) && Instant::now() < fast_deadline {
-            thread::sleep(Duration::from_millis(2));
-        }
-        assert!(
-            !process_exists(fast_pid),
-            "session B did not close concurrently"
-        );
-        assert!(
-            process_exists(stuck_pid),
-            "the resistant session should still prove the failed-stop ownership boundary"
         );
 
         let completion_deadline = Instant::now() + Duration::from_secs(3);
@@ -4085,6 +4089,7 @@ mod tests {
             "the original concurrent shutdown did not finish after escalation"
         );
         assert!(!process_exists(stuck_pid));
+        assert!(!process_exists(fast_pid));
         assert!(
             service
                 .shutdown_until(Instant::now() + Duration::from_secs(1))

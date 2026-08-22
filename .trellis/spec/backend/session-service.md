@@ -215,6 +215,11 @@ they must not duplicate registry, replay, resource, or controller logic.
   socket until stop is retryable, and failed bounded stop leaves the listener
   available. `local_ipc` proves byte-identical single-retry execution and that
   typed outcome unknown rotates only for a later operation.
+- Concurrent shutdown evidence observes that every actor has received its end
+  request before cleanup waiting, then separately requires all child PIDs and
+  ownership to be released under the final absolute deadline. It must not use
+  a fixed process-reap interval shorter than the platform PTY library's signal
+  grace period as a proxy for concurrent initiation.
 
 ## 7. Wrong vs Correct
 
