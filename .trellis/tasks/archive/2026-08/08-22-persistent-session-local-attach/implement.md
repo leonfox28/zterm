@@ -169,10 +169,10 @@ sh tests/foundation/terminal-blackbox.sh --mode herdr
 - [x] 更新 backend specs、README/docs：准确说明 daemon-lifetime persistence、main、local attach、
       resource limit、takeover 和 stop/restart 边界；不宣称远端或 Windows runtime 已完成。
 - [x] 更新 parent/child checklist，只有实际运行且有证据的条目才能勾选。
-- [ ] Unix hosted matrix 跑真实 PTY/socket；Windows hosted job 跑共享 core/proto/daemon compile
+- [x] Unix hosted matrix 跑真实 PTY/socket；Windows hosted job 跑共享 core/proto/daemon compile
       和 unsupported tests，不用本机 cross-compile 代替证据。
-  - CI matrix 已配置；本机 macOS arm64 全绿。Windows 本地 cross-compile 在 native
-    `ring`/MSVC headers 之前失败，不能冒充 hosted Windows 证据，保持未勾选。
+  - GitHub Actions run `32570831589` 已验证 macOS arm64/Intel、Linux x86_64/arm64 的真实
+    PTY/socket 测试，以及 Windows shared/unsupported compile 与共享契约测试；全部绿色。
 - [x] 普通 push 不下载 Herdr、不跑公网/网络 Gate；显式 gate 记录固定版本和清理结果。
 - [x] 运行完整 final gate，检查无用户 secret、真实 transcript、用户 tmux/Herdr 资源或测试
       临时物残留。
@@ -217,11 +217,13 @@ nonblocking actor/driver Drop + background reaper、ByteQueue late enqueue、fat
 独立 checker 随后按 actor 身份修正 shutdown 的 summary/join 去重并保留已观察 actor 直到实际
 join，恢复 poisoned OperationCell 的终态写入/唤醒，并补齐 cleanup-only SessionId 冲突拒绝与普通
 API poison typed-error 断言。对应 adversarial tests 与完整 final gate 均再次全绿；没有遗留设计级
-偏差。hosted Unix/Windows 证据仍按要求保持未完成。
+偏差。最终 commit `6ed5753` 将并发关闭证据从 OS 调度/reap 的 100ms 假设改为 actor ownership
+边界，并把 eventual PID cleanup 保留在独立 absolute deadline。GitHub Actions run `32570831589`
+随后在全部 Unix/Windows、dependency policy 与 relay bundle job 上绿色完成。
 
 ## 完成条件
 
-- [ ] PRD 的全部 M4 验收标准有直接证据，且没有借用 M5–M8 的未实现能力。
+- [x] PRD 的全部 M4 验收标准有直接证据，且没有借用 M5–M8 的未实现能力。
 - [x] 独立 checker 未发现设计级偏差；所有机械修复已回归。
-- [ ] hosted CI 全绿后才完成/归档 child task；更新 parent M4 对应 checklist，但不提前勾选
+- [x] hosted CI 全绿后才完成/归档 child task；更新 parent M4 对应 checklist，但不提前勾选
       remote connection 或最终 CLI 条目。

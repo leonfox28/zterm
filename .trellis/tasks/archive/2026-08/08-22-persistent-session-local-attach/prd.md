@@ -148,7 +148,7 @@ SessionId、进程、工作目录和当前画面。
 - [x] tmux 与固定 Herdr 通过同一个通用本地 attachment harness 完成交互、Unicode、颜色、
       alternate screen、bracketed paste、resize、detach 后存活和 snapshot 恢复；生产源码
       不含程序名特判。
-- [ ] macOS arm64/Intel、Linux x86_64/arm64 的托管 CI 运行适用测试；Windows 保持公共
+- [x] macOS arm64/Intel、Linux x86_64/arm64 的托管 CI 运行适用测试；Windows 保持公共
       domain/proto/daemon unsupported boundary 可编译，不伪装已支持 ConPTY/Named Pipe。
 
 ## 不在本任务范围
