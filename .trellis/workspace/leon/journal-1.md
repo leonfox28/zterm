@@ -98,3 +98,28 @@ Implemented typed core and protobuf contracts, secure per-user state and identit
 ### Status
 
 [OK] **Completed**
+
+
+## Session 5: Complete M4 persistent local sessions
+
+**Date**: 2026-08-22
+**Task**: Complete M4 persistent local sessions
+**Branch**: `main`
+
+### Summary
+
+Implemented and independently verified daemon-lifetime named terminal sessions, authoritative PTY/VT ownership, same-UID local attachments, bounded snapshot/resync, controller takeover, exact mutation replay, resource governance, unwind-safe cleanup, and fatal-listener recovery. All local gates and GitHub Actions run 32570831589 passed on macOS arm64/Intel, Linux x86_64/arm64, and Windows shared boundaries; the M4 child task was archived without advancing M5-M8.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `70ae314` | (see git log) |
+| `c4746c7` | (see git log) |
+| `6a562ad` | (see git log) |
+| `ffe169f` | (see git log) |
+| `6ed5753` | (see git log) |
+
+### Status
+
+[OK] **Completed**
