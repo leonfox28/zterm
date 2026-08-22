@@ -1,0 +1,14 @@
+{"file":".trellis/spec/guides/evidence-driven-simplicity.md","reason":"Audit replay, fallback, finalization and tests for a concrete current consumer and remove redundant machinery."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Trace every session/terminal field and error across proto, service, actor and local adapter."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Check no second registry, projection calculation, frame decoder, terminal parser or test download path was introduced."}
+{"file":".trellis/spec/guides/cross-platform-thinking-guide.md","reason":"Verify source policy, Unix hosted behavior and honest Windows compile/unsupported evidence."}
+{"file":".trellis/spec/backend/core-wire-domain.md","reason":"Verify stable kinds, domain conversions, bounds and exact-result operation replay."}
+{"file":".trellis/spec/backend/terminal-model.md","reason":"Verify semantic snapshot/delta equivalence, safe sequence handling and pre-allocation resource admission."}
+{"file":".trellis/spec/backend/terminal-driver.md","reason":"Verify PTY drain cannot be blocked by attachments and finalization/locks are deterministic."}
+{"file":".trellis/spec/backend/pty-lifecycle.md","reason":"Verify only SessionActor can terminate the root child and detach/drop remains non-destructive."}
+{"file":".trellis/spec/backend/local-daemon-ipc.md","reason":"Verify same-UID peer admission, unary strictness, duplex state validation and connection fault isolation."}
+{"file":".trellis/spec/backend/effective-user-state.md","reason":"Verify live session/terminal/replay data is never persisted or logged."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/local-self-attach.md","reason":"Check local attach shares the exact SessionService/lease and never self-dials or bypasses occupied/takeover."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/terminal-reconnect-state.md","reason":"Check tmux/Herdr use one generic terminal path and reconnect state stays host-authoritative."}
+{"file":".trellis/tasks/archive/2026-08/08-21-foundation-gate/research/pty-wait-lock-retrospective.md","reason":"Review actor/driver wait and mutex lifetimes against the prior deadlock class."}
+{"file":".trellis/tasks/08-22-persistent-session-local-attach/research/current-boundary.md","reason":"Check implementation matches the exact pre-task code boundary and all declared exclusions."}

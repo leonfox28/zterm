@@ -27,6 +27,14 @@ PtySession::resize(&self, size: PtySize) -> Result<(), PtyError>
 PtySession::try_wait(&mut self) -> Result<PtyChildState, PtyError>
 PtySession::wait(&mut self) -> Result<PtyExitStatus, PtyError>
 PtySession::close_explicitly(&mut self) -> Result<PtyExitStatus, PtyError>
+
+// Hidden daemon-owner split after spawn; never an attachment API.
+PtySession::into_driver_parts(self) -> Result<PtyDriverParts, PtyError>
+PtyIo::write_input(&mut self, bytes: &[u8]) -> Result<(), PtyError>
+PtyIo::resize(&self, size: PtySize) -> Result<(), PtyError>
+PtyChild::try_wait(&mut self) -> Result<PtyChildState, PtyError>
+PtyChild::close_explicitly(&mut self) -> Result<PtyExitStatus, PtyError>
+PtyChildInterrupt::interrupt(&self) -> Result<(), PtyError>
 ```
 
 `portable_pty` master, slave, reader, writer, child, killer, exit-status, and
@@ -42,6 +50,14 @@ low-level fixture/integration primitive, not a first-stage user command API.
   `CommandBuilder::new_default_prog()` so portable-pty supplies login argv0.
 - The output reader transfers exactly once. The session retains the PTY master,
   input writer, and root-child handle.
+- The daemon may consume an already-spawned `PtySession` into zterm-owned
+  `PtyReader`, `PtyIo`, and `PtyChild` parts. This is the minimal interruption
+  boundary: a potentially blocking master write/flush is isolated from child
+  observation, portable-pty kill/escalation, and reap. The split does not expose
+  a native fd, portable-pty type, or termination authority to attachments.
+- Unix kernels may report `EIO` from the PTY master after the slave side has
+  closed. `PtyReader` normalizes that native close signal to ordinary EOF so a
+  successful root-shell exit is not reclassified as a terminal-driver failure.
 - Only the session owner may call `close_explicitly()`. Attachments and
   transports may observe terminal state but must not own `PtySession`, a PTY
   handle, or a child-kill capability.
@@ -50,6 +66,15 @@ low-level fixture/integration primitive, not a first-stage user command API.
   Foundation termination triggers.
 - `close_explicitly()` uses portable-pty's child killer once and waits. Zterm
   adds no signal escalation or process-group policy at this layer.
+- portable-pty 0.9's cloned Unix `ChildKiller` sends only `SIGHUP`, while the
+  owned child `kill()` performs its portable grace/escalation behavior. Zterm
+  therefore keeps independent owned child control instead of treating a cloned
+  killer as truthful reap completion. Master close has no clean portable clone
+  that can safely invalidate a concurrently blocked writer.
+- `PtyChildInterrupt` wraps that cloned killer only as a non-waiting unwind
+  signal. It uses nonblocking mutex admission (another caller already holding
+  it counts as interruption in progress), never claims reap completion, and is
+  paired with an owned `PtyChild` reaper for lifecycle truth.
 - Windows keeps the same zterm-owned boundary; current-account Unix login-shell
   behavior returns a typed unsupported-platform error until a native Windows
   implementation is added.
@@ -67,6 +92,7 @@ No environment key is required from a caller for account-backed shell startup.
 | home/cwd is not an accessible directory | `InvalidPath(NotDirectory/Inaccessible)` |
 | effective account lookup fails or has no record | `AccountLookup` / `AccountNotFound` |
 | second reader transfer | `ReaderAlreadyTaken` |
+| Unix master read returns `EIO` after slave close | `PtyReader::read` returns EOF (`0`) |
 | native operation fails | `Operation` with a zterm-owned `PtyOperation` |
 | account login requested on an unsupported target | `UnsupportedPlatform` |
 
@@ -89,6 +115,10 @@ All path and size validation must finish before any PTY is opened.
   creation; assert the login builder uses effective-account values.
 - Unix integration: real PTY input/output, child-observed resize, natural exit
   status, reader single transfer, and explicit close with a bounded deadline.
+- Daemon integration: a HUP-resistant root child makes a short shutdown fail
+  truthfully while it is still owned, an unrelated root child closes
+  concurrently, and the original/retried cleanup eventually observes both PIDs
+  reaped.
 - Drain integration: emit more than the kernel PTY buffer and write an
   independent control marker after all writes; the marker must appear even with
   zero attachments.

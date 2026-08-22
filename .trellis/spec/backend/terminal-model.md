@@ -19,8 +19,12 @@ The retained public boundary is:
 ```rust
 TerminalModel::new(size: TerminalSize, scrollback_rows: usize)
     -> Result<TerminalModel, TerminalError>
+TerminalModel::project_resources(size: TerminalSize, scrollback_rows: usize)
+    -> Result<TerminalResourceProjection, TerminalError>
 TerminalModel::ingest(&mut self, bytes: &[u8])
     -> Result<TerminalUpdate, TerminalError>
+TerminalModel::preflight_resize(&self, size: TerminalSize)
+    -> Result<(Revision, TerminalResourceProjection), TerminalError>
 TerminalModel::resize(&mut self, size: TerminalSize)
     -> Result<TerminalUpdate, TerminalError>
 TerminalModel::checkpoint(&self) -> TerminalCheckpoint
@@ -29,6 +33,7 @@ TerminalModel::delta_or_resync(&self, checkpoint: &TerminalCheckpoint)
     -> TerminalDeltaResult
 TerminalModel::state(&self) -> TerminalState
 TerminalModel::resource_projection(&self) -> TerminalResourceProjection
+TerminalSnapshot::limit_ansi_payload(&mut self, maximum_bytes: usize) -> bool
 ```
 
 `Revision` is the zterm-owned checked newtype shared by core, protocol
@@ -50,10 +55,18 @@ or icon-name event retains at most `MAX_TITLE_BYTES = 256` source bytes.
   visible cells and styles, cursor and active style, and supported input modes.
 - A reconnect client applies `recent_history_ansi` before `screen_ansi`.
   Snapshot replay into a fresh model must reproduce the latest semantic state.
-- A checkpoint privately clones the parser screen. A delta is a single merged
-  latest-state update, not a queue of intermediate revisions. Size mismatch,
-  a future checkpoint, or a delta whose ANSI payload is no smaller than the
-  full snapshot returns `Resync`.
+- Snapshot frame bounding preserves the current `screen_ansi`. If a wire
+  envelope would exceed 8 MiB, the one snapshot limiter drops only oldest
+  complete `CRLF`-terminated history lines, prepends an ANSI reset at the new
+  boundary, and never mutates host scrollback. Proto conversion reserves fixed
+  envelope headroom and the frame encoder remains the final exact size gate.
+- A checkpoint builds a fresh zero-scrollback parser from only the latest
+  visible-screen ANSI and privately retains its main and alternate visible
+  grids. It never clones host scrollback and retains exactly
+  `rows * columns * 2` cell slots independent of the model's history capacity.
+  A delta is one merged latest-state update, not a queue of intermediate
+  revisions. Size mismatch, a future checkpoint, or a delta whose ANSI payload
+  is no smaller than the full snapshot returns `Resync`.
 - `vt100` formats only the active visible grid. When the alternate screen is
   active, Foundation snapshots do not serialize the inactive main grid or its
   history. This is the approved latest-active-screen reconnect boundary, not a
@@ -69,6 +82,13 @@ or icon-name event retains at most `MAX_TITLE_BYTES = 256` source bytes.
   snapshots, transient workload allocations, RSS, and throughput; those
   remain Foundation resource measurements and the projection must not be
   presented as an RSS limit by itself.
+- Attachment checkpoints are deliberately outside the authoritative model
+  projection but are visible-only and fixed. M4 permits one controller plus at
+  most one pending takeover per session, bounding retained checkpoint state to
+  four visible grids per session without retaining history.
+- Registry admission and resize call the public non-allocating
+  `project_resources`/`preflight_resize` owners; they do not reproduce the cell
+  arithmetic or mutate a model to discover whether a request is valid.
 - The Foundation-measured admission baseline for the later session registry is
   2,000 scrollback rows, at most 240x80 cells, at most eight live sessions, and
   at most 128 MiB summed fixed-cell projection under a 256 MiB process-RSS
@@ -86,6 +106,8 @@ or icon-name event retains at most `MAX_TITLE_BYTES = 256` source bytes.
 | Checkpoint revision is newer than the model | Return one full `Resync` snapshot |
 | Checkpoint size differs from current size | Return one full `Resync` snapshot |
 | Delta ANSI length is at least the snapshot ANSI length | Return one full `Resync` snapshot |
+| Snapshot ANSI exceeds the wire budget because of history | Remove oldest complete history lines only; preserve the full screen |
+| Current screen alone exceeds the requested snapshot budget | Preserve the screen, clear history, return `false`; frame encoding rejects if still oversized |
 | More than 32 side events occur in one update | Retain 31 events plus one `EventsDropped { count }` summary |
 | Title or icon input exceeds 256 source bytes | Retain a bounded lossy string with `truncated: true` |
 | OSC 52 or an unknown control payload is received | Classify or drop it; never reproduce its decoded or encoded payload |
@@ -119,7 +141,10 @@ or icon-name event retains at most `MAX_TITLE_BYTES = 256` source bytes.
 - `cargo test -p zterm-core --test terminal_snapshot_delta`: replay snapshots
   into a fresh model, apply a merged delta, and compare semantic state rather
   than bytes. Cover alternate/main transitions, bounded history, resize/future/
-  large-delta resync, invalid size, and resource overflow.
+  large-delta resync, invalid size, and resource overflow. Feed more than the
+  configured history capacity and assert checkpoint scrollback is zero and
+  visible capacity remains `rows * columns * 2`; compare main/alternate,
+  style, Unicode, and resize semantics after applying delta/resync.
 - `cargo test -p zterm-core`: cover revision overflow without mutation.
 - `cargo bench -p zterm-core --bench terminal_state` and
   `sh tests/foundation/resource-gate.sh`: retain the machine-readable candidate

@@ -1,8 +1,11 @@
 # Core and local daemon milestone
 
-This milestone implements Phase One M2–M3. It freezes shared domain and wire
-contracts and delivers a normal user's per-account local daemon. It does not
-yet provide a terminal session or remote connection.
+This document describes Phase One M2–M3: shared domain/wire contracts and a
+normal user's per-account local daemon. M4 now adds daemon-lifetime terminal
+sessions and the internal real-socket attachment adapter documented in
+[Persistent session engine and local attachment](persistent-sessions.md). The
+public command table below remains unchanged until the later raw-terminal CLI
+milestone, and remote connection is still not implemented.
 
 ## Supported commands
 
@@ -71,18 +74,36 @@ supervisor, or automatic update. After a crash or reboot, no daemon starts
 until an explicit setup/restart or future connection command calls the same
 on-demand launcher.
 
-Local unary IPC uses one Unix connection per request and the shared bounded
-protobuf framing. The daemon authorizes the peer UID before decoding bytes:
+Local IPC uses the shared bounded protobuf framing. The daemon authorizes the
+peer UID before decoding bytes:
 Linux uses `SO_PEERCRED`; macOS uses `getpeereid`. It permits at most 32 active
-unary connections, defaults requests to five seconds, caps relative deadlines
+connections, defaults requests to five seconds, caps relative deadlines
 at 30 seconds, caps frames at 8 MiB, and caps control payloads at 1 MiB. The
-client half-closes its write side after one frame so the server can reject all
-trailing request bytes before dispatch. A stop
-acknowledgement is flushed before the listener exits and removes its socket.
-M3 stop has no durable/session mutation and does not use the reserved operation
-replay window; failed acknowledgement delivery leaves the daemon running, while
-stopping an already stopped daemon is a CLI-level success. Replay integration
-begins with M4 stateful session create/rename/close/takeover operations.
+M2–M3 lifecycle calls and M4 session mutations remain strict unary requests:
+the client half-closes its write side after one frame so the server can reject
+all trailing request bytes before dispatch. A `TerminalAttachRequest` instead
+selects one long-lived duplex stream while retaining the same decoder and peer
+gate. Session work runs outside the current-thread runtime with one absolute
+deadline, so a full actor mailbox or blocked PTY cannot stall socket progress.
+Readiness, status, and session list allocate no replay state. A logical client
+lazily obtains a daemon-incarnation/monotonic-ordinal operation lease before its
+first mutation. Only an ambiguous transport failure gets one byte-identical
+retry; a complete typed error is definitive and never silently moves the same
+mutation to another lease.
+
+A stop acknowledgement is produced only after bounded concurrent session
+cleanup succeeds, then flushed before the listener exits and removes its
+socket. Cleanup deadline or failed acknowledgement delivery leaves the daemon
+and listener running for status/retry, while stopping an already stopped daemon
+is a CLI-level success. M4's create/rename/close/takeover mutations use
+per-operation exact-result singleflight; a completed request whose response was
+lost replays on a new socket without repeating its side effect.
+Recoverable listener accept errors stay inside the serve loop. On fatal server
+exit the daemon removes its socket only after all live and provisional session
+owners are released. Failed cleanup retains the process, daemon lock, store,
+service, and children; it compare-rebinds the exact device/inode socket token it
+published and restores status/stop retry. A replaced same-UID socket path is
+never unlinked by that recovery loop.
 
 Readiness and status are local-only. They do not create or bind an Iroh
 endpoint and do not access DNS, Pkarr, Relay, or the Internet.
@@ -123,14 +144,15 @@ daemon; M5 consumes this validated choice when network transport is added.
 
 ## Deliberate exclusions
 
-- No `SessionRegistry`, session/tab creation, PTY attach, or `connect local`.
+- No public `connect local`, raw-terminal renderer, detach key prefix, or user
+  session command tree yet. The M4 service and socket adapter are internal/test-facing.
 - No Iroh endpoint bind, NAT traversal, pairing, remote authorization, or revoke RPC.
 - No GUI, Android, Windows daemon, or iOS client in this milestone.
 - No boot/login autostart and no persistence of live work across daemon restart.
 - No Agent-specific state recognition or notification behavior before 2.0.
 
-M4 must route local attachment through the same future `SessionService` that a
-remote adapter will use. It must not add self-pairing, self-Iroh dial, or a
+M4 routes local attachment through the same `SessionService` that a future
+remote adapter will use. It does not add self-pairing, self-Iroh dial, or a
 second local session registry.
 
 ## Focused verification
@@ -139,6 +161,9 @@ second local session registry.
 cargo test -p zterm-daemon --test persistence
 cargo test -p zterm-daemon --test setup_idempotency
 cargo test -p zterm-daemon --test local_ipc
+cargo test -p zterm-daemon --test local_session_ipc
+cargo test -p zterm-daemon --test session_concurrency
+cargo test -p zterm-daemon --test terminal_recovery
 cargo test -p zterm-daemon --test single_instance
 cargo test -p zterm-daemon --test detached_lifecycle
 cargo test -p zterm-cli --test setup_permissions

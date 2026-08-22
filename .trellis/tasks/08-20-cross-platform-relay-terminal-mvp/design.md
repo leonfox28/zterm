@@ -384,7 +384,7 @@ SessionActor
 - Unix 通过账户数据库（`getpwuid_r` 等）解析当前有效 UID 的 home 与 login shell，不继承 daemon 的 `$SHELL` 或 cwd。
 - 使用该 shell 的 login 模式启动交互式 PTY；具体 argv0/`-l` 适配封装在 `zterm-platform`，并分别测试 bash、zsh、fish。账户配置为不可登录 shell 时不绕过系统选择。
 - 默认 cwd 是账户 home；`--cwd` 在 spawn 前 canonicalize并验证目录存在、属于可进入路径。验证或 spawn 失败不会先登记 session。
-- 初始 terminal size 使用发起 create/connect 的本地 TTY；没有可用尺寸时是 80×24。无人连接时保留最后有效尺寸。
+- 初始 terminal size 使用发起 create/connect 的本地 TTY；没有可用尺寸时是 120×40。无人连接时保留最后有效尺寸，不因 detach 自动 resize。
 - 只有在兼容门通过后设置经验证的 `TERM`（首选 `xterm-256color`）；未验证 truecolor 前不设置 `COLORTERM=truecolor`。
 
 ### 10.3 PTY 数据流
@@ -406,7 +406,6 @@ revision()
 full_snapshot(viewport, recent_history_budget)
 diff_from(baseline)
 resource_usage()
-trim_scrollback(target)
 ```
 
 首选实现以 vt100 0.16.2 的 screen clone、`state_formatted()` 和 `state_diff()` 为基础，并由 zterm adapter 处理 DA/DSR、title/bell、未支持 query、mode 与安全策略。采用前必须通过技术门；接口允许换成更完整的 emulator而不修改 session、protocol 或客户端。
@@ -417,15 +416,14 @@ attach 在 SessionActor 同一个序列化点取得 `(screen clone, revision)` �
 
 ### 10.5 资源默认值
 
-以下是进入 Gate 0 的保守候选值，不是未经测量就冻结的产品承诺。Gate 0 可以依据真实 cell 内存与高输出基准调低或调高默认值，但必须继续满足 PRD 的 main + 至少两个额外 session、当前 screen 可恢复和所有资源有界：
+Gate 0 已完成测量并固定以下产品准入值。它们与 `ResourceLimits` 和 terminal-model spec 共用同一 source of truth：
 
-- 每个 daemon 候选上限 16 个活动 session，且最终上限不得低于 3；达到上限拒绝创建，不回收旧 session。
-- terminal size 最大 512 columns × 256 rows；超限 resize 明确拒绝。
-- 每 session 候选上限 10,000 行标准 scrollback，并受 daemon 候选 256 MiB terminal-state 总预算二次约束；达到总预算按最旧历史行收缩，不动当前 screen。
+- 每个 daemon 最多 8 个活动 session；达到上限拒绝创建，不回收旧 session。
+- terminal size 最大 240 columns × 80 rows；超限 resize 明确拒绝。没有有效初始 viewport 时使用 120×40，detach 后保留最后有效尺寸。
+- 每 session 固定保留至多 2,000 行标准 scrollback；全部 live Session 的 summed fixed-cell projection 不超过 128 MiB。创建和 resize 在分配或变更前拒绝超限，不对已存在 Session 做动态历史收缩。
+- 256 MiB 是 Foundation 的进程 RSS 测量目标，不冒充可由 projection 精确保证的硬内存限额。
 - 每 connection 最多 32 个活动 attachment、32 个并发 control RPC；每 attachment只保留一个待发送 revision，单 frame 8 MiB。
 - 输入、名称、cwd、设备列表与结构化日志字段均有独立长度/数量上限。
-
-技术门会用实际 VT cell 内存基准校准这些候选值并把最终默认值写入 Gate 0 报告；若候选库无法可靠计量/裁剪，则在继续功能实现前替换或封装其 scrollback，而不是取消全局上限。
 
 ## 11. Controller lease 与 takeover
 
@@ -522,7 +520,7 @@ zterm reset --identity
 2. portable-pty启动账户 login shell，验证 reader、input、resize、root child exit及断开 reader不会给 child发送 HUP。
 3. TerminalModel候选解析固定 ANSI corpus，验证 full snapshot→delta等价性、主/备用 screen、Unicode宽度、颜色、cursor、bracketed paste和连续 resize。
 4. 真实黑盒运行 tmux与固定版本 Herdr direct attach，验证常见 DA/DSR查询和无人 client时持续排空。
-5. 以 16 session、10k scrollback与 256 MiB governor作为候选压力目标，量化典型高输出下的内存/CPU；最终默认值可以由报告校准，但至少要可靠支持 3 个 session且保持所有资源有界。
+5. 以 16 session、10k scrollback 与 256 MiB 候选压力矩阵完成内存/CPU量化；报告据此固定产品准入为 8 session、2,000 scrollback、240x80、128 MiB projection，并保留 256 MiB RSS 测量目标。
 
 Gate 0通过条件不是“能显示 hello world”，而是候选 VT 达到 PRD 的通用恢复与黑盒兼容基线。vt100不通过时先在 `TerminalModel` 后评估 avt或更完整实现，再继续协议/session功能；这一替换不需要用户重新决定产品范围。
 

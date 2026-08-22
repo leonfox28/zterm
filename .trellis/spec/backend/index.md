@@ -26,6 +26,7 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Core and Wire Domain Contract](./core-wire-domain.md) | Shared IDs, revisions, operation replay, protobuf framing, and protocol limits | Active |
 | [Effective-User State Contract](./effective-user-state.md) | Per-user paths, configuration, identity, SQLite, and safe file operations | Active |
 | [Local Daemon and IPC Contract](./local-daemon-ipc.md) | Same-UID Unix IPC, single-instance lifecycle, detached spawn, and CLI side effects | Active |
+| [Persistent Session Service Contract](./session-service.md) | Daemon-lifetime sessions, attachments, controller leases, and resource admission | Active |
 
 ---
 

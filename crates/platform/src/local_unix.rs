@@ -10,6 +10,15 @@ use crate::user_state::{FileLock, PathError, UserPaths, open_append};
 /// Daemon lifetime lock required for socket ownership operations.
 pub struct DaemonLock(FileLock);
 
+/// Filesystem identity of the socket created while one daemon lock is held.
+/// Fatal-listener recovery uses this token to avoid unlinking a replaced path.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DaemonSocketOwnership {
+    device: u64,
+    inode: u64,
+}
+
 impl DaemonLock {
     /// Tries to acquire the per-user daemon lifetime lock.
     pub fn try_acquire(paths: &UserPaths) -> Result<Option<Self>, LocalPlatformError> {
@@ -153,6 +162,102 @@ pub fn bind_daemon_socket(
     fs::set_permissions(paths.socket(), fs::Permissions::from_mode(0o600))
         .map_err(|error| LocalPlatformError::Io(error.to_string()))?;
     Ok(listener)
+}
+
+/// Binds a daemon socket and returns its exact filesystem ownership token.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn bind_owned_daemon_socket(
+    paths: &UserPaths,
+    lock: &DaemonLock,
+) -> Result<(std::os::unix::net::UnixListener, DaemonSocketOwnership), LocalPlatformError> {
+    let listener = bind_daemon_socket(paths, lock)?;
+    let ownership = socket_ownership(paths)?.ok_or_else(|| {
+        LocalPlatformError::Io("bound daemon socket disappeared before publication".into())
+    })?;
+    Ok((listener, ownership))
+}
+
+/// Rebinds only when the stale path is the exact socket previously published
+/// under the still-held daemon lock.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn rebind_owned_daemon_socket(
+    paths: &UserPaths,
+    _lock: &DaemonLock,
+    previous: DaemonSocketOwnership,
+) -> Result<(std::os::unix::net::UnixListener, DaemonSocketOwnership), LocalPlatformError> {
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    paths.prepare_runtime_directory()?;
+    match socket_ownership(paths)? {
+        Some(current) if current == previous => {
+            if UnixStream::connect(paths.socket()).is_ok() {
+                return Err(LocalPlatformError::AlreadyRunning);
+            }
+            fs::remove_file(paths.socket())
+                .map_err(|error| LocalPlatformError::Io(error.to_string()))?;
+        }
+        Some(_) => {
+            return Err(LocalPlatformError::UnsafeSocket(
+                paths.socket().to_path_buf(),
+            ));
+        }
+        None => {}
+    }
+    let listener = UnixListener::bind(paths.socket())
+        .map_err(|error| LocalPlatformError::Io(error.to_string()))?;
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(paths.socket(), fs::Permissions::from_mode(0o600))
+        .map_err(|error| LocalPlatformError::Io(error.to_string()))?;
+    let ownership = socket_ownership(paths)?.ok_or_else(|| {
+        LocalPlatformError::Io("rebound daemon socket disappeared before publication".into())
+    })?;
+    Ok((listener, ownership))
+}
+
+/// Removes only the exact socket published by this daemon instance.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn remove_owned_daemon_socket(
+    paths: &UserPaths,
+    _lock: &DaemonLock,
+    ownership: DaemonSocketOwnership,
+) -> Result<(), LocalPlatformError> {
+    match socket_ownership(paths)? {
+        Some(current) if current == ownership => fs::remove_file(paths.socket())
+            .map_err(|error| LocalPlatformError::Io(error.to_string())),
+        Some(_) => Err(LocalPlatformError::UnsafeSocket(
+            paths.socket().to_path_buf(),
+        )),
+        None => Ok(()),
+    }
+}
+
+#[cfg(unix)]
+fn socket_ownership(
+    paths: &UserPaths,
+) -> Result<Option<DaemonSocketOwnership>, LocalPlatformError> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+
+    let metadata = match fs::symlink_metadata(paths.socket()) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(LocalPlatformError::Io(error.to_string())),
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_socket()
+        || metadata.uid() != paths.uid()
+        || metadata.permissions().mode() & 0o177 != 0
+    {
+        return Err(LocalPlatformError::UnsafeSocket(
+            paths.socket().to_path_buf(),
+        ));
+    }
+    Ok(Some(DaemonSocketOwnership {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }))
 }
 
 /// Removes this daemon's own socket during graceful shutdown.
@@ -322,5 +427,39 @@ mod tests {
             bind_daemon_socket(&paths, &lock),
             Err(LocalPlatformError::UnsafeSocket(_))
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fatal_rebind_token_never_unlinks_a_replaced_same_uid_socket() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        let (_temporary, paths) = isolated_paths();
+        let lock = DaemonLock::try_acquire(&paths)
+            .expect("daemon lock probe")
+            .expect("daemon lock acquired");
+        let (listener, ownership) =
+            bind_owned_daemon_socket(&paths, &lock).expect("owned socket bind");
+        drop(listener);
+        fs::remove_file(paths.socket()).expect("replace original socket path");
+        let replacement = UnixListener::bind(paths.socket()).expect("replacement socket bind");
+        fs::set_permissions(paths.socket(), fs::Permissions::from_mode(0o600))
+            .expect("replacement socket permissions");
+
+        assert!(matches!(
+            rebind_owned_daemon_socket(&paths, &lock, ownership),
+            Err(LocalPlatformError::UnsafeSocket(_))
+        ));
+        assert!(matches!(
+            remove_owned_daemon_socket(&paths, &lock, ownership),
+            Err(LocalPlatformError::UnsafeSocket(_))
+        ));
+        assert!(
+            UnixStream::connect(paths.socket()).is_ok(),
+            "mismatched replacement socket was unlinked"
+        );
+        drop(replacement);
+        fs::remove_file(paths.socket()).expect("replacement cleanup");
     }
 }

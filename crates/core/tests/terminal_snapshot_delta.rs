@@ -112,6 +112,55 @@ fn alternate_screen_transitions_restore_latest_state() {
 }
 
 #[test]
+fn checkpoint_retains_only_visible_grids_across_history_styles_and_screen_transitions() {
+    let size = TerminalSize::new(6, 32);
+    let mut source = TerminalModel::new(size, 2_000).expect("source size is valid");
+    for line in 0..2_200 {
+        source
+            .ingest(format!("history-{line:04} 界e\u{301}\r\n").as_bytes())
+            .expect("history ingests");
+    }
+    source
+        .ingest(b"\x1b[2J\x1b[H\x1b[1;3;38;2;9;8;7mstyled-main\x1b[0m")
+        .expect("styled main state ingests");
+    assert!(!source.snapshot().recent_history_ansi.is_empty());
+
+    let main_snapshot = source.snapshot();
+    let main_checkpoint = source.checkpoint();
+    assert_eq!(
+        main_checkpoint.retained_cell_capacity(),
+        usize::from(size.rows) * usize::from(size.columns) * 2
+    );
+    assert_eq!(main_checkpoint.retained_scrollback_rows(), 0);
+    let mut client = apply_snapshot(&main_snapshot);
+
+    source
+        .ingest(b"\x1b[?1049h\x1b[2J\x1b[H\x1b[4;48;5;25mALT-\xe7\x95\x8c-e\xcc\x81\x1b[0m")
+        .expect("styled alternate state ingests");
+    apply_result(&mut client, &source.delta_or_resync(&main_checkpoint));
+    assert_eq!(client.state(), source.state());
+    assert_eq!(client.state().active_screen, ActiveScreen::Alternate);
+
+    let alternate_checkpoint = source.checkpoint();
+    assert_eq!(alternate_checkpoint.retained_scrollback_rows(), 0);
+    source
+        .ingest(b"\x1b[?1049l\x1b[3;7H\x1b[7mrestored-main\x1b[0m")
+        .expect("main screen restores");
+    apply_result(&mut client, &source.delta_or_resync(&alternate_checkpoint));
+    assert_eq!(client.state(), source.state());
+    assert_eq!(client.state().active_screen, ActiveScreen::Main);
+
+    let before_resize = source.checkpoint();
+    let resized = TerminalSize::new(8, 40);
+    source.resize(resized).expect("resize succeeds");
+    let resize_result = source.delta_or_resync(&before_resize);
+    assert!(matches!(resize_result, TerminalDeltaResult::Resync(_)));
+    apply_result(&mut client, &resize_result);
+    assert_eq!(client.state(), source.state());
+    assert_eq!(source.checkpoint().retained_scrollback_rows(), 0);
+}
+
+#[test]
 fn incompatible_or_larger_delta_chooses_full_resync() {
     let size = TerminalSize::new(4, 24);
     let mut resized = TerminalModel::new(size, 8).expect("source size is valid");

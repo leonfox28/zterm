@@ -109,9 +109,9 @@ zterm-core
 
 The dependency direction is now executable: core owns domain/terminal values,
 proto owns the wire codec, platform owns OS boundaries, daemon owns state and
-services, and CLI owns parsing/rendering. Pairing/network adapters and the
-session registry remain later milestones; do not move those responsibilities
-into an earlier crate.
+services (including the live session registry), and CLI owns parsing/rendering.
+Pairing/network adapters and the final terminal UI remain later milestones; do
+not move transport state into core or OS/session ownership into adapters.
 
 ## Quality gate
 

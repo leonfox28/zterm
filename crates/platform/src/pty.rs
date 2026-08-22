@@ -4,8 +4,9 @@ use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, TryLockError};
 
-use portable_pty::{Child, CommandBuilder, MasterPty};
+use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty};
 
 #[cfg(all(unix, not(any(target_os = "android", target_os = "redox"))))]
 use crate::account::{AccountError, EffectiveAccount};
@@ -238,7 +239,22 @@ pub struct PtyReader {
 
 impl Read for PtyReader {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        self.inner.read(buffer)
+        match self.inner.read(buffer) {
+            Err(error) if is_closed_pty_error(&error) => Ok(0),
+            result => result,
+        }
+    }
+}
+
+fn is_closed_pty_error(error: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(nix::libc::EIO)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
     }
 }
 
@@ -339,7 +355,167 @@ pub struct PtySession {
     finished: Option<PtyExitStatus>,
 }
 
+/// PTY input and resize capability separated from root-child control.
+///
+/// The retained terminal driver uses this split so a blocked PTY write cannot
+/// prevent the session owner from terminating and reaping the root child.
+#[doc(hidden)]
+pub struct PtyIo {
+    master: Box<dyn MasterPty + Send>,
+    writer: Box<dyn Write + Send>,
+}
+
+impl PtyIo {
+    /// Writes and flushes ordered bytes to the PTY.
+    pub fn write_input(&mut self, bytes: &[u8]) -> Result<(), PtyError> {
+        self.writer
+            .write_all(bytes)
+            .and_then(|()| self.writer.flush())
+            .map_err(|error| operation_error(PtyOperation::WriteInput, error))
+    }
+
+    /// Resizes the native PTY after validating non-zero dimensions.
+    pub fn resize(&self, size: PtySize) -> Result<(), PtyError> {
+        validate_size(size)?;
+        self.master
+            .resize(to_portable_size(size))
+            .map_err(|error| operation_error(PtyOperation::Resize, error))
+    }
+}
+
+/// Root-child observation and termination capability separated from PTY I/O.
+///
+/// This remains an owner-only platform primitive. Attachments and transports
+/// never receive a `PtyChild`.
+#[doc(hidden)]
+pub struct PtyChild {
+    child: Box<dyn Child + Send + Sync>,
+    finished: Option<PtyExitStatus>,
+}
+
+/// Cloneable, non-waiting child interruption capability.
+///
+/// This is deliberately separate from [`PtyChild`]: unwind/drop paths can
+/// request termination without waiting for the owner which remains responsible
+/// for the truthful kill/wait/reap sequence.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct PtyChildInterrupt {
+    killer: Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>,
+}
+
+impl PtyChildInterrupt {
+    /// Requests child termination without waiting or contending indefinitely.
+    pub fn interrupt(&self) -> Result<(), PtyError> {
+        let mut killer = match self.killer.try_lock() {
+            Ok(killer) => killer,
+            Err(TryLockError::Poisoned(poisoned)) => {
+                self.killer.clear_poison();
+                poisoned.into_inner()
+            }
+            // Another caller already owns the same interruption capability.
+            Err(TryLockError::WouldBlock) => return Ok(()),
+        };
+        killer
+            .kill()
+            .map_err(|error| operation_error(PtyOperation::Close, error))
+    }
+}
+
+impl PtyChild {
+    /// Returns the root child's process identifier when available.
+    #[must_use]
+    pub fn process_id(&self) -> Option<u32> {
+        self.child.process_id()
+    }
+
+    /// Observes root-child exit without blocking.
+    pub fn try_wait(&mut self) -> Result<PtyChildState, PtyError> {
+        if let Some(status) = &self.finished {
+            return Ok(PtyChildState::Exited(status.clone()));
+        }
+
+        match self
+            .child
+            .try_wait()
+            .map_err(|error| operation_error(PtyOperation::Wait, error))?
+        {
+            Some(status) => {
+                let status = map_exit_status(&status);
+                self.finished = Some(status.clone());
+                Ok(PtyChildState::Exited(status))
+            }
+            None => Ok(PtyChildState::Running),
+        }
+    }
+
+    /// Waits until the root child terminates and returns its cached status.
+    pub fn wait(&mut self) -> Result<PtyExitStatus, PtyError> {
+        if let Some(status) = &self.finished {
+            return Ok(status.clone());
+        }
+
+        let status = self
+            .child
+            .wait()
+            .map_err(|error| operation_error(PtyOperation::Wait, error))?;
+        let status = map_exit_status(&status);
+        self.finished = Some(status.clone());
+        Ok(status)
+    }
+
+    /// Explicitly terminates and reaps the root child.
+    pub fn close_explicitly(&mut self) -> Result<PtyExitStatus, PtyError> {
+        if let PtyChildState::Exited(status) = self.try_wait()? {
+            return Ok(status);
+        }
+
+        self.child
+            .kill()
+            .map_err(|error| operation_error(PtyOperation::Close, error))?;
+        self.wait()
+    }
+}
+
+/// Driver-facing ownership split for one already-spawned PTY session.
+#[doc(hidden)]
+pub struct PtyDriverParts {
+    /// Sole blocking output reader.
+    pub reader: PtyReader,
+    /// Ordered PTY input and resize capability.
+    pub io: PtyIo,
+    /// Independent child observation and termination capability.
+    pub child: PtyChild,
+    /// Non-waiting interruption fallback for unwind/drop paths.
+    pub interrupt: PtyChildInterrupt,
+}
+
 impl PtySession {
+    /// Consumes the session into driver-owned reader, I/O, and child controls.
+    ///
+    /// The split is deliberately available only after spawn: all path and size
+    /// validation remains owned by `PtyHost`, while the daemon can isolate a
+    /// potentially blocked writer from child interruption.
+    #[doc(hidden)]
+    pub fn into_driver_parts(mut self) -> Result<PtyDriverParts, PtyError> {
+        let reader = self.reader.take().ok_or(PtyError::ReaderAlreadyTaken)?;
+        let interrupt = PtyChildInterrupt {
+            killer: Arc::new(Mutex::new(self.child.clone_killer())),
+        };
+        Ok(PtyDriverParts {
+            reader,
+            io: PtyIo {
+                master: self.master,
+                writer: self.writer,
+            },
+            child: PtyChild {
+                child: self.child,
+                finished: self.finished,
+            },
+            interrupt,
+        })
+    }
+
     /// Transfers the blocking output reader exactly once.
     pub fn take_reader(&mut self) -> Result<PtyReader, PtyError> {
         self.reader.take().ok_or(PtyError::ReaderAlreadyTaken)
@@ -556,10 +732,29 @@ fn login_shell_builder(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    struct ClosedUnixPty;
+
+    #[cfg(unix)]
+    impl Read for ClosedUnixPty {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::from_raw_os_error(nix::libc::EIO))
+        }
+    }
+
     #[test]
     fn zero_character_dimension_is_rejected() {
         let size = PtySize::new(0, 80);
         assert_eq!(validate_size(size), Err(PtyError::InvalidSize(size)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_eio_after_slave_close_is_normalized_to_eof() {
+        let mut reader = PtyReader {
+            inner: Box::new(ClosedUnixPty),
+        };
+        assert_eq!(reader.read(&mut [0; 1]).expect("normalized EOF"), 0);
     }
 
     #[cfg(all(unix, not(any(target_os = "android", target_os = "redox"))))]

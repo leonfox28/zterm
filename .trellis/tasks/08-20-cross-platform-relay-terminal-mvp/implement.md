@@ -147,7 +147,7 @@ M4 与 M5/M6 在 M3 契约冻结后可以独立推进；M7 负责把两条路径
 - 在 TerminalModel trait 后评估 vt100；以 avt 或更完整候选作为失败后的替换路径。
 - 建立固定 ANSI corpus，覆盖 main/alternate screen、光标、样式、256/true color、Unicode 宽度、组合字符、清屏、scroll region、bracketed paste、mouse/focus mode、DA/DSR。
 - 运行真实 tmux 与固定提交 Herdr 黑盒测试，并将 Codex/OpenCode 仅作为人工全屏 TUI smoke。
-- 以 16 session、每 session 10k scrollback 和 256 MiB 全局 terminal-state 作为候选压力目标，测量高输出与慢 attachment 下的 CPU、内存和 snapshot/delta 体积；最终默认值由报告校准。
+- 以 16 session、每 session 10k scrollback 和 256 MiB 全局 terminal-state 作为 Gate 0 候选压力矩阵完成测量；Foundation 报告最终固定产品准入值为 8 session、每 session 2,000 行、最大 240x80、128 MiB summed fixed-cell projection，进程 RSS 测量目标为 256 MiB。
 
 完成标准：
 
@@ -240,7 +240,7 @@ M4 与 M5/M6 在 M3 契约冻结后可以独立推进；M7 负责把两条路径
 - PTY reader 从创建到 root child exit 始终排空，与 attachment 数无关。
 - 每次 PTY 输出先进入 TerminalModel，再生成有序 revision/delta；慢客户端不得反压 PTY reader。
 - 新 attach 或 revision gap 发送权威 snapshot；客户端应用后发送 `SnapshotApplied(revision)`，服务端确认同步水位后再接受 input/resize。同步期间的普通输入直接丢弃，不排队、不在稍后重放；本地 detach 仍可用。
-- 以 10k scrollback/session、16 session、512x256、256 MiB 全局 terminal-state governor 作为 Gate 0 候选值，根据实测固定最终默认值；至少可靠支持 3 个 session 且所有资源有界。
+- 使用 Gate 0 已实测固定的准入值：2,000 scrollback rows/session、最多 8 session、最大 240x80、128 MiB summed fixed-cell projection；无有效初始 viewport 时使用 120x40，进程 RSS 测量目标保持 256 MiB。
 - 实现一个 controller/session、显式 takeover、旧 controller 失效；内部 attachment map 为未来 observer 保留扩展形状。
 - close session 是显式破坏性操作；idle、client disconnect、Iroh reconnect、无 controller 均不自动 close。
 

@@ -5,12 +5,13 @@ will prefer direct NAT-traversed connections and fall back to an end-to-end
 encrypted Iroh relay path, while keeping remote terminal sessions alive across
 client disconnects.
 
-Phase Zero and the Phase One Foundation/Core/Local-Daemon milestones are
-complete. The repository now contains the shared terminal/domain model,
-versioned protobuf contract, secure per-user state, one same-UID local daemon,
-and the setup/status/diagnostic lifecycle CLI. There is still no session
-registry, local terminal attach, remote pairing, or bound Iroh endpoint; a
-usable terminal begins with the next Phase One session milestone.
+Phase Zero and the Phase One Foundation/Core/Local-Daemon/Persistent-Session
+milestones are complete. The repository now contains the shared terminal/domain
+model, versioned protobuf contract, secure per-user state, one same-UID local
+daemon, daemon-lifetime multi-session registry, and a real local attachment
+adapter. The final raw-terminal CLI is not connected yet, and there is still no
+remote pairing or bound Iroh endpoint, so M4's session interfaces are currently
+service/test-facing rather than public commands.
 
 Current public commands are:
 
@@ -27,6 +28,10 @@ zterm logs [--lines <n>]
 Only `setup` and `daemon restart` may start the daemon. Inspection and stop
 commands never start it. See [Core and local daemon](docs/core-local-daemon.md)
 for exact behavior and current limits.
+
+The [persistent session engine](docs/persistent-sessions.md) documents `main`,
+detach/reconnect, takeover, synchronization, and resource boundaries that the
+later local/remote user interfaces will consume.
 
 ## Version policy
 
@@ -56,6 +61,7 @@ their own non-product version.
 - `docs/relay.md` — relay trust boundary, publication, and deployment.
 - `docs/phase-zero-verification.md` — evidence from the completed local gate.
 - `docs/core-local-daemon.md` — current M2–M3 behavior, state, CLI, and exclusions.
+- `docs/persistent-sessions.md` — M4 daemon-lifetime session and local attachment contracts.
 
 ## Local checks
 

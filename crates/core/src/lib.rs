@@ -4,9 +4,11 @@ pub mod domain;
 pub mod terminal;
 
 pub use domain::{
-    AttachmentId, AttachmentPrincipal, Capabilities, ControllerLease, DeviceId, DomainErrorKind,
-    IdLengthError, OperationId, OperationOutcome, OperationWindow, OperationWindowError,
-    ResourceLimits, Revision, SessionId,
+    AttachmentId, AttachmentPrincipal, Capabilities, ControllerLease, DEFAULT_SESSION_NAME,
+    DaemonIncarnation, DeviceId, DomainErrorKind, IdLengthError, MAX_SESSION_NAME_BYTES,
+    OperationId, OperationLease, OperationOutcome, OperationWindow, OperationWindowError,
+    ResourceLimits, Revision, SessionEndReason, SessionId, SessionName, SessionNameError,
+    SessionSelector,
 };
 
 /// Human-readable name of the active implementation phase.

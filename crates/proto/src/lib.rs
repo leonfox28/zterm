@@ -3,7 +3,14 @@
 use std::fmt;
 
 use prost::Message;
-use zterm_core::{AttachmentId, DeviceId, IdLengthError, OperationId, SessionId};
+use zterm_core::terminal::{
+    ActiveScreen, TerminalDelta, TerminalModes, TerminalMouseEncoding, TerminalMouseMode,
+    TerminalSize, TerminalSnapshot,
+};
+use zterm_core::{
+    AttachmentId, DaemonIncarnation, DeviceId, IdLengthError, OperationId, OperationLease,
+    SessionId,
+};
 
 /// Generated version-one protocol DTOs.
 pub mod v1 {
@@ -21,6 +28,7 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_CONTROL_PAYLOAD_BYTES: usize = 1024 * 1024;
 /// Maximum bytes in an unsigned 64-bit varint prefix.
 pub const MAX_VARINT_BYTES: usize = 10;
+const TERMINAL_SNAPSHOT_FRAME_HEADROOM: usize = 4 * 1024;
 
 /// Stable validated wire message kind.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,38 +60,46 @@ pub enum WireKind {
     PairOffer = 100,
     /// Future pairing proof.
     PairHandshake = 101,
-    /// Future session list request.
+    /// Session list request.
     SessionListRequest = 200,
-    /// Future session list response.
+    /// Session list response.
     SessionListResponse = 201,
-    /// Future session creation request.
+    /// Session creation request.
     SessionCreateRequest = 202,
-    /// Future session mutation response.
+    /// Session mutation response.
     SessionMutateResponse = 203,
-    /// Future session rename request.
+    /// Session rename request.
     SessionRenameRequest = 204,
-    /// Future session close request.
+    /// Session close request.
     SessionCloseRequest = 205,
-    /// Future controller takeover request.
+    /// Controller takeover request.
     SessionTakeoverRequest = 206,
-    /// Future terminal attach request.
+    /// Allocate a daemon-issued mutation replay lease.
+    SessionOperationLeaseRequest = 207,
+    /// Daemon-issued mutation replay lease.
+    SessionOperationLeaseResponse = 208,
+    /// Terminal attach request.
     TerminalAttachRequest = 300,
-    /// Future terminal full snapshot.
+    /// Terminal full snapshot.
     TerminalSnapshot = 301,
-    /// Future terminal merged delta.
+    /// Terminal merged delta.
     TerminalDelta = 302,
-    /// Future terminal input.
+    /// Terminal input.
     TerminalInput = 303,
-    /// Future terminal resize.
+    /// Terminal resize.
     TerminalResize = 304,
-    /// Future terminal detach.
+    /// Terminal detach.
     TerminalDetach = 305,
-    /// Future acknowledgement that a snapshot was applied atomically.
+    /// Acknowledgement that a snapshot was applied atomically.
     TerminalSnapshotApplied = 306,
-    /// Future request for a snapshot from the client's known revision.
+    /// Request for a snapshot from the client's known revision.
     TerminalSyncRequest = 307,
-    /// Future instruction to resynchronize from the latest revision.
+    /// Instruction to resynchronize from the latest revision.
     TerminalSyncRequired = 308,
+    /// A controller attachment lost its lease to a takeover.
+    TerminalLeaseLost = 309,
+    /// The root shell and session have ended.
+    TerminalSessionEnded = 310,
 }
 
 impl WireKind {
@@ -119,6 +135,8 @@ impl TryFrom<u32> for WireKind {
             204 => Self::SessionRenameRequest,
             205 => Self::SessionCloseRequest,
             206 => Self::SessionTakeoverRequest,
+            207 => Self::SessionOperationLeaseRequest,
+            208 => Self::SessionOperationLeaseResponse,
             300 => Self::TerminalAttachRequest,
             301 => Self::TerminalSnapshot,
             302 => Self::TerminalDelta,
@@ -128,6 +146,8 @@ impl TryFrom<u32> for WireKind {
             306 => Self::TerminalSnapshotApplied,
             307 => Self::TerminalSyncRequest,
             308 => Self::TerminalSyncRequired,
+            309 => Self::TerminalLeaseLost,
+            310 => Self::TerminalSessionEnded,
             unknown => return Err(ProtocolError::UnknownKind(unknown)),
         };
         Ok(kind)
@@ -194,6 +214,13 @@ pub enum ProtocolError {
     },
     /// Domain ID field had the wrong fixed width.
     InvalidIdentifier(IdLengthError),
+    /// A wire viewport did not fit the zterm-owned non-zero `u16` boundary.
+    InvalidTerminalSize {
+        /// Wire row count.
+        rows: u32,
+        /// Wire column count.
+        columns: u32,
+    },
 }
 
 impl fmt::Display for ProtocolError {
@@ -221,6 +248,9 @@ impl fmt::Display for ProtocolError {
                 write!(formatter, "expected {expected:?}, got {actual:?}")
             }
             Self::InvalidIdentifier(error) => error.fmt(formatter),
+            Self::InvalidTerminalSize { rows, columns } => {
+                write!(formatter, "invalid terminal viewport {columns}x{rows}")
+            }
         }
     }
 }
@@ -441,18 +471,145 @@ impl TryFrom<v1::AttachmentId> for AttachmentId {
 impl From<OperationId> for v1::OperationId {
     fn from(value: OperationId) -> Self {
         Self {
-            client_epoch: value.client_epoch,
+            lease_ordinal: value.lease.ordinal,
             sequence: value.sequence,
+            daemon_incarnation: value.lease.daemon_incarnation.to_bytes().to_vec(),
         }
     }
 }
 
-impl From<v1::OperationId> for OperationId {
-    fn from(value: v1::OperationId) -> Self {
-        Self {
-            client_epoch: value.client_epoch,
+impl TryFrom<v1::OperationId> for OperationId {
+    type Error = ProtocolError;
+
+    fn try_from(value: v1::OperationId) -> Result<Self, Self::Error> {
+        Ok(Self {
+            lease: OperationLease {
+                daemon_incarnation: DaemonIncarnation::from_bytes(&value.daemon_incarnation)
+                    .map_err(ProtocolError::InvalidIdentifier)?,
+                ordinal: value.lease_ordinal,
+            },
             sequence: value.sequence,
+        })
+    }
+}
+
+impl From<OperationLease> for v1::OperationLease {
+    fn from(value: OperationLease) -> Self {
+        Self {
+            daemon_incarnation: value.daemon_incarnation.to_bytes().to_vec(),
+            ordinal: value.ordinal,
         }
+    }
+}
+
+impl TryFrom<v1::OperationLease> for OperationLease {
+    type Error = ProtocolError;
+
+    fn try_from(value: v1::OperationLease) -> Result<Self, Self::Error> {
+        Ok(Self {
+            daemon_incarnation: DaemonIncarnation::from_bytes(&value.daemon_incarnation)
+                .map_err(ProtocolError::InvalidIdentifier)?,
+            ordinal: value.ordinal,
+        })
+    }
+}
+
+impl From<TerminalSize> for v1::TerminalViewport {
+    fn from(value: TerminalSize) -> Self {
+        Self {
+            rows: u32::from(value.rows),
+            columns: u32::from(value.columns),
+        }
+    }
+}
+
+impl TryFrom<v1::TerminalViewport> for TerminalSize {
+    type Error = ProtocolError;
+
+    fn try_from(value: v1::TerminalViewport) -> Result<Self, Self::Error> {
+        let rows = u16::try_from(value.rows).map_err(|_| ProtocolError::InvalidTerminalSize {
+            rows: value.rows,
+            columns: value.columns,
+        })?;
+        let columns =
+            u16::try_from(value.columns).map_err(|_| ProtocolError::InvalidTerminalSize {
+                rows: value.rows,
+                columns: value.columns,
+            })?;
+        if rows == 0 || columns == 0 {
+            return Err(ProtocolError::InvalidTerminalSize {
+                rows: value.rows,
+                columns: value.columns,
+            });
+        }
+        Ok(TerminalSize::new(rows, columns))
+    }
+}
+
+impl From<ActiveScreen> for v1::TerminalActiveScreen {
+    fn from(value: ActiveScreen) -> Self {
+        match value {
+            ActiveScreen::Main => Self::Main,
+            ActiveScreen::Alternate => Self::Alternate,
+        }
+    }
+}
+
+impl From<TerminalModes> for v1::TerminalModes {
+    fn from(value: TerminalModes) -> Self {
+        Self {
+            application_keypad: value.application_keypad,
+            application_cursor: value.application_cursor,
+            bracketed_paste: value.bracketed_paste,
+            focus_reporting: value.focus_reporting,
+            mouse_mode: match value.mouse_mode {
+                TerminalMouseMode::None => 0,
+                TerminalMouseMode::Press => 1,
+                TerminalMouseMode::PressRelease => 2,
+                TerminalMouseMode::ButtonMotion => 3,
+                TerminalMouseMode::AnyMotion => 4,
+            },
+            mouse_encoding: match value.mouse_encoding {
+                TerminalMouseEncoding::Default => 0,
+                TerminalMouseEncoding::Utf8 => 1,
+                TerminalMouseEncoding::Sgr => 2,
+            },
+        }
+    }
+}
+
+/// Projects one host snapshot into its wire message without reparsing ANSI.
+#[must_use]
+pub fn terminal_snapshot_message(
+    session_id: SessionId,
+    attachment_id: AttachmentId,
+    mut snapshot: TerminalSnapshot,
+) -> v1::TerminalSnapshot {
+    let _ = snapshot.limit_ansi_payload(MAX_FRAME_BYTES - TERMINAL_SNAPSHOT_FRAME_HEADROOM);
+    v1::TerminalSnapshot {
+        session_id: Some(session_id.into()),
+        attachment_id: Some(attachment_id.into()),
+        revision: snapshot.revision.get(),
+        rows: u32::from(snapshot.size.rows),
+        columns: u32::from(snapshot.size.columns),
+        screen_ansi: snapshot.screen_ansi,
+        recent_history_ansi: snapshot.recent_history_ansi,
+        active_screen: v1::TerminalActiveScreen::from(snapshot.active_screen) as i32,
+        modes: Some(snapshot.modes.into()),
+    }
+}
+
+/// Projects one merged host delta into its wire message.
+#[must_use]
+pub fn terminal_delta_message(delta: TerminalDelta) -> v1::TerminalDelta {
+    v1::TerminalDelta {
+        from_revision: delta.from_revision.get(),
+        to_revision: delta.to_revision.get(),
+        ansi: delta.ansi,
+        rows: u32::from(delta.size.rows),
+        columns: u32::from(delta.size.columns),
+        active_screen: v1::TerminalActiveScreen::from(delta.active_screen) as i32,
+        modes: Some(delta.modes.into()),
     }
 }
 
@@ -629,6 +786,33 @@ mod tests {
     }
 
     #[test]
+    fn terminal_snapshot_conversion_crops_only_history_to_fit_one_frame() {
+        let screen = b"host-screen".to_vec();
+        let mut history = b"\x1b[m".to_vec();
+        while history.len() <= MAX_FRAME_BYTES + 1024 {
+            history.extend_from_slice(b"complete-history-line\r\n");
+        }
+        let message = terminal_snapshot_message(
+            SessionId::from_array([1; 16]),
+            AttachmentId::from_array([2; 16]),
+            TerminalSnapshot {
+                revision: zterm_core::Revision::new(7),
+                size: TerminalSize::new(2, 20),
+                active_screen: ActiveScreen::Main,
+                screen_ansi: screen.clone(),
+                recent_history_ansi: history,
+                modes: TerminalModes::default(),
+            },
+        );
+        assert_eq!(message.screen_ansi, screen);
+        assert!(message.recent_history_ansi.starts_with(b"\x1b[m"));
+        assert!(message.recent_history_ansi.ends_with(b"\r\n"));
+        let frame = encode_message(WireKind::TerminalSnapshot, 1, 0, &message)
+            .expect("bounded snapshot frame");
+        assert!(frame.len() <= MAX_FRAME_BYTES + MAX_VARINT_BYTES);
+    }
+
+    #[test]
     fn fixed_width_domain_ids_validate_once_at_proto_boundary() {
         let device = DeviceId::from_array([42; 32]);
         let decoded = DeviceId::try_from(v1::DeviceId::from(device)).expect("valid device id");
@@ -720,6 +904,14 @@ mod tests {
                 v1::MessageKind::SessionTakeoverRequest as u32,
             ),
             (
+                WireKind::SessionOperationLeaseRequest,
+                v1::MessageKind::SessionOperationLeaseRequest as u32,
+            ),
+            (
+                WireKind::SessionOperationLeaseResponse,
+                v1::MessageKind::SessionOperationLeaseResponse as u32,
+            ),
+            (
                 WireKind::TerminalAttachRequest,
                 v1::MessageKind::TerminalAttachRequest as u32,
             ),
@@ -755,6 +947,14 @@ mod tests {
                 WireKind::TerminalSyncRequired,
                 v1::MessageKind::TerminalSyncRequired as u32,
             ),
+            (
+                WireKind::TerminalLeaseLost,
+                v1::MessageKind::TerminalLeaseLost as u32,
+            ),
+            (
+                WireKind::TerminalSessionEnded,
+                v1::MessageKind::TerminalSessionEnded as u32,
+            ),
         ];
 
         for (kind, proto_number) in kinds {
@@ -767,10 +967,11 @@ mod tests {
     }
 
     #[test]
-    fn future_session_and_terminal_contract_shapes_round_trip_without_dispatch() {
+    fn session_and_terminal_contract_shapes_round_trip() {
         let operation_id = Some(v1::OperationId {
-            client_epoch: 7,
+            lease_ordinal: 7,
             sequence: 11,
+            daemon_incarnation: vec![9; 16],
         });
         let target = Some(v1::TargetSelector {
             target: Some(v1::target_selector::Target::Local(true)),
@@ -781,7 +982,7 @@ mod tests {
         assert_message_round_trip(
             WireKind::SessionRenameRequest,
             v1::SessionRenameRequest {
-                operation_id,
+                operation_id: operation_id.clone(),
                 target: target.clone(),
                 session_id: session_id.clone(),
                 name: "build".to_owned(),
@@ -790,9 +991,23 @@ mod tests {
         assert_message_round_trip(
             WireKind::SessionCloseRequest,
             v1::SessionCloseRequest {
-                operation_id,
+                operation_id: operation_id.clone(),
                 target: target.clone(),
                 session_id: session_id.clone(),
+            },
+        );
+        assert_message_round_trip(
+            WireKind::TerminalAttachRequest,
+            v1::TerminalAttachRequest {
+                target: target.clone(),
+                session_id: session_id.clone(),
+                takeover: true,
+                session_name: String::new(),
+                create_main: false,
+                viewport: Some(v1::TerminalViewport {
+                    rows: 40,
+                    columns: 120,
+                }),
             },
         );
         assert_message_round_trip(
@@ -825,5 +1040,37 @@ mod tests {
                 latest_revision: 17,
             },
         );
+        assert_message_round_trip(
+            WireKind::TerminalLeaseLost,
+            v1::TerminalLeaseLost {
+                attachment_id: Some(v1::AttachmentId { value: vec![5; 16] }),
+                generation: 3,
+            },
+        );
+        assert_message_round_trip(
+            WireKind::TerminalSessionEnded,
+            v1::TerminalSessionEnded {
+                session_id: Some(v1::SessionId { value: vec![3; 16] }),
+                attachment_id: Some(v1::AttachmentId { value: vec![5; 16] }),
+                reason: v1::TerminalSessionEndReason::NaturalExit as i32,
+                exit_code: 0,
+                signal: String::new(),
+            },
+        );
+        assert_eq!(
+            TerminalSize::try_from(v1::TerminalViewport {
+                rows: 40,
+                columns: 120,
+            })
+            .expect("bounded viewport"),
+            TerminalSize::new(40, 120)
+        );
+        assert!(matches!(
+            TerminalSize::try_from(v1::TerminalViewport {
+                rows: 0,
+                columns: 120,
+            }),
+            Err(ProtocolError::InvalidTerminalSize { .. })
+        ));
     }
 }

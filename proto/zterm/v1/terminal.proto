@@ -8,6 +8,24 @@ message TerminalAttachRequest {
   TargetSelector target = 1;
   SessionId session_id = 2;
   bool takeover = 3;
+  string session_name = 4;
+  bool create_main = 5;
+  TerminalViewport viewport = 6;
+}
+
+enum TerminalActiveScreen {
+  TERMINAL_ACTIVE_SCREEN_UNSPECIFIED = 0;
+  TERMINAL_ACTIVE_SCREEN_MAIN = 1;
+  TERMINAL_ACTIVE_SCREEN_ALTERNATE = 2;
+}
+
+message TerminalModes {
+  bool application_keypad = 1;
+  bool application_cursor = 2;
+  bool bracketed_paste = 3;
+  bool focus_reporting = 4;
+  uint32 mouse_mode = 5;
+  uint32 mouse_encoding = 6;
 }
 
 message TerminalSnapshot {
@@ -18,12 +36,18 @@ message TerminalSnapshot {
   uint32 columns = 5;
   bytes screen_ansi = 6;
   bytes recent_history_ansi = 7;
+  TerminalActiveScreen active_screen = 8;
+  TerminalModes modes = 9;
 }
 
 message TerminalDelta {
   uint64 from_revision = 1;
   uint64 to_revision = 2;
   bytes ansi = 3;
+  uint32 rows = 4;
+  uint32 columns = 5;
+  TerminalActiveScreen active_screen = 6;
+  TerminalModes modes = 7;
 }
 
 message TerminalInput {
@@ -54,4 +78,25 @@ message TerminalSyncRequest {
 message TerminalSyncRequired {
   AttachmentId attachment_id = 1;
   uint64 latest_revision = 2;
+}
+
+message TerminalLeaseLost {
+  AttachmentId attachment_id = 1;
+  uint64 generation = 2;
+}
+
+enum TerminalSessionEndReason {
+  TERMINAL_SESSION_END_REASON_UNSPECIFIED = 0;
+  TERMINAL_SESSION_END_REASON_NATURAL_EXIT = 1;
+  TERMINAL_SESSION_END_REASON_EXPLICIT_CLOSE = 2;
+  TERMINAL_SESSION_END_REASON_DAEMON_STOP = 3;
+  TERMINAL_SESSION_END_REASON_DRIVER_FAILURE = 4;
+}
+
+message TerminalSessionEnded {
+  SessionId session_id = 1;
+  AttachmentId attachment_id = 2;
+  TerminalSessionEndReason reason = 3;
+  uint32 exit_code = 4;
+  string signal = 5;
 }

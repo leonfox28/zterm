@@ -6,9 +6,27 @@ message DeviceId { bytes value = 1; }
 message SessionId { bytes value = 1; }
 message AttachmentId { bytes value = 1; }
 
+message SessionSelector {
+  oneof selector {
+    SessionId session_id = 1;
+    string name = 2;
+  }
+}
+
+message TerminalViewport {
+  uint32 rows = 1;
+  uint32 columns = 2;
+}
+
 message OperationId {
-  uint64 client_epoch = 1;
+  uint64 lease_ordinal = 1;
   uint64 sequence = 2;
+  bytes daemon_incarnation = 3;
+}
+
+message OperationLease {
+  bytes daemon_incarnation = 1;
+  uint64 ordinal = 2;
 }
 
 message TargetSelector {

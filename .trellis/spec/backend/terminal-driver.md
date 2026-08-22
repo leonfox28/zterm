@@ -24,6 +24,11 @@ TerminalDriver::resize(&self, size: TerminalSize) -> Result<Revision, TerminalDr
 TerminalDriver::try_wait(&self) -> Result<PtyChildState, TerminalDriverError>
 TerminalDriver::wait(&self) -> Result<PtyExitStatus, TerminalDriverError>
 TerminalDriver::close_explicitly(&self) -> Result<PtyExitStatus, TerminalDriverError>
+TerminalDriver::revision_watch(&self) -> watch::Receiver<Revision>
+TerminalDriver::check_health(&self) -> Result<(), TerminalDriverError>
+TerminalDriver::finalize_natural(self) -> Result<PtyExitStatus, TerminalDriverError>
+TerminalDriver::finalize_explicit(self) -> Result<PtyExitStatus, TerminalDriverError>
+TerminalDriver::interrupt_handle(&self) -> owner-only TerminalDriverInterrupt
 
 TerminalAttachment::wait_for_revision_after(revision: Revision, timeout) -> Result<Revision, TerminalDriverError>
 TerminalAttachment::sync_latest(&mut self) -> Result<TerminalDeltaResult, TerminalDriverError>
@@ -44,25 +49,49 @@ blocking PtyReader
 ```
 
 - A full byte queue blocks the reader; it never drops or overwrites PTY bytes.
+- Reader EOF is the only normal transition which finishes the queue. Startup,
+  model failure, and unwind abort it. `push` checks both finished and aborted
+  before and after waiting for capacity, and both terminal transitions wake
+  blocked producers, so no chunk can arrive after model-owner exit.
 - Queue capacity and maximum pending chunks are observable and the high-water
   mark cannot exceed configured capacity.
 - Attachments hold shared terminal-state access and one opaque checkpoint only.
   They never hold a PTY session, reader, writer, child, or close capability.
+- At startup the driver consumes `PtySession` into three owner-only parts: one
+  reader, one `PtyIo` writer/master, and independent `PtyChild` control. A PTY
+  write/flush or resize may hold only the I/O mutex; it cannot prevent the
+  session owner from interrupting/reaping the child through the child mutex.
 - Revision notification is latest-only. No list or channel grows once per
-  revision. A slow attachment may discard its checkpoint and fetch one full
-  latest snapshot.
+  revision. The Tokio watch sender overwrites one watermark; a slow attachment
+  may discard its checkpoint and fetch one full latest snapshot.
 - Zero attachments do not stop the reader, model owner, or root child.
 - Dropping an attachment or transport guard changes only subscription count.
-- `wait()` must poll root-child state while releasing the PTY mutex between
-  polls. The mutex guard must end in an explicit lexical scope before any
-  sleep, yield, retry, channel wait, or other blocking operation; do not rely
-  on a temporary guard in a `match`/`if let` scrutinee because its lifetime can
-  extend through the selected branch. `wait()` must not block model-generated
-  DA/DSR/CPR replies or user input.
+- `wait()` polls root-child state while releasing the child mutex between
+  polls. Child observation/control and PTY I/O never share a mutex, so waiting
+  cannot block model-generated DA/DSR/CPR replies or user input.
 - Failure and latest revision share the condition variable's mutex predicate,
   so a waiter cannot miss a failure notification and misreport a deadline.
-- Thread creation is ordered so a later spawn failure can finish the queue and
-  join the already-created model thread; no detached partial runtime remains.
+- Thread creation is ordered. Failure to start either model or reader thread
+  explicitly kills/reaps the already-spawned child, aborts the queue, and
+  joins every thread which did start; no child or detached partial runtime
+  remains.
+- Resize holds the model owner only long enough to preflight, resize the native
+  PTY, mutate the model, and publish one revision. The checked model preflight
+  is the sole validation owner, so native/model dimensions cannot diverge on a
+  predictable validation failure.
+- Finalization consumes the driver. Natural exit waits without killing;
+  explicit close uses the sole child-kill authority. Both then join the PTY
+  reader and model threads after EOF/queue drain, without holding the PTY or
+  terminal-model mutex across a join. Both join attempts occur even when child
+  wait, the first join, or terminal health reports an error.
+- `TerminalDriver::Drop` is unwind-only and never waits or joins on its caller.
+  It aborts the queue, invokes the independent non-waiting child interrupt, and
+  exclusively transfers reader/model handles plus owned child control to a
+  background reaper. The reaper performs the truthful close/wait/joins and only
+  then publishes the ownership-complete signal used by the actor registry. If
+  reaper thread creation fails, the already-interrupted handles detach and the
+  signal remains unreleased; normal explicit finalization remains the result
+  and ownership truth authority.
 
 No environment variable or network object participates in this data path.
 
@@ -75,6 +104,7 @@ No environment variable or network object participates in this data path.
 | PTY reader/input/resize/wait/close fails | typed `Pty` error |
 | terminal ingest/resize fails | typed `Terminal` error and queue abort |
 | PTY read fails | `Read` recorded for attachments/waiters |
+| Unix PTY slave closes and the master reports `EIO` | platform reader normalizes it to EOF |
 | mutex/condvar is poisoned | `Synchronization` |
 | revision/idle wait expires with no recorded failure | `Deadline` |
 | revision wait races a recorded failure | return the recorded failure, not `Deadline` |
@@ -106,6 +136,16 @@ No environment variable or network object participates in this data path.
   The fixture configures its own PTY with the termios API rather than spawning
   `stty`, so the assertion measures lock ownership rather than helper-process
   scheduling or executable availability.
+- Startup failure injection covers both model-thread and reader-thread creation;
+  the latter proves the started model owner joins, and both prove the child PID
+  is gone.
+- Session isolation uses a non-reading real PTY plus an actor barrier: status,
+  session B, and queued deadline expiry remain responsive while session A's
+  effect is blocked; child interruption releases the real blocked writer.
+- Drop/reaper coverage holds the writer mutex while the reader blocks in a real
+  PTY read, proves Drop returns through a bounded observer, then proves the
+  HUP-resistant child and both threads are eventually released. A queue race
+  proves finished/aborted queues reject and wake a late producer.
 - All waits have deadlines and fixtures remove only their own marker/process.
 
 ### 7. Wrong vs Correct
@@ -129,8 +169,8 @@ let update = terminal_model.ingest(bytes)?;
 latest_revision.publish(update.revision);
 ```
 
-For polling a child behind a shared PTY mutex, first copy the nonblocking state
-out of a lexical guard scope, then sleep:
+For polling a child behind its owner-only mutex, first copy the nonblocking
+state out of a lexical guard scope, then sleep:
 
 ```rust
 let child_state = {

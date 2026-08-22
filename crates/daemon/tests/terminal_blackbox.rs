@@ -402,7 +402,12 @@ fn wait_for_screen(
 fn wait_for_file(path: &Path, driver: &TerminalDriver) -> Result<(), String> {
     let deadline = Instant::now() + DEADLINE;
     loop {
-        if path.is_file() {
+        // Shell redirection creates the marker before the command writes its contents. Waiting
+        // only for the directory entry makes the subsequent parse race an empty file.
+        if path
+            .metadata()
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+        {
             return Ok(());
         }
         if let PtyChildState::Exited(status) = driver.try_wait().map_err(display_error)? {

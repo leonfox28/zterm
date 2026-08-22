@@ -25,7 +25,7 @@ tempfile.workspace = true
 tokio.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
-nix = { workspace = true, features = ["term"] }
+nix = { workspace = true, features = ["signal", "term"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 patchbay.workspace = true

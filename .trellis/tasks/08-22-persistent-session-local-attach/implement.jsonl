@@ -1,0 +1,16 @@
+{"file":".trellis/spec/guides/evidence-driven-simplicity.md","reason":"Keep session recovery, replay and tests limited to current observable failure modes and one owner per invariant."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Map domain→proto→SessionService→local stream data and errors without duplicate decoders or projections."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Extend the retained TerminalModel, TerminalDriver, PtyHost, OperationWindow and local listener instead of creating parallel paths."}
+{"file":".trellis/spec/guides/cross-platform-thinking-guide.md","reason":"Preserve Unix runtime evidence and the explicit Windows unsupported/compile boundary."}
+{"file":".trellis/spec/backend/core-wire-domain.md","reason":"Own typed IDs, Revision, errors, capabilities, bounds and M4 operation replay semantics."}
+{"file":".trellis/spec/backend/terminal-model.md","reason":"Retain the authoritative VT, snapshot/delta, safety and Foundation resource contracts."}
+{"file":".trellis/spec/backend/terminal-driver.md","reason":"Extend the proven continuous drain and latest-only attachment composition without client backpressure."}
+{"file":".trellis/spec/backend/pty-lifecycle.md","reason":"Keep root-child ownership, login shell behavior and explicit close separate from attachment lifetime."}
+{"file":".trellis/spec/backend/local-daemon-ipc.md","reason":"Extend the same-UID bounded Unix listener while preserving unary lifecycle and peer-gate contracts."}
+{"file":".trellis/spec/backend/effective-user-state.md","reason":"Keep Session, PTY, lease and terminal runtime out of persistent SQLite state."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/local-self-attach.md","reason":"Implement the approved self-target path through the same SessionActor and controller lease, without self-Iroh."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/persistent-agent-session.md","reason":"Preserve daemon-lifetime persistence, default main and multi-session user semantics."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/shell-session-startup.md","reason":"Use the current account login shell, home/default cwd and no arbitrary create command boundary."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/terminal-reconnect-state.md","reason":"Keep host-authoritative reconnect behavior and tmux/Herdr as generic black-box programs."}
+{"file":".trellis/tasks/archive/2026-08/08-21-foundation-gate/research/pty-wait-lock-retrospective.md","reason":"Prevent shared PTY/session locks from being held across child waits or reply writes."}
+{"file":".trellis/tasks/08-22-persistent-session-local-attach/research/current-boundary.md","reason":"Start from the exact retained code and task exclusions documented for M4."}

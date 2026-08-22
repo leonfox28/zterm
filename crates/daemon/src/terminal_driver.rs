@@ -8,12 +8,15 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use tokio::sync::watch;
 use zterm_core::Revision;
 use zterm_core::terminal::{
     TerminalCheckpoint, TerminalDeltaResult, TerminalError, TerminalModel, TerminalSize,
     TerminalSnapshot,
 };
-use zterm_platform::pty::{PtyChildState, PtyError, PtyExitStatus, PtySession, PtySize};
+use zterm_platform::pty::{
+    PtyChild, PtyChildInterrupt, PtyChildState, PtyError, PtyExitStatus, PtyIo, PtySession, PtySize,
+};
 
 /// Fixed resource limits for one retained terminal driver.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,97 +104,226 @@ impl From<TerminalError> for TerminalDriverError {
 
 /// Host-owned runtime which drains one PTY independently of attachments.
 pub struct TerminalDriver {
-    session: Arc<Mutex<PtySession>>,
+    io: Arc<Mutex<PtyIo>>,
+    child: Arc<Mutex<PtyChild>>,
+    interrupt: PtyChildInterrupt,
+    ownership: TerminalDriverOwnership,
     shared: Arc<SharedTerminal>,
     queue: Arc<ByteQueue>,
-    _reader_thread: JoinHandle<()>,
-    _model_thread: JoinHandle<()>,
+    reader_thread: Option<JoinHandle<()>>,
+    model_thread: Option<JoinHandle<()>>,
+    finalized: bool,
+}
+
+/// Owner-only child interruption capability for one terminal driver.
+///
+/// It is intentionally independent from the PTY writer mutex so daemon
+/// shutdown can terminate a child even while its session actor is blocked in
+/// a write or flush. This capability is never exposed through attachments.
+#[derive(Clone)]
+pub(crate) struct TerminalDriverInterrupt {
+    child: Arc<Mutex<PtyChild>>,
+    interrupt: PtyChildInterrupt,
+}
+
+impl TerminalDriverInterrupt {
+    pub(crate) fn close_explicitly(&self) -> Result<PtyExitStatus, TerminalDriverError> {
+        Ok(cleanup_lock(&self.child).close_explicitly()?)
+    }
+
+    pub(crate) fn interrupt(&self) {
+        let _ = self.interrupt.interrupt();
+    }
+}
+
+/// Completion signal for the child and both terminal-driver threads.
+/// Actor ownership is not released until this boundary is terminally true.
+#[derive(Clone)]
+pub(crate) struct TerminalDriverOwnership {
+    inner: Arc<TerminalDriverOwnershipInner>,
+}
+
+struct TerminalDriverOwnershipInner {
+    released: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl TerminalDriverOwnership {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(TerminalDriverOwnershipInner {
+                released: Mutex::new(false),
+                changed: Condvar::new(),
+            }),
+        }
+    }
+
+    fn release(&self) {
+        *cleanup_lock(&self.inner.released) = true;
+        self.inner.changed.notify_all();
+    }
+
+    pub(crate) fn wait_released(&self) {
+        let mut released = cleanup_lock(&self.inner.released);
+        while !*released {
+            released = match self.inner.changed.wait(released) {
+                Ok(released) => released,
+                Err(poisoned) => {
+                    self.inner.released.clear_poison();
+                    poisoned.into_inner()
+                }
+            };
+        }
+    }
+
+    #[cfg(test)]
+    fn is_released(&self) -> bool {
+        *cleanup_lock(&self.inner.released)
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartFailureInjection {
+    ModelThread,
+    ReaderThread,
 }
 
 impl TerminalDriver {
     /// Starts the blocking reader and the single ordered terminal-model owner.
     pub fn start(
-        mut session: PtySession,
+        session: PtySession,
         model: TerminalModel,
         config: TerminalDriverConfig,
     ) -> Result<Self, TerminalDriverError> {
+        Self::start_inner(session, model, config, None)
+    }
+
+    fn start_inner(
+        session: PtySession,
+        model: TerminalModel,
+        config: TerminalDriverConfig,
+        #[cfg(test)] failure: Option<StartFailureInjection>,
+        #[cfg(not(test))] _failure: Option<()>,
+    ) -> Result<Self, TerminalDriverError> {
         validate_config(config)?;
 
-        let mut reader = session.take_reader()?;
-        let session = Arc::new(Mutex::new(session));
+        let parts = session.into_driver_parts()?;
+        let mut reader = parts.reader;
+        let io = Arc::new(Mutex::new(parts.io));
+        let child = Arc::new(Mutex::new(parts.child));
+        let interrupt = parts.interrupt;
+        let ownership = TerminalDriverOwnership::new();
         let shared = Arc::new(SharedTerminal::new(model));
         let queue = Arc::new(ByteQueue::new(config.byte_channel_capacity));
 
         let model_queue = Arc::clone(&queue);
         let model_shared = Arc::clone(&shared);
-        let model_session = Arc::clone(&session);
-        let model_thread = thread::Builder::new()
-            .name("zterm-terminal-model".into())
-            .spawn(move || {
-                while let Some(bytes) = model_queue.pop() {
-                    let update = match model_shared.ingest(&bytes) {
-                        Ok(update) => update,
-                        Err(error) => {
-                            model_queue.complete();
-                            model_shared.fail(error);
-                            model_queue.abort();
-                            return;
+        let model_io = Arc::clone(&io);
+        #[cfg(test)]
+        let inject_model_failure = failure == Some(StartFailureInjection::ModelThread);
+        #[cfg(not(test))]
+        let inject_model_failure = false;
+        let model_thread = if inject_model_failure {
+            Err(std::io::Error::other(
+                "injected terminal model thread start failure",
+            ))
+        } else {
+            thread::Builder::new()
+                .name("zterm-terminal-model".into())
+                .spawn(move || {
+                    while let Some(bytes) = model_queue.pop() {
+                        let update = match model_shared.ingest(&bytes) {
+                            Ok(update) => update,
+                            Err(error) => {
+                                model_queue.complete();
+                                model_shared.fail(error);
+                                model_queue.abort();
+                                return;
+                            }
+                        };
+                        if !update.replies.is_empty() {
+                            let result = lock(&model_io, "PTY I/O").and_then(|mut io| {
+                                io.write_input(&update.replies).map_err(Into::into)
+                            });
+                            if let Err(error) = result {
+                                model_queue.complete();
+                                model_shared.fail(error);
+                                model_queue.abort();
+                                return;
+                            }
                         }
-                    };
-                    if !update.replies.is_empty() {
-                        let result = lock(&model_session, "PTY session").and_then(|mut session| {
-                            session.write_input(&update.replies).map_err(Into::into)
-                        });
-                        if let Err(error) = result {
-                            model_queue.complete();
-                            model_shared.fail(error);
-                            model_queue.abort();
-                            return;
-                        }
+                        model_shared.record_processed(bytes.len(), update.revision);
+                        model_queue.complete();
                     }
-                    model_shared.record_processed(bytes.len(), update.revision);
-                    model_queue.complete();
-                }
-                model_shared.mark_drain_finished();
-            })
-            .map_err(|error| TerminalDriverError::Read(error.to_string()))?;
+                    model_shared.mark_drain_finished();
+                })
+        };
+        let model_thread = match model_thread {
+            Ok(thread) => thread,
+            Err(error) => {
+                let cleanup = close_startup_child(&child);
+                return Err(cleanup.unwrap_or_else(|| TerminalDriverError::Read(error.to_string())));
+            }
+        };
 
+        #[cfg(test)]
+        let inject_reader_failure = failure == Some(StartFailureInjection::ReaderThread);
+        #[cfg(not(test))]
+        let inject_reader_failure = false;
         let reader_queue = Arc::clone(&queue);
         let reader_shared = Arc::clone(&shared);
-        let reader_thread = match thread::Builder::new()
-            .name("zterm-pty-reader".into())
-            .spawn(move || {
-                let mut buffer = vec![0_u8; config.read_chunk_bytes];
-                loop {
-                    match reader.read(&mut buffer) {
-                        Ok(0) => break,
-                        Ok(count) => {
-                            if !reader_queue.push(buffer[..count].to_vec()) {
+        let reader_thread = if inject_reader_failure {
+            Err(std::io::Error::other(
+                "injected PTY reader thread start failure",
+            ))
+        } else {
+            thread::Builder::new()
+                .name("zterm-pty-reader".into())
+                .spawn(move || {
+                    let mut buffer = vec![0_u8; config.read_chunk_bytes];
+                    loop {
+                        match reader.read(&mut buffer) {
+                            Ok(0) => break,
+                            Ok(count) => {
+                                if !reader_queue.push(buffer[..count].to_vec()) {
+                                    break;
+                                }
+                            }
+                            Err(error) => {
+                                reader_shared.fail(TerminalDriverError::Read(error.to_string()));
                                 break;
                             }
                         }
-                        Err(error) => {
-                            reader_shared.fail(TerminalDriverError::Read(error.to_string()));
-                            break;
-                        }
                     }
-                }
-                reader_queue.finish();
-            }) {
+                    reader_queue.finish();
+                })
+        };
+        let reader_thread = match reader_thread {
             Ok(thread) => thread,
             Err(error) => {
-                queue.finish();
-                let _ = model_thread.join();
-                return Err(TerminalDriverError::Read(error.to_string()));
+                queue.abort();
+                let cleanup = close_startup_child(&child);
+                let join = model_thread
+                    .join()
+                    .err()
+                    .map(|_| TerminalDriverError::Synchronization("terminal model thread"));
+                return Err(cleanup
+                    .or(join)
+                    .unwrap_or_else(|| TerminalDriverError::Read(error.to_string())));
             }
         };
 
         Ok(Self {
-            session,
+            io,
+            child,
+            interrupt,
+            ownership,
             shared,
             queue,
-            _reader_thread: reader_thread,
-            _model_thread: model_thread,
+            reader_thread: Some(reader_thread),
+            model_thread: Some(model_thread),
+            finalized: false,
         })
     }
 
@@ -207,28 +339,43 @@ impl TerminalDriver {
 
     /// Writes user input to the hosted PTY.
     pub fn write_input(&self, bytes: &[u8]) -> Result<(), TerminalDriverError> {
-        lock(&self.session, "PTY session")?.write_input(bytes)?;
+        lock(&self.io, "PTY I/O")?.write_input(bytes)?;
         Ok(())
     }
 
     /// Resizes both the native PTY and the authoritative terminal model.
     pub fn resize(&self, size: TerminalSize) -> Result<Revision, TerminalDriverError> {
-        lock(&self.session, "PTY session")?.resize(PtySize::new(size.rows, size.columns))?;
-        let revision = self.shared.resize(size)?;
+        let mut model = lock(&self.shared.model, "terminal model")?;
+        model.preflight_resize(size)?;
+        lock(&self.io, "PTY I/O")?.resize(PtySize::new(size.rows, size.columns))?;
+        let revision = model.resize(size)?.revision;
+        drop(model);
+        self.shared.publish_revision(revision)?;
         Ok(revision)
+    }
+
+    /// Subscribes to the latest revision without retaining per-revision events.
+    #[must_use]
+    pub fn revision_watch(&self) -> watch::Receiver<Revision> {
+        self.shared.revision_sender.subscribe()
+    }
+
+    /// Returns a recorded model/reader failure without mutating the child.
+    pub fn check_health(&self) -> Result<(), TerminalDriverError> {
+        self.shared.check_failure()
     }
 
     /// Observes root-child exit without terminating it.
     pub fn try_wait(&self) -> Result<PtyChildState, TerminalDriverError> {
-        Ok(lock(&self.session, "PTY session")?.try_wait()?)
+        Ok(lock(&self.child, "PTY child")?.try_wait()?)
     }
 
     /// Waits for natural root-child exit without invoking the child killer.
     pub fn wait(&self) -> Result<PtyExitStatus, TerminalDriverError> {
         loop {
             let child_state = {
-                let mut session = lock(&self.session, "PTY session")?;
-                session.try_wait()?
+                let mut child = lock(&self.child, "PTY child")?;
+                child.try_wait()?
             };
             match child_state {
                 PtyChildState::Running => thread::sleep(Duration::from_millis(5)),
@@ -239,7 +386,62 @@ impl TerminalDriver {
 
     /// Explicitly terminates the root child and waits for it.
     pub fn close_explicitly(&self) -> Result<PtyExitStatus, TerminalDriverError> {
-        Ok(lock(&self.session, "PTY session")?.close_explicitly()?)
+        Ok(lock(&self.child, "PTY child")?.close_explicitly()?)
+    }
+
+    /// Returns the owner-only close capability used by bounded daemon shutdown.
+    pub(crate) fn interrupt_handle(&self) -> TerminalDriverInterrupt {
+        TerminalDriverInterrupt {
+            child: Arc::clone(&self.child),
+            interrupt: self.interrupt.clone(),
+        }
+    }
+
+    pub(crate) fn ownership_handle(&self) -> TerminalDriverOwnership {
+        self.ownership.clone()
+    }
+
+    /// Consumes a naturally exited driver, drains queued bytes, and joins its threads.
+    pub fn finalize_natural(self) -> Result<PtyExitStatus, TerminalDriverError> {
+        self.finalize(false)
+    }
+
+    /// Explicitly closes a driver, drains queued bytes, and joins its threads.
+    pub fn finalize_explicit(self) -> Result<PtyExitStatus, TerminalDriverError> {
+        self.finalize(true)
+    }
+
+    fn finalize(mut self, explicit: bool) -> Result<PtyExitStatus, TerminalDriverError> {
+        let status = if explicit {
+            self.close_explicitly()
+        } else {
+            self.wait()
+        };
+        let reader = self
+            .reader_thread
+            .take()
+            .expect("live terminal driver owns its reader thread")
+            .join()
+            .map_err(|_| TerminalDriverError::Synchronization("PTY reader thread"));
+        let model = self
+            .model_thread
+            .take()
+            .expect("live terminal driver owns its model thread")
+            .join()
+            .map_err(|_| TerminalDriverError::Synchronization("terminal model thread"));
+        let health = self.shared.check_failure();
+        if status.is_ok() {
+            // Both joins have returned (including a panic result), and the
+            // child status proves it is no longer owned. Model health affects
+            // the reported result, not lifecycle truth.
+            self.ownership.release();
+            self.finalized = true;
+        }
+        let status = status?;
+        reader?;
+        model?;
+        health?;
+        Ok(status)
     }
 
     /// Waits until all bytes read so far have reached the terminal model.
@@ -265,6 +467,12 @@ impl TerminalDriver {
         Revision::new(self.shared.revision.load(Ordering::Acquire))
     }
 
+    /// Returns a full latest snapshot without creating an attachment.
+    pub fn latest_snapshot(&self) -> Result<TerminalSnapshot, TerminalDriverError> {
+        self.shared.check_failure()?;
+        Ok(lock(&self.shared.model, "terminal model")?.snapshot())
+    }
+
     /// Returns bounded queue and subscriber statistics.
     pub fn stats(&self) -> Result<TerminalDriverStats, TerminalDriverError> {
         let queue = self.queue.stats()?;
@@ -279,6 +487,41 @@ impl TerminalDriver {
     }
 }
 
+impl Drop for TerminalDriver {
+    fn drop(&mut self) {
+        if self.finalized {
+            return;
+        }
+        // Last-resort unwind ownership is transferred without joining on the
+        // caller. Fast interruption and queue abort happen first; a dedicated
+        // reaper performs the truthful child wait and thread joins. If reaper
+        // thread creation itself fails, dropping the closure safely detaches
+        // already-interrupted JoinHandles and deliberately leaves the
+        // ownership signal unreleased.
+        self.queue.abort();
+        let _ = self.interrupt.interrupt();
+        let child = Arc::clone(&self.child);
+        let queue = Arc::clone(&self.queue);
+        let ownership = self.ownership.clone();
+        let reader = self.reader_thread.take();
+        let model = self.model_thread.take();
+        spawn_background_reaper("zterm-terminal-reaper", move || {
+            let child = cleanup_lock(&child).close_explicitly();
+            queue.abort();
+            if let Some(reader) = reader {
+                let _ = reader.join();
+            }
+            if let Some(model) = model {
+                let _ = model.join();
+            }
+            if child.is_ok() {
+                ownership.release();
+            }
+        });
+        self.finalized = true;
+    }
+}
+
 /// Latest-only terminal view owned by one UI or transport attachment.
 pub struct TerminalAttachment {
     shared: Arc<SharedTerminal>,
@@ -286,6 +529,12 @@ pub struct TerminalAttachment {
 }
 
 impl TerminalAttachment {
+    /// Subscribes to the driver's latest-only revision watermark.
+    #[must_use]
+    pub fn revision_watch(&self) -> watch::Receiver<Revision> {
+        self.shared.revision_sender.subscribe()
+    }
+
     /// Waits until the authoritative model advances beyond `revision`.
     pub fn wait_for_revision_after(
         &self,
@@ -333,6 +582,7 @@ struct SharedTerminal {
     revision: AtomicU64,
     revision_wait: Mutex<RevisionState>,
     revision_changed: Condvar,
+    revision_sender: watch::Sender<Revision>,
     processed_chunks: AtomicU64,
     processed_bytes: AtomicU64,
     attachments: AtomicUsize,
@@ -347,6 +597,7 @@ struct RevisionState {
 impl SharedTerminal {
     fn new(model: TerminalModel) -> Self {
         let revision = model.revision();
+        let (revision_sender, _) = watch::channel(revision);
         Self {
             model: Mutex::new(model),
             revision: AtomicU64::new(revision.get()),
@@ -355,6 +606,7 @@ impl SharedTerminal {
                 failure: None,
             }),
             revision_changed: Condvar::new(),
+            revision_sender,
             processed_chunks: AtomicU64::new(0),
             processed_bytes: AtomicU64::new(0),
             attachments: AtomicUsize::new(0),
@@ -367,12 +619,6 @@ impl SharedTerminal {
         bytes: &[u8],
     ) -> Result<zterm_core::terminal::TerminalUpdate, TerminalDriverError> {
         Ok(lock(&self.model, "terminal model")?.ingest(bytes)?)
-    }
-
-    fn resize(&self, size: TerminalSize) -> Result<Revision, TerminalDriverError> {
-        let update = lock(&self.model, "terminal model")?.resize(size)?;
-        self.publish_revision(update.revision)?;
-        Ok(update.revision)
     }
 
     fn record_processed(&self, byte_count: usize, revision: Revision) {
@@ -389,6 +635,7 @@ impl SharedTerminal {
     fn publish_revision(&self, revision: Revision) -> Result<(), TerminalDriverError> {
         self.revision.store(revision.get(), Ordering::Release);
         lock(&self.revision_wait, "revision waterline")?.latest = revision;
+        self.revision_sender.send_replace(revision);
         self.revision_changed.notify_all();
         Ok(())
     }
@@ -497,13 +744,13 @@ impl ByteQueue {
         let Ok(mut state) = self.state.lock() else {
             return false;
         };
-        while state.chunks.len() == self.capacity && !state.aborted {
+        while state.chunks.len() == self.capacity && !state.finished && !state.aborted {
             let Ok(next) = self.not_full.wait(state) else {
                 return false;
             };
             state = next;
         }
-        if state.aborted {
+        if state.finished || state.aborted {
             return false;
         }
         state.chunks.push_back(bytes);
@@ -542,12 +789,11 @@ impl ByteQueue {
             state.finished = true;
         }
         self.not_empty.notify_all();
+        self.not_full.notify_all();
     }
 
     fn abort(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.aborted = true;
-        }
+        cleanup_lock(&self.state).aborted = true;
         self.not_empty.notify_all();
         self.not_full.notify_all();
     }
@@ -576,6 +822,22 @@ fn lock<'a, T>(
         .map_err(|_| TerminalDriverError::Synchronization(name))
 }
 
+fn cleanup_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            mutex.clear_poison();
+            poisoned.into_inner()
+        }
+    }
+}
+
+pub(crate) fn spawn_background_reaper(name: &'static str, work: impl FnOnce() + Send + 'static) {
+    // `spawn` consumes and drops `work` on failure. All callers must therefore
+    // interrupt/abort before handing exclusively-taken handles to this helper.
+    let _ = thread::Builder::new().name(name.into()).spawn(work);
+}
+
 fn validate_config(config: TerminalDriverConfig) -> Result<(), TerminalDriverError> {
     if config.byte_channel_capacity == 0 {
         return Err(TerminalDriverError::InvalidConfig(
@@ -590,9 +852,22 @@ fn validate_config(config: TerminalDriverConfig) -> Result<(), TerminalDriverErr
     Ok(())
 }
 
+fn close_startup_child(child: &Arc<Mutex<PtyChild>>) -> Option<TerminalDriverError> {
+    match lock(child, "PTY child") {
+        Ok(mut child) => child.close_explicitly().err().map(Into::into),
+        Err(error) => Some(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    use std::path::Path;
+
+    #[cfg(unix)]
+    use zterm_platform::pty::{ExplicitPtyCommand, PtyHost};
 
     #[test]
     fn zero_queue_limits_are_rejected() {
@@ -626,5 +901,170 @@ mod tests {
         let stats = queue.stats().expect("queue stats");
         assert_eq!(stats.maximum_pending, 2);
         assert!(stats.pending <= 2);
+    }
+
+    #[test]
+    fn finished_or_aborted_queue_rejects_late_enqueues() {
+        let finished = Arc::new(ByteQueue::new(1));
+        assert!(finished.push(vec![1]));
+        let late = Arc::clone(&finished);
+        let (started, observed) = std::sync::mpsc::sync_channel(1);
+        let (done, result) = std::sync::mpsc::sync_channel(1);
+        let producer = thread::spawn(move || {
+            started.send(()).expect("late producer starts");
+            let _ = done.send(late.push(vec![2]));
+        });
+        observed.recv().expect("late producer observed");
+        finished.finish();
+        assert!(
+            !result
+                .recv_timeout(Duration::from_secs(1))
+                .expect("finish wakes blocked producer"),
+            "a finished queue must reject a late chunk"
+        );
+        producer.join().expect("late producer joins");
+        assert_eq!(finished.pop(), Some(vec![1]));
+        assert_eq!(finished.pop(), None);
+
+        let aborted = ByteQueue::new(1);
+        aborted.abort();
+        assert!(!aborted.push(vec![3]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drop_returns_before_blocked_io_while_reaper_releases_child_and_threads() {
+        let shell = Path::new("/bin/sh");
+        if !shell.is_file() {
+            return;
+        }
+        let cwd = std::env::current_dir().expect("current test directory");
+        let session = PtyHost::new()
+            .spawn(
+                ExplicitPtyCommand::new(shell, cwd)
+                    .arg("-c")
+                    .arg("trap '' HUP; printf 'DROP-READY\\r\\n'; while :; do :; done"),
+                PtySize::new(24, 80),
+            )
+            .expect("spawn drop/reaper fixture");
+        let process_id = session.process_id().expect("fixture process id");
+        let model =
+            TerminalModel::new(TerminalSize::new(24, 80), 0).expect("fixture terminal model");
+        let driver = TerminalDriver::start(session, model, TerminalDriverConfig::default())
+            .expect("fixture driver starts");
+        let ready_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = driver.latest_snapshot().expect("fixture snapshot");
+            if snapshot
+                .screen_ansi
+                .windows(b"DROP-READY".len())
+                .any(|window| window == b"DROP-READY")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < ready_deadline,
+                "fixture never became ready"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        // Hold the writer ownership mutex while the PTY reader is blocked in
+        // its next read. Drop must need neither one.
+        let io = Arc::clone(&driver.io);
+        let (writer_locked, observed_lock) = std::sync::mpsc::sync_channel(1);
+        let (release_writer, writer_release) = std::sync::mpsc::sync_channel(1);
+        let writer = thread::spawn(move || {
+            let _io = io.lock().expect("writer mutex");
+            writer_locked.send(()).expect("writer lock observer");
+            writer_release.recv().expect("writer release");
+        });
+        observed_lock
+            .recv()
+            .expect("writer is deliberately blocked");
+
+        let ownership = driver.ownership_handle();
+        let (dropped, drop_result) = std::sync::mpsc::sync_channel(1);
+        thread::spawn(move || {
+            drop(driver);
+            let _ = dropped.send(());
+        });
+        drop_result
+            .recv_timeout(Duration::from_millis(100))
+            .expect("Drop never waits for PTY child/reader/writer cleanup");
+        assert!(
+            !ownership.is_released(),
+            "HUP-resistant child cannot be reported released before reaping"
+        );
+        release_writer.send(()).expect("release writer mutex");
+        writer.join().expect("writer owner joins");
+
+        let process_id = i32::try_from(process_id).expect("pid fits pid_t");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !ownership.is_released() {
+            assert!(
+                Instant::now() < deadline,
+                "background reaper never completed"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        loop {
+            let result = nix::sys::signal::kill(nix::unistd::Pid::from_raw(process_id), None);
+            if result == Err(nix::errno::Errno::ESRCH) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "reaper left child running");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn thread_start_failures_close_spawned_children_and_join_started_owners() {
+        let shell = Path::new("/bin/sh");
+        if !shell.is_file() {
+            return;
+        }
+        for failure in [
+            StartFailureInjection::ModelThread,
+            StartFailureInjection::ReaderThread,
+        ] {
+            let cwd = std::env::current_dir().expect("current test directory");
+            let session = PtyHost::new()
+                .spawn(
+                    ExplicitPtyCommand::new(shell, cwd)
+                        .arg("-c")
+                        .arg("trap '' HUP; while :; do sleep 1; done"),
+                    PtySize::new(24, 80),
+                )
+                .expect("spawn startup-cleanup fixture");
+            let process_id = session.process_id().expect("fixture process id");
+            let model =
+                TerminalModel::new(TerminalSize::new(24, 80), 0).expect("fixture terminal model");
+
+            let error = TerminalDriver::start_inner(
+                session,
+                model,
+                TerminalDriverConfig::default(),
+                Some(failure),
+            )
+            .err()
+            .expect("injected terminal-driver thread start failure");
+            assert!(matches!(error, TerminalDriverError::Read(_)));
+
+            let process_id = i32::try_from(process_id).expect("process id fits pid_t");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let result = nix::sys::signal::kill(nix::unistd::Pid::from_raw(process_id), None);
+                if result == Err(nix::errno::Errno::ESRCH) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{failure:?} left child {process_id} running"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
     }
 }

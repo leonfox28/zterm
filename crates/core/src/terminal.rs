@@ -281,6 +281,22 @@ impl TerminalSnapshot {
     pub fn ansi_payload_len(&self) -> usize {
         self.screen_ansi.len() + self.recent_history_ansi.len()
     }
+
+    /// Drops only oldest complete history lines until the ANSI payload fits.
+    ///
+    /// The current screen is always preserved. The returned value is `false`
+    /// only when the screen by itself exceeds `maximum_bytes`.
+    pub fn limit_ansi_payload(&mut self, maximum_bytes: usize) -> bool {
+        if self.ansi_payload_len() <= maximum_bytes {
+            return true;
+        }
+        let Some(history_budget) = maximum_bytes.checked_sub(self.screen_ansi.len()) else {
+            self.recent_history_ansi.clear();
+            return false;
+        };
+        limit_recent_history(&mut self.recent_history_ansi, history_budget);
+        self.ansi_payload_len() <= maximum_bytes
+    }
 }
 
 /// A merged current-screen delta from one checkpoint to the latest revision.
@@ -325,6 +341,7 @@ pub struct TerminalCheckpoint {
     active_screen: ActiveScreen,
     focus_reporting: bool,
     screen: vt100::Screen,
+    retained_cell_capacity: usize,
 }
 
 impl fmt::Debug for TerminalCheckpoint {
@@ -335,6 +352,28 @@ impl fmt::Debug for TerminalCheckpoint {
             .field("size", &self.size)
             .field("active_screen", &self.active_screen)
             .finish_non_exhaustive()
+    }
+}
+
+impl TerminalCheckpoint {
+    /// Returns the fixed visible-cell capacity retained by this checkpoint.
+    ///
+    /// A checkpoint keeps only main and alternate visible grids. Host
+    /// scrollback remains owned once by `TerminalModel` and is never cloned
+    /// into an attachment baseline.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn retained_cell_capacity(&self) -> usize {
+        self.retained_cell_capacity
+    }
+
+    /// Returns the number of main-screen history rows retained by this baseline.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn retained_scrollback_rows(&self) -> usize {
+        let mut screen = self.screen.clone();
+        screen.set_scrollback(usize::MAX);
+        screen.scrollback()
     }
 }
 
@@ -386,6 +425,15 @@ pub struct TerminalModel {
 }
 
 impl TerminalModel {
+    /// Computes the fixed-cell projection without allocating a parser.
+    pub fn project_resources(
+        size: TerminalSize,
+        scrollback_rows: usize,
+    ) -> Result<TerminalResourceProjection, TerminalError> {
+        validate_size(size)?;
+        project_resources(size, scrollback_rows)
+    }
+
     /// Creates a terminal with fixed, bounded main-screen scrollback.
     pub fn new(size: TerminalSize, scrollback_rows: usize) -> Result<Self, TerminalError> {
         validate_size(size)?;
@@ -442,9 +490,7 @@ impl TerminalModel {
 
     /// Resizes the viewport and advances the revision exactly once.
     pub fn resize(&mut self, size: TerminalSize) -> Result<TerminalUpdate, TerminalError> {
-        validate_size(size)?;
-        let next_revision = self.next_revision()?;
-        let resource_projection = project_resources(size, self.scrollback_rows)?;
+        let (next_revision, resource_projection) = self.preflight_resize(size)?;
         self.parser.screen_mut().set_size(size.rows, size.columns);
         self.revision = next_revision;
         self.resource_projection = resource_projection;
@@ -455,15 +501,37 @@ impl TerminalModel {
         })
     }
 
+    /// Checks a resize without changing parser state or allocating a new model.
+    pub fn preflight_resize(
+        &self,
+        size: TerminalSize,
+    ) -> Result<(Revision, TerminalResourceProjection), TerminalError> {
+        validate_size(size)?;
+        let next_revision = self.next_revision()?;
+        let resource_projection = project_resources(size, self.scrollback_rows)?;
+        Ok((next_revision, resource_projection))
+    }
+
     /// Captures an opaque baseline for a later merged delta.
     #[must_use]
     pub fn checkpoint(&self) -> TerminalCheckpoint {
+        let screen = self.parser.screen();
+        let size = self.size();
+        let active_screen = active_screen(screen);
+        let focus_reporting = self.parser.callbacks().focus_reporting;
+        let mut baseline =
+            vt100::Parser::new_with_callbacks(size.rows, size.columns, 0, SafeCallbacks::default());
+        baseline.process(&visible_screen_ansi(screen, active_screen, focus_reporting));
+        let retained_cell_capacity = usize::from(size.rows)
+            .saturating_mul(usize::from(size.columns))
+            .saturating_mul(2);
         TerminalCheckpoint {
             revision: self.revision,
-            size: self.size(),
-            active_screen: active_screen(self.parser.screen()),
-            focus_reporting: self.parser.callbacks().focus_reporting,
-            screen: self.parser.screen().clone(),
+            size,
+            active_screen,
+            focus_reporting,
+            screen: baseline.screen().clone(),
+            retained_cell_capacity,
         }
     }
 
@@ -473,13 +541,7 @@ impl TerminalModel {
         let screen = self.parser.screen();
         let active_screen = active_screen(screen);
         let modes = terminal_modes(screen, self.parser.callbacks().focus_reporting);
-        let mut screen_ansi = Vec::new();
-        screen_ansi.extend_from_slice(MAIN_SCREEN);
-        if active_screen == ActiveScreen::Alternate {
-            screen_ansi.extend_from_slice(ALTERNATE_SCREEN);
-        }
-        screen_ansi.extend_from_slice(&screen.state_formatted());
-        screen_ansi.extend_from_slice(focus_reporting_ansi(modes.focus_reporting));
+        let screen_ansi = visible_screen_ansi(screen, active_screen, modes.focus_reporting);
 
         TerminalSnapshot {
             revision: self.revision,
@@ -792,6 +854,21 @@ fn terminal_modes(screen: &vt100::Screen, focus_reporting: bool) -> TerminalMode
     }
 }
 
+fn visible_screen_ansi(
+    screen: &vt100::Screen,
+    active_screen: ActiveScreen,
+    focus_reporting: bool,
+) -> Vec<u8> {
+    let mut ansi = Vec::new();
+    ansi.extend_from_slice(MAIN_SCREEN);
+    if active_screen == ActiveScreen::Alternate {
+        ansi.extend_from_slice(ALTERNATE_SCREEN);
+    }
+    ansi.extend_from_slice(&screen.state_formatted());
+    ansi.extend_from_slice(focus_reporting_ansi(focus_reporting));
+    ansi
+}
+
 fn terminal_cell(cell: &vt100::Cell) -> TerminalCell {
     TerminalCell {
         contents: cell.contents().to_owned(),
@@ -886,6 +963,46 @@ fn recent_history_ansi(screen: &vt100::Screen) -> Vec<u8> {
     output
 }
 
+fn limit_recent_history(history: &mut Vec<u8>, maximum_bytes: usize) {
+    const RESET: &[u8] = b"\x1b[m";
+    const LINE_END: &[u8] = b"\r\n";
+
+    if history.len() <= maximum_bytes {
+        return;
+    }
+    if maximum_bytes < RESET.len() + LINE_END.len() || !history.starts_with(RESET) {
+        history.clear();
+        return;
+    }
+
+    let suffix_budget = maximum_bytes - RESET.len();
+    let desired = history.len().saturating_sub(suffix_budget).max(RESET.len());
+    let starts_on_boundary = desired >= LINE_END.len()
+        && history.get(desired - LINE_END.len()..desired) == Some(LINE_END);
+    let start = if starts_on_boundary {
+        desired
+    } else {
+        let Some(boundary) = history.get(desired..).and_then(|suffix| {
+            suffix
+                .windows(LINE_END.len())
+                .position(|bytes| bytes == LINE_END)
+        }) else {
+            history.clear();
+            return;
+        };
+        desired + boundary + LINE_END.len()
+    };
+    if start >= history.len() {
+        history.clear();
+        return;
+    }
+
+    let retained = history.len() - start;
+    history.copy_within(start.., RESET.len());
+    history[..RESET.len()].copy_from_slice(RESET);
+    history.truncate(RESET.len() + retained);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -907,5 +1024,47 @@ mod tests {
             Err(TerminalError::RevisionOverflow)
         );
         assert_eq!(model.state(), before);
+    }
+
+    #[test]
+    fn projection_and_resize_preflight_do_not_mutate() {
+        let size = TerminalSize::new(40, 120);
+        let projected = TerminalModel::project_resources(size, 2_000)
+            .expect("foundation projection is representable");
+        let model = TerminalModel::new(size, 2_000).expect("foundation model");
+        assert_eq!(model.resource_projection(), projected);
+        let before = model.state();
+        let (revision, resized) = model
+            .preflight_resize(TerminalSize::new(80, 240))
+            .expect("maximum viewport preflights");
+        assert_eq!(revision, Revision::new(1));
+        assert!(resized.estimated_cell_storage_bytes > projected.estimated_cell_storage_bytes);
+        assert_eq!(model.state(), before);
+        assert!(matches!(
+            TerminalModel::project_resources(TerminalSize::new(0, 1), 2_000),
+            Err(TerminalError::InvalidSize(_))
+        ));
+    }
+
+    #[test]
+    fn snapshot_wire_limit_preserves_screen_and_complete_recent_lines() {
+        let screen = b"authoritative-screen".to_vec();
+        let mut snapshot = TerminalSnapshot {
+            revision: Revision::new(9),
+            size: TerminalSize::new(2, 20),
+            active_screen: ActiveScreen::Main,
+            screen_ansi: screen.clone(),
+            recent_history_ansi: b"\x1b[mold-line\r\nrecent-one\r\nrecent-two\r\n".to_vec(),
+            modes: TerminalModes::default(),
+        };
+        let maximum = screen.len() + b"\x1b[mrecent-two\r\n".len();
+        assert!(snapshot.limit_ansi_payload(maximum));
+        assert_eq!(snapshot.screen_ansi, screen);
+        assert_eq!(snapshot.recent_history_ansi, b"\x1b[mrecent-two\r\n");
+        assert!(snapshot.ansi_payload_len() <= maximum);
+
+        assert!(!snapshot.limit_ansi_payload(screen.len() - 1));
+        assert_eq!(snapshot.screen_ansi, screen);
+        assert!(snapshot.recent_history_ansi.is_empty());
     }
 }

@@ -3,6 +3,11 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+/// Reserved name used by the default create-if-missing attach path.
+pub const DEFAULT_SESSION_NAME: &str = "main";
+/// Maximum encoded UTF-8 bytes in a user-visible session name.
+pub const MAX_SESSION_NAME_BYTES: usize = 64;
+
 macro_rules! fixed_id {
     ($name:ident, $length:expr, $description:literal) => {
         #[doc = $description]
@@ -47,10 +52,137 @@ macro_rules! fixed_id {
 
 fixed_id!(DeviceId, 32, "Stable public identity of one zterm device.");
 fixed_id!(
+    DaemonIncarnation,
+    16,
+    "Random identity of one running daemon incarnation."
+);
+fixed_id!(
     SessionId,
     16,
     "Stable identifier of one live terminal session."
 );
+
+/// Validated, case-sensitive name of one live terminal session.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SessionName(String);
+
+impl SessionName {
+    /// Validates a user-visible session name without trimming or normalizing it.
+    pub fn new(value: impl Into<String>) -> Result<Self, SessionNameError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(SessionNameError::Empty);
+        }
+        if value.len() > MAX_SESSION_NAME_BYTES {
+            return Err(SessionNameError::TooLong {
+                actual: value.len(),
+                maximum: MAX_SESSION_NAME_BYTES,
+            });
+        }
+        if value.trim() != value {
+            return Err(SessionNameError::SurroundingWhitespace);
+        }
+        if value.chars().any(char::is_control) {
+            return Err(SessionNameError::ControlCharacter);
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the reserved default session name.
+    #[must_use]
+    pub fn main() -> Self {
+        Self(DEFAULT_SESSION_NAME.to_owned())
+    }
+
+    /// Returns whether this is the reserved default name.
+    #[must_use]
+    pub fn is_main(&self) -> bool {
+        self.0 == DEFAULT_SESSION_NAME
+    }
+
+    /// Borrows the validated name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SessionName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// Failure while validating a session name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionNameError {
+    /// A name must contain at least one byte.
+    Empty,
+    /// A name exceeded the fixed UTF-8 byte bound.
+    TooLong {
+        /// Observed byte count.
+        actual: usize,
+        /// Maximum accepted byte count.
+        maximum: usize,
+    },
+    /// Leading or trailing Unicode whitespace is forbidden.
+    SurroundingWhitespace,
+    /// Unicode control characters are forbidden.
+    ControlCharacter,
+}
+
+impl fmt::Display for SessionNameError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => write!(formatter, "session name must not be empty"),
+            Self::TooLong { actual, maximum } => write!(
+                formatter,
+                "session name must contain at most {maximum} UTF-8 bytes, got {actual}"
+            ),
+            Self::SurroundingWhitespace => {
+                write!(
+                    formatter,
+                    "session name must not have surrounding whitespace"
+                )
+            }
+            Self::ControlCharacter => {
+                write!(
+                    formatter,
+                    "session name must not contain control characters"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for SessionNameError {}
+
+/// Stable way to select one live session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionSelector {
+    /// Select by immutable daemon-lifetime identifier.
+    Id(SessionId),
+    /// Select by current unique name.
+    Name(SessionName),
+}
+
+/// Why a live session stopped owning its root shell and PTY.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionEndReason {
+    /// The root shell exited without an explicit zterm close.
+    NaturalExit {
+        /// Portable exit code projection.
+        exit_code: u32,
+        /// Bounded platform signal description, when available.
+        signal: Option<String>,
+    },
+    /// The user explicitly closed this session.
+    ExplicitClose,
+    /// The per-user daemon is shutting down.
+    DaemonStop,
+    /// The retained terminal driver failed.
+    DriverFailure,
+}
 fixed_id!(
     AttachmentId,
     16,
@@ -146,7 +278,7 @@ pub enum AttachmentPrincipal {
     },
 }
 
-/// Current controller ownership token for a future live session.
+/// Current controller ownership token for one live session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ControllerLease {
     /// Attachment which owns controller input.
@@ -209,7 +341,7 @@ pub struct ResourceLimits {
     pub max_viewport_columns: u16,
     /// Admission ceiling for summed fixed-cell projections.
     pub aggregate_cell_projection_bytes: usize,
-    /// Maximum simultaneous local unary IPC connections.
+    /// Maximum simultaneous local unary or attachment IPC connections.
     pub max_local_connections: usize,
     /// Maximum accepted relative local request deadline.
     pub max_local_deadline_seconds: u32,
@@ -234,12 +366,21 @@ impl Default for ResourceLimits {
 /// Whole-process memory target measured by integration gates, not admission.
 pub const DAEMON_RSS_MEASUREMENT_TARGET_BYTES: usize = 256 * 1024 * 1024;
 
+/// Daemon-issued bounded replay lease for one authenticated principal.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct OperationLease {
+    /// Random daemon-lifetime identity. Leases never survive daemon restart.
+    pub daemon_incarnation: DaemonIncarnation,
+    /// Daemon-monotonic issued ordinal for this stable principal/auth generation.
+    pub ordinal: u64,
+}
+
 /// Stable identifier of one state-changing client operation.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct OperationId {
-    /// Random epoch generated for one authenticated client runtime.
-    pub client_epoch: u64,
-    /// Monotonic sequence within the epoch.
+    /// Lease allocated by the daemon before the first mutation.
+    pub lease: OperationLease,
+    /// Monotonic non-zero sequence within the lease.
     pub sequence: u64,
 }
 
@@ -257,7 +398,7 @@ pub enum OperationOutcome<R> {
 pub enum OperationWindowError {
     /// A replay window must retain at least one result.
     InvalidCapacity,
-    /// The operation belongs to another epoch or its result was evicted.
+    /// The operation belongs to another lease or its result was evicted.
     OutcomeUnknown,
 }
 
@@ -274,22 +415,22 @@ impl fmt::Display for OperationWindowError {
 
 impl std::error::Error for OperationWindowError {}
 
-/// Bounded exact-result replay for one fixed authenticated client epoch.
+/// Bounded exact-result replay for one fixed daemon-issued operation lease.
 pub struct OperationWindow<R> {
-    client_epoch: u64,
+    lease: OperationLease,
     capacity: usize,
     low_water: u64,
     results: BTreeMap<u64, R>,
 }
 
 impl<R: Clone> OperationWindow<R> {
-    /// Creates one fixed-epoch replay window.
-    pub fn new(client_epoch: u64, capacity: usize) -> Result<Self, OperationWindowError> {
+    /// Creates one fixed-lease replay window.
+    pub fn new(lease: OperationLease, capacity: usize) -> Result<Self, OperationWindowError> {
         if capacity == 0 {
             return Err(OperationWindowError::InvalidCapacity);
         }
         Ok(Self {
-            client_epoch,
+            lease,
             capacity,
             low_water: 0,
             results: BTreeMap::new(),
@@ -302,7 +443,7 @@ impl<R: Clone> OperationWindow<R> {
         id: OperationId,
         operation: impl FnOnce() -> R,
     ) -> Result<OperationOutcome<R>, OperationWindowError> {
-        if id.client_epoch != self.client_epoch {
+        if id.lease != self.lease || id.sequence == 0 {
             return Err(OperationWindowError::OutcomeUnknown);
         }
         if let Some(result) = self.results.get(&id.sequence) {
@@ -381,8 +522,26 @@ pub enum DomainErrorKind {
     ControlPayloadTooLarge,
     /// Framing or protobuf bytes are malformed.
     MalformedFrame,
-    /// A replay result was evicted or belongs to another epoch.
+    /// A replay result was evicted or belongs to another lease.
     OperationOutcomeUnknown,
+    /// A session name failed its product validation contract.
+    InvalidSessionName,
+    /// A requested session working directory is invalid or inaccessible.
+    InvalidWorkingDirectory,
+    /// A normal create or rename attempted to use the reserved `main` name.
+    ReservedSessionName,
+    /// A live session already uses the requested name.
+    SessionAlreadyExists,
+    /// The selected live session does not exist.
+    SessionNotFound,
+    /// The selected session already has a controller.
+    SessionOccupied,
+    /// An attachment has not confirmed the latest full snapshot.
+    NotSynchronized,
+    /// An attachment no longer owns the controller lease.
+    LeaseLost,
+    /// A fixed session, viewport, or projection bound would be exceeded.
+    ResourceExhausted,
     /// A defined future service is not implemented in this milestone.
     ServiceNotImplemented,
 }
@@ -417,6 +576,15 @@ impl DomainErrorKind {
             Self::ControlPayloadTooLarge => "control_payload_too_large",
             Self::MalformedFrame => "malformed_frame",
             Self::OperationOutcomeUnknown => "operation_outcome_unknown",
+            Self::InvalidSessionName => "invalid_session_name",
+            Self::InvalidWorkingDirectory => "invalid_working_directory",
+            Self::ReservedSessionName => "reserved_session_name",
+            Self::SessionAlreadyExists => "session_already_exists",
+            Self::SessionNotFound => "session_not_found",
+            Self::SessionOccupied => "session_occupied",
+            Self::NotSynchronized => "not_synchronized",
+            Self::LeaseLost => "lease_lost",
+            Self::ResourceExhausted => "resource_exhausted",
             Self::ServiceNotImplemented => "service_not_implemented",
         }
     }
@@ -450,6 +618,15 @@ impl DomainErrorKind {
             "control_payload_too_large" => Self::ControlPayloadTooLarge,
             "malformed_frame" => Self::MalformedFrame,
             "operation_outcome_unknown" => Self::OperationOutcomeUnknown,
+            "invalid_session_name" => Self::InvalidSessionName,
+            "invalid_working_directory" => Self::InvalidWorkingDirectory,
+            "reserved_session_name" => Self::ReservedSessionName,
+            "session_already_exists" => Self::SessionAlreadyExists,
+            "session_not_found" => Self::SessionNotFound,
+            "session_occupied" => Self::SessionOccupied,
+            "not_synchronized" => Self::NotSynchronized,
+            "lease_lost" => Self::LeaseLost,
+            "resource_exhausted" => Self::ResourceExhausted,
             "service_not_implemented" => Self::ServiceNotImplemented,
             _ => return None,
         })
@@ -499,13 +676,58 @@ mod tests {
     }
 
     #[test]
+    fn session_names_and_selectors_have_one_validation_owner() {
+        let main = SessionName::main();
+        assert!(main.is_main());
+        assert_eq!(main.as_str(), DEFAULT_SESSION_NAME);
+        assert_eq!(SessionName::new(""), Err(SessionNameError::Empty));
+        assert_eq!(
+            SessionName::new(" padded"),
+            Err(SessionNameError::SurroundingWhitespace)
+        );
+        assert_eq!(
+            SessionName::new("line\nbreak"),
+            Err(SessionNameError::ControlCharacter)
+        );
+        assert!(matches!(
+            SessionName::new("界".repeat(22)),
+            Err(SessionNameError::TooLong {
+                actual: 66,
+                maximum: 64
+            })
+        ));
+        let named = SessionName::new("Work-界").expect("bounded Unicode name");
+        assert_eq!(named.as_str(), "Work-界");
+        assert_ne!(named, SessionName::new("work-界").expect("case-sensitive"));
+        assert_eq!(
+            SessionSelector::Name(named.clone()),
+            SessionSelector::Name(named)
+        );
+
+        for kind in [
+            DomainErrorKind::InvalidSessionName,
+            DomainErrorKind::InvalidWorkingDirectory,
+            DomainErrorKind::ReservedSessionName,
+            DomainErrorKind::SessionAlreadyExists,
+            DomainErrorKind::SessionNotFound,
+            DomainErrorKind::SessionOccupied,
+            DomainErrorKind::NotSynchronized,
+            DomainErrorKind::LeaseLost,
+            DomainErrorKind::ResourceExhausted,
+        ] {
+            assert_eq!(DomainErrorKind::from_code(kind.code()), Some(kind));
+        }
+    }
+
+    #[test]
     fn operation_window_replays_exact_results_and_never_reruns_evicted_ids() {
-        let mut window = OperationWindow::new(41, 2).expect("non-zero replay capacity");
-        let mut executions = 0;
-        let first = OperationId {
-            client_epoch: 41,
-            sequence: 4,
+        let lease = OperationLease {
+            daemon_incarnation: DaemonIncarnation::from_array([4; 16]),
+            ordinal: 41,
         };
+        let mut window = OperationWindow::new(lease, 2).expect("non-zero replay capacity");
+        let mut executions = 0;
+        let first = OperationId { lease, sequence: 4 };
         assert_eq!(
             window.execute(first, || {
                 executions += 1;
@@ -522,14 +744,8 @@ mod tests {
         );
         assert_eq!(executions, 1);
 
-        let two = OperationId {
-            client_epoch: 41,
-            sequence: 5,
-        };
-        let three = OperationId {
-            client_epoch: 41,
-            sequence: 6,
-        };
+        let two = OperationId { lease, sequence: 5 };
+        let three = OperationId { lease, sequence: 6 };
         assert!(matches!(
             window.execute(two, || Ok(2)),
             Ok(OperationOutcome::Executed(Ok(2)))
@@ -546,7 +762,10 @@ mod tests {
         assert_eq!(
             window.execute(
                 OperationId {
-                    client_epoch: 99,
+                    lease: OperationLease {
+                        ordinal: 99,
+                        ..lease
+                    },
                     sequence: 7
                 },
                 || Ok(7)
@@ -554,11 +773,15 @@ mod tests {
             Err(OperationWindowError::OutcomeUnknown)
         );
 
-        let mut out_of_order = OperationWindow::new(7, 2).expect("bounded window");
+        let second_lease = OperationLease {
+            ordinal: 7,
+            ..lease
+        };
+        let mut out_of_order = OperationWindow::new(second_lease, 2).expect("bounded window");
         assert!(matches!(
             out_of_order.execute(
                 OperationId {
-                    client_epoch: 7,
+                    lease: second_lease,
                     sequence: 10,
                 },
                 || "ten"
@@ -568,7 +791,7 @@ mod tests {
         assert!(matches!(
             out_of_order.execute(
                 OperationId {
-                    client_epoch: 7,
+                    lease: second_lease,
                     sequence: 12,
                 },
                 || "twelve"
@@ -578,7 +801,7 @@ mod tests {
         assert!(matches!(
             out_of_order.execute(
                 OperationId {
-                    client_epoch: 7,
+                    lease: second_lease,
                     sequence: 11,
                 },
                 || "eleven"
@@ -589,7 +812,7 @@ mod tests {
         assert_eq!(
             out_of_order.execute(
                 OperationId {
-                    client_epoch: 7,
+                    lease: second_lease,
                     sequence: 10,
                 },
                 || "must-not-run"

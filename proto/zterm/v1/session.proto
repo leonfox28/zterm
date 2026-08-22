@@ -9,16 +9,22 @@ message SessionSummary {
   string name = 2;
   uint64 revision = 3;
   bool has_controller = 4;
+  string working_directory = 5;
+  TerminalViewport viewport = 6;
 }
 
 message SessionListRequest { TargetSelector target = 1; }
 message SessionListResponse { repeated SessionSummary sessions = 1; }
+
+message SessionOperationLeaseRequest { TargetSelector target = 1; }
+message SessionOperationLeaseResponse { OperationLease lease = 1; }
 
 message SessionCreateRequest {
   OperationId operation_id = 1;
   TargetSelector target = 2;
   string name = 3;
   string working_directory = 4;
+  TerminalViewport viewport = 5;
 }
 
 message SessionRenameRequest {

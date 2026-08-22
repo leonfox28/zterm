@@ -1,7 +1,7 @@
-//! Per-user state, local daemon lifecycle, terminal driver, and future Iroh adapter.
+//! Per-user state, local daemon lifecycle, persistent sessions, and future Iroh adapter.
 //!
 //! Local readiness binds only a same-UID Unix socket. Iroh endpoint binding,
-//! pairing, and session service remain later milestones.
+//! pairing, remote transport, and the final raw-terminal UI remain later milestones.
 
 pub mod bootstrap;
 pub mod config;
@@ -11,6 +11,7 @@ pub mod lifecycle;
 pub mod local_ipc;
 pub mod operations;
 pub mod service;
+pub mod session;
 pub mod store;
 pub mod terminal_driver;
 pub mod transport;

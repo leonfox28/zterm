@@ -30,6 +30,8 @@ const LOCK_POLL: Duration = Duration::from_millis(20);
 const READINESS_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 #[cfg(unix)]
 const LOG_ROTATE_BYTES: u64 = 4 * 1024 * 1024;
+#[cfg(unix)]
+const RECOVERY_REBIND_BACKOFF: Duration = Duration::from_millis(20);
 
 /// Executable and one hidden argument used by explicit lifecycle operations.
 #[derive(Clone, Debug)]
@@ -69,7 +71,7 @@ impl DaemonLauncher {
         ensure_daemon_with(paths, &self.executable, &self.internal_argument).await
     }
 
-    /// Returns the M3 platform limitation on non-Unix targets.
+    /// Returns the current platform limitation on non-Unix targets.
     #[cfg(not(unix))]
     pub async fn ensure(&self, _paths: &UserPaths) -> Result<DaemonReadiness, DaemonError> {
         let _ = (&self.executable, &self.internal_argument);
@@ -148,7 +150,7 @@ pub async fn ensure_daemon_with(
 }
 
 #[cfg(not(unix))]
-/// Returns the M3 platform limitation on non-Unix targets.
+/// Returns the current platform limitation on non-Unix targets.
 pub async fn ensure_current_daemon(_paths: &UserPaths) -> Result<DaemonReadiness, DaemonError> {
     Err(unsupported())
 }
@@ -190,12 +192,34 @@ pub fn run_daemon(paths: &UserPaths) -> Result<(), DaemonError> {
         })?;
     let store = StateStore::open(paths)?;
     let setup = validate_committed_setup_with_store(paths, &store)?;
-    let listener = zterm_platform::local_unix::bind_daemon_socket(paths, &daemon_lock)
-        .map_err(platform_error)?;
+    let (listener, socket_ownership) =
+        zterm_platform::local_unix::bind_owned_daemon_socket(paths, &daemon_lock)
+            .map_err(platform_error)?;
     let _store_actor = StoreActor::start(store)?;
     let service = Arc::new(DaemonService::new(setup));
     tracing::info!(socket = %paths.socket().display(), "local daemon ready");
 
+    run_owned_daemon_listener(
+        paths,
+        &daemon_lock,
+        listener,
+        socket_ownership,
+        service,
+        crate::local_ipc::LocalIpcLimits::default(),
+        Duration::from_secs(5),
+    )
+}
+
+#[cfg(unix)]
+fn run_owned_daemon_listener(
+    paths: &UserPaths,
+    daemon_lock: &zterm_platform::local_unix::DaemonLock,
+    mut listener: std::os::unix::net::UnixListener,
+    mut socket_ownership: zterm_platform::local_unix::DaemonSocketOwnership,
+    service: std::sync::Arc<DaemonService>,
+    mut limits: crate::local_ipc::LocalIpcLimits,
+    cleanup_timeout: Duration,
+) -> Result<(), DaemonError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -205,15 +229,97 @@ pub fn run_daemon(paths: &UserPaths) -> Result<(), DaemonError> {
                 format!("unable to build daemon runtime: {error}"),
             )
         })?;
-    let server_result = runtime.block_on(crate::local_ipc::serve_local(
+    loop {
+        let server_result = runtime.block_on(crate::local_ipc::serve_local_with_limits(
+            listener,
+            paths.uid(),
+            std::sync::Arc::clone(&service),
+            limits,
+        ));
+        let cleanup_deadline = Instant::now() + cleanup_timeout;
+        let session_cleanup = service
+            .sessions()
+            .shutdown_until(cleanup_deadline)
+            .map(|_| ());
+        match (server_result, session_cleanup) {
+            (Ok(()), Ok(())) => {
+                tracing::info!("local daemon stopping");
+                return zterm_platform::local_unix::remove_owned_daemon_socket(
+                    paths,
+                    daemon_lock,
+                    socket_ownership,
+                )
+                .map_err(platform_error);
+            }
+            (Err(server_error), Ok(())) => {
+                // A fatal listener is allowed to terminate only after all
+                // child/actor ownership is truthfully released.
+                zterm_platform::local_unix::remove_owned_daemon_socket(
+                    paths,
+                    daemon_lock,
+                    socket_ownership,
+                )
+                .map_err(platform_error)?;
+                return Err(server_error);
+            }
+            (server_result, Err(cleanup_error)) => {
+                // Retain the daemon lock, store/service, and process. The held
+                // lock proves that the stale same-UID socket was created by
+                // this daemon's listener; `bind_daemon_socket` validates that
+                // path again before replacing it.
+                match server_result {
+                    Ok(()) => tracing::warn!(
+                        error = %cleanup_error,
+                        "listener stopped before owned sessions were released; rebinding"
+                    ),
+                    Err(server_error) => tracing::warn!(
+                        error = %server_error,
+                        cleanup = %cleanup_error,
+                        "fatal listener exit retained owned sessions; rebinding"
+                    ),
+                }
+                limits = limits.without_accept_failure_injection();
+                let rebound = loop {
+                    match zterm_platform::local_unix::rebind_owned_daemon_socket(
+                        paths,
+                        daemon_lock,
+                        socket_ownership,
+                    ) {
+                        Ok(rebound) => break rebound,
+                        Err(error) => {
+                            tracing::warn!(%error, "unable to rebind owned daemon socket; retrying");
+                            std::thread::sleep(RECOVERY_REBIND_BACKOFF);
+                        }
+                    }
+                };
+                (listener, socket_ownership) = rebound;
+                tracing::info!(socket = %paths.socket().display(), "local daemon listener recovered");
+            }
+        }
+    }
+}
+
+/// Runs the exact owned-listener recovery loop with deterministic limits.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn run_owned_daemon_listener_for_test(
+    paths: &UserPaths,
+    daemon_lock: zterm_platform::local_unix::DaemonLock,
+    listener: std::os::unix::net::UnixListener,
+    socket_ownership: zterm_platform::local_unix::DaemonSocketOwnership,
+    service: std::sync::Arc<DaemonService>,
+    limits: crate::local_ipc::LocalIpcLimits,
+    cleanup_timeout: Duration,
+) -> Result<(), DaemonError> {
+    run_owned_daemon_listener(
+        paths,
+        &daemon_lock,
         listener,
-        paths.uid(),
+        socket_ownership,
         service,
-    ));
-    tracing::info!("local daemon stopping");
-    let cleanup_result =
-        zterm_platform::local_unix::remove_own_socket(paths, &daemon_lock).map_err(platform_error);
-    server_result.and(cleanup_result)
+        limits,
+        cleanup_timeout,
+    )
 }
 
 pub(crate) async fn probe_readiness(
@@ -318,6 +424,6 @@ fn platform_error(error: zterm_platform::local_unix::LocalPlatformError) -> Daem
 fn unsupported() -> DaemonError {
     DaemonError::new(
         DomainErrorKind::UnsupportedPlatform,
-        "local daemon lifecycle is Unix-only in M3",
+        "local daemon lifecycle is Unix-only in the current milestone",
     )
 }
