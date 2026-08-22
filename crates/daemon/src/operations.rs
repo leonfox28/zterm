@@ -8,10 +8,14 @@ use std::time::Instant;
 use zterm_core::DomainErrorKind;
 use zterm_platform::user_state::UserPaths;
 
-use crate::bootstrap::{BootstrapResult, bootstrap_with_lock_held};
+use crate::bootstrap::BootstrapResult;
+#[cfg(unix)]
+use crate::bootstrap::bootstrap_with_lock_held;
 use crate::config::ValidatedConfig;
 use crate::error::DaemonError;
-use crate::lifecycle::{DaemonLauncher, acquire_lifecycle_lock, probe_readiness};
+#[cfg(unix)]
+use crate::lifecycle::acquire_lifecycle_lock;
+use crate::lifecycle::{DaemonLauncher, probe_readiness};
 use crate::local_ipc::LocalClient;
 use crate::service::{DaemonReadiness, DaemonStatus, SessionImpact};
 
@@ -253,6 +257,8 @@ fn inspect_account_home(paths: &UserPaths) -> DoctorCheck {
                     };
                 }
             }
+            #[cfg(not(unix))]
+            let _ = metadata;
             DoctorCheck {
                 name: "account_home",
                 ok: true,
@@ -432,24 +438,36 @@ pub async fn setup_and_ensure(
     requested: &ValidatedConfig,
     launcher: &DaemonLauncher,
 ) -> Result<BootstrapResult, DaemonError> {
-    paths
-        .prepare_state_directories()
-        .map_err(|error| DaemonError::new(DomainErrorKind::PathUnsafe, error.to_string()))?;
-    if probe_readiness(paths).await?.is_some() {
-        return validate_running_setup(paths, requested).await;
-    }
+    #[cfg(unix)]
+    {
+        paths
+            .prepare_state_directories()
+            .map_err(|error| DaemonError::new(DomainErrorKind::PathUnsafe, error.to_string()))?;
+        if probe_readiness(paths).await?.is_some() {
+            return validate_running_setup(paths, requested).await;
+        }
 
-    let lifecycle = acquire_lifecycle_lock(paths, Instant::now()).await?;
-    if probe_readiness(paths).await?.is_some() {
+        let lifecycle = acquire_lifecycle_lock(paths, Instant::now()).await?;
+        if probe_readiness(paths).await?.is_some() {
+            drop(lifecycle);
+            return validate_running_setup(paths, requested).await;
+        }
+        let result = bootstrap_with_lock_held(paths, requested)?;
         drop(lifecycle);
-        return validate_running_setup(paths, requested).await;
+        launcher.ensure(paths).await?;
+        Ok(result)
     }
-    let result = bootstrap_with_lock_held(paths, requested)?;
-    drop(lifecycle);
-    launcher.ensure(paths).await?;
-    Ok(result)
+    #[cfg(not(unix))]
+    {
+        let _ = (paths, requested, launcher);
+        Err(DaemonError::new(
+            DomainErrorKind::UnsupportedPlatform,
+            "local daemon setup is Unix-only in M3",
+        ))
+    }
 }
 
+#[cfg(unix)]
 async fn validate_running_setup(
     paths: &UserPaths,
     requested: &ValidatedConfig,

@@ -79,15 +79,21 @@ fn cross_uid_client(socket: &str) {
         &v1::LocalReadinessRequest {},
     )
     .expect("readiness frame");
-    stream.write_all(&request).expect("other UID write");
+    match stream.write_all(&request) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(error) => panic!("unexpected cross-UID write error: {error}"),
+    }
     let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .expect("peer rejection EOF");
-    assert!(
-        response.is_empty(),
-        "peer UID is rejected before request decode/response"
-    );
+    match stream.read_to_end(&mut response) {
+        Ok(_) => assert!(
+            response.is_empty(),
+            "peer UID is rejected before request decode/response"
+        ),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::ConnectionReset && response.is_empty() => {}
+        Err(error) => panic!("unexpected cross-UID read error: {error}"),
+    }
 }
 
 #[cfg(unix)]
@@ -116,19 +122,30 @@ async fn cross_uid_server() {
     std::fs::set_permissions(state.paths.socket(), std::fs::Permissions::from_mode(0o666))
         .expect("test-only reachable socket");
 
+    let source_executable = std::env::current_exe().expect("harness executable");
+    let client_executable = temporary_root.join("cross-uid-client");
+    std::fs::copy(source_executable, &client_executable)
+        .expect("copy harness into test-only traversable fixture");
+    std::fs::set_permissions(&client_executable, std::fs::Permissions::from_mode(0o511))
+        .expect("make test-only client executable");
+
     let server = tokio::spawn(serve_local(
         listener,
         state.paths.uid(),
         Arc::new(DaemonService::new(setup)),
     ));
-    let executable = std::env::current_exe().expect("harness executable");
-    let status = std::process::Command::new("sudo")
-        .args(["-n", "-u", "nobody", "--"])
-        .arg(executable)
-        .arg("--cross-uid-client")
-        .arg(state.paths.socket())
-        .status()
-        .expect("run cross-UID client");
+    let socket = state.paths.socket().to_path_buf();
+    let status = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("sudo")
+            .args(["-n", "-u", "nobody", "--"])
+            .arg(client_executable)
+            .arg("--cross-uid-client")
+            .arg(socket)
+            .status()
+    })
+    .await
+    .expect("join cross-UID client")
+    .expect("run cross-UID client");
     assert!(
         status.success(),
         "cross-UID client harness failed: {status}"

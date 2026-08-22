@@ -2,26 +2,38 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(unix)]
 use tokio::sync::{Semaphore, mpsc};
+#[cfg(unix)]
 use tokio::task::JoinSet;
-use zterm_core::{DomainErrorKind, ResourceLimits};
+use zterm_core::DomainErrorKind;
+#[cfg(unix)]
+use zterm_core::ResourceLimits;
+#[cfg(unix)]
 use zterm_proto::{DecodedFrame, FrameDecoder, WireKind, encode_message, v1};
 
 use crate::config::ValidatedConfig;
 use crate::error::DaemonError;
 use crate::service::{
-    DaemonReadiness, DaemonService, DaemonStatus, ProtocolStatus, ServiceReply, SessionImpact,
-    ValidatedSetupStatus, protocol_error,
+    DaemonReadiness, DaemonService, DaemonStatus, SessionImpact, ValidatedSetupStatus,
 };
+#[cfg(unix)]
+use crate::service::{ProtocolStatus, ServiceReply, protocol_error};
 
+#[cfg(unix)]
 const DEFAULT_DEADLINE: Duration = Duration::from_secs(5);
+#[cfg(unix)]
 const DRAIN_GRACE: Duration = Duration::from_secs(30);
 
 /// Fixed production limits with a reduced test constructor for deadline evidence.
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
 pub struct LocalIpcLimits {
     initial_read_timeout: Duration,
@@ -30,6 +42,7 @@ pub struct LocalIpcLimits {
     maximum_connections: usize,
 }
 
+#[cfg(unix)]
 impl Default for LocalIpcLimits {
     fn default() -> Self {
         let resources = ResourceLimits::default();
@@ -44,6 +57,7 @@ impl Default for LocalIpcLimits {
     }
 }
 
+#[cfg(unix)]
 impl LocalIpcLimits {
     /// Creates bounded limits for deterministic isolated tests.
     #[doc(hidden)]
@@ -241,6 +255,7 @@ async fn read_one(stream: &mut tokio::net::UnixStream) -> Result<DecodedFrame, D
 #[derive(Debug)]
 pub struct LocalClient {
     socket: PathBuf,
+    #[cfg(unix)]
     next_request_id: AtomicU64,
 }
 
@@ -250,6 +265,7 @@ impl LocalClient {
     pub fn new(socket: impl Into<PathBuf>) -> Self {
         Self {
             socket: socket.into(),
+            #[cfg(unix)]
             next_request_id: AtomicU64::new(1),
         }
     }
@@ -473,6 +489,7 @@ impl LocalClient {
     }
 }
 
+#[cfg(unix)]
 fn decode_response<Message>(frame: &DecodedFrame) -> Result<Message, DaemonError>
 where
     Message: prost::Message + Default,
@@ -480,6 +497,7 @@ where
     frame.decode_message(frame.kind).map_err(protocol_error)
 }
 
+#[cfg(unix)]
 fn protocol_status(protocol: Option<v1::ProtocolVersion>) -> Result<ProtocolStatus, DaemonError> {
     let protocol = protocol.ok_or_else(|| malformed("local response omitted protocol"))?;
     Ok(ProtocolStatus {
@@ -489,6 +507,7 @@ fn protocol_status(protocol: Option<v1::ProtocolVersion>) -> Result<ProtocolStat
     })
 }
 
+#[cfg(unix)]
 fn connect_error(error: std::io::Error) -> DaemonError {
     let kind = match error.kind() {
         std::io::ErrorKind::PermissionDenied => DomainErrorKind::PermissionMismatch,
@@ -497,6 +516,7 @@ fn connect_error(error: std::io::Error) -> DaemonError {
     DaemonError::new(kind, format!("local daemon is unavailable: {error}"))
 }
 
+#[cfg(unix)]
 fn daemon_io(operation: &str, error: std::io::Error) -> DaemonError {
     DaemonError::new(
         DomainErrorKind::DaemonStopped,
@@ -504,6 +524,7 @@ fn daemon_io(operation: &str, error: std::io::Error) -> DaemonError {
     )
 }
 
+#[cfg(unix)]
 fn malformed(detail: impl Into<String>) -> DaemonError {
     DaemonError::new(DomainErrorKind::MalformedFrame, detail)
 }

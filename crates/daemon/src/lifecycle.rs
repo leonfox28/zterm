@@ -1,23 +1,34 @@
 //! Per-user daemon singleflight launch, detached entry, and graceful cleanup.
 
+#[cfg(unix)]
 use std::fs;
+#[cfg(unix)]
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use zterm_core::DomainErrorKind;
 use zterm_platform::account::EffectiveAccount;
-use zterm_platform::user_state::{FileLock, UserPaths, validate_regular_file};
+use zterm_platform::user_state::UserPaths;
+#[cfg(unix)]
+use zterm_platform::user_state::{FileLock, validate_regular_file};
 
 use crate::error::DaemonError;
 use crate::local_ipc::LocalClient;
-use crate::service::{DaemonReadiness, DaemonService};
+use crate::service::DaemonReadiness;
+#[cfg(unix)]
+use crate::service::DaemonService;
 
 /// Hidden product argument used only to enter the detached daemon child.
 pub const INTERNAL_DAEMON_ARGUMENT: &str = "--internal-daemon";
 
+#[cfg(unix)]
 const START_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(unix)]
 const LOCK_POLL: Duration = Duration::from_millis(20);
 const READINESS_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(unix)]
 const LOG_ROTATE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Executable and one hidden argument used by explicit lifecycle operations.
@@ -61,6 +72,7 @@ impl DaemonLauncher {
     /// Returns the M3 platform limitation on non-Unix targets.
     #[cfg(not(unix))]
     pub async fn ensure(&self, _paths: &UserPaths) -> Result<DaemonReadiness, DaemonError> {
+        let _ = (&self.executable, &self.internal_argument);
         Err(unsupported())
     }
 }
@@ -279,6 +291,7 @@ fn rotate_lifecycle_log(paths: &UserPaths) -> Result<(), DaemonError> {
         .map_err(|error| DaemonError::new(DomainErrorKind::PathUnsafe, error.to_string()))
 }
 
+#[cfg(unix)]
 fn init_lifecycle_logging() {
     let _ = tracing_subscriber::fmt()
         .with_ansi(false)
