@@ -74,3 +74,27 @@ Completed and verified the Iroh profile, terminal model, PTY lifecycle, retained
 ### Status
 
 [OK] **Completed**
+
+
+## Session 4: Complete M2-M3 core and local daemon
+
+**Date**: 2026-08-22
+**Task**: Complete M2-M3 core and local daemon
+**Branch**: `main`
+
+### Summary
+
+Implemented typed core and protobuf contracts, secure per-user state and identity, same-UID Unix IPC, detached single-instance daemon lifecycle, and thin CLI diagnostics. Added real Linux cross-UID rejection coverage, native Windows shared-boundary CI, independent review fixes, hosted evidence, and archived the completed child task.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `2eb16dc` | (see git log) |
+| `0850435` | (see git log) |
+| `38f9e78` | (see git log) |
+| `e5050a4` | (see git log) |
+
+### Status
+
+[OK] **Completed**
