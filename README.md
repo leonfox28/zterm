@@ -5,11 +5,28 @@ will prefer direct NAT-traversed connections and fall back to an end-to-end
 encrypted Iroh relay path, while keeping remote terminal sessions alive across
 client disconnects.
 
-Phase Zero is complete. The repository currently contains a reproducible Rust
-workspace, a build-only protobuf probe, and a verified Docker wrapper for the
-official `iroh-relay` 1.0.3 binary. There is no usable terminal, daemon,
-pairing, transport, or session behavior yet; the `zterm` binary is deliberately
-a side-effect-free placeholder while Phase One begins.
+Phase Zero and the Phase One Foundation/Core/Local-Daemon milestones are
+complete. The repository now contains the shared terminal/domain model,
+versioned protobuf contract, secure per-user state, one same-UID local daemon,
+and the setup/status/diagnostic lifecycle CLI. There is still no session
+registry, local terminal attach, remote pairing, or bound Iroh endpoint; a
+usable terminal begins with the next Phase One session milestone.
+
+Current public commands are:
+
+```text
+zterm setup --name <name> --profile official-n0
+zterm status [--json]
+zterm doctor [--json]
+zterm daemon status [--json]
+zterm daemon stop [--force]
+zterm daemon restart [--force]
+zterm logs [--lines <n>]
+```
+
+Only `setup` and `daemon restart` may start the daemon. Inspection and stop
+commands never start it. See [Core and local daemon](docs/core-local-daemon.md)
+for exact behavior and current limits.
 
 ## Version policy
 
@@ -28,8 +45,8 @@ their own non-product version.
 
 ## Repository boundaries
 
-- `crates/` — five minimal Rust crates proving the planned dependency direction.
-- `proto/` — a build-only schema compiled with vendored `protoc` binaries.
+- `crates/` — five Rust crates owning core, protocol, platform, daemon, and CLI boundaries.
+- `proto/zterm/v1/` — the product wire schema compiled with vendored `protoc` binaries.
 - `deploy/relay/` — official relay artifact verification and Compose deployment.
 - `.github/workflows/relay-image.yml` — multi-platform publisher for the
   separate `zterm-relay` production and `zterm-relay-dev` development GHCR
@@ -38,6 +55,7 @@ their own non-product version.
 - `docs/development.md` — exact local toolchain baseline and repeatable commands.
 - `docs/relay.md` — relay trust boundary, publication, and deployment.
 - `docs/phase-zero-verification.md` — evidence from the completed local gate.
+- `docs/core-local-daemon.md` — current M2–M3 behavior, state, CLI, and exclusions.
 
 ## Local checks
 
@@ -49,15 +67,15 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo doc --workspace --no-deps
 cargo deny check
+sh tests/core-local-daemon/cross-uid.sh
 sh tests/relay/publication-channels.sh
 sh tests/relay/static.sh
 sh tests/relay/verify-upstream.sh
 sh tests/relay/build-platforms.sh
 sh tests/relay/smoke.sh
-sh tests/relay/secret-scan.sh
+sh tests/secret-scan.sh
 ```
 
-Do not connect this repository to a public server until the Phase Zero local
-checks pass and the user explicitly provides the server entry point, relay
-domain/DNS status, and Docker status. Never place SSH private keys or real
+The local daemon/readiness path deliberately does not bind Iroh or require DNS,
+Relay, or Internet access. Never place SSH private keys, identity keys, or real
 deployment credentials in this repository.

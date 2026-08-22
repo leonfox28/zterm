@@ -20,12 +20,12 @@ TerminalDriver::start(
 
 TerminalDriver::attach(&self) -> TerminalAttachment
 TerminalDriver::write_input(&self, bytes: &[u8]) -> Result<(), TerminalDriverError>
-TerminalDriver::resize(&self, size: TerminalSize) -> Result<u64, TerminalDriverError>
+TerminalDriver::resize(&self, size: TerminalSize) -> Result<Revision, TerminalDriverError>
 TerminalDriver::try_wait(&self) -> Result<PtyChildState, TerminalDriverError>
 TerminalDriver::wait(&self) -> Result<PtyExitStatus, TerminalDriverError>
 TerminalDriver::close_explicitly(&self) -> Result<PtyExitStatus, TerminalDriverError>
 
-TerminalAttachment::wait_for_revision_after(revision, timeout) -> Result<u64, TerminalDriverError>
+TerminalAttachment::wait_for_revision_after(revision: Revision, timeout) -> Result<Revision, TerminalDriverError>
 TerminalAttachment::sync_latest(&mut self) -> Result<TerminalDeltaResult, TerminalDriverError>
 TerminalAttachment::discard_checkpoint(&mut self)
 TerminalAttachment::latest_snapshot(&self) -> Result<TerminalSnapshot, TerminalDriverError>

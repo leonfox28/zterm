@@ -147,7 +147,7 @@ fn incompatible_or_larger_delta_chooses_full_resync() {
     }
     let dense_checkpoint = dense_baseline.checkpoint();
     let mut blank_latest = TerminalModel::new(large_size, 8).expect("blank latest is valid");
-    for _ in 0..dense_baseline.revision() {
+    for _ in 0..dense_baseline.revision().get() {
         blank_latest.ingest(b"\x1b[2J").expect("clear ingests");
     }
     let result = blank_latest.delta_or_resync(&dense_checkpoint);
@@ -168,9 +168,9 @@ fn incompatible_or_larger_delta_chooses_full_resync() {
 fn history_resources_and_revision_rules_are_bounded_and_typed() {
     let size = TerminalSize::new(3, 12);
     let mut model = TerminalModel::new(size, 4).expect("bounded model is valid");
-    assert_eq!(model.revision(), 0);
+    assert_eq!(model.revision().get(), 0);
     let empty = model.ingest(b"").expect("empty ingest is a no-op");
-    assert_eq!(empty.revision, 0);
+    assert_eq!(empty.revision.get(), 0);
 
     for line in 0..12 {
         model
@@ -181,7 +181,12 @@ fn history_resources_and_revision_rules_are_bounded_and_typed() {
     model
         .resize(size)
         .expect("same-size resize is still ordered");
-    assert_eq!(model.revision(), revision_before_resize + 1);
+    assert_eq!(
+        model.revision(),
+        revision_before_resize
+            .checked_next()
+            .expect("test revision has room")
+    );
 
     let snapshot = model.snapshot();
     assert!(!snapshot.recent_history_ansi.is_empty());

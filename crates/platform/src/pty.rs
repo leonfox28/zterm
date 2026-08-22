@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 
 use portable_pty::{Child, CommandBuilder, MasterPty};
 
+#[cfg(all(unix, not(any(target_os = "android", target_os = "redox"))))]
+use crate::account::{AccountError, EffectiveAccount};
+
 /// Visible dimensions supplied when a pseudo-terminal is opened or resized.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PtySize {
@@ -279,7 +282,7 @@ impl PtyHost {
 
         #[cfg(all(unix, not(any(target_os = "android", target_os = "redox"))))]
         {
-            let account = effective_account()?;
+            let account = EffectiveAccount::current().map_err(account_error)?;
             let builder = login_shell_builder(&account, working_directory)?;
             self.spawn_builder(builder, size)
         }
@@ -522,26 +525,14 @@ fn map_exit_status(status: &portable_pty::ExitStatus) -> PtyExitStatus {
 }
 
 #[cfg(all(unix, not(any(target_os = "android", target_os = "redox"))))]
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct EffectiveAccount {
-    home: PathBuf,
-    shell: PathBuf,
-}
-
-#[cfg(all(unix, not(any(target_os = "android", target_os = "redox"))))]
-fn effective_account() -> Result<EffectiveAccount, PtyError> {
-    use nix::unistd::{Uid, User};
-
-    let uid = Uid::effective();
-    let user = User::from_uid(uid).map_err(|error| PtyError::AccountLookup {
-        uid: uid.as_raw(),
-        detail: error.to_string(),
-    })?;
-    let user = user.ok_or(PtyError::AccountNotFound { uid: uid.as_raw() })?;
-    Ok(EffectiveAccount {
-        home: user.dir,
-        shell: user.shell,
-    })
+fn account_error(error: AccountError) -> PtyError {
+    match error {
+        AccountError::Lookup { uid, detail } => PtyError::AccountLookup { uid, detail },
+        AccountError::NotFound { uid } => PtyError::AccountNotFound { uid },
+        AccountError::UnsupportedPlatform => PtyError::UnsupportedPlatform {
+            operation: "current-account login shell",
+        },
+    }
 }
 
 #[cfg(all(unix, not(any(target_os = "android", target_os = "redox"))))]
@@ -549,14 +540,14 @@ fn login_shell_builder(
     account: &EffectiveAccount,
     requested_cwd: Option<&Path>,
 ) -> Result<CommandBuilder, PtyError> {
-    validate_directory(&account.home, PtyPathKind::HomeDirectory)?;
-    validate_executable(&account.shell, PtyPathKind::LoginShell)?;
-    let cwd = requested_cwd.unwrap_or(&account.home);
+    validate_directory(account.home(), PtyPathKind::HomeDirectory)?;
+    validate_executable(account.shell(), PtyPathKind::LoginShell)?;
+    let cwd = requested_cwd.unwrap_or_else(|| account.home());
     validate_directory(cwd, PtyPathKind::WorkingDirectory)?;
 
     let mut builder = CommandBuilder::new_default_prog();
-    builder.env("HOME", &account.home);
-    builder.env("SHELL", &account.shell);
+    builder.env("HOME", account.home());
+    builder.env("SHELL", account.shell());
     builder.cwd(cwd);
     Ok(builder)
 }
@@ -574,15 +565,15 @@ mod tests {
     #[cfg(all(unix, not(any(target_os = "android", target_os = "redox"))))]
     #[test]
     fn login_builder_uses_effective_account_defaults() -> Result<(), PtyError> {
-        let account = effective_account()?;
+        let account = EffectiveAccount::current().map_err(account_error)?;
         let builder = login_shell_builder(&account, None)?;
 
         assert!(builder.is_default_prog());
-        assert_eq!(builder.get_env("HOME"), Some(account.home.as_os_str()));
-        assert_eq!(builder.get_env("SHELL"), Some(account.shell.as_os_str()));
+        assert_eq!(builder.get_env("HOME"), Some(account.home().as_os_str()));
+        assert_eq!(builder.get_env("SHELL"), Some(account.shell().as_os_str()));
         assert_eq!(
             builder.get_cwd().map(OsString::as_os_str),
-            Some(account.home.as_os_str())
+            Some(account.home().as_os_str())
         );
         Ok(())
     }
@@ -631,13 +622,15 @@ mod tests {
     #[cfg(all(unix, not(any(target_os = "android", target_os = "redox"))))]
     #[test]
     fn login_builder_rejects_invalid_shell_and_cwd_before_open() -> Result<(), PtyError> {
-        let account = effective_account()?;
+        let account = EffectiveAccount::current().map_err(account_error)?;
         let missing_shell =
             std::env::temp_dir().join(format!("zterm-missing-login-shell-{}", std::process::id()));
-        let invalid_account = EffectiveAccount {
-            home: account.home.clone(),
-            shell: missing_shell.clone(),
-        };
+        let invalid_account = EffectiveAccount::for_test(
+            account.uid(),
+            account.gid(),
+            account.home().to_path_buf(),
+            missing_shell.clone(),
+        );
         assert_eq!(
             login_shell_builder(&invalid_account, None).err(),
             Some(PtyError::InvalidPath {

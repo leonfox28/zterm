@@ -151,7 +151,7 @@ fn run_one(options: Options) -> Result<(), String> {
         structural_bytes = structural_bytes
             .checked_add(model.resource_projection().estimated_cell_storage_bytes)
             .ok_or_else(|| "structural byte count overflow".to_owned())?;
-        final_revision = final_revision.max(model.revision());
+        final_revision = final_revision.max(model.revision().get());
     }
     black_box(&models);
     let elapsed_ns = started.elapsed().as_nanos();

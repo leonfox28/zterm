@@ -21,7 +21,7 @@ use iroh::{
 };
 use patchbay::{Device, Lab, Nat};
 use tokio::{sync::oneshot, task::JoinHandle, time::timeout};
-use zterm_daemon::transport::{FOUNDATION_GATE_ALPN, InfrastructureProfile};
+use zterm_daemon::transport::{InfrastructureProfile, ZTERM_ALPN};
 
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -492,7 +492,7 @@ async fn client_task(
         .context("server stopped before advertising its address")?;
     let connection = timeout(
         CONNECT_TIMEOUT,
-        endpoint.connect(advert.dial_addr, FOUNDATION_GATE_ALPN),
+        endpoint.connect(advert.dial_addr, ZTERM_ALPN),
     )
     .await
     .context("client connect timed out")?

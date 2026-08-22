@@ -23,6 +23,9 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Host-Authoritative Terminal Model Contract](./terminal-model.md) | Parser boundary, terminal state, safe replies, snapshots, and deltas | Active |
 | [PTY Lifecycle Contract](./pty-lifecycle.md) | Account login shell, PTY ownership, validation, and termination authority | Active |
 | [Retained Terminal Driver Contract](./terminal-driver.md) | Bounded PTY drain, latest-only attachments, and transport-independent lifetime | Active |
+| [Core and Wire Domain Contract](./core-wire-domain.md) | Shared IDs, revisions, operation replay, protobuf framing, and protocol limits | Active |
+| [Effective-User State Contract](./effective-user-state.md) | Per-user paths, configuration, identity, SQLite, and safe file operations | Active |
+| [Local Daemon and IPC Contract](./local-daemon-ipc.md) | Same-UID Unix IPC, single-instance lifecycle, detached spawn, and CLI side effects | Active |
 
 ---
 

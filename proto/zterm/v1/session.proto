@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package zterm.v1;
+
+import "zterm/v1/common.proto";
+
+message SessionSummary {
+  SessionId session_id = 1;
+  string name = 2;
+  uint64 revision = 3;
+  bool has_controller = 4;
+}
+
+message SessionListRequest { TargetSelector target = 1; }
+message SessionListResponse { repeated SessionSummary sessions = 1; }
+
+message SessionCreateRequest {
+  OperationId operation_id = 1;
+  TargetSelector target = 2;
+  string name = 3;
+  string working_directory = 4;
+}
+
+message SessionRenameRequest {
+  OperationId operation_id = 1;
+  TargetSelector target = 2;
+  SessionId session_id = 3;
+  string name = 4;
+}
+
+message SessionCloseRequest {
+  OperationId operation_id = 1;
+  TargetSelector target = 2;
+  SessionId session_id = 3;
+}
+
+message SessionTakeoverRequest {
+  OperationId operation_id = 1;
+  TargetSelector target = 2;
+  SessionId session_id = 3;
+  AttachmentId attachment_id = 4;
+}
+
+message SessionMutateResponse { SessionSummary session = 1; }

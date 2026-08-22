@@ -1,33 +1,829 @@
-//! Reproducibly generated protobuf types.
-//!
-//! Foundation still retains only the build probe. Terminal protocol messages
-//! remain intentionally out of scope until the protocol milestone.
+//! Versioned protobuf DTOs and the one bounded zterm frame codec.
 
-/// Build-only protobuf messages.
-pub mod bootstrap {
-    /// First version of the build-only schema.
-    pub mod v1 {
-        include!(concat!(env!("OUT_DIR"), "/zterm.bootstrap.v1.rs"));
+use std::fmt;
+
+use prost::Message;
+use zterm_core::{AttachmentId, DeviceId, IdLengthError, OperationId, SessionId};
+
+/// Generated version-one protocol DTOs.
+pub mod v1 {
+    #![allow(missing_docs)]
+    include!(concat!(env!("OUT_DIR"), "/zterm.v1.rs"));
+}
+
+/// Product wire major shared by local IPC and ALPN `zterm/1`.
+pub const WIRE_MAJOR: u32 = 1;
+/// Current persistent-state schema exposed in readiness/status.
+pub const STATE_SCHEMA_VERSION: u32 = zterm_core::STATE_SCHEMA_VERSION;
+/// Maximum encoded `WireFrame` body size.
+pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum concrete control-message payload size.
+pub const MAX_CONTROL_PAYLOAD_BYTES: usize = 1024 * 1024;
+/// Maximum bytes in an unsigned 64-bit varint prefix.
+pub const MAX_VARINT_BYTES: usize = 10;
+
+/// Stable validated wire message kind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum WireKind {
+    /// Local daemon readiness request.
+    LocalReadinessRequest = 1,
+    /// Local daemon readiness response.
+    LocalReadinessResponse = 2,
+    /// Local daemon status request.
+    LocalStatusRequest = 3,
+    /// Local daemon status response.
+    LocalStatusResponse = 4,
+    /// Validate existing setup request.
+    LocalValidateSetupRequest = 5,
+    /// Validate existing setup response.
+    LocalValidateSetupResponse = 6,
+    /// Graceful daemon stop request.
+    LocalStopRequest = 7,
+    /// Graceful daemon stop response.
+    LocalStopResponse = 8,
+    /// Manual update preflight request.
+    LocalUpdatePreflightRequest = 9,
+    /// Manual update preflight response.
+    LocalUpdatePreflightResponse = 10,
+    /// Typed service error response.
+    ServiceErrorResponse = 11,
+    /// Future one-time pairing offer.
+    PairOffer = 100,
+    /// Future pairing proof.
+    PairHandshake = 101,
+    /// Future session list request.
+    SessionListRequest = 200,
+    /// Future session list response.
+    SessionListResponse = 201,
+    /// Future session creation request.
+    SessionCreateRequest = 202,
+    /// Future session mutation response.
+    SessionMutateResponse = 203,
+    /// Future session rename request.
+    SessionRenameRequest = 204,
+    /// Future session close request.
+    SessionCloseRequest = 205,
+    /// Future controller takeover request.
+    SessionTakeoverRequest = 206,
+    /// Future terminal attach request.
+    TerminalAttachRequest = 300,
+    /// Future terminal full snapshot.
+    TerminalSnapshot = 301,
+    /// Future terminal merged delta.
+    TerminalDelta = 302,
+    /// Future terminal input.
+    TerminalInput = 303,
+    /// Future terminal resize.
+    TerminalResize = 304,
+    /// Future terminal detach.
+    TerminalDetach = 305,
+    /// Future acknowledgement that a snapshot was applied atomically.
+    TerminalSnapshotApplied = 306,
+    /// Future request for a snapshot from the client's known revision.
+    TerminalSyncRequest = 307,
+    /// Future instruction to resynchronize from the latest revision.
+    TerminalSyncRequired = 308,
+}
+
+impl WireKind {
+    /// Returns whether the kind uses the stricter control-payload limit.
+    #[must_use]
+    pub const fn is_control(self) -> bool {
+        !matches!(self, Self::TerminalSnapshot | Self::TerminalDelta)
     }
 }
 
-/// Version shared by the source schema and the workspace identity.
-pub const SCHEMA_VERSION: u32 = zterm_core::BOOTSTRAP_SCHEMA_VERSION;
+impl TryFrom<u32> for WireKind {
+    type Error = ProtocolError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        let kind = match value {
+            1 => Self::LocalReadinessRequest,
+            2 => Self::LocalReadinessResponse,
+            3 => Self::LocalStatusRequest,
+            4 => Self::LocalStatusResponse,
+            5 => Self::LocalValidateSetupRequest,
+            6 => Self::LocalValidateSetupResponse,
+            7 => Self::LocalStopRequest,
+            8 => Self::LocalStopResponse,
+            9 => Self::LocalUpdatePreflightRequest,
+            10 => Self::LocalUpdatePreflightResponse,
+            11 => Self::ServiceErrorResponse,
+            100 => Self::PairOffer,
+            101 => Self::PairHandshake,
+            200 => Self::SessionListRequest,
+            201 => Self::SessionListResponse,
+            202 => Self::SessionCreateRequest,
+            203 => Self::SessionMutateResponse,
+            204 => Self::SessionRenameRequest,
+            205 => Self::SessionCloseRequest,
+            206 => Self::SessionTakeoverRequest,
+            300 => Self::TerminalAttachRequest,
+            301 => Self::TerminalSnapshot,
+            302 => Self::TerminalDelta,
+            303 => Self::TerminalInput,
+            304 => Self::TerminalResize,
+            305 => Self::TerminalDetach,
+            306 => Self::TerminalSnapshotApplied,
+            307 => Self::TerminalSyncRequest,
+            308 => Self::TerminalSyncRequired,
+            unknown => return Err(ProtocolError::UnknownKind(unknown)),
+        };
+        Ok(kind)
+    }
+}
+
+/// A decoded frame after major, kind, and size validation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecodedFrame {
+    /// Stable message kind.
+    pub kind: WireKind,
+    /// Unary request correlation ID.
+    pub request_id: u64,
+    /// Relative request deadline in milliseconds; zero selects service default.
+    pub deadline_ms: u32,
+    /// Still-encoded concrete protobuf message.
+    pub payload: Vec<u8>,
+}
+
+impl DecodedFrame {
+    /// Decodes the concrete message after checking its expected kind.
+    pub fn decode_message<M: Message + Default>(
+        &self,
+        expected: WireKind,
+    ) -> Result<M, ProtocolError> {
+        if self.kind != expected {
+            return Err(ProtocolError::UnexpectedKind {
+                expected,
+                actual: self.kind,
+            });
+        }
+        M::decode(self.payload.as_slice()).map_err(ProtocolError::MalformedProtobuf)
+    }
+}
+
+/// Errors returned by the zterm frame/protobuf validation boundary.
+#[derive(Debug)]
+pub enum ProtocolError {
+    /// Length prefix exceeded unsigned 64-bit varint syntax.
+    MalformedVarint,
+    /// Stream ended in a prefix or frame body.
+    TruncatedFrame,
+    /// Frame length exceeded the 8 MiB bound before allocation.
+    FrameTooLarge(usize),
+    /// Control payload exceeded the 1 MiB bound before concrete decoding.
+    ControlPayloadTooLarge(usize),
+    /// `WireFrame` or concrete payload protobuf was malformed.
+    MalformedProtobuf(prost::DecodeError),
+    /// Peer uses an incompatible product wire major.
+    WireMajorMismatch {
+        /// Local supported major.
+        expected: u32,
+        /// Peer-provided major.
+        actual: u32,
+    },
+    /// Numeric message kind is not registered.
+    UnknownKind(u32),
+    /// Caller attempted to decode a frame as another known kind.
+    UnexpectedKind {
+        /// Kind required by the typed decoder.
+        expected: WireKind,
+        /// Kind present in the frame.
+        actual: WireKind,
+    },
+    /// Domain ID field had the wrong fixed width.
+    InvalidIdentifier(IdLengthError),
+}
+
+impl fmt::Display for ProtocolError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MalformedVarint => write!(formatter, "malformed frame length varint"),
+            Self::TruncatedFrame => write!(formatter, "stream ended inside a frame"),
+            Self::FrameTooLarge(length) => {
+                write!(
+                    formatter,
+                    "frame length {length} exceeds {MAX_FRAME_BYTES} bytes"
+                )
+            }
+            Self::ControlPayloadTooLarge(length) => write!(
+                formatter,
+                "control payload length {length} exceeds {MAX_CONTROL_PAYLOAD_BYTES} bytes"
+            ),
+            Self::MalformedProtobuf(error) => write!(formatter, "malformed protobuf: {error}"),
+            Self::WireMajorMismatch { expected, actual } => write!(
+                formatter,
+                "wire major mismatch: local {expected}, peer {actual}"
+            ),
+            Self::UnknownKind(kind) => write!(formatter, "unknown wire message kind {kind}"),
+            Self::UnexpectedKind { expected, actual } => {
+                write!(formatter, "expected {expected:?}, got {actual:?}")
+            }
+            Self::InvalidIdentifier(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for ProtocolError {}
+
+/// Incremental decoder for `varint length + WireFrame` streams.
+#[derive(Debug, Default)]
+pub struct FrameDecoder {
+    prefix: [u8; MAX_VARINT_BYTES],
+    prefix_len: usize,
+    body: Vec<u8>,
+    expected_body: Option<usize>,
+}
+
+impl FrameDecoder {
+    /// Creates an empty incremental decoder.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            prefix: [0; MAX_VARINT_BYTES],
+            prefix_len: 0,
+            body: Vec::new(),
+            expected_body: None,
+        }
+    }
+
+    /// Feeds arbitrary stream bytes and returns every complete validated frame.
+    pub fn feed(&mut self, mut input: &[u8]) -> Result<Vec<DecodedFrame>, ProtocolError> {
+        let mut frames = Vec::new();
+        while !input.is_empty() {
+            if self.expected_body.is_none() {
+                let byte = input[0];
+                input = &input[1..];
+                if self.prefix_len == MAX_VARINT_BYTES {
+                    return Err(ProtocolError::MalformedVarint);
+                }
+                self.prefix[self.prefix_len] = byte;
+                self.prefix_len += 1;
+                if byte & 0x80 == 0 {
+                    let length = decode_varint(&self.prefix[..self.prefix_len])?;
+                    let length = usize::try_from(length)
+                        .map_err(|_| ProtocolError::FrameTooLarge(usize::MAX))?;
+                    if length > MAX_FRAME_BYTES {
+                        return Err(ProtocolError::FrameTooLarge(length));
+                    }
+                    self.body = Vec::with_capacity(length);
+                    self.expected_body = Some(length);
+                } else if self.prefix_len == MAX_VARINT_BYTES {
+                    return Err(ProtocolError::MalformedVarint);
+                }
+            }
+
+            if let Some(expected) = self.expected_body {
+                let needed = expected.saturating_sub(self.body.len());
+                let taken = needed.min(input.len());
+                self.body.extend_from_slice(&input[..taken]);
+                input = &input[taken..];
+                if self.body.len() == expected {
+                    let body = std::mem::take(&mut self.body);
+                    self.expected_body = None;
+                    self.prefix_len = 0;
+                    frames.push(decode_wire_frame(&body)?);
+                }
+            }
+        }
+        Ok(frames)
+    }
+
+    /// Verifies that a completed byte stream ended on a frame boundary.
+    pub fn finish(self) -> Result<(), ProtocolError> {
+        if self.prefix_len == 0 && self.expected_body.is_none() {
+            Ok(())
+        } else {
+            Err(ProtocolError::TruncatedFrame)
+        }
+    }
+}
+
+/// Encodes one concrete protobuf message into the bounded stream format.
+pub fn encode_message<M: Message>(
+    kind: WireKind,
+    request_id: u64,
+    deadline_ms: u32,
+    message: &M,
+) -> Result<Vec<u8>, ProtocolError> {
+    encode_payload(kind, request_id, deadline_ms, message.encode_to_vec())
+}
+
+/// Encodes an already serialized concrete payload into the bounded stream format.
+pub fn encode_payload(
+    kind: WireKind,
+    request_id: u64,
+    deadline_ms: u32,
+    payload: Vec<u8>,
+) -> Result<Vec<u8>, ProtocolError> {
+    validate_payload_limit(kind, payload.len())?;
+    let wire = v1::WireFrame {
+        wire_major: WIRE_MAJOR,
+        kind: kind as u32,
+        payload,
+        request_id,
+        deadline_ms,
+    };
+    let body = wire.encode_to_vec();
+    if body.len() > MAX_FRAME_BYTES {
+        return Err(ProtocolError::FrameTooLarge(body.len()));
+    }
+    let mut output = Vec::with_capacity(MAX_VARINT_BYTES + body.len());
+    encode_varint(body.len() as u64, &mut output);
+    output.extend_from_slice(&body);
+    Ok(output)
+}
+
+fn decode_wire_frame(body: &[u8]) -> Result<DecodedFrame, ProtocolError> {
+    let wire = v1::WireFrame::decode(body).map_err(ProtocolError::MalformedProtobuf)?;
+    if wire.wire_major != WIRE_MAJOR {
+        return Err(ProtocolError::WireMajorMismatch {
+            expected: WIRE_MAJOR,
+            actual: wire.wire_major,
+        });
+    }
+    let kind = WireKind::try_from(wire.kind)?;
+    validate_payload_limit(kind, wire.payload.len())?;
+    Ok(DecodedFrame {
+        kind,
+        request_id: wire.request_id,
+        deadline_ms: wire.deadline_ms,
+        payload: wire.payload,
+    })
+}
+
+fn validate_payload_limit(kind: WireKind, length: usize) -> Result<(), ProtocolError> {
+    if kind.is_control() && length > MAX_CONTROL_PAYLOAD_BYTES {
+        Err(ProtocolError::ControlPayloadTooLarge(length))
+    } else {
+        Ok(())
+    }
+}
+
+fn encode_varint(mut value: u64, output: &mut Vec<u8>) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            output.push(byte);
+            return;
+        }
+        output.push(byte | 0x80);
+    }
+}
+
+fn decode_varint(bytes: &[u8]) -> Result<u64, ProtocolError> {
+    let mut value = 0_u64;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if index == 9 && byte > 1 {
+            return Err(ProtocolError::MalformedVarint);
+        }
+        value |= u64::from(byte & 0x7f) << (index * 7);
+        if byte & 0x80 == 0 {
+            if index > 0 && byte == 0 {
+                return Err(ProtocolError::MalformedVarint);
+            }
+            return Ok(value);
+        }
+    }
+    Err(ProtocolError::MalformedVarint)
+}
+
+impl From<DeviceId> for v1::DeviceId {
+    fn from(value: DeviceId) -> Self {
+        Self {
+            value: value.to_bytes().to_vec(),
+        }
+    }
+}
+
+impl TryFrom<v1::DeviceId> for DeviceId {
+    type Error = ProtocolError;
+
+    fn try_from(value: v1::DeviceId) -> Result<Self, Self::Error> {
+        Self::from_bytes(&value.value).map_err(ProtocolError::InvalidIdentifier)
+    }
+}
+
+impl From<SessionId> for v1::SessionId {
+    fn from(value: SessionId) -> Self {
+        Self {
+            value: value.to_bytes().to_vec(),
+        }
+    }
+}
+
+impl TryFrom<v1::SessionId> for SessionId {
+    type Error = ProtocolError;
+
+    fn try_from(value: v1::SessionId) -> Result<Self, Self::Error> {
+        Self::from_bytes(&value.value).map_err(ProtocolError::InvalidIdentifier)
+    }
+}
+
+impl From<AttachmentId> for v1::AttachmentId {
+    fn from(value: AttachmentId) -> Self {
+        Self {
+            value: value.to_bytes().to_vec(),
+        }
+    }
+}
+
+impl TryFrom<v1::AttachmentId> for AttachmentId {
+    type Error = ProtocolError;
+
+    fn try_from(value: v1::AttachmentId) -> Result<Self, Self::Error> {
+        Self::from_bytes(&value.value).map_err(ProtocolError::InvalidIdentifier)
+    }
+}
+
+impl From<OperationId> for v1::OperationId {
+    fn from(value: OperationId) -> Self {
+        Self {
+            client_epoch: value.client_epoch,
+            sequence: value.sequence,
+        }
+    }
+}
+
+impl From<v1::OperationId> for OperationId {
+    fn from(value: v1::OperationId) -> Self {
+        Self {
+            client_epoch: value.client_epoch,
+            sequence: value.sequence,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
-    use prost::Message;
+    use super::*;
 
-    use super::{SCHEMA_VERSION, bootstrap::v1::BuildProbe};
+    fn assert_message_round_trip<M>(kind: WireKind, message: M)
+    where
+        M: Message + Default + PartialEq + fmt::Debug,
+    {
+        let bytes = encode_message(kind, 41, 9_000, &message).expect("bounded future frame");
+        let mut decoder = FrameDecoder::new();
+        let frames = decoder.feed(&bytes).expect("future frame decodes");
+        decoder.finish().expect("future frame is complete");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].kind, kind);
+        assert_eq!(frames[0].request_id, 41);
+        assert_eq!(frames[0].deadline_ms, 9_000);
+        let decoded: M = frames[0]
+            .decode_message(kind)
+            .expect("future message payload decodes");
+        assert_eq!(decoded, message);
+    }
 
     #[test]
-    fn vendored_protoc_generates_round_trippable_code() -> Result<(), prost::DecodeError> {
-        let probe = BuildProbe {
-            schema_version: SCHEMA_VERSION,
-        };
-        let decoded = BuildProbe::decode(probe.encode_to_vec().as_slice())?;
+    fn frame_round_trip_and_unknown_fields_are_compatible() {
+        let message = v1::LocalStatusRequest {};
+        let mut bytes = encode_message(WireKind::LocalStatusRequest, 17, 5_000, &message)
+            .expect("bounded status frame");
+        assert_eq!(
+            bytes,
+            [0x09, 0x08, 0x01, 0x10, 0x03, 0x20, 0x11, 0x28, 0x88, 0x27],
+            "language-neutral v1 empty-status golden frame"
+        );
+        let body_length = bytes[0] as usize;
+        assert!(body_length < 0x80, "fixture keeps one-byte prefix");
+        bytes[0] = u8::try_from(body_length + 3).expect("small fixture body");
+        bytes.extend_from_slice(&[0xf8, 0x07, 0x01]);
 
-        assert_eq!(decoded, probe);
-        Ok(())
+        let mut decoder = FrameDecoder::new();
+        let frames = decoder
+            .feed(&bytes)
+            .expect("unknown protobuf field ignored");
+        decoder.finish().expect("complete frame boundary");
+        assert_eq!(frames.len(), 1);
+        let decoded: v1::LocalStatusRequest = frames[0]
+            .decode_message(WireKind::LocalStatusRequest)
+            .expect("typed payload");
+        assert_eq!(decoded, message);
+        assert_eq!(frames[0].request_id, 17);
+    }
+
+    #[test]
+    fn decoder_rejects_unknown_major_kind_and_incomplete_or_malformed_lengths() {
+        let unknown_major = v1::WireFrame {
+            wire_major: 2,
+            kind: WireKind::LocalStatusRequest as u32,
+            payload: Vec::new(),
+            request_id: 1,
+            deadline_ms: 0,
+        };
+        let mut bytes = Vec::new();
+        let body = unknown_major.encode_to_vec();
+        encode_varint(body.len() as u64, &mut bytes);
+        bytes.extend_from_slice(&body);
+        assert!(matches!(
+            FrameDecoder::new().feed(&bytes),
+            Err(ProtocolError::WireMajorMismatch { actual: 2, .. })
+        ));
+
+        let unknown_kind = v1::WireFrame {
+            wire_major: WIRE_MAJOR,
+            kind: 65_535,
+            payload: Vec::new(),
+            request_id: 1,
+            deadline_ms: 0,
+        };
+        let body = unknown_kind.encode_to_vec();
+        let mut bytes = Vec::new();
+        encode_varint(body.len() as u64, &mut bytes);
+        bytes.extend_from_slice(&body);
+        assert!(matches!(
+            FrameDecoder::new().feed(&bytes),
+            Err(ProtocolError::UnknownKind(65_535))
+        ));
+
+        let mut truncated = FrameDecoder::new();
+        assert!(truncated.feed(&[5, 1, 2]).is_ok());
+        assert!(matches!(
+            truncated.finish(),
+            Err(ProtocolError::TruncatedFrame)
+        ));
+        assert!(matches!(
+            FrameDecoder::new().feed(&[0x80; MAX_VARINT_BYTES]),
+            Err(ProtocolError::MalformedVarint)
+        ));
+        assert!(matches!(
+            FrameDecoder::new().feed(&[0x80, 0x00]),
+            Err(ProtocolError::MalformedVarint)
+        ));
+        assert!(matches!(
+            FrameDecoder::new().feed(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02]),
+            Err(ProtocolError::MalformedVarint)
+        ));
+        assert!(matches!(
+            FrameDecoder::new().feed(&[0xff, 0xff, 0xff, 0xff, 0x7f]),
+            Err(ProtocolError::FrameTooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn encoder_and_decoder_enforce_control_and_total_frame_limits() {
+        let exact_control = encode_payload(
+            WireKind::LocalStatusResponse,
+            1,
+            0,
+            vec![0; MAX_CONTROL_PAYLOAD_BYTES],
+        )
+        .expect("exact control ceiling is accepted");
+        assert_eq!(
+            FrameDecoder::new()
+                .feed(&exact_control)
+                .expect("exact control frame decodes")
+                .len(),
+            1
+        );
+        assert!(matches!(
+            encode_payload(
+                WireKind::LocalStatusResponse,
+                1,
+                0,
+                vec![0; MAX_CONTROL_PAYLOAD_BYTES + 1]
+            ),
+            Err(ProtocolError::ControlPayloadTooLarge(_))
+        ));
+        let oversized_control = v1::WireFrame {
+            wire_major: WIRE_MAJOR,
+            kind: WireKind::LocalStatusResponse as u32,
+            payload: vec![0; MAX_CONTROL_PAYLOAD_BYTES + 1],
+            request_id: 1,
+            deadline_ms: 0,
+        }
+        .encode_to_vec();
+        let mut oversized_control_frame = Vec::new();
+        encode_varint(oversized_control.len() as u64, &mut oversized_control_frame);
+        oversized_control_frame.extend_from_slice(&oversized_control);
+        assert!(matches!(
+            FrameDecoder::new().feed(&oversized_control_frame),
+            Err(ProtocolError::ControlPayloadTooLarge(_))
+        ));
+        let terminal = encode_payload(
+            WireKind::TerminalSnapshot,
+            1,
+            0,
+            vec![0; MAX_CONTROL_PAYLOAD_BYTES + 1],
+        )
+        .expect("terminal data can use the frame ceiling");
+        let mut decoder = FrameDecoder::new();
+        assert_eq!(
+            decoder
+                .feed(&terminal)
+                .expect("bounded terminal frame")
+                .len(),
+            1
+        );
+
+        let mut prefix = Vec::new();
+        encode_varint((MAX_FRAME_BYTES + 1) as u64, &mut prefix);
+        assert!(matches!(
+            FrameDecoder::new().feed(&prefix),
+            Err(ProtocolError::FrameTooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn fixed_width_domain_ids_validate_once_at_proto_boundary() {
+        let device = DeviceId::from_array([42; 32]);
+        let decoded = DeviceId::try_from(v1::DeviceId::from(device)).expect("valid device id");
+        assert_eq!(decoded, device);
+        assert!(matches!(
+            DeviceId::try_from(v1::DeviceId { value: vec![0; 31] }),
+            Err(ProtocolError::InvalidIdentifier(_))
+        ));
+    }
+
+    #[test]
+    fn wire_kind_registry_matches_the_proto_source_of_truth() {
+        let kinds = [
+            (
+                WireKind::LocalReadinessRequest,
+                v1::MessageKind::LocalReadinessRequest as u32,
+            ),
+            (
+                WireKind::LocalReadinessResponse,
+                v1::MessageKind::LocalReadinessResponse as u32,
+            ),
+            (
+                WireKind::LocalStatusRequest,
+                v1::MessageKind::LocalStatusRequest as u32,
+            ),
+            (
+                WireKind::LocalStatusResponse,
+                v1::MessageKind::LocalStatusResponse as u32,
+            ),
+            (
+                WireKind::LocalValidateSetupRequest,
+                v1::MessageKind::LocalValidateSetupRequest as u32,
+            ),
+            (
+                WireKind::LocalValidateSetupResponse,
+                v1::MessageKind::LocalValidateSetupResponse as u32,
+            ),
+            (
+                WireKind::LocalStopRequest,
+                v1::MessageKind::LocalStopRequest as u32,
+            ),
+            (
+                WireKind::LocalStopResponse,
+                v1::MessageKind::LocalStopResponse as u32,
+            ),
+            (
+                WireKind::LocalUpdatePreflightRequest,
+                v1::MessageKind::LocalUpdatePreflightRequest as u32,
+            ),
+            (
+                WireKind::LocalUpdatePreflightResponse,
+                v1::MessageKind::LocalUpdatePreflightResponse as u32,
+            ),
+            (
+                WireKind::ServiceErrorResponse,
+                v1::MessageKind::ServiceErrorResponse as u32,
+            ),
+            (WireKind::PairOffer, v1::MessageKind::PairOffer as u32),
+            (
+                WireKind::PairHandshake,
+                v1::MessageKind::PairHandshake as u32,
+            ),
+            (
+                WireKind::SessionListRequest,
+                v1::MessageKind::SessionListRequest as u32,
+            ),
+            (
+                WireKind::SessionListResponse,
+                v1::MessageKind::SessionListResponse as u32,
+            ),
+            (
+                WireKind::SessionCreateRequest,
+                v1::MessageKind::SessionCreateRequest as u32,
+            ),
+            (
+                WireKind::SessionMutateResponse,
+                v1::MessageKind::SessionMutateResponse as u32,
+            ),
+            (
+                WireKind::SessionRenameRequest,
+                v1::MessageKind::SessionRenameRequest as u32,
+            ),
+            (
+                WireKind::SessionCloseRequest,
+                v1::MessageKind::SessionCloseRequest as u32,
+            ),
+            (
+                WireKind::SessionTakeoverRequest,
+                v1::MessageKind::SessionTakeoverRequest as u32,
+            ),
+            (
+                WireKind::TerminalAttachRequest,
+                v1::MessageKind::TerminalAttachRequest as u32,
+            ),
+            (
+                WireKind::TerminalSnapshot,
+                v1::MessageKind::TerminalSnapshot as u32,
+            ),
+            (
+                WireKind::TerminalDelta,
+                v1::MessageKind::TerminalDelta as u32,
+            ),
+            (
+                WireKind::TerminalInput,
+                v1::MessageKind::TerminalInput as u32,
+            ),
+            (
+                WireKind::TerminalResize,
+                v1::MessageKind::TerminalResize as u32,
+            ),
+            (
+                WireKind::TerminalDetach,
+                v1::MessageKind::TerminalDetach as u32,
+            ),
+            (
+                WireKind::TerminalSnapshotApplied,
+                v1::MessageKind::TerminalSnapshotApplied as u32,
+            ),
+            (
+                WireKind::TerminalSyncRequest,
+                v1::MessageKind::TerminalSyncRequest as u32,
+            ),
+            (
+                WireKind::TerminalSyncRequired,
+                v1::MessageKind::TerminalSyncRequired as u32,
+            ),
+        ];
+
+        for (kind, proto_number) in kinds {
+            assert_eq!(kind as u32, proto_number);
+            assert_eq!(
+                WireKind::try_from(proto_number).expect("registered kind"),
+                kind
+            );
+        }
+    }
+
+    #[test]
+    fn future_session_and_terminal_contract_shapes_round_trip_without_dispatch() {
+        let operation_id = Some(v1::OperationId {
+            client_epoch: 7,
+            sequence: 11,
+        });
+        let target = Some(v1::TargetSelector {
+            target: Some(v1::target_selector::Target::Local(true)),
+        });
+        let session_id = Some(v1::SessionId { value: vec![3; 16] });
+        let attachment_id = Some(v1::AttachmentId { value: vec![5; 16] });
+
+        assert_message_round_trip(
+            WireKind::SessionRenameRequest,
+            v1::SessionRenameRequest {
+                operation_id,
+                target: target.clone(),
+                session_id: session_id.clone(),
+                name: "build".to_owned(),
+            },
+        );
+        assert_message_round_trip(
+            WireKind::SessionCloseRequest,
+            v1::SessionCloseRequest {
+                operation_id,
+                target: target.clone(),
+                session_id: session_id.clone(),
+            },
+        );
+        assert_message_round_trip(
+            WireKind::SessionTakeoverRequest,
+            v1::SessionTakeoverRequest {
+                operation_id,
+                target,
+                session_id,
+                attachment_id: attachment_id.clone(),
+            },
+        );
+        assert_message_round_trip(
+            WireKind::TerminalSnapshotApplied,
+            v1::TerminalSnapshotApplied {
+                attachment_id: attachment_id.clone(),
+                revision: 13,
+            },
+        );
+        assert_message_round_trip(
+            WireKind::TerminalSyncRequest,
+            v1::TerminalSyncRequest {
+                attachment_id: attachment_id.clone(),
+                known_revision: 13,
+            },
+        );
+        assert_message_round_trip(
+            WireKind::TerminalSyncRequired,
+            v1::TerminalSyncRequired {
+                attachment_id,
+                latest_revision: 17,
+            },
+        );
     }
 }

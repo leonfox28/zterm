@@ -1,0 +1,14 @@
+{"file": ".trellis/spec/guides/evidence-driven-simplicity.md", "reason": "Keep validation, recovery and test ownership minimal and evidence-driven."}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Map core/proto/platform/daemon/CLI contracts and keep one decoder per boundary."}
+{"file": ".trellis/spec/guides/cross-platform-thinking-guide.md", "reason": "Preserve macOS/Linux behavior and Windows checkout/compile contracts."}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "Reuse the existing effective-account, terminal and infrastructure boundaries."}
+{"file": ".trellis/spec/backend/pty-lifecycle.md", "reason": "Refactor account lookup without changing the proven PTY ownership/lifecycle contract."}
+{"file": ".trellis/spec/backend/terminal-driver.md", "reason": "Keep daemon composition and revision ownership compatible with the retained driver."}
+{"file": ".trellis/spec/backend/relay-deployment.md", "reason": "Retain official N0 as product default and self-hosted Relay as an explicit separate profile."}
+{"file": ".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/local-self-attach.md", "reason": "Preserve the approved local selector and one-SessionService self-attach boundary."}
+{"file": ".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/per-user-daemon.md", "reason": "Preserve the approved per-user detached daemon and no-autostart decision."}
+{"file": ".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/install-version-identity-lifecycle.md", "reason": "Preserve setup-time identity generation and uninstall/reinstall identity semantics."}
+{"file": ".trellis/tasks/archive/2026-08/08-21-foundation-gate/research/platform-matrix.md", "reason": "Use the proven macOS/Linux/Windows compilation and PTY platform boundary."}
+{"file": ".trellis/tasks/archive/2026-08/08-21-foundation-gate/research/pty-wait-lock-retrospective.md", "reason": "Avoid holding shared process locks across waits and avoid retry-masking concurrency defects."}
+{"file": ".trellis/tasks/08-22-core-local-daemon/research/current-boundary.md", "reason": "Start from the actual Foundation code and avoid recreating or skipping retained layers."}
+{"file": ".trellis/tasks/08-22-core-local-daemon/research/dependency-and-platform-primitives.md", "reason": "Use the selected Rust 1.98, SQLite, file-lock, peer-credential and detach primitives."}

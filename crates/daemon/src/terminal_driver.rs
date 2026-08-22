@@ -8,6 +8,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use zterm_core::Revision;
 use zterm_core::terminal::{
     TerminalCheckpoint, TerminalDeltaResult, TerminalError, TerminalModel, TerminalSize,
     TerminalSnapshot,
@@ -211,7 +212,7 @@ impl TerminalDriver {
     }
 
     /// Resizes both the native PTY and the authoritative terminal model.
-    pub fn resize(&self, size: TerminalSize) -> Result<u64, TerminalDriverError> {
+    pub fn resize(&self, size: TerminalSize) -> Result<Revision, TerminalDriverError> {
         lock(&self.session, "PTY session")?.resize(PtySize::new(size.rows, size.columns))?;
         let revision = self.shared.resize(size)?;
         Ok(revision)
@@ -260,8 +261,8 @@ impl TerminalDriver {
 
     /// Returns the latest published model revision.
     #[must_use]
-    pub fn latest_revision(&self) -> u64 {
-        self.shared.revision.load(Ordering::Acquire)
+    pub fn latest_revision(&self) -> Revision {
+        Revision::new(self.shared.revision.load(Ordering::Acquire))
     }
 
     /// Returns bounded queue and subscriber statistics.
@@ -288,9 +289,9 @@ impl TerminalAttachment {
     /// Waits until the authoritative model advances beyond `revision`.
     pub fn wait_for_revision_after(
         &self,
-        revision: u64,
+        revision: Revision,
         timeout: Duration,
-    ) -> Result<u64, TerminalDriverError> {
+    ) -> Result<Revision, TerminalDriverError> {
         self.shared.wait_for_revision_after(revision, timeout)
     }
 
@@ -339,7 +340,7 @@ struct SharedTerminal {
 }
 
 struct RevisionState {
-    latest: u64,
+    latest: Revision,
     failure: Option<TerminalDriverError>,
 }
 
@@ -348,7 +349,7 @@ impl SharedTerminal {
         let revision = model.revision();
         Self {
             model: Mutex::new(model),
-            revision: AtomicU64::new(revision),
+            revision: AtomicU64::new(revision.get()),
             revision_wait: Mutex::new(RevisionState {
                 latest: revision,
                 failure: None,
@@ -368,13 +369,13 @@ impl SharedTerminal {
         Ok(lock(&self.model, "terminal model")?.ingest(bytes)?)
     }
 
-    fn resize(&self, size: TerminalSize) -> Result<u64, TerminalDriverError> {
+    fn resize(&self, size: TerminalSize) -> Result<Revision, TerminalDriverError> {
         let update = lock(&self.model, "terminal model")?.resize(size)?;
         self.publish_revision(update.revision)?;
         Ok(update.revision)
     }
 
-    fn record_processed(&self, byte_count: usize, revision: u64) {
+    fn record_processed(&self, byte_count: usize, revision: Revision) {
         self.processed_chunks.fetch_add(1, Ordering::AcqRel);
         self.processed_bytes.fetch_add(
             u64::try_from(byte_count).unwrap_or(u64::MAX),
@@ -385,8 +386,8 @@ impl SharedTerminal {
         }
     }
 
-    fn publish_revision(&self, revision: u64) -> Result<(), TerminalDriverError> {
-        self.revision.store(revision, Ordering::Release);
+    fn publish_revision(&self, revision: Revision) -> Result<(), TerminalDriverError> {
+        self.revision.store(revision.get(), Ordering::Release);
         lock(&self.revision_wait, "revision waterline")?.latest = revision;
         self.revision_changed.notify_all();
         Ok(())
@@ -394,9 +395,9 @@ impl SharedTerminal {
 
     fn wait_for_revision_after(
         &self,
-        revision: u64,
+        revision: Revision,
         timeout: Duration,
-    ) -> Result<u64, TerminalDriverError> {
+    ) -> Result<Revision, TerminalDriverError> {
         let deadline = Instant::now() + timeout;
         let mut state = lock(&self.revision_wait, "revision waterline")?;
         loop {

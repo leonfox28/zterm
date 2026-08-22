@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package zterm.v1;
+
+message DeviceId { bytes value = 1; }
+message SessionId { bytes value = 1; }
+message AttachmentId { bytes value = 1; }
+
+message OperationId {
+  uint64 client_epoch = 1;
+  uint64 sequence = 2;
+}
+
+message TargetSelector {
+  oneof target {
+    bool local = 1;
+    DeviceId device = 2;
+  }
+}
+
+message ProtocolVersion {
+  uint32 wire_major = 1;
+  uint32 state_schema = 2;
+  uint64 capabilities = 3;
+}
+
+message ServiceError {
+  string code = 1;
+  string message = 2;
+}

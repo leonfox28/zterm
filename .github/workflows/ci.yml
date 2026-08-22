@@ -45,12 +45,24 @@ jobs:
       - name: Check formatting
         run: cargo +1.98.0 fmt --all -- --check
       - name: Run Clippy
+        if: runner.os != 'Windows'
         run: cargo +1.98.0 clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Compile Windows shared and unsupported boundaries
+        if: runner.os == 'Windows'
+        run: cargo +1.98.0 clippy --workspace --lib --bins --all-features -- -D warnings
       - name: Run tests (Unix includes PTY lifecycle)
+        if: runner.os != 'Windows'
         run: cargo +1.98.0 test --workspace --all-features
+      - name: Run Windows shared-contract tests
+        if: runner.os == 'Windows'
+        run: >-
+          cargo +1.98.0 test
+          -p zterm-core -p zterm-proto -p zterm-platform -p zterm-daemon
+          --lib --all-features
       - name: Build documentation
         run: cargo +1.98.0 doc --workspace --no-deps
-      - name: Run side-effect-free Foundation placeholder
+      - name: Run no-argument M3 milestone help
+        if: runner.os != 'Windows'
         run: cargo +1.98.0 run --quiet --package zterm-cli
 
   dependencies:

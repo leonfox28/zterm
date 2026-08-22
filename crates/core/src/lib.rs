@@ -1,14 +1,21 @@
 //! Shared zterm domain types and build identity.
 
+pub mod domain;
 pub mod terminal;
 
+pub use domain::{
+    AttachmentId, AttachmentPrincipal, Capabilities, ControllerLease, DeviceId, DomainErrorKind,
+    IdLengthError, OperationId, OperationOutcome, OperationWindow, OperationWindowError,
+    ResourceLimits, Revision, SessionId,
+};
+
 /// Human-readable name of the active implementation phase.
-pub const PHASE_NAME: &str = "phase-one-foundation-gate";
+pub const PHASE_NAME: &str = "phase-one-core-local-daemon";
 
-/// Version of the build-only protobuf probe schema.
-pub const BOOTSTRAP_SCHEMA_VERSION: u32 = 1;
+/// Current persistent-state schema version.
+pub const STATE_SCHEMA_VERSION: u32 = 1;
 
-/// Immutable identity exposed by the placeholder binaries.
+/// Immutable identity exposed by build and status projections.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BuildIdentity {
     /// Cargo package version.

@@ -10,8 +10,24 @@ name = "zterm"
 path = "src/main.rs"
 
 [dependencies]
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+zterm-core.workspace = true
 zterm-daemon.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+zterm-platform.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+nix.workspace = true
 
 [lints]
 workspace = true
 
+[[test]]
+name = "daemon_autospawn"
+path = "tests/daemon_autospawn.rs"
+harness = false

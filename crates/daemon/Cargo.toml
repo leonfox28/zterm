@@ -7,6 +7,13 @@ publish.workspace = true
 
 [dependencies]
 iroh.workspace = true
+prost.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 zterm-core.workspace = true
 zterm-platform.workspace = true
 zterm-proto.workspace = true
@@ -14,6 +21,7 @@ zterm-proto.workspace = true
 [dev-dependencies]
 anyhow.workspace = true
 futures-util.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
@@ -35,6 +43,21 @@ harness = false
 [[test]]
 name = "terminal_blackbox"
 path = "tests/terminal_blackbox.rs"
+harness = false
+
+[[test]]
+name = "single_instance"
+path = "tests/single_instance.rs"
+harness = false
+
+[[test]]
+name = "detached_lifecycle"
+path = "tests/detached_lifecycle.rs"
+harness = false
+
+[[test]]
+name = "cross_uid"
+path = "tests/cross_uid.rs"
 harness = false
 
 [lints]

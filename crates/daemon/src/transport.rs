@@ -1,7 +1,7 @@
 //! Iroh infrastructure selection for zterm endpoints.
 
 use iroh::{
-    Endpoint, RelayMode, RelayUrl, SecretKey,
+    Endpoint, RelayConfig, RelayMap, RelayMode, RelayUrl, SecretKey,
     address_lookup::{
         AddrFilter, DnsAddressLookup, N0_DNS_ENDPOINT_ORIGIN_PROD, N0_DNS_PKARR_RELAY_PROD,
         PkarrPublisher, PkarrResolver,
@@ -9,8 +9,10 @@ use iroh::{
     endpoint::{Builder, presets},
 };
 
-/// The first protocol identifier used only by the Foundation Gate.
-pub const FOUNDATION_GATE_ALPN: &[u8] = b"zterm-gate/1";
+use crate::config::ValidatedInfrastructure;
+
+/// Product protocol identifier for wire major one.
+pub const ZTERM_ALPN: &[u8] = b"zterm/1";
 
 /// Effective configuration of one Relay entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -41,8 +43,17 @@ pub struct InfrastructureProfileSummary {
 }
 
 /// The infrastructure services used to build an Iroh endpoint.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct InfrastructureProfile;
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum InfrastructureProfile {
+    /// Iroh's pinned official n0 production map.
+    #[default]
+    OfficialN0,
+    /// One explicit self-hosted Relay with QAD disabled.
+    SelfHosted {
+        /// Relay-only HTTPS URL.
+        relay_url: RelayUrl,
+    },
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProductionAddressLookups {
@@ -79,14 +90,26 @@ impl InfrastructureProfile {
     /// change this product profile.
     #[must_use]
     pub const fn zterm() -> Self {
-        Self
+        Self::OfficialN0
+    }
+
+    /// Constructs the endpoint profile selected by validated config.
+    #[must_use]
+    pub fn from_validated(config: &ValidatedInfrastructure) -> Self {
+        match config {
+            ValidatedInfrastructure::OfficialN0 => Self::OfficialN0,
+            ValidatedInfrastructure::SelfHosted(relay_url) => Self::SelfHosted {
+                relay_url: relay_url.clone(),
+            },
+        }
     }
 
     /// Returns a read-only projection of the effective Relay and lookup configuration.
     #[must_use]
     pub fn summary(&self) -> InfrastructureProfileSummary {
         let lookups = ProductionAddressLookups::from_iroh_constants();
-        let relays = RelayMode::Default
+        let relays = self
+            .relay_mode()
             .relay_map()
             .relays::<Vec<_>>()
             .into_iter()
@@ -103,7 +126,7 @@ impl InfrastructureProfile {
             dns_lookup_origin: lookups.dns_origin,
             publishes_direct_addresses: false,
             portmapper_enabled: true,
-            alpns: vec![FOUNDATION_GATE_ALPN.to_vec()],
+            alpns: vec![ZTERM_ALPN.to_vec()],
         }
     }
 
@@ -118,8 +141,20 @@ impl InfrastructureProfile {
         ProductionAddressLookups::from_iroh_constants()
             .apply(Endpoint::builder(presets::Minimal))
             .secret_key(secret_key)
-            .relay_mode(RelayMode::Default)
+            .relay_mode(self.relay_mode())
             .addr_filter(AddrFilter::relay_only())
-            .alpns(vec![FOUNDATION_GATE_ALPN.to_vec()])
+            .alpns(vec![ZTERM_ALPN.to_vec()])
+    }
+
+    fn relay_mode(&self) -> RelayMode {
+        match self {
+            Self::OfficialN0 => RelayMode::Default,
+            Self::SelfHosted { relay_url } => {
+                RelayMode::Custom(RelayMap::from_iter([RelayConfig::new(
+                    relay_url.clone(),
+                    None,
+                )]))
+            }
+        }
     }
 }

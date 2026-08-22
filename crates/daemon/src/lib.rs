@@ -1,13 +1,21 @@
-//! Daemon foundations.
+//! Per-user state, local daemon lifecycle, terminal driver, and future Iroh adapter.
 //!
-//! The crate still does not start a process or bind sockets by itself. It owns
-//! the infrastructure profile used when a caller explicitly creates an Iroh
-//! endpoint.
+//! Local readiness binds only a same-UID Unix socket. Iroh endpoint binding,
+//! pairing, and session service remain later milestones.
 
+pub mod bootstrap;
+pub mod config;
+pub mod error;
+pub mod identity;
+pub mod lifecycle;
+pub mod local_ipc;
+pub mod operations;
+pub mod service;
+pub mod store;
 pub mod terminal_driver;
 pub mod transport;
 
-/// Information printed by the Foundation CLI placeholder.
+/// Static workspace build information.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BootstrapStatus {
     /// Cargo package version.
@@ -18,7 +26,7 @@ pub struct BootstrapStatus {
     pub os: &'static str,
     /// Compile-time CPU architecture.
     pub arch: &'static str,
-    /// Build-only protobuf schema version.
+    /// Persistent-state schema version.
     pub schema_version: u32,
 }
 
@@ -33,7 +41,7 @@ pub const fn bootstrap_status() -> BootstrapStatus {
         phase: identity.phase,
         os: platform.os,
         arch: platform.arch,
-        schema_version: zterm_proto::SCHEMA_VERSION,
+        schema_version: zterm_proto::STATE_SCHEMA_VERSION,
     }
 }
 
@@ -42,9 +50,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn placeholder_reports_only_static_build_data() {
+    fn build_status_reports_only_static_data() {
         let status = bootstrap_status();
         assert_eq!(status.phase, zterm_core::PHASE_NAME);
-        assert_eq!(status.schema_version, zterm_core::BOOTSTRAP_SCHEMA_VERSION);
+        assert_eq!(status.schema_version, zterm_core::STATE_SCHEMA_VERSION);
     }
 }

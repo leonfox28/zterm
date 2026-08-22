@@ -7,6 +7,8 @@
 
 use std::{fmt, mem};
 
+use crate::Revision;
+
 const PRIMARY_DEVICE_ATTRIBUTES_REPLY: &[u8] = b"\x1b[?1;2c";
 const DEVICE_STATUS_OK_REPLY: &[u8] = b"\x1b[0n";
 const MAIN_SCREEN: &[u8] = b"\x1b[?1049l";
@@ -226,7 +228,7 @@ pub enum TerminalSideEvent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TerminalUpdate {
     /// Model revision after the operation.
-    pub revision: u64,
+    pub revision: Revision,
     /// Controlled bytes which must be written back to the hosted PTY.
     pub replies: Vec<u8>,
     /// Bounded non-rendering side events.
@@ -255,7 +257,7 @@ pub struct TerminalResourceProjection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TerminalSnapshot {
     /// Revision represented by the snapshot.
-    pub revision: u64,
+    pub revision: Revision,
     /// Viewport size represented by the snapshot.
     pub size: TerminalSize,
     /// Screen selected by the snapshot.
@@ -285,9 +287,9 @@ impl TerminalSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TerminalDelta {
     /// Checkpoint revision used as the baseline.
-    pub from_revision: u64,
+    pub from_revision: Revision,
     /// Latest model revision represented by the delta.
-    pub to_revision: u64,
+    pub to_revision: Revision,
     /// Viewport size represented by the delta.
     pub size: TerminalSize,
     /// Screen selected after applying the delta.
@@ -318,7 +320,7 @@ pub enum TerminalDeltaResult {
 /// Opaque baseline for producing one merged latest-state delta.
 #[derive(Clone)]
 pub struct TerminalCheckpoint {
-    revision: u64,
+    revision: Revision,
     size: TerminalSize,
     active_screen: ActiveScreen,
     focus_reporting: bool,
@@ -378,7 +380,7 @@ impl std::error::Error for TerminalError {}
 /// Host-authoritative terminal model.
 pub struct TerminalModel {
     parser: vt100::Parser<SafeCallbacks>,
-    revision: u64,
+    revision: Revision,
     scrollback_rows: usize,
     resource_projection: TerminalResourceProjection,
 }
@@ -395,7 +397,7 @@ impl TerminalModel {
                 scrollback_rows,
                 SafeCallbacks::default(),
             ),
-            revision: 0,
+            revision: Revision::ZERO,
             scrollback_rows,
             resource_projection,
         })
@@ -403,7 +405,7 @@ impl TerminalModel {
 
     /// Returns the current monotonically increasing revision.
     #[must_use]
-    pub const fn revision(&self) -> u64 {
+    pub const fn revision(&self) -> Revision {
         self.revision
     }
 
@@ -561,9 +563,9 @@ impl TerminalModel {
         self.resource_projection
     }
 
-    fn next_revision(&self) -> Result<u64, TerminalError> {
+    fn next_revision(&self) -> Result<Revision, TerminalError> {
         self.revision
-            .checked_add(1)
+            .checked_next()
             .ok_or(TerminalError::RevisionOverflow)
     }
 }
@@ -892,7 +894,7 @@ mod tests {
     fn revision_overflow_never_mutates_terminal_state() {
         let mut model =
             TerminalModel::new(TerminalSize::new(2, 8), 0).expect("small terminal model is valid");
-        model.revision = u64::MAX;
+        model.revision = Revision::new(u64::MAX);
         let before = model.state();
 
         assert_eq!(

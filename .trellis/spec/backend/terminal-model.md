@@ -31,7 +31,8 @@ TerminalModel::state(&self) -> TerminalState
 TerminalModel::resource_projection(&self) -> TerminalResourceProjection
 ```
 
-`TerminalSnapshot` carries `revision`, `size`, `active_screen`,
+`Revision` is the zterm-owned checked newtype shared by core, protocol
+conversions, and the daemon driver. `TerminalSnapshot` carries `revision`, `size`, `active_screen`,
 `screen_ansi`, `recent_history_ansi`, and `modes`. `TerminalDelta` carries
 `from_revision`, `to_revision`, `size`, `active_screen`, `ansi`, and `modes`.
 `TerminalCheckpoint` is opaque. No public field or signature may expose a
@@ -42,7 +43,7 @@ or icon-name event retains at most `MAX_TITLE_BYTES = 256` source bytes.
 
 ## 3. Contracts
 
-- Non-empty PTY chunks are ingested in order and advance one checked `u64`
+- Non-empty PTY chunks are ingested in order and advance one checked `Revision`
   revision. Empty input is a no-op. A successful resize also advances exactly
   one revision, including a same-size resize.
 - `TerminalState` is the semantic comparison boundary: current screen, size,

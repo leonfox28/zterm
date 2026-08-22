@@ -7,7 +7,7 @@ use iroh::{
     address_lookup::{N0_DNS_ENDPOINT_ORIGIN_PROD, N0_DNS_PKARR_RELAY_PROD},
     defaults::DEFAULT_RELAY_QUIC_PORT,
 };
-use zterm_daemon::transport::{FOUNDATION_GATE_ALPN, InfrastructureProfile};
+use zterm_daemon::transport::{InfrastructureProfile, ZTERM_ALPN};
 
 const EXPECTED_N0_PRODUCTION_RELAYS: [&str; 4] = [
     "https://use1-1.relay.n0.iroh.link.",
@@ -143,7 +143,7 @@ fn assert_production_lookup_contract(profile: &InfrastructureProfile) {
     assert_eq!(summary.dns_lookup_origin, EXPECTED_N0_PRODUCTION_DNS_ORIGIN);
     assert!(!summary.publishes_direct_addresses);
     assert!(summary.portmapper_enabled);
-    assert_eq!(summary.alpns, [FOUNDATION_GATE_ALPN.to_vec()]);
+    assert_eq!(summary.alpns, [ZTERM_ALPN.to_vec()]);
 
     assert_effective_builder_contract(profile);
 }

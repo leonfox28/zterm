@@ -69,7 +69,9 @@ Each entry retains Iroh's default QAD configuration on UDP 7842. The same test
 asserted that the production map is disjoint from `RelayMode::Staging` and does
 not contain `relay.zenithconsulting.cn`. The n0 DNS/Pkarr publisher, resolver,
 and DNS lookup remain installed; publication remains relay-only; port mapping
-remains enabled; and the Gate accepts only `zterm-gate/1`. An isolated child
+remains enabled; and the Foundation Gate accepted its then-temporary
+`zterm-gate/1` ALPN. M3 subsequently replaced it with product ALPN `zterm/1`
+when the versioned wire contract landed. An isolated child
 process regression also confirmed that setting `IROH_FORCE_STAGING_RELAYS`
 does not change any production lookup URL, DNS origin, or Relay entry.
 Identities were generated in memory and were not written to `~/.zterm`.
@@ -140,9 +142,11 @@ profile, candidate construction, and path observation code are unchanged.
 The retained `zterm-core::terminal` boundary uses exactly `vt100 0.16.2`
 behind private fields. Public snapshots, deltas, checkpoints, states, modes,
 cells, side events, resource projections, and errors are all zterm-owned types;
-no parser type or wire format crosses the boundary. `BuildIdentity` remains
-available and now reports `phase-one-foundation-gate`; the CLI is still a
-side-effect-free build probe rather than a daemon/session user interface.
+no parser type or wire format crosses the boundary. At the time of this
+retained report, `BuildIdentity` reported `phase-one-foundation-gate` and the
+CLI was a side-effect-free build probe. M3 now reports
+`phase-one-core-local-daemon` and provides lifecycle commands; terminal/session
+attach remains unimplemented.
 
 Ordered non-empty ingest and every successful resize advance one checked `u64`
 revision. Empty ingest is a no-op. Invalid sizes, revision overflow, and
@@ -384,10 +388,11 @@ Clippy, all workspace tests (including real PTY/drain/resync), and docs, then
 removed its exact container and target volume. The local Windows platform-only
 MSVC cross-check described in Step 3 passed before the hosted Windows run.
 
-`PHASE_NAME` now reports `phase-one-foundation-gate`. The CLI remains the same
-side-effect-free build probe at workspace version 0.1.1; no daemon process,
-configuration, socket, pairing state, session registry, or UI was added by the
-phase-name update.
+For this historical Foundation result, `PHASE_NAME` reported
+`phase-one-foundation-gate` and the CLI remained the same side-effect-free
+build probe at workspace version 0.1.1; that Gate added no daemon process,
+configuration, socket, pairing state, session registry, or UI. M3 later added
+the per-user local daemon while retaining the session/network exclusions.
 
 The final aggregate source, format, lint, workspace test, docs, dependency,
 secret, shell, action-workflow, task-context, cross-target, and diff checks all

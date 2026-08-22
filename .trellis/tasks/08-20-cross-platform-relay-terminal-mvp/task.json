@@ -21,7 +21,8 @@
   "children": [
     "08-21-phase-zero-bootstrap",
     "08-21-simplify-relay-release-deployment",
-    "08-21-foundation-gate"
+    "08-21-foundation-gate",
+    "08-22-core-local-daemon"
   ],
   "parent": null,
   "relatedFiles": [

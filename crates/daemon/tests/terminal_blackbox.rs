@@ -381,7 +381,7 @@ fn wait_for_screen(
     let deadline = Instant::now() + DEADLINE;
     loop {
         let snapshot = attachment.latest_snapshot().map_err(display_error)?;
-        if snapshot.active_screen == expected_screen && snapshot.revision > 0 {
+        if snapshot.active_screen == expected_screen && snapshot.revision.get() > 0 {
             return Ok(snapshot);
         }
         if let PtyChildState::Exited(status) = driver.try_wait().map_err(display_error)? {

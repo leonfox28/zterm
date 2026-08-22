@@ -1,0 +1,57 @@
+syntax = "proto3";
+
+package zterm.v1;
+
+import "zterm/v1/common.proto";
+
+message TerminalAttachRequest {
+  TargetSelector target = 1;
+  SessionId session_id = 2;
+  bool takeover = 3;
+}
+
+message TerminalSnapshot {
+  SessionId session_id = 1;
+  AttachmentId attachment_id = 2;
+  uint64 revision = 3;
+  uint32 rows = 4;
+  uint32 columns = 5;
+  bytes screen_ansi = 6;
+  bytes recent_history_ansi = 7;
+}
+
+message TerminalDelta {
+  uint64 from_revision = 1;
+  uint64 to_revision = 2;
+  bytes ansi = 3;
+}
+
+message TerminalInput {
+  OperationId operation_id = 1;
+  AttachmentId attachment_id = 2;
+  bytes bytes = 3;
+}
+
+message TerminalResize {
+  OperationId operation_id = 1;
+  AttachmentId attachment_id = 2;
+  uint32 rows = 3;
+  uint32 columns = 4;
+}
+
+message TerminalDetach { AttachmentId attachment_id = 1; }
+
+message TerminalSnapshotApplied {
+  AttachmentId attachment_id = 1;
+  uint64 revision = 2;
+}
+
+message TerminalSyncRequest {
+  AttachmentId attachment_id = 1;
+  uint64 known_revision = 2;
+}
+
+message TerminalSyncRequired {
+  AttachmentId attachment_id = 1;
+  uint64 latest_revision = 2;
+}

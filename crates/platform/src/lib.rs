@@ -1,6 +1,10 @@
 //! Cross-platform operating-system integration for zterm.
 
+pub mod account;
+#[cfg(unix)]
+pub mod local_unix;
 pub mod pty;
+pub mod user_state;
 
 /// Platform facts safe to expose from the side-effect-free Foundation probe.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

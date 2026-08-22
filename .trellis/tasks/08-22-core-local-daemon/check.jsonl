@@ -1,0 +1,12 @@
+{"file": ".trellis/spec/guides/evidence-driven-simplicity.md", "reason": "Audit each validator/test/recovery mechanism for a current consumer and single owner."}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Verify data and errors survive core→proto→platform→daemon→CLI without duplicate parsing."}
+{"file": ".trellis/spec/guides/cross-platform-thinking-guide.md", "reason": "Verify LF/source policy and the declared macOS/Linux/Windows evidence."}
+{"file": ".trellis/spec/backend/pty-lifecycle.md", "reason": "Confirm account refactoring leaves PTY lifecycle and login-shell behavior intact."}
+{"file": ".trellis/spec/backend/terminal-driver.md", "reason": "Confirm shared Revision changes and daemon lifecycle do not regress terminal drain ownership."}
+{"file": ".trellis/spec/backend/relay-deployment.md", "reason": "Confirm configuration does not mix staging or optional self-hosted Relay into official N0."}
+{"file": ".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/local-self-attach.md", "reason": "Check local IPC reserves one future SessionService path and never self-dials Iroh."}
+{"file": ".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/per-user-daemon.md", "reason": "Check no supervisor/autostart/admin boundary drift was introduced."}
+{"file": ".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/install-version-identity-lifecycle.md", "reason": "Check repeated/partial setup never silently rotates or exposes the identity key."}
+{"file": ".trellis/tasks/archive/2026-08/08-21-foundation-gate/research/pty-wait-lock-retrospective.md", "reason": "Review lock lifetimes and deterministic concurrency tests against the prior deadlock class."}
+{"file": ".trellis/tasks/08-22-core-local-daemon/research/current-boundary.md", "reason": "Check the implementation matches the exact pre-task code boundary and exclusions."}
+{"file": ".trellis/tasks/08-22-core-local-daemon/research/dependency-and-platform-primitives.md", "reason": "Check selected dependencies/features remain minimal and match verified platform APIs."}

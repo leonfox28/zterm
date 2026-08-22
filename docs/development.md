@@ -1,4 +1,4 @@
-# Phase Zero development environment
+# Development environment
 
 ## Exact project baseline
 
@@ -107,9 +107,11 @@ zterm-core
        cli
 ```
 
-These crates only prove compilation and code-generation boundaries. Phase Zero
-must not add PTY, terminal state, daemon lifecycle, configuration, device
-identity, pairing, networking, or persistent session behavior.
+The dependency direction is now executable: core owns domain/terminal values,
+proto owns the wire codec, platform owns OS boundaries, daemon owns state and
+services, and CLI owns parsing/rendering. Pairing/network adapters and the
+session registry remain later milestones; do not move those responsibilities
+into an earlier crate.
 
 ## Quality gate
 
@@ -121,8 +123,11 @@ cargo +1.98.0 clippy --workspace --all-targets --all-features -- -D warnings
 cargo +1.98.0 test --workspace --all-features
 cargo +1.98.0 doc --workspace --no-deps
 cargo deny check
-cargo run --quiet --package zterm-cli
+sh tests/core-local-daemon/cross-uid.sh
+sh tests/secret-scan.sh
 ```
 
-The placeholder CLI only prints static build metadata and must not create
-`~/.zterm`, start a process, or open a network connection.
+`cargo run --quiet --package zterm-cli -- --help` and `--version` are
+side-effect free. Never use real `~/.zterm` for mutation tests; inject
+task-private `UserPaths` through the library harnesses. Local readiness must
+remain independent of Iroh, DNS, Relay, and Internet access.
