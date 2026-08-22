@@ -1,12 +1,18 @@
 //! Typed M3 local-daemon service dispatch.
 
+#[cfg(unix)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use zterm_core::{Capabilities, DeviceId, DomainErrorKind};
+use zterm_core::DeviceId;
+#[cfg(unix)]
+use zterm_core::{Capabilities, DomainErrorKind};
+#[cfg(unix)]
 use zterm_proto::{DecodedFrame, WireKind, encode_message, v1};
 
 use crate::bootstrap::BootstrapResult;
+#[cfg(unix)]
 use crate::config::{ValidatedConfig, validate_setup_profile};
+#[cfg(unix)]
 use crate::error::DaemonError;
 
 /// Protocol version projected by readiness and status.
@@ -81,18 +87,29 @@ pub struct SessionImpact {
 /// Immutable M3 service state for one daemon process.
 #[derive(Clone, Debug)]
 pub struct DaemonService {
+    #[cfg(unix)]
     setup: BootstrapResult,
+    #[cfg(unix)]
     started_at_unix: u64,
 }
 
 impl DaemonService {
     /// Creates service state from already validated persistent setup.
+    #[cfg(unix)]
     #[must_use]
     pub fn new(setup: BootstrapResult) -> Self {
         Self::with_started_at(setup, now_unix())
     }
 
+    /// Creates the non-Unix placeholder for the M3 unsupported boundary.
+    #[cfg(not(unix))]
+    #[must_use]
+    pub fn new(_setup: BootstrapResult) -> Self {
+        Self {}
+    }
+
     /// Creates service state with an explicit timestamp for isolated tests.
+    #[cfg(unix)]
     #[doc(hidden)]
     #[must_use]
     pub fn with_started_at(setup: BootstrapResult, started_at_unix: u64) -> Self {
@@ -102,7 +119,16 @@ impl DaemonService {
         }
     }
 
+    /// Creates the non-Unix placeholder for isolated cross-platform callers.
+    #[cfg(not(unix))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_started_at(_setup: BootstrapResult, _started_at_unix: u64) -> Self {
+        Self {}
+    }
+
     /// Dispatches one validated local request frame.
+    #[cfg(unix)]
     pub(crate) async fn dispatch(&self, frame: DecodedFrame) -> ServiceReply {
         let request_id = frame.request_id;
         let result = self.dispatch_inner(frame);
@@ -112,6 +138,7 @@ impl DaemonService {
         }
     }
 
+    #[cfg(unix)]
     fn dispatch_inner(&self, frame: DecodedFrame) -> Result<ServiceReply, DaemonError> {
         let request_id = frame.request_id;
         match frame.kind {
@@ -206,11 +233,13 @@ impl DaemonService {
     }
 }
 
+#[cfg(unix)]
 pub(crate) struct ServiceReply {
     pub(crate) bytes: Vec<u8>,
     pub(crate) stop_after_flush: bool,
 }
 
+#[cfg(unix)]
 impl ServiceReply {
     fn message<Message>(
         kind: WireKind,
@@ -242,6 +271,7 @@ impl ServiceReply {
     }
 }
 
+#[cfg(unix)]
 pub(crate) fn protocol_error(error: zterm_proto::ProtocolError) -> DaemonError {
     use zterm_proto::ProtocolError;
     let kind = match error {
@@ -258,6 +288,7 @@ pub(crate) fn protocol_error(error: zterm_proto::ProtocolError) -> DaemonError {
     DaemonError::new(kind, error.to_string())
 }
 
+#[cfg(unix)]
 fn decode_request<Message>(frame: &DecodedFrame) -> Result<Message, DaemonError>
 where
     Message: prost::Message + Default,
@@ -265,6 +296,7 @@ where
     frame.decode_message(frame.kind).map_err(protocol_error)
 }
 
+#[cfg(unix)]
 fn protocol_proto() -> v1::ProtocolVersion {
     v1::ProtocolVersion {
         wire_major: zterm_proto::WIRE_MAJOR,
@@ -273,6 +305,7 @@ fn protocol_proto() -> v1::ProtocolVersion {
     }
 }
 
+#[cfg(unix)]
 fn config_from_wire(
     request: &v1::LocalValidateSetupRequest,
 ) -> Result<ValidatedConfig, DaemonError> {
@@ -284,6 +317,7 @@ fn config_from_wire(
     )
 }
 
+#[cfg(unix)]
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
