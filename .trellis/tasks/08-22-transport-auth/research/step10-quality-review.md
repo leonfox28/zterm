@@ -14,14 +14,14 @@ daemon owners, errors stay typed, sensitive values are redacted/zeroized, and
 the public CLI remains within the M5-M6 boundary.
 
 The implementation has no unresolved task-owned code or external-environment
-gate. Clean hosted runs passed Linux x86_64/arm64 (including real-Iroh loopback
-and cross-UID gates), Windows, macOS arm64/Intel, dependency policy, and the
+gate. The final scope-corrected head `4ec0cba` passed all seven hosted jobs in
+run `32615123176`: Linux x86_64/arm64 (including real-Iroh loopback and
+cross-UID gates), Windows, macOS arm64/Intel, dependency policy, and the
 repository-wide optional Relay bundle. Relay/path acceptance composes the
 already accepted Foundation official-n0 Case C, the current exact production
 profile regression, and the current Linux real-Iroh M5-M6 loopback tests. The
-optional self-hosted Relay is not an M5-M6 completion condition. This scope
-correction still requires the normal non-network quality review before archive;
-this macOS review did not execute an Endpoint locally.
+optional self-hosted Relay is not an M5-M6 completion condition. This macOS
+review did not execute an Endpoint locally; the task is ready to archive.
 
 ## Findings fixed during review
 
@@ -168,6 +168,7 @@ Linux execution.
 | [`32610795848`](https://github.com/leonfox28/zterm/actions/runs/32610795848), `4b85260` | All seven jobs passed on one head: Linux x86_64/arm64, Windows, macOS arm64/Intel, dependency policy, and Relay bundle. Both Linux rows executed the real broker/two-daemon/two-process pairing gates; arm64 also passed the exact F6 regression | clean hosted matrix achieved; later ordinary runs add the cross-UID evidence |
 | [`32611781285`](https://github.com/leonfox28/zterm/actions/runs/32611781285), `5e021cd` | All seven ordinary jobs passed; both Linux rows also executed the harness-false cross-UID test under `CI=true`, where unavailable `sudo -u nobody` is a hard failure rather than a skip | cross-UID environment gate achieved |
 | [`32612691539`](https://github.com/leonfox28/zterm/actions/runs/32612691539), `bf3d313` | All seven ordinary jobs passed again; production Rust/proto remained the same as the clean M5-M6 head | clean matrix and cross-UID evidence retained |
+| [`32615123176`](https://github.com/leonfox28/zterm/actions/runs/32615123176), `4ec0cba` | All seven jobs passed after restoring the official-n0 acceptance scope: Linux x86_64/arm64, Windows, macOS arm64/Intel, dependency policy, and optional Relay bundle | final archive head; no public/self-hosted M5-M6 gate remains |
 
 The later green runs preserve the required clean matrix and add cross-UID
 evidence; the first two runs are retained to document the task-owned failures
@@ -200,6 +201,6 @@ not M5-M6 runtime evidence.
 No public or self-hosted Relay gate remains for M5-M6. The optional deployment
 keeps its direct post-update handshake runbook, while representative
 two-physical-network automatic discovery remains explicitly deferred to parent
-M10. After this scope-correction diff passes the normal non-public quality and
-hosted checks, the remaining work is parent-progress bookkeeping, task
-validation, finish-work, and archive.
+M10. The final scope-corrected head passed the normal non-public quality and
+hosted checks; only parent-progress bookkeeping, task validation, finish-work,
+and archive remain.

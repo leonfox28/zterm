@@ -218,9 +218,9 @@ Stop on any revoke/principal path that ends a Session/PTY or weakens local same-
 
 - [x] Profile summary/builder exact four official QAD relays + production lookups + two ALPNs；self-hosted
   exactly one no-QAD relay；staging env cannot alter either。
-- [ ] Fully offline DNS/Relay/Internet and injected Endpoint bind failure still serve local readiness,
+- [x] Fully offline DNS/Relay/Internet and injected Endpoint bind failure still serve local readiness,
   status、Session create/attach/stop，with truthful degraded observation and unchanged identity。
-- [ ] Fatal local listener rebind retains the same network/store/session owner；final stop closes
+- [x] Fatal local listener rebind retains the same network/store/session owner；final stop closes
   Endpoint once and removes only exact owned socket。
 - [x] No inspection command binds Endpoint、queries network or spawns daemon when stopped。
 
@@ -266,7 +266,7 @@ or network cleanup short-circuits retained Session ownership.
   both endpoints，loser does not kill winner/demand。
 - [x] `stream_limits`: per/global overflow、stalled first frame、malformed/oversize stream affect only
   offender while another peer、local status and PTY drain progress。
-- [ ] `authorization`: unknown/revoked inbound rejected before Hello payload read；one-way connection does
+- [x] `authorization`: unknown/revoked inbound rejected before Hello payload read；one-way connection does
   not permit reverse service stream。
 - [x] Route lookup success/failure/cache/ticket/unknown cache version；dynamic remote relay leaves
   configured profile summary byte-for-byte unchanged。
@@ -349,8 +349,9 @@ partial failure is hidden as success.
 
 ### Tests
 
-- [ ] Real same-UID `local_device_ipc` covers kinds 12–21、strict EOF、deadline、oversize ticket、
-  alias conflicts and direction fields；wrong UID仍zero response bytes before decode。
+- [x] Real same-UID `local_pair_ipc` + `local_device_ipc` jointly cover kinds 12–21、strict EOF、
+  deadline、oversize ticket、alias conflicts and direction fields；`cross_uid` proves wrong UID仍在
+  decode前zero response bytes。
 - [x] `revoke_races` barrier proves started old commit completes before DB revoke，queued/new commit fails
   after commit，all old connections/streams/controllers close，restart remains revoked。
 - [x] Inject DB revoke failure：connection/stream/attachment/generation unchanged and retry succeeds。
@@ -430,8 +431,8 @@ turns unavailable public Internet into a product-code retry requirement.
 - [x] Record one clean hosted matrix on a single head：macOS arm64/Intel、Linux x86_64/arm64、
   Windows shared boundary、dependency policy and repository-wide optional Relay static bundle all passed
   in CI run `32610795848`；the bundle is not M5-M6 runtime evidence。
-- [ ] Update parent M5–M6 checklist/progress only after all task gates pass；do not mark M7/M8。
-- [ ] Run task validation and prepare finish-work/archive only after implementation approval scope is
+- [x] Update parent M5–M6 checklist/progress only after all task gates pass；do not mark M7/M8。
+- [x] Run task validation and prepare finish-work/archive only after implementation approval scope is
   genuinely complete。
 
 ### Final gate
@@ -449,6 +450,7 @@ git diff --check
 ```
 
 Required hosted evidence：macOS arm64/Intel、Linux x86_64/arm64 full applicable jobs；Windows shared
-core/proto/daemon compile/tests。The clean matrix passed in CI run `32610795848`。After this scope
-correction passes the normal quality/hosted review，`trellis-finish-work` may archive the child and
-record M5–M6 complete；no public/self-hosted Relay gate remains。
+core/proto/daemon compile/tests。The final scope-corrected head `4ec0cba` passed all seven jobs in CI
+run `32615123176`，including both Linux real-Iroh loopback gates and cross-UID evidence。The child is
+ready for `trellis-finish-work` archive and parent M5–M6 completion；no public/self-hosted Relay gate
+remains。

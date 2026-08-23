@@ -267,6 +267,13 @@ same-UID local attachment，M5–M8 的远端 transport 和最终 CLI 仍保持�
 
 ### M5. Iroh Endpoint 与 Connection broker
 
+状态：**已完成**。子任务 `08-22-transport-auth` 已交付 daemon-owned 单 Endpoint、exact
+official-n0 profile、connection broker、route fallback、duplicate convergence、stream/admission
+上限与 network lifecycle。最终 scope-corrected head `4ec0cba` 在 GitHub Actions run
+`32615123176` 的 macOS arm64/Intel、Linux x86_64/arm64、Windows、dependency 与 Relay bundle
+七个 jobs 全绿。官方 Relay/path 证据沿用 Foundation Case C，并与当前 profile gate 和 Linux
+real-Iroh loopback gates 组合；可选 self-hosted Relay 不构成本里程碑门槛。
+
 工作内容：
 
 - 按 design.md 建立默认和 self-host profile，只允许显式 relay URL 列表。
@@ -293,6 +300,11 @@ same-UID local attachment，M5–M8 的远端 transport 和最终 CLI 仍保持�
     cargo test -p zterm-daemon --test path_migration
 
 ### M6. 配对、认证与撤销
+
+状态：**已完成**。同一子任务已交付一次性文本票据、`zterm-pair/1` HMAC 握手、单向授权、
+normal confirmation、same-UID pair/device IPC、generation gate、持久 revoke 与 Session/PTY
+隔离，并通过 Linux 双进程 real-Iroh、cross-UID、竞态、平台及 secret/policy 门禁。M7 远端
+Session adapter 与 M8 public CLI 仍保持未完成，未在本次完成状态中提前计入。
 
 工作内容：
 

@@ -132,30 +132,30 @@ Endpoint 和 connection broker；用户可以通过一次性文本票据建立 S
 
 ## 验收标准
 
-- [ ] daemon 使用已提交身份绑定一个含 `zterm/1` 与 `zterm-pair/1` 的 Endpoint；official
+- [x] daemon 使用已提交身份绑定一个含 `zterm/1` 与 `zterm-pair/1` 的 Endpoint；official
       与 self-hosted profile 的有效 Relay/QAD/DNS/Pkarr map、staging隔离、relay-only publication
       和有界 shutdown 均有自动化证据。
-- [ ] 同一 device pair 的并发 dial、多 local client 和多个预留业务 stream 最终只使用一条
+- [x] 同一 device pair 的并发 dial、多 local client 和多个预留业务 stream 最终只使用一条
       primary connection；inbound/outbound duplicate race 确定性收敛且 loser 不影响 winner。
-- [ ] connection/stream/handshake/frame/queue 上限和首帧 deadline 被逐一越界验证；恶意或
+- [x] connection/stream/handshake/frame/queue 上限和首帧 deadline 被逐一越界验证；恶意或
       stalled peer 不阻塞正常 peer、local IPC、SessionService 或 PTY drain。
-- [ ] A 创建 ticket、B 安全导入后只产生 `A authorizes B`；B 被保存为 A 的 authorized
+- [x] A 创建 ticket、B 安全导入后只产生 `A authorizes B`；B 被保存为 A 的 authorized
       device，A 只成为 B 的 known device。没有反向 ticket 时 A 不获得控制 B 的权限。
-- [ ] ticket 编解码与 canonical transcript golden vectors 可供其他语言独立复现；过期、
+- [x] ticket 编解码与 canonical transcript golden vectors 可供其他语言独立复现；过期、
       篡改、错误 EndpointId/secret、重放、并发消费与成功响应丢失都不能让 host 产生第二次
       授权或半提交。controller 本地提交失败必须返回 outcome unknown 并可通过 normal
       confirmation 修复，不能谎报成功；runtime ticket/secret 不落盘、不进入日志/错误，且
       本任务不提供可把 ticket 放进 argv 的 public 入口。
-- [ ] 未授权/revoked EndpointId 即使能连公开 Relay 也在任何业务 frame 前被拒绝；普通
+- [x] 未授权/revoked EndpointId 即使能连公开 Relay 也在任何业务 frame 前被拒绝；普通
       connection 和每个敏感 stream/RPC 均绑定当前 authorization generation。
-- [ ] revoke 提交成功返回后，旧 connection、所有 stream、排队 RPC、竞态 reconnect 和
+- [x] revoke 提交成功返回后，旧 connection、所有 stream、排队 RPC、竞态 reconnect 和
       controller lease 都失效；daemon restart 后仍 revoked。同一 Session/PTY 及其他设备继续。
-- [ ] DNS/Pkarr 失败时，有效 ticket 或已验证 cache Relay 可寻址；无任何路由时明确失败且
+- [x] DNS/Pkarr 失败时，有效 ticket 或已验证 cache Relay 可寻址；无任何路由时明确失败且
       不改变身份、授权、known device 或 live Session。direct/relay path 变化只更新诊断。
-- [ ] same-UID local IPC 与真实 daemon-internal/test adapter 覆盖 pair create/accept、device
+- [x] same-UID local IPC 与真实 daemon-internal/test adapter 覆盖 pair create/accept、device
       list/rename/revoke、方向投影、alias 与错误边界；不提前新增 M8 public CLI command tree、
       TTY prompt 或 remote terminal UI。
-- [ ] format、Clippy、workspace tests、dependency/secret checks及适用的 macOS arm64/Intel、
+- [x] format、Clippy、workspace tests、dependency/secret checks及适用的 macOS arm64/Intel、
       Linux x86_64/arm64 CI 通过；Windows shared crates 保持编译边界。
 
 ## 不在本任务范围
