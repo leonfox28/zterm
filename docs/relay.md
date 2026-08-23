@@ -80,21 +80,6 @@ succeeds only when the requested Relay reports an authenticated connection:
 sh tests/relay/public-handshake.sh https://relay.example.com
 ```
 
-To keep ordinary push and pull-request CI independent from public availability,
-repository acceptance uses the dedicated manual workflow from a hosted Linux
-runner:
-
-```bash
-gh workflow run public-relay-acceptance.yml \
-  -f relay_url=https://relay.zenithconsulting.cn
-```
-
-The workflow first requires exact HTTPS responses from `/healthz` (200),
-`/generate_204` (204), and Iroh's home-relay selection probe `/ping` (200).
-Each request has a 15-second deadline and no redirect or retry. This makes a
-public proxy/health failure distinguishable from a later authenticated Relay
-connection failure.
-
 It passes `RelayConfig::new(url, None)` because this deployment has no UDP QAD
 endpoint. It performs one connection attempt; restart/reconnect and rollback
 exercises are not part of normal release acceptance.

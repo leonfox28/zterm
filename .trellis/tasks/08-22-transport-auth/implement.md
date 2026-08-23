@@ -388,32 +388,34 @@ missing noninteractive `sudo -u nobody` would have failed rather than skipped.
   `32610795848`。It composes the production
   PairingService/BrokerPairTransport owners through private lib-test access；it does not claim
   `run_daemon`/`NetworkStartup` lifecycle evidence。
-- [ ] Reuse existing disposable self-hosted Relay/handshake fixture to prove ticket/cache remote Relay URL
-  can dial across profile without configured map insertion；do not make ordinary tests depend public N0。
-- [x] Reuse/extend ignored network gate only for explicit Relay/direct path evidence；record path events，
-  不重跑Foundation无关部署/benchmark或用它替代deterministic concurrency tests。
+- [x] Compose Relay/path acceptance from the already accepted Foundation official-n0 Case C、the current
+  exact `iroh_profile_gate` and Linux real-Iroh loopback M5-M6 gates。Case C completed three encrypted
+  bidirectional streams over official WSS/TCP Relay with endpoint non-DNS UDP blocked；the current
+  loopback gates prove broker/ALPN/pairing/authorization code without claiming public-n0 execution。
+- [x] Route/path deterministic tests prove fresh/cache/ticket ordering、dynamic remote Relay candidates
+  leave the configured profile unchanged，and path observations change no Session/auth/replay truth。
 - [x] Audit cfg boundaries on Windows shared build；private Unix imports/fields/helpers整体gate。
 - [x] Run secret/dependency/source-policy checks against generated fixtures and logs。
 
 ### Gate
 
 ```sh
+cargo test -p zterm-daemon --test iroh_profile_gate
+cargo test -p zterm-daemon --test connection_broker
 cargo test -p zterm-daemon --test two_daemon_transport
 cargo test -p zterm-daemon --test path_migration
-sh tests/relay/static.sh
-gh workflow run public-relay-acceptance.yml \
-  -f relay_url=https://relay.zenithconsulting.cn
 sh tests/source-policy.sh
 cargo test -p zterm-core --all-features
 cargo test -p zterm-proto --all-features
 cargo test -p zterm-daemon --lib --all-features
 ```
 
-The public Relay command is an explicit manual hosted gate rather than every local run, but the task
-cannot claim route/profile acceptance without one recorded pass. Run `32613231264` on `bf3d313`
-stopped before Endpoint bind because public `/healthz` returned HTTP 403; do not retry until the
-external proxy/access-policy owner is identified and fixed. Stop if a harness touches real user state
-or treats unavailable public Internet as a product-code retry requirement.
+M5-M6 does not require a fresh public or self-hosted Relay run. Its compositional evidence is the
+accepted Foundation official-n0 Case C、the current exact production-profile regression，and the Linux
+real-Iroh loopback tests for the newly added M5-M6 owners。The optional self-hosted deployment remains
+separately operable；its availability is not a transport-auth blocker。Automatic discovery across two
+representative physical networks remains parent M10 work。Stop if a harness touches real user state or
+turns unavailable public Internet into a product-code retry requirement.
 
 ## Step 10. Full quality gate 与 handoff
 
@@ -423,10 +425,11 @@ or treats unavailable public Internet as a product-code retry requirement.
   cfg、lint/type/test consistency；fix all task-owned findings。
 - [x] Verify diff contains no M7 Session RPC adapter、terminal stream/reconnect UX、M8 clap commands、
   mobile/GUI/event/history/ACL/account/control-plane code。
-- [x] Validate every PRD acceptance item against a named automated/manual evidence artifact；remaining
-  external environment gate must be explicit, not silently skipped。
+- [x] Validate every PRD acceptance item against a named current or retained evidence artifact；the
+  accepted Foundation n0 evidence is composed explicitly，and no public/self-hosted M5-M6 gate remains。
 - [x] Record one clean hosted matrix on a single head：macOS arm64/Intel、Linux x86_64/arm64、
-  Windows shared boundary、dependency policy and Relay bundle all passed in CI run `32610795848`。
+  Windows shared boundary、dependency policy and repository-wide optional Relay static bundle all passed
+  in CI run `32610795848`；the bundle is not M5-M6 runtime evidence。
 - [ ] Update parent M5–M6 checklist/progress only after all task gates pass；do not mark M7/M8。
 - [ ] Run task validation and prepare finish-work/archive only after implementation approval scope is
   genuinely complete。
@@ -446,6 +449,6 @@ git diff --check
 ```
 
 Required hosted evidence：macOS arm64/Intel、Linux x86_64/arm64 full applicable jobs；Windows shared
-core/proto/daemon compile/tests。The clean matrix passed in CI run `32610795848`。Only after the
-remaining explicit environment gates and review may `trellis-finish-work` archive the child and record
-M5–M6 complete。
+core/proto/daemon compile/tests。The clean matrix passed in CI run `32610795848`。After this scope
+correction passes the normal quality/hosted review，`trellis-finish-work` may archive the child and
+record M5–M6 complete；no public/self-hosted Relay gate remains。

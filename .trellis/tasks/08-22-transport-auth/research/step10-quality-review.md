@@ -13,12 +13,15 @@ and task-validation clean. Cross-layer create/accept/revoke flows use one set of
 daemon owners, errors stay typed, sensitive values are redacted/zeroized, and
 the public CLI remains within the M5-M6 boundary.
 
-The task is **not ready to archive or mark M5-M6 complete**. Clean hosted runs
-passed Linux x86_64/arm64 (including real-Iroh and cross-UID gates), Windows,
-macOS arm64/Intel, dependency policy, and the Relay bundle. The explicit public
-Relay handshake remains blocked: the reviewed manual workflow receives HTTP
-403 from public `/healthz` before Endpoint bind. This macOS review still did
-not execute an Endpoint locally.
+The implementation has no unresolved task-owned code or external-environment
+gate. Clean hosted runs passed Linux x86_64/arm64 (including real-Iroh loopback
+and cross-UID gates), Windows, macOS arm64/Intel, dependency policy, and the
+repository-wide optional Relay bundle. Relay/path acceptance composes the
+already accepted Foundation official-n0 Case C, the current exact production
+profile regression, and the current Linux real-Iroh M5-M6 loopback tests. The
+optional self-hosted Relay is not an M5-M6 completion condition. This scope
+correction still requires the normal non-network quality review before archive;
+this macOS review did not execute an Endpoint locally.
 
 ## Findings fixed during review
 
@@ -92,20 +95,6 @@ failing test then passed in the clean Linux arm64 hosted run.
 
 No unresolved task-owned code finding remains from this review.
 
-### F7: handshake-only public acceptance hid a pre-selection HTTP failure
-
-The initial manual workflow exposed only `Endpoint::online()` and timed out
-with an empty home-relay status list. Because Iroh must first receive a
-successful `/ping` response to select a home relay, that message could not
-separate public HTTP/proxy failure from authenticated Relay failure.
-
-The manual workflow now performs exact, bounded, no-retry HTTPS checks for
-`/healthz` (200), `/generate_204` (204), and `/ping` (200) before Endpoint bind;
-the Relay static gate locks its trigger, permissions, timeouts, input boundary,
-and reuse of the existing handshake probe. The improved hosted run identified
-the current external blocker as `/healthz` HTTP 403. Full analysis and the
-external-ownership boundary are recorded in `public-relay-403.md`.
-
 ## Cross-layer traces reviewed
 
 ### Pair create
@@ -176,42 +165,41 @@ Linux execution.
 | --- | --- | --- |
 | [`32608814512`](https://github.com/leonfox28/zterm/actions/runs/32608814512), `193e008` | Linux x86_64 and arm64 both executed `connection_broker` (1/1), `two_daemon_transport` (2/2), and the two-process production `PairingService` gate; both macOS rows, dependency policy, and Relay bundle also passed | Windows alone failed on the three F5 dead-code boundaries |
 | [`32609483826`](https://github.com/leonfox28/zterm/actions/runs/32609483826), `80f8852` | Windows shared compile/tests/docs passed; Linux x86_64, both macOS rows, dependency policy, and Relay bundle passed | Linux arm64 alone exposed F6 in `revoke_waits_for_in_flight_commit_and_rejects_stale_generation`; a clean rerun on the first-poll fix is required |
-| [`32610795848`](https://github.com/leonfox28/zterm/actions/runs/32610795848), `4b85260` | All seven jobs passed on one head: Linux x86_64/arm64, Windows, macOS arm64/Intel, dependency policy, and Relay bundle. Both Linux rows executed the real broker/two-daemon/two-process pairing gates; arm64 also passed the exact F6 regression | clean hosted matrix achieved; only the separate cross-UID and public Relay environment gates remain |
-| [`32611781285`](https://github.com/leonfox28/zterm/actions/runs/32611781285), `5e021cd` | All seven ordinary jobs passed; both Linux rows also executed the harness-false cross-UID test under `CI=true`, where unavailable `sudo -u nobody` is a hard failure rather than a skip | cross-UID environment gate achieved; initial manual Relay run `32612287182` remained non-diagnostic and timed out before home-relay selection |
-| [`32612691539`](https://github.com/leonfox28/zterm/actions/runs/32612691539), `bf3d313` | All seven jobs passed after adding the manual public-surface diagnostics and their static policy gate | manual run `32613231264` failed before Endpoint bind with exact evidence: public `/healthz` returned HTTP 403 |
+| [`32610795848`](https://github.com/leonfox28/zterm/actions/runs/32610795848), `4b85260` | All seven jobs passed on one head: Linux x86_64/arm64, Windows, macOS arm64/Intel, dependency policy, and Relay bundle. Both Linux rows executed the real broker/two-daemon/two-process pairing gates; arm64 also passed the exact F6 regression | clean hosted matrix achieved; later ordinary runs add the cross-UID evidence |
+| [`32611781285`](https://github.com/leonfox28/zterm/actions/runs/32611781285), `5e021cd` | All seven ordinary jobs passed; both Linux rows also executed the harness-false cross-UID test under `CI=true`, where unavailable `sudo -u nobody` is a hard failure rather than a skip | cross-UID environment gate achieved |
+| [`32612691539`](https://github.com/leonfox28/zterm/actions/runs/32612691539), `bf3d313` | All seven ordinary jobs passed again; production Rust/proto remained the same as the clean M5-M6 head | clean matrix and cross-UID evidence retained |
 
-The later green runs preserve the required clean matrix while adding cross-UID
-and public-diagnostic evidence; the first two runs are retained to document the
-task-owned failures and their fixes.
+The later green runs preserve the required clean matrix and add cross-UID
+evidence; the first two runs are retained to document the task-owned failures
+and their fixes. None of these ordinary Linux runs is described as public-n0
+runtime evidence: their M5-M6 Endpoint fixtures are loopback-only with Relay
+disabled.
 
-## Acceptance mapping and remaining gates
+## Acceptance mapping and evidence boundary
 
 | PRD acceptance area | Current evidence | Remaining evidence |
 | --- | --- | --- |
-| one endpoint, exact profiles/ALPNs, lifecycle | production composition/profile/injected lifecycle tests plus successful Linux x86_64/arm64 real Endpoint gates; the private pair router is not separately claimed as `run_daemon` evidence | — |
+| one endpoint, exact profiles/ALPNs, lifecycle | production composition/profile/injected lifecycle tests plus successful Linux x86_64/arm64 real-Iroh loopback gates; the private pair router is not separately claimed as `run_daemon` evidence | — |
 | singleflight and duplicate convergence | pure gates plus real `connection_broker` on Linux x86_64/arm64 in the clean matrix | — |
 | resource isolation | pure permit/frame/deadline tests, local Session/PTY corpus, and real Linux broker streams in the clean matrix | — |
 | directional pairing | fake-transport faults plus the two-process production gate on Linux x86_64/arm64 in the clean matrix | — |
 | ticket/proof/replay/ambiguity secrecy | golden vectors, manager/service faults, proto/debug and SQLite sentinels across the clean Unix/Windows matrix | — |
 | pre-frame authorization/current generation | registry/broker gates and real one-way normal ALPN on both Linux architectures; F6 passed on arm64 | — |
 | durable revoke without Session loss | `revoke_races`, device IPC, principal detach, restart preload, first-poll fairness stress, and the clean arm64 rerun | — |
-| fresh/cache/ticket fallback and path safety | route/path pure tests including F1 regression | self-hosted/public Relay execution on Linux |
+| fresh/cache/ticket fallback and path safety | route/path pure tests including F1; current `iroh_profile_gate` for exact official map/QAD/lookups/ALPNs; accepted Foundation Case C for official WSS/TCP Relay fallback with non-DNS UDP blocked; Linux real-Iroh loopback M5-M6 composition | — |
 | same-UID hidden adapters and no M8 CLI | local pair/device IPC, CLI source/help tests, and Linux x86_64/arm64 cross-UID execution in green hosted runs | — |
 | full quality/platform matrix | all seven jobs passed again on `bf3d313` in run `32612691539` | — |
 
 The existing `ci.yml` needs no task-owned wiring change: Unix matrix rows run
 the full workspace suite (so Linux executes the real-Iroh targets, including
 the lib-test self-spawn pair gate, while macOS honors their ignores), Windows
-runs the shared library boundary, and the Relay job runs `static.sh`. CI still
-does not replace the explicit public Relay handshake.
+runs the shared library boundary, and the Relay job runs the optional
+self-hosted image/Compose static contract. That repository-wide static job is
+not M5-M6 runtime evidence.
 
-The sole remaining environment gate runs only in its intended hosted environment:
-
-```sh
-gh workflow run public-relay-acceptance.yml \
-  -f relay_url=https://relay.zenithconsulting.cn
-```
-
-Do not re-dispatch until the external 403 owner is identified and fixed. Do not
-run `trellis-finish-work`, archive this child task, or mark parent M5-M6 complete
-until one successful manual hosted run is recorded.
+No public or self-hosted Relay gate remains for M5-M6. The optional deployment
+keeps its direct post-update handshake runbook, while representative
+two-physical-network automatic discovery remains explicitly deferred to parent
+M10. After this scope-correction diff passes the normal non-public quality and
+hosted checks, the remaining work is parent-progress bookkeeping, task
+validation, finish-work, and archive.

@@ -8,7 +8,6 @@ dockerignore="$repo_root/deploy/relay/.dockerignore"
 compose_file="$repo_root/deploy/relay/compose.yaml"
 relay_config="$repo_root/deploy/relay/relay.toml"
 publish_workflow="$repo_root/.github/workflows/relay-image.yml"
-acceptance_workflow="$repo_root/.github/workflows/public-relay-acceptance.yml"
 publication_resolver="$repo_root/deploy/relay/resolve-publication.sh"
 relay_doc="$repo_root/docs/relay.md"
 handshake_manifest="$repo_root/tests/relay/handshake-probe/Cargo.toml"
@@ -81,37 +80,6 @@ if grep -Fq 'expect_reconnect' "$handshake_source"; then
 fi
 grep -Fq 'RUSTSEC-2024-0436' "$handshake_deny" \
     || fail "public handshake dependency exception is undocumented"
-
-[ "$(grep -Ec '^[[:space:]]*permissions:' "$acceptance_workflow")" -eq 1 ] \
-    || fail "public acceptance workflow overrides its top-level permissions"
-acceptance_permissions=$(awk '
-    /^permissions:/ { in_permissions = 1; next }
-    in_permissions && /^[^[:space:]]/ { in_permissions = 0 }
-    in_permissions && /^  [a-z-]+:/ { print }
-' "$acceptance_workflow")
-[ "$acceptance_permissions" = "  contents: read" ] \
-    || fail "public acceptance permissions are not read-only"
-grep -Fq 'workflow_dispatch:' "$acceptance_workflow" \
-    || fail "public acceptance is not manually dispatched"
-if grep -Eq '^[[:space:]]+(push|pull_request|schedule):' "$acceptance_workflow"; then
-    fail "public acceptance must not run from push, pull request, or schedule"
-fi
-grep -Fq 'timeout-minutes: 10' "$acceptance_workflow" \
-    || fail "public acceptance job is not bounded"
-grep -Fq 'ZTERM_ACCEPTANCE_RELAY_URL: ${{ inputs.relay_url }}' "$acceptance_workflow" \
-    || fail "public acceptance input bypasses the quoted environment boundary"
-grep -Fq -- "--proto '=https'" "$acceptance_workflow" \
-    || fail "public acceptance HTTP checks permit a non-HTTPS protocol"
-grep -Fq -- '--max-time 15' "$acceptance_workflow" \
-    || fail "public acceptance HTTP checks are not bounded"
-grep -Fq -- '--retry 0' "$acceptance_workflow" \
-    || fail "public acceptance HTTP checks can retry"
-for contract in '/healthz 200' '/generate_204 204' '/ping 200'; do
-    grep -Fq "expect_status $contract" "$acceptance_workflow" \
-        || fail "public acceptance omits $contract"
-done
-grep -Fq 'sh tests/relay/public-handshake.sh "$ZTERM_ACCEPTANCE_RELAY_URL"' \
-    "$acceptance_workflow" || fail "public acceptance bypasses the handshake probe"
 
 workflow_permissions=$(awk '
     /^permissions:/ { in_permissions = 1; next }

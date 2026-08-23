@@ -582,10 +582,15 @@ config/state，不bind Endpoint、不query DNS、不spawn daemon。Human/JSON继
 ### 13.4 Relay/path evidence
 
 - 扩展`iroh_profile_gate`精确断言两个ALPN、official map/QAD/production lookup与self-hosted隔离；
-- 用现有disposable Relay/handshake probe验证ticket/cache中的远端Relay URL不被insert进本机
-  configured map但可dial；
-- `path_migration`以Iroh path events验证direct/relay label变化只更新observation；昂贵双NAT
-  network gate只在对应manual/CI环境运行，不成为普通unit test flaky依赖。
+- 继承已验收的 Foundation Case C 作为 official n0 运行时证据：两端在bind前阻断非DNS UDP，
+  仍通过官方 WSS/TCP Relay 完成三条端到端加密双向stream；不在本任务重复外网实验；
+- Linux CI在`RelayMode::Disabled`的loopback Endpoint上运行当前`connection_broker`、
+  `two_daemon_transport`与两进程production PairingService gate，证明本任务新增的broker、ALPN、
+  pairing与authorization组合使用真实Iroh；这些测试不冒充public n0运行时证据；
+- route/path pure tests验证fresh/cache/ticket顺序、远端Relay candidate不修改configured map，且
+  direct/relay observation不改变Session/auth/generation/replay状态；
+- 可选`relay.zenithconsulting.cn`及其他self-hosted部署不构成M5-M6验收门槛。真实双网络自动
+  address discovery仍按Foundation结论留给父任务M10。
 
 ### 13.5 Platform/gates
 

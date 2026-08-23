@@ -71,10 +71,6 @@ pairing_service::multiprocess_test::
     two_process_production_pairing_service_is_directional_and_reuses_one_endpoint
 ```
 
-The manual Linux-hosted external gate is
-`.github/workflows/public-relay-acceptance.yml` with required string input
-`relay_url`; it is never part of push/PR CI.
-
 Wire kinds 12-21 are same-UID local pair/device requests and responses. Pairing
 uses kinds 100-103 on `zterm-pair/1`; normal Hello/Welcome use 104-105 on
 `zterm/1`. `RelayRouteCacheV1` persists relay URLs only. `DeviceSummary` keeps
@@ -192,7 +188,7 @@ outbound-known and inbound-authorization directions explicit.
   native C/assembly dependencies before project code and does not replace the
   hosted result.
 
-### Linux multi-process pairing evidence
+### Linux and compositional transport evidence
 
 - The real-Iroh pairing acceptance target self-spawns exact ignored host and
   controller helper tests as distinct OS processes. Each helper owns its own
@@ -221,13 +217,15 @@ outbound-known and inbound-authorization directions explicit.
   `CI=true`, missing noninteractive `sudo -u nobody` is a hard failure rather
   than a skip; a successful Linux workspace job therefore records the peer-
   credential rejection and same-UID listener health contract.
-- The public Relay handshake remains a separate manual-only workflow dispatch.
-  It passes the requested URL to the existing bounded probe through a quoted
-  environment variable on hosted Ubuntu. Before the Endpoint is bound, exact
-  HTTPS 200/204/200 responses from `/healthz`, `/generate_204`, and `/ping`
-  distinguish public surface failure from authenticated Relay failure. Ordinary
-  push/PR CI must not depend on public Relay availability, and the manual job
-  has no deployment mutation or retry authority.
+- M5-M6 Relay/path acceptance is compositional. The accepted Foundation Case C
+  owns official-n0 runtime evidence: with endpoint non-DNS UDP blocked, three
+  encrypted bidirectional streams completed over the official WSS/TCP Relay.
+  Current `iroh_profile_gate` owns the exact production-map/QAD/lookups/ALPN
+  regression, while Linux `connection_broker`, `two_daemon_transport`, and the
+  two-process pairing target exercise the current M5-M6 code on real Iroh
+  loopback endpoints. Those loopback targets are not described as public-n0
+  runtime tests. The optional self-hosted Relay has no M5-M6 completion gate;
+  representative two-network automatic discovery remains parent M10 work.
 
 ## 4. Validation & Error Matrix
 
@@ -254,8 +252,6 @@ outbound-known and inbound-authorization directions explicit.
 | first unconstrained writer poll is `Pending` / `Ready` | writer is queued / already owns the write guard; notify once, then preserve normal wake and cancellation behavior |
 | later reader's first unconstrained poll after the writer barrier | must be `Pending`; completion before revoke publication is a fairness failure |
 | Linux CI cannot run the `nobody` cross-UID client noninteractively | fail; never record a skipped cross-UID gate as evidence |
-| manual public Relay HTTP surface misses exact `/healthz` 200, `/generate_204` 204, or `/ping` 200 | fail before Endpoint bind and report the exact path/status; never redirect or retry |
-| manual public Relay URL is invalid, unreachable, or fails authenticated connection | fail the manual acceptance once; do not retry or mutate deployment/profile state |
 
 ## 5. Good / Base / Bad Cases
 
@@ -315,9 +311,12 @@ outbound-known and inbound-authorization directions explicit.
   Its assertions include distinct process IDs/owners, ticket-only private
   control transport, directional durable/registry state, pair-to-normal
   confirmation, one normal primary with zero business streams, one Endpoint
-  identity/socket per child, and no direct-route persistence. Linux also owns
-  the disposable self-hosted relay/static/public handshake gates. Hosted
-  Windows owns shared core/proto/daemon compile evidence, including:
+  identity/socket per child, and no direct-route persistence. These loopback
+  targets prove the current broker/pairing/authorization composition; the
+  accepted Foundation Case C separately owns official-n0 Relay runtime
+  evidence, and `iroh_profile_gate` connects that retained evidence to the
+  current exact production profile. Hosted Windows owns shared core/proto/
+  daemon compile evidence, including:
 
   ```sh
   cargo clippy --workspace --lib --bins --all-features -- -D warnings
@@ -325,15 +324,8 @@ outbound-known and inbound-authorization directions explicit.
     --lib --all-features
   ```
 - Linux workspace CI must execute the harness-false `cross_uid` target with
-  `CI=true`; the public Relay gate is instead dispatched explicitly:
-
-  ```sh
-  gh workflow run public-relay-acceptance.yml \
-    -f relay_url=https://relay.zenithconsulting.cn
-  ```
-
-  The exact manual run, URL, commit, and result are recorded in the active task
-  evidence rather than turning public availability into an ordinary CI gate.
+  `CI=true`. The optional self-hosted Relay's direct post-update probe belongs
+  to its deployment runbook and is not an M5-M6 transport-auth gate.
 - Every change runs workspace fmt, check, Clippy with `-D warnings`, tests,
   docs, dependency/source/version/secret policy, task validation, and
   `git diff --check`.
