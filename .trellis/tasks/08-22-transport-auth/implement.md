@@ -373,6 +373,10 @@ sh tests/core-local-daemon/cross-uid.sh
 Stop if DB failure changes live access, revoke closes PTY/Session, same-UID IPC logs ticket, or public CLI
 scope drifts into M8.
 
+The harness-false `cross_uid` target executed successfully under `CI=true` on
+both Linux architectures in hosted runs `32611781285` and `32612691539`;
+missing noninteractive `sudo -u nobody` would have failed rather than skipped.
+
 ## Step 9. Real two-daemon、Relay/path 与 platform evidence
 
 ### Work
@@ -397,16 +401,19 @@ scope drifts into M8.
 cargo test -p zterm-daemon --test two_daemon_transport
 cargo test -p zterm-daemon --test path_migration
 sh tests/relay/static.sh
-sh tests/relay/public-handshake.sh https://relay.zenithconsulting.cn
+gh workflow run public-relay-acceptance.yml \
+  -f relay_url=https://relay.zenithconsulting.cn
 sh tests/source-policy.sh
 cargo test -p zterm-core --all-features
 cargo test -p zterm-proto --all-features
 cargo test -p zterm-daemon --lib --all-features
 ```
 
-The disposable Relay command may be an explicit environment gate rather than every local run, but the
-task cannot claim route/profile acceptance without one recorded pass. Stop if a harness touches real
-user state or treats unavailable public Internet as a product-code retry requirement.
+The public Relay command is an explicit manual hosted gate rather than every local run, but the task
+cannot claim route/profile acceptance without one recorded pass. Run `32613231264` on `bf3d313`
+stopped before Endpoint bind because public `/healthz` returned HTTP 403; do not retry until the
+external proxy/access-policy owner is identified and fixed. Stop if a harness touches real user state
+or treats unavailable public Internet as a product-code retry requirement.
 
 ## Step 10. Full quality gate 与 handoff
 
