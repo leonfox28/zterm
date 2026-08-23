@@ -142,6 +142,10 @@ before adding another infrastructure profile or validation layer.
   externally visible input: `relay_url`. Pass that value to the existing
   `tests/relay/public-handshake.sh` through a quoted environment variable;
   never interpolate workflow input directly into shell source.
+- Before binding the ephemeral Endpoint, require one HTTPS request each to
+  `/healthz`, `/generate_204`, and the Iroh home-relay selection path `/ping`.
+  Their exact responses are respectively 200, 204, and 200. Each request has a
+  15-second deadline, follows no redirect, and performs no retry.
 - The existing Rust `RelayUrl` parser owns URL validation. The probe makes one
   bounded connection attempt with QAD disabled, closes its ephemeral Endpoint,
   and returns the process status. Do not add workflow retries, deployment
@@ -168,6 +172,7 @@ before adding another infrastructure profile or validation layer.
 | Post-update health or authenticated Iroh handshake fails | Deployment is not accepted; report the observed failure |
 | All post-update checks pass | End validation without rollback or reconnect exercises |
 | Push or pull request runs ordinary CI | Do not schedule the public Relay acceptance job |
+| Public `/healthz`, `/generate_204`, or `/ping` does not return 200, 204, or 200 respectively | Fail before binding the Endpoint and identify the exact path/status |
 | Manual acceptance input is invalid, unreachable, or cannot authenticate within the probe deadline | Fail the manual run without retrying or changing the deployment |
 
 ### 5. Good / Base / Bad Cases

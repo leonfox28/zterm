@@ -28,6 +28,45 @@ jobs:
       - uses: actions/checkout@v5
       - name: Install exact Rust toolchain
         run: rustup toolchain install 1.98.0 --profile minimal
+      - name: Check public Relay HTTP surface
+        shell: bash
+        env:
+          ZTERM_ACCEPTANCE_RELAY_URL: ${{ inputs.relay_url }}
+        run: |
+          set -euo pipefail
+
+          case "$ZTERM_ACCEPTANCE_RELAY_URL" in
+            https://*) ;;
+            *)
+              echo "public Relay acceptance requires an HTTPS URL" >&2
+              exit 64
+              ;;
+          esac
+
+          base_url=${ZTERM_ACCEPTANCE_RELAY_URL%/}
+          expect_status() {
+            local path=$1
+            local expected=$2
+            local actual
+            actual=$(curl \
+              --proto '=https' \
+              --connect-timeout 10 \
+              --max-time 15 \
+              --retry 0 \
+              --silent \
+              --show-error \
+              --output /dev/null \
+              --write-out '%{http_code}' \
+              --url "${base_url}${path}")
+            if [[ "$actual" != "$expected" ]]; then
+              echo "${path} returned HTTP ${actual}; expected ${expected}" >&2
+              return 1
+            fi
+          }
+
+          expect_status /healthz 200
+          expect_status /generate_204 204
+          expect_status /ping 200
       - name: Establish authenticated Iroh Relay connection
         env:
           ZTERM_ACCEPTANCE_RELAY_URL: ${{ inputs.relay_url }}

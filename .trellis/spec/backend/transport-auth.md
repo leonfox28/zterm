@@ -223,9 +223,11 @@ outbound-known and inbound-authorization directions explicit.
   credential rejection and same-UID listener health contract.
 - The public Relay handshake remains a separate manual-only workflow dispatch.
   It passes the requested URL to the existing bounded probe through a quoted
-  environment variable on hosted Ubuntu. Ordinary push/PR CI must not depend
-  on public Relay availability, and the manual job has no deployment mutation
-  or retry authority.
+  environment variable on hosted Ubuntu. Before the Endpoint is bound, exact
+  HTTPS 200/204/200 responses from `/healthz`, `/generate_204`, and `/ping`
+  distinguish public surface failure from authenticated Relay failure. Ordinary
+  push/PR CI must not depend on public Relay availability, and the manual job
+  has no deployment mutation or retry authority.
 
 ## 4. Validation & Error Matrix
 
@@ -252,6 +254,7 @@ outbound-known and inbound-authorization directions explicit.
 | first unconstrained writer poll is `Pending` / `Ready` | writer is queued / already owns the write guard; notify once, then preserve normal wake and cancellation behavior |
 | later reader's first unconstrained poll after the writer barrier | must be `Pending`; completion before revoke publication is a fairness failure |
 | Linux CI cannot run the `nobody` cross-UID client noninteractively | fail; never record a skipped cross-UID gate as evidence |
+| manual public Relay HTTP surface misses exact `/healthz` 200, `/generate_204` 204, or `/ping` 200 | fail before Endpoint bind and report the exact path/status; never redirect or retry |
 | manual public Relay URL is invalid, unreachable, or fails authenticated connection | fail the manual acceptance once; do not retry or mutate deployment/profile state |
 
 ## 5. Good / Base / Bad Cases
