@@ -13,7 +13,7 @@ mod session_fixture;
 mod state_fixture;
 
 use std::collections::BTreeMap;
-use std::future::Future;
+use std::future::{Future, poll_fn};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -165,7 +165,7 @@ struct Harness {
     access: Arc<BarrierRemoteAccess>,
     registry: AuthorizationRegistry,
     sessions: SessionService,
-    before_revoke: mpsc::UnboundedReceiver<DeviceId>,
+    revoke_writer_polled: mpsc::UnboundedReceiver<DeviceId>,
     order: Arc<Mutex<Vec<&'static str>>>,
 }
 
@@ -193,10 +193,10 @@ impl Harness {
             Arc::clone(&order),
         ));
         let remote_access: Arc<dyn RemoteDeviceAccess> = access.clone();
-        let (before_revoke_tx, before_revoke) = mpsc::unbounded_channel();
+        let (revoke_writer_polled_tx, revoke_writer_polled) = mpsc::unbounded_channel();
         let management =
             DeviceManagement::new(handle.clone(), directory, registry.clone(), remote_access)
-                .with_before_revoke_guard_for_test(before_revoke_tx);
+                .with_revoke_guard_after_first_poll_for_test(revoke_writer_polled_tx);
         let service = Arc::new(
             DaemonService::with_sessions(setup, 123, sessions.clone())
                 .with_device_management(management),
@@ -220,7 +220,7 @@ impl Harness {
             access,
             registry,
             sessions,
-            before_revoke,
+            revoke_writer_polled,
             order,
         }
     }
@@ -229,11 +229,11 @@ impl Harness {
         LocalDeviceClient::new(self.state.paths.socket())
     }
 
-    async fn wait_before_revoke(&mut self, expected: DeviceId) {
+    async fn wait_for_revoke_writer(&mut self, expected: DeviceId) {
         assert_eq!(
-            self.before_revoke.recv().await,
+            self.revoke_writer_polled.recv().await,
             Some(expected),
-            "revoke reaches the write-gate boundary"
+            "revoke writer has queued or acquired the write gate"
         );
     }
 
@@ -336,19 +336,34 @@ async fn revoke_orders_started_and_queued_commits_before_close_and_detach() {
 
     let socket = harness.state.paths.socket().to_path_buf();
     let revoke = tokio::spawn(async move { LocalDeviceClient::new(socket).revoke(REMOTE).await });
-    harness.wait_before_revoke(REMOTE).await;
+    harness.wait_for_revoke_writer(REMOTE).await;
 
     let queued_registry = harness.registry.clone();
-    let (queued_started_tx, queued_started_rx) = oneshot::channel();
+    let (queued_polled_tx, queued_polled_rx) = oneshot::channel();
     let queued = tokio::spawn(async move {
-        queued_started_tx.send(()).expect("signal queued reader");
-        queued_registry
-            .acquire_commit(REMOTE, generation(1))
-            .await
-            .map(|_| ())
-            .map_err(|error| error.kind())
+        let acquire =
+            tokio::task::unconstrained(queued_registry.acquire_commit(REMOTE, generation(1)));
+        tokio::pin!(acquire);
+        let mut observer = Some(queued_polled_tx);
+        poll_fn(|context| {
+            let result = acquire.as_mut().poll(context);
+            if let Some(observer) = observer.take() {
+                observer
+                    .send(result.is_pending())
+                    .expect("signal queued reader first poll");
+            }
+            result
+        })
+        .await
+        .map(|_| ())
+        .map_err(|error| error.kind())
     });
-    queued_started_rx.await.expect("queued reader starts");
+    assert!(
+        queued_polled_rx
+            .await
+            .expect("queued reader first poll observed"),
+        "reader arriving after the revoke writer must wait on the fair gate"
+    );
 
     assert_eq!(
         harness
@@ -545,7 +560,7 @@ async fn failed_revoke_preserves_live_state_and_retry_completes_order() {
             .kind(),
         DomainErrorKind::StoreUnavailable
     );
-    harness.wait_before_revoke(REMOTE).await;
+    harness.wait_for_revoke_writer(REMOTE).await;
     let authorized = AuthorizationSnapshot {
         status: AuthorizationStatus::Authorized,
         generation: generation(1),
@@ -584,7 +599,7 @@ async fn failed_revoke_preserves_live_state_and_retry_completes_order() {
     }
     let socket = harness.state.paths.socket().to_path_buf();
     let retry = tokio::spawn(async move { LocalDeviceClient::new(socket).revoke(REMOTE).await });
-    harness.wait_before_revoke(REMOTE).await;
+    harness.wait_for_revoke_writer(REMOTE).await;
     let close = harness.access.wait_for_close_count(1).await;
     assert_eq!(close.durable.status, AuthorizationStatus::Revoked);
     assert_eq!(close.memory, close.durable);

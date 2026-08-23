@@ -8,6 +8,7 @@
 //! durable write, in-memory publish, connection close, and Session detach.
 
 use std::collections::BTreeMap;
+use std::future::{Future, poll_fn};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, watch};
@@ -159,24 +160,36 @@ impl AuthorizationRegistry {
     }
 
     /// Acquires the revoke writer while exposing one deterministic test-only
-    /// notification immediately before the fair write-lock future is polled.
+    /// notification after the fair write-lock future's first actual poll.
     ///
-    /// Entry lookup and state cloning finish before notification. Sending on
-    /// an unbounded channel is synchronous and non-blocking, and the next
-    /// expression directly awaits `write_owned`, so a notified test can queue
-    /// a later reader only after this writer has entered Tokio's fair queue.
+    /// The lock future is polled without Tokio's cooperative budget so a
+    /// pending result means the writer has joined the lock queue, rather than
+    /// merely exhausting the task budget. If the first poll is ready, the
+    /// notification is sent only after the write guard has been acquired.
+    /// Once notified, a test can therefore queue a later reader knowing this
+    /// writer either owns the lock or precedes that reader in Tokio's fair
+    /// queue.
     #[doc(hidden)]
-    pub async fn revoke_guard_before_wait_for_test(
+    pub async fn revoke_guard_after_first_poll_for_test(
         &self,
         device_id: DeviceId,
-        before_wait: &tokio::sync::mpsc::UnboundedSender<DeviceId>,
+        after_first_poll: &tokio::sync::mpsc::UnboundedSender<DeviceId>,
     ) -> Result<AuthorizationWriteGuard, DaemonError> {
         let Some(entry) = self.entry(device_id) else {
             return Err(device_not_found());
         };
         let state = entry.state.clone();
-        let _ = before_wait.send(device_id);
-        let guard = state.write_owned().await;
+        let write = tokio::task::unconstrained(state.write_owned());
+        tokio::pin!(write);
+        let mut observer = Some(after_first_poll);
+        let guard = poll_fn(|context| {
+            let result = write.as_mut().poll(context);
+            if let Some(observer) = observer.take() {
+                let _ = observer.send(device_id);
+            }
+            result
+        })
+        .await;
         Ok(AuthorizationWriteGuard { entry, guard })
     }
 

@@ -261,7 +261,7 @@ or network cleanup short-circuits retained Session ownership.
 
 ### Tests
 
-- [ ] `connection_broker`: concurrent local demands/open streams one dial/primary；different peers isolate。
+- [x] `connection_broker`: concurrent local demands/open streams one dial/primary；different peers isolate。
 - [x] `duplicate_connection`: barrier-driven simultaneous inbound/outbound dial produces same winner on
   both endpoints，loser does not kill winner/demand。
 - [x] `stream_limits`: per/global overflow、stalled first frame、malformed/oversize stream affect only
@@ -314,7 +314,7 @@ health becomes Session lifetime truth.
   exhaustion terminally fails without consume。
 - [x] Drop PairAccepted response after host commit；normal confirmation repairs B known device exactly
   once。Drop local pair-create/accept response；same operation bytes replay exact result。
-- [ ] Pair connection never appears as normal primary and no 0-RTT API is used。
+- [x] Pair connection never appears as normal primary and no 0-RTT API is used。
 - [x] Secret sentinel absent from logs、errors、status、SQLite bytes and panic output。
 
 ### Gate
@@ -380,7 +380,8 @@ scope drifts into M8.
 - [x] Build one task-private multi-process two-daemon harness using explicit UserPaths/identities and
   localhost direct candidates；prove daemon-owned Endpoint复用，不添加production state override argv。
   The production `PairingService` self-spawn gate compiles on macOS but remains ignored before bind；
-  its real pair/normal execution is a required Linux CI result。It composes the production
+  its real pair/normal execution passed on Linux x86_64 and arm64 in CI run
+  `32608814512`。It composes the production
   PairingService/BrokerPairTransport owners through private lib-test access；it does not claim
   `run_daemon`/`NetworkStartup` lifecycle evidence。
 - [ ] Reuse existing disposable self-hosted Relay/handshake fixture to prove ticket/cache remote Relay URL

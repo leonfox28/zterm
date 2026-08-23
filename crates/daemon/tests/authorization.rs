@@ -3,6 +3,8 @@
 #[path = "support/state_fixture.rs"]
 mod state_fixture;
 
+use std::future::{Future, poll_fn};
+
 use tokio::sync::{mpsc, oneshot};
 use zterm_core::{
     AuthGeneration, AuthorizationSnapshot, AuthorizationStatus, DeviceDisplayName, DeviceId,
@@ -201,15 +203,12 @@ async fn revoke_waits_for_in_flight_commit_and_rejects_stale_generation() {
     entered_rx.await.expect("committer holds read permit");
 
     let revoker_registry = registry.clone();
-    let (writer_started_tx, writer_started_rx) = oneshot::channel();
+    let (writer_polled_tx, mut writer_polled_rx) = mpsc::unbounded_channel();
     let (writer_acquired_tx, writer_acquired_rx) = oneshot::channel();
     let (publish_tx, publish_rx) = oneshot::channel();
     let revoker = tokio::spawn(async move {
-        // This send does not yield. The task next polls the write lock and can
-        // yield only after Tokio has queued the writer behind the held reader.
-        writer_started_tx.send(()).expect("signal writer start");
         let mut guard = revoker_registry
-            .revoke_guard(device)
+            .revoke_guard_after_first_poll_for_test(device, &writer_polled_tx)
             .await
             .expect("write permit");
         writer_acquired_tx.send(()).expect("signal writer acquired");
@@ -221,27 +220,44 @@ async fn revoke_waits_for_in_flight_commit_and_rejects_stale_generation() {
             })
             .expect("publish revoke");
     });
-    writer_started_rx.await.expect("writer is queued");
+    assert_eq!(
+        writer_polled_rx.recv().await,
+        Some(device),
+        "writer has joined the fair lock queue"
+    );
 
-    // A reader arriving after the queued writer must not overtake it. Like the
-    // writer barrier above, the start signal is immediately followed by the
-    // first poll of the lock future before this task can yield.
+    // A reader arriving after the queued writer must not overtake it. Poll the
+    // read future without a cooperative budget so the barrier proves it is
+    // pending on the fair lock queue, rather than merely scheduled to start.
     let later_registry = registry.clone();
-    let (reader_started_tx, reader_started_rx) = oneshot::channel();
+    let (reader_polled_tx, reader_polled_rx) = oneshot::channel();
     let (reader_result_tx, mut reader_result_rx) = mpsc::channel(1);
     let later_reader = tokio::spawn(async move {
-        reader_started_tx.send(()).expect("signal reader start");
-        let result = later_registry
-            .acquire_commit(device, generation(1))
-            .await
-            .map(|_| ())
-            .map_err(|error| error.kind());
+        let acquire =
+            tokio::task::unconstrained(later_registry.acquire_commit(device, generation(1)));
+        tokio::pin!(acquire);
+        let mut observer = Some(reader_polled_tx);
+        let result = poll_fn(|context| {
+            let result = acquire.as_mut().poll(context);
+            if let Some(observer) = observer.take() {
+                observer
+                    .send(result.is_pending())
+                    .expect("signal reader first poll");
+            }
+            result
+        })
+        .await
+        .map(|_| ())
+        .map_err(|error| error.kind());
         reader_result_tx
             .send(result)
             .await
             .expect("send reader result");
     });
-    reader_started_rx.await.expect("later reader is queued");
+    assert!(
+        reader_polled_rx.await.expect("reader first poll observed"),
+        "later reader must wait behind the already-queued writer"
+    );
 
     // Neither queued waiter can finish while the original commit holds its
     // permit.

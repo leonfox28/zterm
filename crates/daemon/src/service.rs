@@ -208,7 +208,7 @@ pub struct DeviceManagement {
     directory: DeviceDirectory,
     authorization: AuthorizationRegistry,
     remote_access: Arc<dyn RemoteDeviceAccess>,
-    before_revoke_guard_for_test: Option<tokio::sync::mpsc::UnboundedSender<DeviceId>>,
+    revoke_guard_after_first_poll_for_test: Option<tokio::sync::mpsc::UnboundedSender<DeviceId>>,
 }
 
 #[cfg(unix)]
@@ -228,19 +228,19 @@ impl DeviceManagement {
             directory,
             authorization,
             remote_access,
-            before_revoke_guard_for_test: None,
+            revoke_guard_after_first_poll_for_test: None,
         }
     }
 
-    /// Installs a deterministic notification immediately before the revoke
-    /// writer begins waiting on its fair authorization gate.
+    /// Installs a deterministic notification after the revoke writer's first
+    /// actual lock poll proves that it has queued or acquired the fair gate.
     #[doc(hidden)]
     #[must_use]
-    pub fn with_before_revoke_guard_for_test(
+    pub fn with_revoke_guard_after_first_poll_for_test(
         mut self,
         observer: tokio::sync::mpsc::UnboundedSender<DeviceId>,
     ) -> Self {
-        self.before_revoke_guard_for_test = Some(observer);
+        self.revoke_guard_after_first_poll_for_test = Some(observer);
         self
     }
 }
@@ -647,11 +647,11 @@ impl DaemonService {
         // The write permit is held across the complete ordered revoke. A
         // queued sensitive commit cannot overtake it, while an already-held
         // read permit completes before the durable transaction begins.
-        let mut guard = match &devices.before_revoke_guard_for_test {
+        let mut guard = match &devices.revoke_guard_after_first_poll_for_test {
             Some(observer) => {
                 devices
                     .authorization
-                    .revoke_guard_before_wait_for_test(device_id, observer)
+                    .revoke_guard_after_first_poll_for_test(device_id, observer)
                     .await?
             }
             None => devices.authorization.revoke_guard(device_id).await?,

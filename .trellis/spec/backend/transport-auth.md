@@ -56,6 +56,13 @@ AuthorizationRegistry::authorize_guard(device_id)
 AuthorizationRegistry::revoke_guard(device_id)
     -> Result<AuthorizationWriteGuard, DaemonError>
 
+// Test-only scheduling evidence; production revoke_guard remains unchanged.
+#[doc(hidden)]
+AuthorizationRegistry::revoke_guard_after_first_poll_for_test(
+    device_id,
+    observer: &tokio::sync::mpsc::UnboundedSender<DeviceId>,
+) -> Result<AuthorizationWriteGuard, DaemonError>
+
 LocalDeviceClient::new(socket: impl Into<PathBuf>) -> LocalDeviceClient
 LocalDeviceClient::{list, rename, revoke}(...) // Unix: IPC; non-Unix: UnsupportedPlatform
 
@@ -142,14 +149,24 @@ outbound-known and inbound-authorization directions explicit.
   Session, then local response. A database failure changes none of the later
   owners. Detach removes only the matching remote attachments/controller lease;
   it does not close the Session, PTY, or another principal.
+- A concurrency test must not treat a channel send immediately before
+  `write_owned().await`, `yield_now`, or a sleep as proof that the writer has
+  entered Tokio's fair lock queue. Another runtime worker may consume the
+  notification and poll a later reader first. The deterministic test seam pins
+  the real lock future, wraps it in `tokio::task::unconstrained`, and notifies
+  only after its first actual poll: `Pending` proves queue entry and `Ready`
+  means the guard is already held. A later reader uses the same first-poll
+  barrier and must observe `Pending`. These observers never change the
+  production authorization or revoke path.
 
 ### Secret and user-surface boundaries
 
-- Ticket, secret, nonce, proof, confirmation, decoded payload, and encoded local
-  request owners are zeroized at their narrowest owner. Their `Debug` output is
-  redacted; prost generation uses exact `skip_debug` entries for sensitive
-  messages and `WireFrame`. Errors/status/tracing/SQLite never contain bearer
-  or proof bytes.
+- Ticket, secret, proof, confirmation, and ticket/proof-bearing decoded or
+  encoded request owners are zeroized at their narrowest owner. Their `Debug`
+  output is redacted; prost generation also redacts the public handshake nonces
+  in pair wire messages and `WireFrame`. Public nonces remain ordinary
+  fixed-width protocol values, but errors/status/tracing/SQLite never contain
+  nonce, bearer, or proof bytes.
 - Pair/device local IPC remains behind the same-UID gate, strict unary EOF, one
   shared frame decoder, and byte-identical ambiguous retry. The hidden clients
   do not spawn the daemon or bind an endpoint. Public clap still exposes no
@@ -218,6 +235,9 @@ outbound-known and inbound-authorization directions explicit.
 | pairing helper misses the shared exit deadline | kill, boundedly reap, and fail without emitting child output |
 | Unix-only private field or actor-query chain in a shared Windows module | gate every private owner/variant/arm/helper together; shared Clippy must have zero dead code |
 | non-Unix caller constructs or invokes `LocalDeviceClient` | construction succeeds without Unix state; operation returns typed `UnsupportedPlatform` |
+| writer test observer fires before the lock future's first poll | invalid scheduling evidence; do not infer queue order |
+| first unconstrained writer poll is `Pending` / `Ready` | writer is queued / already owns the write guard; notify once, then preserve normal wake and cancellation behavior |
+| later reader's first unconstrained poll after the writer barrier | must be `Pending`; completion before revoke publication is a fairness failure |
 
 ## 5. Good / Base / Bad Cases
 
@@ -233,11 +253,16 @@ outbound-known and inbound-authorization directions explicit.
   but the target remains ignored and its helper guard precedes every bind.
 - **Base:** Windows compiles the shared hidden device-client surface without a
   Unix socket field; invoking an operation returns `UnsupportedPlatform`.
+- **Good:** a held authorization reader forces the revoke writer's first real
+  poll to `Pending`; only then is a later commit reader started, and its own
+  first poll is also `Pending` behind the writer.
 - **Bad:** cap the combined route list at four, accept unidirectional QUIC
   streams that no actor consumes, persist a direct address, roll back an
   outcome-unknown authorization, detach a PTY because one device was revoked,
   place a bearer ticket in child argv/env/output, or leave a Unix-only actor
-  command compiled and unused on Windows.
+  command compiled and unused on Windows. It is also invalid to signal "writer
+  started" before polling the lock and assume multi-thread scheduling preserves
+  source order.
 
 ## 6. Tests Required
 
@@ -254,6 +279,12 @@ outbound-known and inbound-authorization directions explicit.
 - Named transport gates: `duplicate_connection`, `stream_limits`,
   `authorization`, `path_migration`, and `network_lifecycle` must be
   deterministic and socket-free where possible.
+- `authorization` and `revoke_races` must establish writer-before-later-reader
+  ordering from observed first polls, with `unconstrained` excluding Tokio
+  cooperative-budget false `Pending`. Assert the later reader's first result is
+  `Pending`, then assert it receives the revoked/current generation only after
+  the original reader releases and the writer publishes. Do not replace these
+  assertions with timing sleeps, yields, or start notifications.
 - Real Iroh targets are compiled on developer macOS but not executed there.
   Linux CI owns execution of `connection_broker` and `two_daemon_transport`,
   and this exact two-process production pairing target:
@@ -352,3 +383,30 @@ enum SessionCommand {
 
 The corresponding service method, dispatch arm, and helper carry the same
 `cfg(unix)` boundary, so every compiled target has a real consumer.
+
+For fair authorization races, notifying before the lock future is polled is
+also wrong on a multi-thread runtime:
+
+```rust
+started.send(())?;
+let guard = state.write_owned().await; // another worker may poll a reader first
+```
+
+Observe the lock future's first actual poll instead:
+
+```rust
+let write = tokio::task::unconstrained(state.write_owned());
+tokio::pin!(write);
+let mut observer = Some(observer);
+let guard = poll_fn(|cx| {
+    let result = write.as_mut().poll(cx);
+    if let Some(observer) = observer.take() {
+        let _ = observer.send(device_id);
+    }
+    result
+})
+.await;
+```
+
+This keeps Tokio's real queue, waker, and cancellation semantics while making
+the barrier independent of which runtime worker runs next.
