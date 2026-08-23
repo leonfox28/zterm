@@ -27,6 +27,7 @@ mod unix {
             threads.push(thread::spawn(move || {
                 barrier.wait();
                 match fixture.service.prepare_attach(
+                    fixture.principal,
                     None,
                     true,
                     true,
@@ -52,7 +53,13 @@ mod unix {
 
         let prepared = fixture
             .service
-            .prepare_attach(Some(SessionSelector::Id(ids[0])), false, false, None)
+            .prepare_attach(
+                fixture.principal,
+                Some(SessionSelector::Id(ids[0])),
+                false,
+                false,
+                None,
+            )
             .map_err(support::display)?;
         support::activate(&prepared)?;
         prepared
@@ -64,7 +71,7 @@ mod unix {
 
         let reattached = fixture
             .service
-            .prepare_attach(None, true, false, None)
+            .prepare_attach(fixture.principal, None, true, false, None)
             .map_err(support::display)?;
         assert_eq!(reattached.attachment.session_id(), ids[0]);
         support::activate(&reattached)?;
@@ -86,7 +93,7 @@ mod unix {
         );
         let replacement = fixture
             .service
-            .prepare_attach(None, true, false, None)
+            .prepare_attach(fixture.principal, None, true, false, None)
             .map_err(support::display)?;
         assert_ne!(replacement.attachment.session_id(), ids[0]);
         let mut replacement_lifecycle = replacement
@@ -242,6 +249,7 @@ mod unix {
         let attached = fixture
             .service
             .prepare_attach(
+                fixture.principal,
                 Some(SessionSelector::Id(build.session_id)),
                 false,
                 false,

@@ -7,7 +7,9 @@ use iroh::{
     address_lookup::{N0_DNS_ENDPOINT_ORIGIN_PROD, N0_DNS_PKARR_RELAY_PROD},
     defaults::DEFAULT_RELAY_QUIC_PORT,
 };
-use zterm_daemon::transport::{InfrastructureProfile, ZTERM_ALPN};
+use zterm_daemon::transport::{
+    InfrastructureProfile, InfrastructureProfileSummary, ZTERM_ALPN, ZTERM_PAIR_ALPN,
+};
 
 const EXPECTED_N0_PRODUCTION_RELAYS: [&str; 4] = [
     "https://use1-1.relay.n0.iroh.link.",
@@ -57,6 +59,14 @@ fn effective_profile_uses_relay_only_n0_lookup_and_gate_alpn() {
 }
 
 #[test]
+fn self_hosted_profile_is_exactly_one_no_qad_relay_with_two_alpns() {
+    let profile = InfrastructureProfile::SelfHosted {
+        relay_url: parse_relay_url(SELF_HOSTED_RELAY),
+    };
+    assert_self_hosted_contract(&profile);
+}
+
+#[test]
 fn staging_environment_cannot_change_the_production_profile() {
     let output = Command::new(std::env::current_exe().expect("test executable is available"))
         .args([
@@ -88,6 +98,11 @@ fn production_profile_under_staging_environment_child() {
     let profile = InfrastructureProfile::zterm();
     assert_production_relay_contract(&profile);
     assert_production_lookup_contract(&profile);
+
+    let self_hosted = InfrastructureProfile::SelfHosted {
+        relay_url: parse_relay_url(SELF_HOSTED_RELAY),
+    };
+    assert_self_hosted_contract(&self_hosted);
 }
 
 fn parse_relay_url(url: &str) -> RelayUrl {
@@ -124,9 +139,42 @@ fn assert_production_relay_contract(profile: &InfrastructureProfile) {
     ));
 }
 
+fn assert_self_hosted_contract(profile: &InfrastructureProfile) {
+    let relay_url = parse_relay_url(SELF_HOSTED_RELAY);
+    let summary = profile.summary();
+
+    assert_eq!(summary.relays.len(), 1);
+    assert_eq!(summary.relays[0].url, relay_url);
+    assert!(!summary.relays[0].quic_address_discovery);
+    assert_common_summary_contract(&summary);
+
+    let builder_debug = format!("{:?}", profile.endpoint_builder(SecretKey::generate()));
+    assert_common_builder_contract(&builder_debug);
+    assert!(builder_debug.contains("relay.zenithconsulting.cn"));
+    for relay in RelayMode::Default.relay_map().relays::<Vec<_>>() {
+        let host = relay.url.host_str().expect("official Relay has a host");
+        assert!(
+            !builder_debug.contains(host),
+            "self-hosted builder included official Relay {host}"
+        );
+    }
+    for relay in RelayMode::Staging.relay_map().relays::<Vec<_>>() {
+        let host = relay.url.host_str().expect("staging Relay has a host");
+        assert!(
+            !builder_debug.contains(host),
+            "self-hosted builder included staging Relay {host}"
+        );
+    }
+}
+
 fn assert_production_lookup_contract(profile: &InfrastructureProfile) {
     let summary = profile.summary();
 
+    assert_common_summary_contract(&summary);
+    assert_effective_builder_contract(profile);
+}
+
+fn assert_common_summary_contract(summary: &InfrastructureProfileSummary) {
     assert_eq!(N0_DNS_PKARR_RELAY_PROD, EXPECTED_N0_PRODUCTION_PKARR_URL);
     assert_eq!(
         N0_DNS_ENDPOINT_ORIGIN_PROD,
@@ -143,14 +191,34 @@ fn assert_production_lookup_contract(profile: &InfrastructureProfile) {
     assert_eq!(summary.dns_lookup_origin, EXPECTED_N0_PRODUCTION_DNS_ORIGIN);
     assert!(!summary.publishes_direct_addresses);
     assert!(summary.portmapper_enabled);
-    assert_eq!(summary.alpns, [ZTERM_ALPN.to_vec()]);
-
-    assert_effective_builder_contract(profile);
+    assert_eq!(
+        summary.alpns,
+        [ZTERM_ALPN.to_vec(), ZTERM_PAIR_ALPN.to_vec()]
+    );
 }
 
 fn assert_effective_builder_contract(profile: &InfrastructureProfile) {
     let builder_debug = format!("{:?}", profile.endpoint_builder(SecretKey::generate()));
 
+    assert_common_builder_contract(&builder_debug);
+
+    for relay in EXPECTED_N0_PRODUCTION_RELAYS.map(parse_relay_url) {
+        let host = relay.host_str().expect("production Relay has a host");
+        assert!(
+            builder_debug.contains(host),
+            "effective builder omitted production Relay {host}"
+        );
+    }
+    for relay in RelayMode::Staging.relay_map().relays::<Vec<_>>() {
+        let host = relay.url.host_str().expect("Iroh staging Relay has a host");
+        assert!(
+            !builder_debug.contains(host),
+            "effective builder included staging Relay {host}"
+        );
+    }
+}
+
+fn assert_common_builder_contract(builder_debug: &str) {
     // Iroh 1.0.3 does not expose read-only Builder accessors for lookup
     // services. Its pinned Debug projection lets this regression inspect the
     // builder that will actually be bound without publishing a test identity
@@ -167,19 +235,6 @@ fn assert_effective_builder_contract(profile: &InfrastructureProfile) {
     assert!(!builder_debug.contains("staging-dns.iroh.link"));
     assert!(builder_debug.contains("addr_filter: Some(AddrFilter"));
     assert!(builder_debug.contains("portmapper_config: Enabled"));
-
-    for relay in EXPECTED_N0_PRODUCTION_RELAYS.map(parse_relay_url) {
-        let host = relay.host_str().expect("production Relay has a host");
-        assert!(
-            builder_debug.contains(host),
-            "effective builder omitted production Relay {host}"
-        );
-    }
-    for relay in RelayMode::Staging.relay_map().relays::<Vec<_>>() {
-        let host = relay.url.host_str().expect("Iroh staging Relay has a host");
-        assert!(
-            !builder_debug.contains(host),
-            "effective builder included staging Relay {host}"
-        );
-    }
+    let expected_alpns = vec![ZTERM_ALPN.to_vec(), ZTERM_PAIR_ALPN.to_vec()];
+    assert!(builder_debug.contains(&format!("alpn_protocols: {expected_alpns:?}")));
 }

@@ -36,7 +36,8 @@ pub fn run_child_if_requested() -> bool {
     if let Err(error) = zterm_platform::local_unix::detach_current_process()
         .map_err(|error| error.to_string())
         .and_then(|()| {
-            zterm_daemon::lifecycle::run_daemon(&paths).map_err(|error| error.to_string())
+            zterm_daemon::lifecycle::run_local_only_daemon_for_test(&paths)
+                .map_err(|error| error.to_string())
         })
     {
         eprintln!("daemon harness failed: {error}");

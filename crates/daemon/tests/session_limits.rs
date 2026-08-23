@@ -49,6 +49,7 @@ fn session_viewport_and_projection_limits_fail_without_mutation() -> Result<(), 
     let attached = fixture
         .service
         .prepare_attach(
+            fixture.principal,
             Some(SessionSelector::Id(session.session_id)),
             false,
             false,
@@ -84,6 +85,7 @@ fn session_viewport_and_projection_limits_fail_without_mutation() -> Result<(), 
         "failed resize must retain state and reservation"
     );
     let oversized_attach = match fixture.service.prepare_attach(
+        fixture.principal,
         Some(SessionSelector::Id(session.session_id)),
         false,
         true,

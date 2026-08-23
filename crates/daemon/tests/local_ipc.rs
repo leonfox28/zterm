@@ -190,7 +190,7 @@ async fn same_uid_service_errors_are_connection_local_and_stop_ack_is_flushed() 
         .await
         .expect("server survives unary half-close deadline");
 
-    let future = encode_message(WireKind::PairOffer, 13, 0, &v1::PairOffer::default())
+    let future = encode_message(WireKind::PairBegin, 13, 0, &v1::PairBegin::default())
         .expect("future request");
     assert_error_code(&state, future, "service_not_implemented").await;
     client

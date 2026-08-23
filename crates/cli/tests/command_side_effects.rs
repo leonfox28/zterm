@@ -23,6 +23,16 @@ async fn help_version_status_doctor_logs_and_stop_never_spawn() {
     assert!(help.contains("setup"));
     assert!(help.contains("daemon"));
     assert!(!help.contains("internal-daemon"));
+    let public_commands = definition
+        .get_subcommands()
+        .map(clap::Command::get_name)
+        .collect::<Vec<_>>();
+    for unavailable in ["pair", "device", "connect", "session"] {
+        assert!(
+            !public_commands.contains(&unavailable),
+            "{unavailable} must not be exposed before its public CLI milestone"
+        );
+    }
     let version = Cli::try_parse_from(["zterm", "--version"]).expect_err("clap prints version");
     assert_eq!(version.kind(), ErrorKind::DisplayVersion);
     assert!(version.to_string().contains(env!("CARGO_PKG_VERSION")));
@@ -57,12 +67,30 @@ async fn help_version_status_doctor_logs_and_stop_never_spawn() {
     let json: serde_json::Value = serde_json::from_str(&json).expect("status JSON");
     assert_eq!(json["state"], "not_configured");
     assert_eq!(json["active_session_count"], 0);
+    assert_eq!(json["network_state"], serde_json::Value::Null);
+    assert_eq!(json["address_publish_state"], serde_json::Value::Null);
+    assert_eq!(json["address_lookup_state"], serde_json::Value::Null);
+    assert_eq!(json["authenticated_connection_count"], 0);
+    assert_eq!(json["direct_path_count"], 0);
+    assert_eq!(json["relay_path_count"], 0);
+    assert_eq!(json["network_diagnostic"], serde_json::Value::Null);
 
     let doctor = run(&runtime, ["zterm", "doctor", "--json"]).await;
     let doctor: serde_json::Value = serde_json::from_str(&doctor).expect("doctor JSON");
     assert_eq!(doctor["healthy"], false);
     assert_eq!(doctor["checks"][1]["name"], "autostart");
     let checks = doctor["checks"].as_array().expect("doctor checks");
+    let network = checks
+        .iter()
+        .find(|check| check["name"] == "network")
+        .expect("network check");
+    assert_eq!(network["ok"], true);
+    assert!(
+        network["detail"]
+            .as_str()
+            .expect("network detail")
+            .contains("not attempted")
+    );
     let state_paths = checks
         .iter()
         .find(|check| check["name"] == "state_paths")

@@ -557,8 +557,15 @@ async fn failed_bounded_stop_keeps_the_listener_available_until_session_ownershi
             Ok((session, working_directory))
         },
     );
+    let principal = sessions.local_principal(AttachmentId::from_array([46; 16]));
     let prepared = sessions
-        .prepare_attach(None, true, false, Some(TerminalSize::new(24, 80)))
+        .prepare_attach(
+            principal,
+            None,
+            true,
+            false,
+            Some(TerminalSize::new(24, 80)),
+        )
         .map_err(session_fixture::display)?;
     let ready_deadline = Instant::now() + EVENT_DEADLINE;
     loop {
@@ -730,6 +737,7 @@ async fn fatal_listener_exit_rebinds_actual_daemon_loop_until_owned_child_can_st
         .map_err(session_fixture::display)?;
     let ready = sessions
         .prepare_attach(
+            principal,
             Some(SessionSelector::Id(created.session_id)),
             false,
             false,

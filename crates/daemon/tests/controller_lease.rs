@@ -13,10 +13,11 @@ fn takeover_requires_snapshot_and_invalidates_the_old_controller() -> Result<(),
     let fixture = support::Fixture::new(ResourceLimits::default())?;
     let first = fixture
         .service
-        .prepare_attach(None, true, false, None)
+        .prepare_attach(fixture.principal, None, true, false, None)
         .map_err(support::display)?;
     support::activate(&first)?;
     let occupied = fixture.service.prepare_attach(
+        fixture.principal,
         Some(SessionSelector::Id(first.attachment.session_id())),
         false,
         false,
@@ -31,6 +32,7 @@ fn takeover_requires_snapshot_and_invalidates_the_old_controller() -> Result<(),
     let pending = fixture
         .service
         .prepare_attach(
+            fixture.principal,
             Some(SessionSelector::Id(first.attachment.session_id())),
             false,
             true,
@@ -46,6 +48,7 @@ fn takeover_requires_snapshot_and_invalidates_the_old_controller() -> Result<(),
         DomainErrorKind::NotSynchronized
     );
     let second_pending = fixture.service.prepare_attach(
+        fixture.principal,
         Some(SessionSelector::Id(first.attachment.session_id())),
         false,
         true,
@@ -93,6 +96,7 @@ fn takeover_requires_snapshot_and_invalidates_the_old_controller() -> Result<(),
     let replacement = fixture
         .service
         .prepare_attach(
+            fixture.principal,
             Some(SessionSelector::Id(first.attachment.session_id())),
             false,
             true,
@@ -131,13 +135,19 @@ fn same_operation_continuation_reacquires_authority_after_old_controller_detache
     let fixture = support::Fixture::new(ResourceLimits::default())?;
     let original = fixture
         .service
-        .prepare_attach(None, true, false, None)
+        .prepare_attach(fixture.principal, None, true, false, None)
         .map_err(support::display)?;
     support::activate(&original)?;
     let session_id = original.attachment.session_id();
     let first = fixture
         .service
-        .prepare_attach(Some(SessionSelector::Id(session_id)), false, true, None)
+        .prepare_attach(
+            fixture.principal,
+            Some(SessionSelector::Id(session_id)),
+            false,
+            true,
+            None,
+        )
         .map_err(support::display)?;
     support::activate(&first)?;
     let retained = fixture
@@ -150,7 +160,13 @@ fn same_operation_continuation_reacquires_authority_after_old_controller_detache
     // deterministically reaps the detached controller before continuation.
     let replacement = fixture
         .service
-        .prepare_attach(Some(SessionSelector::Id(session_id)), false, true, None)
+        .prepare_attach(
+            fixture.principal,
+            Some(SessionSelector::Id(session_id)),
+            false,
+            true,
+            None,
+        )
         .map_err(support::display)?;
     support::activate(&replacement)?;
     let continued = fixture
@@ -176,13 +192,19 @@ fn stale_same_operation_continuation_cannot_clobber_a_later_controller() -> Resu
     let fixture = support::Fixture::new(ResourceLimits::default())?;
     let original = fixture
         .service
-        .prepare_attach(None, true, false, None)
+        .prepare_attach(fixture.principal, None, true, false, None)
         .map_err(support::display)?;
     support::activate(&original)?;
     let session_id = original.attachment.session_id();
     let old = fixture
         .service
-        .prepare_attach(Some(SessionSelector::Id(session_id)), false, true, None)
+        .prepare_attach(
+            fixture.principal,
+            Some(SessionSelector::Id(session_id)),
+            false,
+            true,
+            None,
+        )
         .map_err(support::display)?;
     support::activate(&old)?;
     fixture
@@ -192,7 +214,13 @@ fn stale_same_operation_continuation_cannot_clobber_a_later_controller() -> Resu
 
     let later = fixture
         .service
-        .prepare_attach(Some(SessionSelector::Id(session_id)), false, true, None)
+        .prepare_attach(
+            fixture.principal,
+            Some(SessionSelector::Id(session_id)),
+            false,
+            true,
+            None,
+        )
         .map_err(support::display)?;
     support::activate(&later)?;
     fixture
@@ -202,7 +230,13 @@ fn stale_same_operation_continuation_cannot_clobber_a_later_controller() -> Resu
 
     let stale = fixture
         .service
-        .prepare_attach(Some(SessionSelector::Id(session_id)), false, true, None)
+        .prepare_attach(
+            fixture.principal,
+            Some(SessionSelector::Id(session_id)),
+            false,
+            true,
+            None,
+        )
         .map_err(support::display)?;
     support::activate(&stale)?;
     let rejected = fixture

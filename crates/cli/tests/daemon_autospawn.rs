@@ -90,24 +90,71 @@ async fn cli_autospawn() {
     );
     let human = run(&runtime, ["zterm", "status"]).await;
     assert!(human.contains("State: running"));
+    assert!(human.contains("Network: disabled"));
+    assert!(human.contains("Endpoint bound: false"));
+    assert!(human.contains("Address publish: disabled"));
+    assert!(human.contains("Address lookup: disabled"));
+    assert!(human.contains("Paths: direct=0, relay=0"));
     let json = run(&runtime, ["zterm", "status", "--json"]).await;
     let json: serde_json::Value = serde_json::from_str(&json).expect("running JSON");
     assert_eq!(json["state"], "running");
     assert_eq!(json["device_name"], "cli-host");
     assert_eq!(json["active_session_count"], 0);
+    assert_eq!(json["network_state"], "disabled");
+    assert_eq!(json["endpoint_bound"], false);
+    assert_eq!(json["network_bind_attempts"], 0);
+    assert_eq!(json["address_publish_state"], "disabled");
+    assert_eq!(json["address_lookup_state"], "disabled");
+    assert_eq!(json["authenticated_connection_count"], 0);
+    assert_eq!(json["primary_connection_count"], 0);
+    assert_eq!(json["active_stream_count"], 0);
+    assert_eq!(json["direct_path_count"], 0);
+    assert_eq!(json["relay_path_count"], 0);
+    assert_eq!(json["network_diagnostic"], serde_json::Value::Null);
     let doctor = run(&runtime, ["zterm", "doctor", "--json"]).await;
     let doctor: serde_json::Value = serde_json::from_str(&doctor).expect("running doctor JSON");
     assert_eq!(doctor["healthy"], true);
+    let running_network = doctor["checks"]
+        .as_array()
+        .expect("running doctor checks")
+        .iter()
+        .find(|check| check["name"] == "network")
+        .expect("running network check");
+    assert_eq!(running_network["ok"], true);
+    assert!(
+        running_network["detail"]
+            .as_str()
+            .expect("running network detail")
+            .contains("state=disabled")
+    );
 
     run(&runtime, ["zterm", "daemon", "stop"]).await;
     wait_for_socket(&state.paths, false).await;
     let stopped = run(&runtime, ["zterm", "status", "--json"]).await;
     let stopped: serde_json::Value = serde_json::from_str(&stopped).expect("stopped JSON");
     assert_eq!(stopped["state"], "configured_stopped");
+    assert_eq!(stopped["network_state"], "stopped");
+    assert_eq!(stopped["endpoint_bound"], false);
+    assert_eq!(stopped["address_publish_state"], "disabled");
+    assert_eq!(stopped["address_lookup_state"], "disabled");
     assert!(!state.paths.socket().exists(), "status does not restart");
     let doctor = run(&runtime, ["zterm", "doctor", "--json"]).await;
     let doctor: serde_json::Value = serde_json::from_str(&doctor).expect("stopped doctor JSON");
     assert_eq!(doctor["healthy"], true);
+    let stopped_network = doctor["checks"]
+        .as_array()
+        .expect("stopped doctor checks")
+        .iter()
+        .find(|check| check["name"] == "network")
+        .expect("stopped network check");
+    assert_eq!(stopped_network["ok"], true);
+    assert!(
+        stopped_network["detail"]
+            .as_str()
+            .expect("stopped network detail")
+            .contains("not attempted")
+    );
+    assert!(!state.paths.socket().exists(), "doctor does not restart");
 
     let log_bytes = std::fs::read(state.paths.daemon_log()).expect("daemon log bytes");
     assert!(
