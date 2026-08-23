@@ -1,0 +1,34 @@
+name: public relay acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      relay_url:
+        description: HTTPS Iroh Relay URL to authenticate against
+        required: true
+        type: string
+        default: https://relay.zenithconsulting.cn
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-relay-acceptance-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  handshake:
+    name: Authenticated public Relay handshake
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install exact Rust toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal
+      - name: Establish authenticated Iroh Relay connection
+        env:
+          ZTERM_ACCEPTANCE_RELAY_URL: ${{ inputs.relay_url }}
+        run: sh tests/relay/public-handshake.sh "$ZTERM_ACCEPTANCE_RELAY_URL"

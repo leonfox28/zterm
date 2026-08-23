@@ -71,6 +71,10 @@ pairing_service::multiprocess_test::
     two_process_production_pairing_service_is_directional_and_reuses_one_endpoint
 ```
 
+The manual Linux-hosted external gate is
+`.github/workflows/public-relay-acceptance.yml` with required string input
+`relay_url`; it is never part of push/PR CI.
+
 Wire kinds 12-21 are same-UID local pair/device requests and responses. Pairing
 uses kinds 100-103 on `zterm-pair/1`; normal Hello/Welcome use 104-105 on
 `zterm/1`. `RelayRouteCacheV1` persists relay URLs only. `DeviceSummary` keeps
@@ -213,6 +217,15 @@ outbound-known and inbound-authorization directions explicit.
   and one-Endpoint reuse. Its private test-only ALPN router is not evidence for
   `run_daemon`, `NetworkStartup`, the future public CLI, or full daemon
   lifecycle recovery.
+- Cross-UID evidence is the Linux `cross_uid` harness-false test itself. Under
+  `CI=true`, missing noninteractive `sudo -u nobody` is a hard failure rather
+  than a skip; a successful Linux workspace job therefore records the peer-
+  credential rejection and same-UID listener health contract.
+- The public Relay handshake remains a separate manual-only workflow dispatch.
+  It passes the requested URL to the existing bounded probe through a quoted
+  environment variable on hosted Ubuntu. Ordinary push/PR CI must not depend
+  on public Relay availability, and the manual job has no deployment mutation
+  or retry authority.
 
 ## 4. Validation & Error Matrix
 
@@ -238,6 +251,8 @@ outbound-known and inbound-authorization directions explicit.
 | writer test observer fires before the lock future's first poll | invalid scheduling evidence; do not infer queue order |
 | first unconstrained writer poll is `Pending` / `Ready` | writer is queued / already owns the write guard; notify once, then preserve normal wake and cancellation behavior |
 | later reader's first unconstrained poll after the writer barrier | must be `Pending`; completion before revoke publication is a fairness failure |
+| Linux CI cannot run the `nobody` cross-UID client noninteractively | fail; never record a skipped cross-UID gate as evidence |
+| manual public Relay URL is invalid, unreachable, or fails authenticated connection | fail the manual acceptance once; do not retry or mutate deployment/profile state |
 
 ## 5. Good / Base / Bad Cases
 
@@ -306,6 +321,16 @@ outbound-known and inbound-authorization directions explicit.
   cargo test -p zterm-core -p zterm-proto -p zterm-platform -p zterm-daemon \
     --lib --all-features
   ```
+- Linux workspace CI must execute the harness-false `cross_uid` target with
+  `CI=true`; the public Relay gate is instead dispatched explicitly:
+
+  ```sh
+  gh workflow run public-relay-acceptance.yml \
+    -f relay_url=https://relay.zenithconsulting.cn
+  ```
+
+  The exact manual run, URL, commit, and result are recorded in the active task
+  evidence rather than turning public availability into an ordinary CI gate.
 - Every change runs workspace fmt, check, Clippy with `-D warnings`, tests,
   docs, dependency/source/version/secret policy, task validation, and
   `git diff --check`.

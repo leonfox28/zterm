@@ -9,6 +9,7 @@ Apply this contract when changing:
 - the Iroh endpoint preset, Relay map, QAD, address publication, or transport
   acceptance tests;
 - the optional official Relay image or GitHub publication workflow;
+- the manual public Relay acceptance workflow or authenticated handshake probe;
 - `deploy/relay/Dockerfile`, `relay.toml`, or `compose.yaml`;
 - the selected 1Panel deployment for `relay.zenithconsulting.cn`.
 
@@ -62,6 +63,9 @@ before adding another infrastructure profile or validation layer.
 
 - Development package: `ghcr.io/leonfox28/zterm-relay-dev`.
 - Optional self-hosted URL: `https://relay.zenithconsulting.cn`.
+- Manual acceptance workflow:
+  `.github/workflows/public-relay-acceptance.yml`, input
+  `relay_url: string` (required; default is the optional self-hosted URL).
 - Reverse-proxy upstream: `http://127.0.0.1:38451`.
 - Server Compose root: `/opt/1panel/docker/compose/zterm-relay`.
 - Compose project and container: `zterm-relay`.
@@ -129,6 +133,20 @@ before adding another infrastructure profile or validation layer.
 - Updates are manual. After one successful post-update health and authenticated
   handshake acceptance, stop; do not restart or perform a recovery drill.
 
+#### Public acceptance execution
+
+- Push and pull-request CI must not depend on a public Relay. The authenticated
+  public handshake runs only through the dedicated `workflow_dispatch`
+  workflow on a hosted Ubuntu runner.
+- The workflow has only `contents: read`, a ten-minute job deadline, and one
+  externally visible input: `relay_url`. Pass that value to the existing
+  `tests/relay/public-handshake.sh` through a quoted environment variable;
+  never interpolate workflow input directly into shell source.
+- The existing Rust `RelayUrl` parser owns URL validation. The probe makes one
+  bounded connection attempt with QAD disabled, closes its ephemeral Endpoint,
+  and returns the process status. Do not add workflow retries, deployment
+  mutation, credentials, or a second handshake implementation.
+
 ### 4. Validation & Error Matrix
 
 | Condition | Required result |
@@ -149,6 +167,8 @@ before adding another infrastructure profile or validation layer.
 | Self-hosted Compose publishes anything except host-loopback TCP 38451 | Reject the deployment model |
 | Post-update health or authenticated Iroh handshake fails | Deployment is not accepted; report the observed failure |
 | All post-update checks pass | End validation without rollback or reconnect exercises |
+| Push or pull request runs ordinary CI | Do not schedule the public Relay acceptance job |
+| Manual acceptance input is invalid, unreachable, or cannot authenticate within the probe deadline | Fail the manual run without retrying or changing the deployment |
 
 ### 5. Good / Base / Bad Cases
 
@@ -167,8 +187,12 @@ before adding another infrastructure profile or validation layer.
   `zterm-relay:v0.1.1` and `zterm-relay:latest`.
 - **Good optional deployment:** one explicit pull/up recreates the stateless
   container; loopback health and one public authenticated handshake pass.
+- **Good acceptance:** an authorized operator dispatches the dedicated
+  workflow with one HTTPS Relay URL; the hosted runner reports one authenticated
+  Iroh connection and exits.
 - **Bad optional deployment:** adds digest pinning, unused metrics/QAD/direct
-  templates, or a rollback drill without an observed need.
+  templates, a public-network dependency to ordinary CI, or a rollback drill
+  without an observed need.
 
 ### 6. Tests Required
 
@@ -197,6 +221,9 @@ before adding another infrastructure profile or validation layer.
   `/generate_204`; do not duplicate this with Docker health state or metrics.
 - Public acceptance after a manual self-hosted update consists of public
   health/204 plus one authenticated Iroh Relay handshake with QAD disabled.
+- Dispatch `.github/workflows/public-relay-acceptance.yml` with the reviewed
+  HTTPS URL and require the exact `Authenticated public Relay handshake` job to
+  pass. A push/PR run must never invoke this workflow.
 - Repository secret scan and ordinary Rust/dependency/cross-platform CI remain
   required.
 
