@@ -397,6 +397,18 @@ struct StatusView {
     started_at_unix: Option<u64>,
     active_session_count: u32,
     active_session_names: Vec<String>,
+    network_state: Option<String>,
+    endpoint_bound: Option<bool>,
+    network_bind_attempts: u64,
+    home_relay: Option<String>,
+    address_publish_state: Option<String>,
+    address_lookup_state: Option<String>,
+    authenticated_connection_count: u32,
+    primary_connection_count: u32,
+    active_stream_count: u32,
+    direct_path_count: u32,
+    relay_path_count: u32,
+    network_diagnostic: Option<String>,
 }
 
 impl StatusView {
@@ -412,6 +424,21 @@ impl StatusView {
                 started_at_unix: Some(status.started_at_unix),
                 active_session_count: status.active_session_count,
                 active_session_names: status.active_session_names,
+                network_state: Some(status.network.state.as_str().to_owned()),
+                endpoint_bound: Some(status.network.endpoint_bound),
+                network_bind_attempts: status.network.bind_attempts,
+                home_relay: status.network.home_relay,
+                address_publish_state: Some(status.network.publish.as_str().to_owned()),
+                address_lookup_state: Some(status.network.lookup.as_str().to_owned()),
+                authenticated_connection_count: status.network.authenticated_connection_count,
+                primary_connection_count: status.network.primary_connection_count,
+                active_stream_count: status.network.active_stream_count,
+                direct_path_count: status.network.direct_path_count,
+                relay_path_count: status.network.relay_path_count,
+                network_diagnostic: status
+                    .network
+                    .diagnostic
+                    .map(|diagnostic| diagnostic.code().to_owned()),
             },
             ObservedState::ConfiguredStopped(setup) => Self {
                 state: "configured_stopped",
@@ -423,6 +450,18 @@ impl StatusView {
                 started_at_unix: None,
                 active_session_count: 0,
                 active_session_names: Vec::new(),
+                network_state: Some("stopped".to_owned()),
+                endpoint_bound: Some(false),
+                network_bind_attempts: 0,
+                home_relay: None,
+                address_publish_state: Some("disabled".to_owned()),
+                address_lookup_state: Some("disabled".to_owned()),
+                authenticated_connection_count: 0,
+                primary_connection_count: 0,
+                active_stream_count: 0,
+                direct_path_count: 0,
+                relay_path_count: 0,
+                network_diagnostic: None,
             },
             ObservedState::NotConfigured => Self {
                 state: "not_configured",
@@ -434,6 +473,18 @@ impl StatusView {
                 started_at_unix: None,
                 active_session_count: 0,
                 active_session_names: Vec::new(),
+                network_state: None,
+                endpoint_bound: None,
+                network_bind_attempts: 0,
+                home_relay: None,
+                address_publish_state: None,
+                address_lookup_state: None,
+                authenticated_connection_count: 0,
+                primary_connection_count: 0,
+                active_stream_count: 0,
+                direct_path_count: 0,
+                relay_path_count: 0,
+                network_diagnostic: None,
             },
         }
     }
@@ -448,6 +499,40 @@ impl StatusView {
         }
         if let Some(profile) = &self.infrastructure_profile {
             output.push_str(&format!("Infrastructure: {profile}\n"));
+        }
+        if let Some(network) = &self.network_state {
+            output.push_str(&format!("Network: {network}\n"));
+            if let Some(bound) = self.endpoint_bound {
+                output.push_str(&format!("Endpoint bound: {bound}\n"));
+            }
+            output.push_str(&format!(
+                "Network bind attempts: {}\n",
+                self.network_bind_attempts
+            ));
+            if let Some(publish) = &self.address_publish_state {
+                output.push_str(&format!("Address publish: {publish}\n"));
+            }
+            if let Some(lookup) = &self.address_lookup_state {
+                output.push_str(&format!("Address lookup: {lookup}\n"));
+            }
+        }
+        if let Some(relay) = &self.home_relay {
+            output.push_str(&format!("Home Relay: {relay}\n"));
+        }
+        if self.network_state.is_some() {
+            output.push_str(&format!(
+                "Connections: authenticated={}, primary={}, streams={}\n",
+                self.authenticated_connection_count,
+                self.primary_connection_count,
+                self.active_stream_count,
+            ));
+            output.push_str(&format!(
+                "Paths: direct={}, relay={}\n",
+                self.direct_path_count, self.relay_path_count,
+            ));
+            if let Some(diagnostic) = &self.network_diagnostic {
+                output.push_str(&format!("Network diagnostic: {diagnostic}\n"));
+            }
         }
         output.push_str(&format!("Active sessions: {}\n", self.active_session_count));
         output
@@ -488,4 +573,77 @@ fn json_line(value: &impl Serialize) -> Result<String, CliError> {
     serde_json::to_string_pretty(value)
         .map(|json| format!("{json}\n"))
         .map_err(|error| CliError::Serialization(error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use zterm_core::DeviceId;
+    use zterm_daemon::network::{
+        AddressServiceState, NetworkDiagnostic, NetworkObservation, NetworkState,
+    };
+    use zterm_daemon::service::ProtocolStatus;
+
+    use super::*;
+
+    #[test]
+    fn human_and_json_share_the_complete_redacted_network_view() {
+        let device_id = DeviceId::from_array([0x63; 32]);
+        let view = StatusView::from_observed(ObservedState::Running(DaemonStatus {
+            protocol: ProtocolStatus {
+                wire_major: 1,
+                state_schema: 1,
+                capabilities: zterm_core::Capabilities::LOCAL_LIFECYCLE,
+            },
+            version: "test".to_owned(),
+            phase: "test".to_owned(),
+            device_id,
+            endpoint_id: "public-endpoint".to_owned(),
+            device_name: "status-host".to_owned(),
+            infrastructure_profile: "official-n0".to_owned(),
+            started_at_unix: 1,
+            active_session_count: 2,
+            active_session_names: vec!["one".to_owned(), "two".to_owned()],
+            network: NetworkObservation {
+                device_id,
+                state: NetworkState::Degraded,
+                endpoint_bound: true,
+                bind_attempts: 7,
+                home_relay: Some("https://relay.example.test".to_owned()),
+                publish: AddressServiceState::Configured,
+                lookup: AddressServiceState::Degraded,
+                authenticated_connection_count: 4,
+                primary_connection_count: 2,
+                active_stream_count: 5,
+                direct_path_count: 1,
+                relay_path_count: 1,
+                diagnostic: Some(NetworkDiagnostic::HomeRelayUnavailable),
+            },
+        }));
+
+        let human = view.human();
+        assert!(human.contains("Network: degraded"));
+        assert!(human.contains("Network bind attempts: 7"));
+        assert!(human.contains("Address publish: configured"));
+        assert!(human.contains("Address lookup: degraded"));
+        assert!(human.contains("Connections: authenticated=4, primary=2, streams=5"));
+        assert!(human.contains("Paths: direct=1, relay=1"));
+        assert!(human.contains("Network diagnostic: home_relay_unavailable"));
+
+        let json = serde_json::to_value(&view).expect("serialize status view");
+        assert_eq!(json["network_state"], "degraded");
+        assert_eq!(json["network_bind_attempts"], 7);
+        assert_eq!(json["address_publish_state"], "configured");
+        assert_eq!(json["address_lookup_state"], "degraded");
+        assert_eq!(json["authenticated_connection_count"], 4);
+        assert_eq!(json["primary_connection_count"], 2);
+        assert_eq!(json["active_stream_count"], 5);
+        assert_eq!(json["direct_path_count"], 1);
+        assert_eq!(json["relay_path_count"], 1);
+        assert_eq!(json["network_diagnostic"], "home_relay_unavailable");
+
+        let rendered = format!("{human}{}", serde_json::to_string(&view).expect("JSON"));
+        for forbidden in ["direct_ip", "route_cache", "pair_secret", "ticket"] {
+            assert!(!rendered.contains(forbidden));
+        }
+    }
 }

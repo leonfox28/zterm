@@ -108,6 +108,26 @@ pub struct PreparedAttachment {
     pub snapshot: TerminalSnapshot,
 }
 
+/// Per-session impact of detaching one remote principal.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PrincipalDetachOutcome {
+    /// Attachments removed from this session.
+    pub attachments_removed: usize,
+    /// Whether the removed principal owned the controller lease.
+    pub controller_released: bool,
+}
+
+/// Aggregate impact of detaching one remote principal across every session.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PrincipalDetachImpact {
+    /// Sessions in which at least one attachment was removed.
+    pub sessions_affected: usize,
+    /// Total attachments removed across all sessions.
+    pub attachments_removed: usize,
+    /// Number of sessions whose controller lease was released.
+    pub controllers_released: usize,
+}
+
 /// Transport-independent handle to one live attachment.
 pub struct SessionAttachment {
     actor: Arc<SessionActor>,
@@ -479,12 +499,14 @@ impl SessionService {
     /// Resolves a session and prepares its first full snapshot.
     pub fn prepare_attach(
         &self,
+        principal: AttachmentPrincipal,
         selector: Option<SessionSelector>,
         create_main: bool,
         takeover: bool,
         initial_viewport: Option<TerminalSize>,
     ) -> Result<PreparedAttachment, DaemonError> {
         self.prepare_attach_until(
+            principal,
             selector,
             create_main,
             takeover,
@@ -495,6 +517,7 @@ impl SessionService {
 
     pub(crate) fn prepare_attach_until(
         &self,
+        principal: AttachmentPrincipal,
         selector: Option<SessionSelector>,
         create_main: bool,
         takeover: bool,
@@ -519,6 +542,7 @@ impl SessionService {
         };
         actor.request(deadline, |meta, reply| SessionCommand::PrepareAttach {
             meta,
+            principal,
             takeover,
             reply,
         })
@@ -576,6 +600,127 @@ impl SessionService {
         deadline: Instant,
     ) -> Result<SessionSummary, DaemonError> {
         self.execute_takeover_replayed(principal, operation_id, session_id, attachment_id, deadline)
+    }
+
+    /// Detaches every attachment owned by one remote endpoint across all live
+    /// and provisional sessions without closing any session or PTY.
+    pub fn detach_remote_principal(
+        &self,
+        device_id: DeviceId,
+    ) -> Result<PrincipalDetachImpact, DaemonError> {
+        self.detach_remote_principal_until(device_id, default_deadline())
+    }
+
+    pub(crate) fn detach_remote_principal_until(
+        &self,
+        device_id: DeviceId,
+        deadline: Instant,
+    ) -> Result<PrincipalDetachImpact, DaemonError> {
+        #[cfg(test)]
+        {
+            self.detach_remote_principal_inner(device_id, deadline, None)
+        }
+        #[cfg(not(test))]
+        {
+            self.detach_remote_principal_inner(device_id, deadline)
+        }
+    }
+
+    /// Counts current attachments owned by one remote endpoint without
+    /// detaching them, releasing controller leases, or changing Session state.
+    pub(crate) fn remote_attachment_count_until(
+        &self,
+        device_id: DeviceId,
+        deadline: Instant,
+    ) -> Result<usize, DaemonError> {
+        ensure_before_deadline(deadline)?;
+        let entries = self.inner.owned_entries()?;
+        let mut waiters = Vec::with_capacity(entries.len());
+        for entry in entries {
+            match entry.actor.enqueue_command(deadline, move |meta, reply| {
+                SessionCommand::CountRemoteAttachments {
+                    meta,
+                    device_id,
+                    reply,
+                }
+            }) {
+                Ok(waiter) => waiters.push(waiter),
+                Err(error) if error.kind() == DomainErrorKind::SessionNotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        let mut total = 0_usize;
+        for waiter in waiters {
+            let count = match waiter.wait(deadline) {
+                Ok(count) => count,
+                Err(error) if error.kind() == DomainErrorKind::SessionNotFound => continue,
+                Err(error) => return Err(error),
+            };
+            total = total
+                .checked_add(count)
+                .ok_or_else(|| resource_error("remote attachment count overflowed"))?;
+        }
+        Ok(total)
+    }
+
+    #[cfg(test)]
+    fn detach_remote_principal_until_observed(
+        &self,
+        device_id: DeviceId,
+        deadline: Instant,
+        observe: impl Fn(SessionId) -> Option<SyncSender<()>>,
+    ) -> Result<PrincipalDetachImpact, DaemonError> {
+        self.detach_remote_principal_inner(device_id, deadline, Some(&observe))
+    }
+
+    fn detach_remote_principal_inner(
+        &self,
+        device_id: DeviceId,
+        deadline: Instant,
+        #[cfg(test)] observe: Option<&dyn Fn(SessionId) -> Option<SyncSender<()>>>,
+    ) -> Result<PrincipalDetachImpact, DaemonError> {
+        ensure_before_deadline(deadline)?;
+        let entries = self.inner.owned_entries()?;
+        // Phase 1: admit a detach command to every owned actor. A session
+        // whose actor already ended is skipped; its in-flight result would be
+        // unreachable anyway. No wait happens here, so a blocked actor cannot
+        // prevent another session's detach from being admitted.
+        let mut waiters = Vec::with_capacity(entries.len());
+        for entry in entries {
+            #[cfg(test)]
+            let session_id = entry.actor.id;
+            match entry.actor.enqueue_command(deadline, move |meta, reply| {
+                SessionCommand::DetachRemotePrincipal {
+                    meta,
+                    device_id,
+                    #[cfg(test)]
+                    processed: observe.and_then(|observer| observer(session_id)),
+                    reply,
+                }
+            }) {
+                Ok(waiter) => waiters.push(waiter),
+                Err(error) if error.kind() == DomainErrorKind::SessionNotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        // Phase 2: collect exact outcomes under the same absolute deadline.
+        let mut impact = PrincipalDetachImpact::default();
+        for waiter in waiters {
+            let outcome = match waiter.wait(deadline) {
+                Ok(outcome) => outcome,
+                Err(error) if error.kind() == DomainErrorKind::SessionNotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if outcome.attachments_removed > 0 {
+                impact.sessions_affected += 1;
+                impact.attachments_removed += outcome.attachments_removed;
+            }
+            if outcome.controller_released {
+                impact.controllers_released += 1;
+            }
+        }
+        Ok(impact)
     }
 
     /// Explicitly closes every current session and returns their pre-stop summaries.
@@ -921,6 +1066,7 @@ impl SessionService {
                     let actor = self.resolve(&SessionSelector::Id(session_id))?;
                     actor.request(deadline, |meta, reply| SessionCommand::Takeover {
                         meta,
+                        principal,
                         attachment_id,
                         operation_key,
                         continuation: false,
@@ -937,6 +1083,7 @@ impl SessionService {
                 let actor = self.resolve(&SessionSelector::Id(session_id))?;
                 actor.request(deadline, |meta, reply| SessionCommand::Takeover {
                     meta,
+                    principal,
                     attachment_id,
                     operation_key,
                     continuation: true,
@@ -2143,6 +2290,7 @@ struct SessionRuntime {
 }
 
 struct ActorAttachment {
+    principal: AttachmentPrincipal,
     terminal: TerminalAttachment,
     sync: AttachmentSync,
     lifecycle: watch::Sender<AttachmentLifecycle>,
@@ -2209,9 +2357,22 @@ impl CommandMeta {
     }
 }
 
+/// One enqueued actor command whose result has not yet been awaited.
+struct CommandWaiter<R> {
+    response: Receiver<Result<R, DaemonError>>,
+    gate: Arc<CommandGate>,
+}
+
+impl<R> CommandWaiter<R> {
+    fn wait(self, deadline: Instant) -> Result<R, DaemonError> {
+        wait_for_command_response(self.response, self.gate, deadline)
+    }
+}
+
 enum SessionCommand {
     PrepareAttach {
         meta: CommandMeta,
+        principal: AttachmentPrincipal,
         takeover: bool,
         reply: SyncSender<Result<PreparedAttachment, DaemonError>>,
     },
@@ -2252,10 +2413,23 @@ enum SessionCommand {
     },
     Takeover {
         meta: CommandMeta,
+        principal: AttachmentPrincipal,
         attachment_id: AttachmentId,
         operation_key: ReplayOperationKey,
         continuation: bool,
         reply: SyncSender<Result<(), DaemonError>>,
+    },
+    DetachRemotePrincipal {
+        meta: CommandMeta,
+        device_id: DeviceId,
+        #[cfg(test)]
+        processed: Option<SyncSender<()>>,
+        reply: SyncSender<Result<PrincipalDetachOutcome, DaemonError>>,
+    },
+    CountRemoteAttachments {
+        meta: CommandMeta,
+        device_id: DeviceId,
+        reply: SyncSender<Result<usize, DaemonError>>,
     },
     #[cfg(test)]
     BlockPtyEffect {
@@ -2364,6 +2538,18 @@ impl SessionActor {
         deadline: Instant,
         build: impl FnOnce(CommandMeta, SyncSender<Result<R, DaemonError>>) -> SessionCommand,
     ) -> Result<R, DaemonError> {
+        self.enqueue_command(deadline, build)?.wait(deadline)
+    }
+
+    /// Enqueues one command without waiting for its result. The returned
+    /// [`CommandWaiter`] must be awaited to observe the exact outcome. This
+    /// split lets a multi-actor operation admit every command before waiting
+    /// for any of them, so one blocked actor cannot delay another's effect.
+    fn enqueue_command<R>(
+        &self,
+        deadline: Instant,
+        build: impl FnOnce(CommandMeta, SyncSender<Result<R, DaemonError>>) -> SessionCommand,
+    ) -> Result<CommandWaiter<R>, DaemonError> {
         let gate = Arc::new(CommandGate::default());
         let meta = CommandMeta {
             deadline,
@@ -2392,7 +2578,10 @@ impl SessionActor {
                 }
             }
         }
-        wait_for_command_response(response, gate, deadline)
+        Ok(CommandWaiter {
+            response,
+            gate: Arc::clone(&gate),
+        })
     }
 
     fn runtime_summary(&self) -> Result<ActorRuntimeSummary, DaemonError> {
@@ -2791,10 +2980,11 @@ fn dispatch_command(
     match command {
         SessionCommand::PrepareAttach {
             meta,
+            principal,
             takeover,
             reply,
         } => respond(actor, meta, reply, || {
-            prepare_attach(actor, runtime, takeover)
+            prepare_attach(actor, runtime, principal, takeover)
         }),
         SessionCommand::SnapshotApplied {
             meta,
@@ -2841,12 +3031,41 @@ fn dispatch_command(
         }),
         SessionCommand::Takeover {
             meta,
+            principal,
             attachment_id,
             operation_key,
             continuation,
             reply,
         } => respond(actor, meta, reply, || {
-            takeover(actor, runtime, attachment_id, operation_key, continuation)
+            takeover(
+                actor,
+                runtime,
+                principal,
+                attachment_id,
+                operation_key,
+                continuation,
+            )
+        }),
+        SessionCommand::DetachRemotePrincipal {
+            meta,
+            device_id,
+            #[cfg(test)]
+            processed,
+            reply,
+        } => respond(actor, meta, reply, || {
+            let outcome = detach_remote_principal(actor, runtime, device_id);
+            #[cfg(test)]
+            if let Some(processed) = processed {
+                let _ = processed.send(());
+            }
+            Ok(outcome)
+        }),
+        SessionCommand::CountRemoteAttachments {
+            meta,
+            device_id,
+            reply,
+        } => respond(actor, meta, reply, || {
+            Ok(count_remote_attachments(runtime, device_id))
         }),
         #[cfg(test)]
         SessionCommand::BlockPtyEffect {
@@ -2890,6 +3109,7 @@ fn respond<R>(
 fn prepare_attach(
     actor: &Arc<SessionActor>,
     runtime: &mut SessionRuntime,
+    principal: AttachmentPrincipal,
     takeover: bool,
 ) -> Result<PreparedAttachment, DaemonError> {
     reap_detached(actor, runtime);
@@ -2943,6 +3163,7 @@ fn prepare_attach(
     runtime.attachments.insert(
         attachment_id,
         ActorAttachment {
+            principal,
             terminal,
             sync: AttachmentSync::Awaiting {
                 revision: snapshot.revision,
@@ -3182,10 +3403,19 @@ fn resize(
 fn takeover(
     actor: &Arc<SessionActor>,
     runtime: &mut SessionRuntime,
+    principal: AttachmentPrincipal,
     attachment_id: AttachmentId,
     operation_key: ReplayOperationKey,
     continuation: bool,
 ) -> Result<(), DaemonError> {
+    let owner = runtime
+        .attachments
+        .get(&attachment_id)
+        .map(|attachment| attachment.principal)
+        .ok_or_else(lease_lost)?;
+    if owner != principal {
+        return Err(principal_mismatch());
+    }
     if continuation
         && runtime
             .controller
@@ -3266,6 +3496,64 @@ fn reap_detached(actor: &SessionActor, runtime: &mut SessionRuntime) {
         }
     }
     actor.update_cached(runtime, false);
+}
+
+fn detach_remote_principal(
+    actor: &SessionActor,
+    runtime: &mut SessionRuntime,
+    device_id: DeviceId,
+) -> PrincipalDetachOutcome {
+    let removed = runtime
+        .attachments
+        .iter()
+        .filter(|(_, attachment)| {
+            matches!(
+                attachment.principal,
+                AttachmentPrincipal::RemoteEndpoint {
+                    device_id: remote,
+                    ..
+                } if remote == device_id
+            )
+        })
+        .map(|(attachment_id, _)| *attachment_id)
+        .collect::<Vec<_>>();
+
+    let mut outcome = PrincipalDetachOutcome::default();
+    for attachment_id in removed {
+        if let Some(attachment) = runtime.attachments.remove(&attachment_id) {
+            attachment.detached.store(true, Ordering::Release);
+            outcome.attachments_removed += 1;
+        }
+        if runtime
+            .controller
+            .is_some_and(|lease| lease.attachment_id == attachment_id)
+        {
+            runtime.controller = None;
+            runtime.controller_operation = None;
+            outcome.controller_released = true;
+        }
+    }
+    if outcome.attachments_removed > 0 {
+        actor.update_cached(runtime, false);
+    }
+    outcome
+}
+
+fn count_remote_attachments(runtime: &SessionRuntime, device_id: DeviceId) -> usize {
+    runtime
+        .attachments
+        .values()
+        .filter(|attachment| {
+            !attachment.detached.load(Ordering::Acquire)
+                && matches!(
+                    attachment.principal,
+                    AttachmentPrincipal::RemoteEndpoint {
+                        device_id: remote,
+                        ..
+                    } if remote == device_id
+                )
+        })
+        .count()
 }
 
 fn require_controller(
@@ -3417,6 +3705,13 @@ fn invalid_session(detail: impl Into<String>) -> DaemonError {
 
 fn session_not_found() -> DaemonError {
     DaemonError::new(DomainErrorKind::SessionNotFound, "session is not live")
+}
+
+fn principal_mismatch() -> DaemonError {
+    DaemonError::new(
+        DomainErrorKind::LeaseLost,
+        "takeover attachment belongs to a different principal",
+    )
 }
 
 fn not_synchronized(detail: impl Into<String>) -> DaemonError {
@@ -3726,6 +4021,97 @@ mod tests {
         assert!(replay.retired_through.is_empty());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn remote_attachment_count_is_directional_and_read_only() {
+        let temporary = tempfile::tempdir().expect("temporary attachment-count fixture");
+        let service = unix_fixture_service(
+            DeviceId::from_array([0x71; 32]),
+            temporary.path().to_path_buf(),
+            "exec /bin/cat",
+        );
+        let local = service.local_principal(AttachmentId::from_array([0x71; 16]));
+        let lease = service
+            .issue_operation_lease(local)
+            .expect("fixture operation lease");
+        let create = |sequence, name: &str| {
+            service
+                .create(
+                    local,
+                    OperationId { lease, sequence },
+                    SessionName::new(name).expect("fixture session name"),
+                    None,
+                    None,
+                )
+                .expect("fixture session creates")
+        };
+        let first = create(1, "remote-count-a");
+        let second = create(2, "remote-count-b");
+        let other = create(3, "remote-count-c");
+        let target_id = DeviceId::from_array([0x72; 32]);
+        let target = AttachmentPrincipal::RemoteEndpoint {
+            device_id: target_id,
+            auth_generation: 4,
+        };
+        let other_id = DeviceId::from_array([0x73; 32]);
+        let first_attachment = service
+            .prepare_attach(
+                target,
+                Some(SessionSelector::Id(first.session_id)),
+                false,
+                false,
+                None,
+            )
+            .expect("first remote attachment");
+        let second_attachment = service
+            .prepare_attach(
+                target,
+                Some(SessionSelector::Id(second.session_id)),
+                false,
+                false,
+                None,
+            )
+            .expect("second remote attachment");
+        let other_attachment = service
+            .prepare_attach(
+                AttachmentPrincipal::RemoteEndpoint {
+                    device_id: other_id,
+                    auth_generation: 9,
+                },
+                Some(SessionSelector::Id(other.session_id)),
+                false,
+                false,
+                None,
+            )
+            .expect("other remote attachment");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        assert_eq!(
+            service
+                .remote_attachment_count_until(target_id, deadline)
+                .expect("target count"),
+            2
+        );
+        assert_eq!(
+            service
+                .remote_attachment_count_until(other_id, deadline)
+                .expect("other count"),
+            1
+        );
+        assert_eq!(service.list().expect("sessions remain live").len(), 3);
+
+        for prepared in [&first_attachment, &second_attachment, &other_attachment] {
+            assert!(
+                prepared
+                    .attachment
+                    .snapshot_applied(prepared.snapshot.revision)
+                    .expect("count leaves attachment usable")
+                    .is_none()
+            );
+        }
+        service.shutdown().expect("fixture sessions shut down");
+    }
+
     #[test]
     fn panicking_execution_completes_duplicate_waiters_with_outcome_unknown() {
         let service = SessionService::with_spawner(
@@ -3941,6 +4327,153 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn blocked_session_does_not_prevent_remote_detach_on_another_session() {
+        let temporary = tempfile::tempdir().expect("temporary remote-detach fixture");
+        let working_directory = temporary.path().to_path_buf();
+        let shell = [Path::new("/bin/sh"), Path::new("/usr/bin/sh")]
+            .into_iter()
+            .find(|path| path.is_file())
+            .expect("POSIX shell fixture")
+            .to_path_buf();
+        let service = SessionService::with_spawner(
+            DeviceId::from_array([63; 32]),
+            ResourceLimits::default(),
+            move |size, requested| {
+                let cwd = requested.unwrap_or(&working_directory).to_path_buf();
+                let session = PtyHost::new()
+                    .spawn(
+                        ExplicitPtyCommand::new(&shell, &cwd).arg("-i"),
+                        PtySize::new(size.rows, size.columns),
+                    )
+                    .map_err(map_pty_error)?;
+                Ok((session, cwd))
+            },
+        );
+        let principal = service.local_principal(AttachmentId::from_array([9; 16]));
+        let operation_lease = service
+            .issue_operation_lease(principal)
+            .expect("fixture operation lease");
+        let create = |sequence, name: &str| {
+            service
+                .create(
+                    principal,
+                    OperationId {
+                        lease: operation_lease,
+                        sequence,
+                    },
+                    SessionName::new(name).expect("test session name"),
+                    None,
+                    None,
+                )
+                .expect("test session creates")
+        };
+        let blocked = create(1, "blocked-a");
+        let responsive = create(2, "responsive-b");
+        let blocked_actor = service
+            .resolve(&SessionSelector::Id(blocked.session_id))
+            .expect("blocked actor resolves");
+
+        // One remote endpoint becomes the controller of both sessions. The
+        // prepared handles stay alive so their actor attachments are not reaped
+        // as detached before the detach under test.
+        let remote = AttachmentPrincipal::RemoteEndpoint {
+            device_id: DeviceId::from_array([0x63; 32]),
+            auth_generation: 1,
+        };
+        let _blocked_attach = service
+            .prepare_attach(
+                remote,
+                Some(SessionSelector::Id(blocked.session_id)),
+                false,
+                false,
+                None,
+            )
+            .expect("blocked session remote attach succeeds");
+        let _responsive_attach = service
+            .prepare_attach(
+                remote,
+                Some(SessionSelector::Id(responsive.session_id)),
+                false,
+                false,
+                None,
+            )
+            .expect("responsive session remote attach succeeds");
+
+        // Deterministically block session A inside its PTY-effect boundary.
+        let (entered, entered_rx) = mpsc::sync_channel(1);
+        let (release, release_rx) = mpsc::sync_channel(1);
+        let blocked_actor_thread = Arc::clone(&blocked_actor);
+        let block_thread = thread::spawn(move || {
+            blocked_actor_thread.block_pty_effect_for_test(
+                Instant::now() + Duration::from_secs(3),
+                entered,
+                release_rx,
+                Arc::new(AtomicUsize::new(0)),
+            )
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("session A entered its blocking boundary");
+
+        // Detach the remote endpoint in a background thread. Phase one admits a
+        // command to every actor before phase two waits, so the responsive
+        // session must be released even while A is still blocked. A test-only
+        // observer fires inside the responsive actor after it has processed its
+        // detach command, giving a deterministic barrier instead of a poll.
+        let responsive_id = responsive.session_id;
+        let (processed_tx, processed_rx) = mpsc::sync_channel(1);
+        let detach_service = service.clone();
+        let (impact_tx, impact_rx) = mpsc::sync_channel(1);
+        let detach_thread = thread::spawn(move || {
+            let impact = detach_service.detach_remote_principal_until_observed(
+                DeviceId::from_array([0x63; 32]),
+                Instant::now() + Duration::from_secs(5),
+                move |session_id| (session_id == responsive_id).then(|| processed_tx.clone()),
+            );
+            let _ = impact_tx.send(impact);
+        });
+
+        processed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("responsive actor processed its detach while session A stayed blocked");
+
+        // The observer fires after the actor refreshes its cached summary, so a
+        // single synchronous read (no polling) is deterministic evidence.
+        let controller_of = |session_id: SessionId| {
+            service
+                .list()
+                .expect("list succeeds")
+                .into_iter()
+                .any(|summary| summary.session_id == session_id && summary.has_controller)
+        };
+        assert!(
+            !controller_of(responsive_id),
+            "responsive session remote controller was not released while session A stayed blocked"
+        );
+        assert!(
+            controller_of(blocked.session_id),
+            "blocked session controller must remain attached until its actor is released"
+        );
+
+        release.send(()).expect("release session A");
+        let impact = impact_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("remote detach completes after session A releases")
+            .expect("remote detach succeeds");
+        assert_eq!(impact.sessions_affected, 2);
+        assert_eq!(impact.attachments_removed, 2);
+        assert_eq!(impact.controllers_released, 2);
+        block_thread
+            .join()
+            .expect("blocked effect thread joins")
+            .expect("blocked effect succeeds");
+        detach_thread.join().expect("detach thread joins");
+
+        service.shutdown().expect("fixture sessions shut down");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn shutdown_is_concurrent_bounded_and_truthful_until_owned_children_are_reaped() {
         let temporary = tempfile::tempdir().expect("temporary shutdown fixture");
         let working_directory = temporary.path().to_path_buf();
@@ -4017,6 +4550,7 @@ mod tests {
             .expect("fast actor remains addressable");
         let prepared = service
             .prepare_attach(
+                principal,
                 Some(SessionSelector::Id(stuck.session_id)),
                 false,
                 false,

@@ -14,6 +14,9 @@ use crate::config::ValidatedInfrastructure;
 /// Product protocol identifier for wire major one.
 pub const ZTERM_ALPN: &[u8] = b"zterm/1";
 
+/// Short-lived pairing protocol identifier for format/protocol major one.
+pub const ZTERM_PAIR_ALPN: &[u8] = b"zterm-pair/1";
+
 /// Effective configuration of one Relay entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelayProfileSummary {
@@ -126,7 +129,7 @@ impl InfrastructureProfile {
             dns_lookup_origin: lookups.dns_origin,
             publishes_direct_addresses: false,
             portmapper_enabled: true,
-            alpns: vec![ZTERM_ALPN.to_vec()],
+            alpns: vec![ZTERM_ALPN.to_vec(), ZTERM_PAIR_ALPN.to_vec()],
         }
     }
 
@@ -143,7 +146,7 @@ impl InfrastructureProfile {
             .secret_key(secret_key)
             .relay_mode(self.relay_mode())
             .addr_filter(AddrFilter::relay_only())
-            .alpns(vec![ZTERM_ALPN.to_vec()])
+            .alpns(vec![ZTERM_ALPN.to_vec(), ZTERM_PAIR_ALPN.to_vec()])
     }
 
     fn relay_mode(&self) -> RelayMode {

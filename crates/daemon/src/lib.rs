@@ -1,15 +1,25 @@
-//! Per-user state, local daemon lifecycle, persistent sessions, and future Iroh adapter.
+//! Per-user state, local daemon lifecycle, persistent sessions, and Iroh transport.
 //!
-//! Local readiness binds only a same-UID Unix socket. Iroh endpoint binding,
-//! pairing, remote transport, and the final raw-terminal UI remain later milestones.
+//! Local readiness remains owned by the same-UID Unix socket and does not wait
+//! for network availability. The daemon also owns one Iroh endpoint, pairing,
+//! directional device authorization, and the normal connection broker. The
+//! remote Session adapter and final raw-terminal UI remain later milestones.
 
+pub mod authorization;
 pub mod bootstrap;
 pub mod config;
+pub mod connection_broker;
+pub mod device_directory;
 pub mod error;
 pub mod identity;
 pub mod lifecycle;
 pub mod local_ipc;
+pub mod network;
 pub mod operations;
+pub mod pair_framing;
+pub mod pairing;
+pub mod pairing_service;
+pub mod route;
 pub mod service;
 pub mod session;
 pub mod store;

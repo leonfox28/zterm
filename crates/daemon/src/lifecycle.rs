@@ -33,6 +33,13 @@ const LOG_ROTATE_BYTES: u64 = 4 * 1024 * 1024;
 #[cfg(unix)]
 const RECOVERY_REBIND_BACKOFF: Duration = Duration::from_millis(20);
 
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum DaemonNetworkMode {
+    Production,
+    LocalOnlyTest,
+}
+
 /// Executable and one hidden argument used by explicit lifecycle operations.
 #[derive(Clone, Debug)]
 pub struct DaemonLauncher {
@@ -170,14 +177,41 @@ pub fn run_internal_daemon() -> Result<(), DaemonError> {
     }
 }
 
-/// Runs one already-detached daemon against explicit paths for test harnesses.
+/// Runs one already-detached product daemon against explicit paths.
 #[cfg(unix)]
 #[doc(hidden)]
 pub fn run_daemon(paths: &UserPaths) -> Result<(), DaemonError> {
+    run_daemon_with_network_mode(paths, DaemonNetworkMode::Production)
+}
+
+/// Runs an already-detached test daemon with only same-UID local IPC.
+///
+/// This explicit harness entry never prepares or binds an Iroh Endpoint. Product
+/// startup always enters through [`run_daemon`] and retains the network owner.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn run_local_only_daemon_for_test(paths: &UserPaths) -> Result<(), DaemonError> {
+    run_daemon_with_network_mode(paths, DaemonNetworkMode::LocalOnlyTest)
+}
+
+#[cfg(unix)]
+fn run_daemon_with_network_mode(
+    paths: &UserPaths,
+    network_mode: DaemonNetworkMode,
+) -> Result<(), DaemonError> {
     use std::sync::Arc;
 
+    use crate::authorization::AuthorizationRegistry;
     use crate::bootstrap::validate_committed_setup_with_store;
+    use crate::connection_broker::ConnectionIdentity;
+    use crate::device_directory::DeviceDirectory;
+    use crate::identity::DeviceIdentity;
+    use crate::network::NetworkStartup;
+    use crate::pairing::PairingManager;
+    use crate::pairing_service::PairingService;
+    use crate::service::{BrokerRemoteDeviceAccess, DeviceManagement};
     use crate::store::{StateStore, StoreActor};
+    use crate::transport::InfrastructureProfile;
 
     paths
         .prepare_state_directories()
@@ -192,11 +226,68 @@ pub fn run_daemon(paths: &UserPaths) -> Result<(), DaemonError> {
         })?;
     let store = StateStore::open(paths)?;
     let setup = validate_committed_setup_with_store(paths, &store)?;
+    let network_inputs = match network_mode {
+        DaemonNetworkMode::Production => {
+            Some((store.list_authorizations()?, DeviceIdentity::load(paths)?))
+        }
+        DaemonNetworkMode::LocalOnlyTest => None,
+    };
     let (listener, socket_ownership) =
         zterm_platform::local_unix::bind_owned_daemon_socket(paths, &daemon_lock)
             .map_err(platform_error)?;
-    let _store_actor = StoreActor::start(store)?;
-    let service = Arc::new(DaemonService::new(setup));
+    let (service, network, _store_actor) = match network_inputs {
+        Some((authorizations, identity)) => {
+            let store_actor = StoreActor::start(store)?;
+            let store_handle = store_actor.handle();
+            let authorization = AuthorizationRegistry::new();
+            authorization.preload(authorizations)?;
+            let directory = DeviceDirectory::new(store_handle.clone());
+            let connection_identity =
+                ConnectionIdentity::product(setup.device_id, setup.config.device_name.clone())?;
+            let profile = InfrastructureProfile::from_validated(&setup.config.infrastructure);
+            let limits = zterm_core::TransportLimits::default();
+            let (network_startup, network_handle) = NetworkStartup::prepare(
+                identity,
+                profile,
+                connection_identity.clone(),
+                store_handle.clone(),
+                authorization.clone(),
+                limits,
+            )?;
+            let pairing = PairingService::new(
+                PairingManager::new(setup.device_id, limits).map_err(DaemonError::from)?,
+                store_handle.clone(),
+                authorization.clone(),
+                directory.clone(),
+                network_handle.broker(),
+                network_handle.observe(),
+                connection_identity,
+                limits,
+            )?;
+            let network_startup = network_startup.with_pair_handler(pairing.clone());
+            let service = DaemonService::with_network(setup, network_handle.observe());
+            let remote_access = Arc::new(BrokerRemoteDeviceAccess::new(
+                network_handle.broker(),
+                service.sessions().clone(),
+            ));
+            let devices =
+                DeviceManagement::new(store_handle, directory, authorization, remote_access);
+            (
+                Arc::new(
+                    service
+                        .with_device_management(devices)
+                        .with_pairing(pairing),
+                ),
+                Some((network_startup, network_handle)),
+                Some(store_actor),
+            )
+        }
+        None => (
+            Arc::new(DaemonService::new(setup)),
+            None,
+            Some(StoreActor::start(store)?),
+        ),
+    };
     tracing::info!(socket = %paths.socket().display(), "local daemon ready");
 
     run_owned_daemon_listener(
@@ -207,10 +298,12 @@ pub fn run_daemon(paths: &UserPaths) -> Result<(), DaemonError> {
         service,
         crate::local_ipc::LocalIpcLimits::default(),
         Duration::from_secs(5),
+        network,
     )
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 fn run_owned_daemon_listener(
     paths: &UserPaths,
     daemon_lock: &zterm_platform::local_unix::DaemonLock,
@@ -219,6 +312,10 @@ fn run_owned_daemon_listener(
     service: std::sync::Arc<DaemonService>,
     mut limits: crate::local_ipc::LocalIpcLimits,
     cleanup_timeout: Duration,
+    network: Option<(
+        crate::network::NetworkStartup,
+        crate::network::NetworkHandle,
+    )>,
 ) -> Result<(), DaemonError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -229,6 +326,7 @@ fn run_owned_daemon_listener(
                 format!("unable to build daemon runtime: {error}"),
             )
         })?;
+    let mut network = network.map(|(startup, handle)| startup.spawn(handle));
     loop {
         let server_result = runtime.block_on(crate::local_ipc::serve_local_with_limits(
             listener,
@@ -244,16 +342,37 @@ fn run_owned_daemon_listener(
         match (server_result, session_cleanup) {
             (Ok(()), Ok(())) => {
                 tracing::info!("local daemon stopping");
-                return zterm_platform::local_unix::remove_owned_daemon_socket(
+                let pairing_cleanup = match service.pairing() {
+                    Some(pairing) => runtime.block_on(pairing.shutdown_until(cleanup_deadline)),
+                    None => Ok(()),
+                };
+                let network_cleanup = match network.as_mut() {
+                    Some(network) => runtime.block_on(network.shutdown_until(cleanup_deadline)),
+                    None => Ok(()),
+                };
+                let socket_cleanup = zterm_platform::local_unix::remove_owned_daemon_socket(
                     paths,
                     daemon_lock,
                     socket_ownership,
                 )
                 .map_err(platform_error);
+                pairing_cleanup?;
+                network_cleanup?;
+                return socket_cleanup;
             }
             (Err(server_error), Ok(())) => {
                 // A fatal listener is allowed to terminate only after all
                 // child/actor ownership is truthfully released.
+                if let Some(pairing) = service.pairing()
+                    && let Err(error) = runtime.block_on(pairing.shutdown_until(cleanup_deadline))
+                {
+                    tracing::warn!(%error, "pairing cleanup failed after fatal local listener exit");
+                }
+                if let Some(network) = network.as_mut()
+                    && let Err(error) = runtime.block_on(network.shutdown_until(cleanup_deadline))
+                {
+                    tracing::warn!(%error, "network cleanup failed after fatal local listener exit");
+                }
                 zterm_platform::local_unix::remove_owned_daemon_socket(
                     paths,
                     daemon_lock,
@@ -319,6 +438,7 @@ pub fn run_owned_daemon_listener_for_test(
         service,
         limits,
         cleanup_timeout,
+        None,
     )
 }
 

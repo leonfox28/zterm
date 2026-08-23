@@ -11,7 +11,6 @@ use zterm_platform::user_state::{UserPaths, atomic_create, validate_regular_file
 use crate::error::DaemonError;
 
 /// Loaded long-term device identity. Secret bytes are never formatted.
-#[derive(Clone)]
 pub struct DeviceIdentity {
     secret_key: SecretKey,
 }
@@ -59,6 +58,16 @@ impl DeviceIdentity {
     #[must_use]
     pub fn endpoint_id(&self) -> String {
         self.secret_key.public().to_string()
+    }
+
+    /// Transfers the long-term secret into the daemon-owned network supervisor.
+    ///
+    /// This is deliberately crate-private: CLI and protocol layers can only
+    /// observe [`Self::device_id`] and [`Self::endpoint_id`]. Consuming `self`
+    /// also prevents a second subsystem from accidentally retaining an
+    /// independent owner of the same long-term secret.
+    pub(crate) fn into_secret_key(self) -> SecretKey {
+        self.secret_key
     }
 }
 

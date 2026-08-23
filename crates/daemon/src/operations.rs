@@ -24,6 +24,7 @@ const MAX_LOG_BYTES: u64 = 1024 * 1024;
 
 /// Side-effect-free observation of local setup and daemon state.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum ObservedState {
     /// Setup is complete and the daemon answered status.
     Running(DaemonStatus),
@@ -187,6 +188,7 @@ impl LocalRuntime {
     pub async fn doctor(&self) -> DoctorReport {
         let mut checks = Vec::new();
         let observed = self.observe().await;
+        let network = inspect_network_observation(&observed);
         let setup_complete = matches!(
             observed,
             Ok(ObservedState::Running(_) | ObservedState::ConfiguredStopped(_))
@@ -220,6 +222,7 @@ impl LocalRuntime {
             ok: true,
             detail: lifecycle_limitation().to_owned(),
         });
+        checks.push(network);
         checks.push(inspect_account_home(&self.paths));
         checks.push(inspect_login_shell(&self.paths));
         checks.push(inspect_state_paths(&self.paths, setup_complete));
@@ -228,6 +231,56 @@ impl LocalRuntime {
             healthy: checks.iter().all(|check| check.ok),
             checks,
         }
+    }
+}
+
+fn inspect_network_observation(observed: &Result<ObservedState, DaemonError>) -> DoctorCheck {
+    match observed {
+        Ok(ObservedState::Running(status)) => {
+            let network = &status.network;
+            let diagnostic = network
+                .diagnostic
+                .map_or("none", crate::network::NetworkDiagnostic::code);
+            let ok = !matches!(
+                network.state,
+                crate::network::NetworkState::Degraded
+                    | crate::network::NetworkState::Stopping
+                    | crate::network::NetworkState::Stopped
+            ) && network.diagnostic.is_none();
+            DoctorCheck {
+                name: "network",
+                ok,
+                detail: format!(
+                    "state={}, endpoint_bound={}, bind_attempts={}, home_relay={}, publish={}, lookup={}, authenticated={}, primary={}, streams={}, direct_paths={}, relay_paths={}, diagnostic={diagnostic}",
+                    network.state.as_str(),
+                    network.endpoint_bound,
+                    network.bind_attempts,
+                    network.home_relay.as_deref().unwrap_or("none"),
+                    network.publish.as_str(),
+                    network.lookup.as_str(),
+                    network.authenticated_connection_count,
+                    network.primary_connection_count,
+                    network.active_stream_count,
+                    network.direct_path_count,
+                    network.relay_path_count,
+                ),
+            }
+        }
+        Ok(ObservedState::ConfiguredStopped(_)) => DoctorCheck {
+            name: "network",
+            ok: true,
+            detail: "daemon is stopped; network observation was not attempted".to_owned(),
+        },
+        Ok(ObservedState::NotConfigured) => DoctorCheck {
+            name: "network",
+            ok: true,
+            detail: "setup is incomplete; network observation was not attempted".to_owned(),
+        },
+        Err(error) => DoctorCheck {
+            name: "network",
+            ok: false,
+            detail: format!("network observation unavailable: {error}"),
+        },
     }
 }
 
@@ -495,5 +548,71 @@ async fn wait_until_stopped(paths: &UserPaths) -> Result<(), DaemonError> {
             ));
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use zterm_core::{Capabilities, DeviceId};
+
+    use super::*;
+    use crate::network::{
+        AddressServiceState, NetworkDiagnostic, NetworkObservation, NetworkState,
+    };
+    use crate::service::ProtocolStatus;
+
+    #[test]
+    fn doctor_projects_only_redacted_typed_network_observation() {
+        let device_id = DeviceId::from_array([0x52; 32]);
+        let observed = Ok(ObservedState::Running(DaemonStatus {
+            protocol: ProtocolStatus {
+                wire_major: 1,
+                state_schema: 1,
+                capabilities: Capabilities::LOCAL_LIFECYCLE,
+            },
+            version: "test".to_owned(),
+            phase: "test".to_owned(),
+            device_id,
+            endpoint_id: "public-endpoint".to_owned(),
+            device_name: "doctor-host".to_owned(),
+            infrastructure_profile: "official-n0".to_owned(),
+            started_at_unix: 1,
+            active_session_count: 0,
+            active_session_names: Vec::new(),
+            network: NetworkObservation {
+                device_id,
+                state: NetworkState::Degraded,
+                endpoint_bound: true,
+                bind_attempts: 3,
+                home_relay: Some("https://relay.example.test".to_owned()),
+                publish: AddressServiceState::Configured,
+                lookup: AddressServiceState::Degraded,
+                authenticated_connection_count: 4,
+                primary_connection_count: 2,
+                active_stream_count: 5,
+                direct_path_count: 1,
+                relay_path_count: 1,
+                diagnostic: Some(NetworkDiagnostic::HomeRelayUnavailable),
+            },
+        }));
+
+        let check = inspect_network_observation(&observed);
+        assert_eq!(check.name, "network");
+        assert!(!check.ok);
+        assert!(check.detail.contains("state=degraded"));
+        assert!(check.detail.contains("publish=configured"));
+        assert!(check.detail.contains("direct_paths=1"));
+        assert!(check.detail.contains("relay_paths=1"));
+        assert!(check.detail.contains("home_relay_unavailable"));
+        for forbidden in ["direct_ip", "route_cache", "pair_secret", "ticket"] {
+            assert!(!check.detail.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn doctor_skips_network_when_setup_is_absent() {
+        let check = inspect_network_observation(&Ok(ObservedState::NotConfigured));
+        assert!(check.ok);
+        assert!(check.detail.contains("not attempted"));
     }
 }

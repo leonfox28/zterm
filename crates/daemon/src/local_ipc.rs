@@ -12,21 +12,30 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use iroh::SecretKey;
 #[cfg(unix)]
+use ring::rand::{SecureRandom, SystemRandom};
+#[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::sync::{Mutex as AsyncMutex, Semaphore, mpsc, oneshot};
 #[cfg(unix)]
 use tokio::task::JoinSet;
 #[cfg(unix)]
+use zeroize::{Zeroize, Zeroizing};
+#[cfg(unix)]
 use zterm_core::{
-    AttachmentId, OperationId, OperationLease, ResourceLimits, Revision, SessionSelector,
+    AttachmentId, DEFAULT_PAIR_TTL_SECONDS, EphemeralOperationId, OperationId, OperationLease,
+    PairFingerprint, ResourceLimits, Revision, SessionSelector,
 };
-use zterm_core::{DomainErrorKind, SessionId, SessionName};
+use zterm_core::{DeviceAlias, DeviceId, DeviceSummary, DomainErrorKind, SessionId, SessionName};
 #[cfg(unix)]
 use zterm_proto::{DecodedFrame, FrameDecoder, WireKind, encode_message, v1};
 
 use crate::config::ValidatedConfig;
 use crate::error::DaemonError;
+#[cfg(unix)]
+use crate::network::{AddressServiceState, NetworkDiagnostic, NetworkObservation, NetworkState};
+#[cfg(unix)]
+use crate::pairing::PairTicketText;
 use crate::service::{
     DaemonReadiness, DaemonService, DaemonStatus, SessionImpact, ValidatedSetupStatus,
 };
@@ -37,6 +46,8 @@ use crate::session::{AttachmentLifecycle, AttachmentUpdate, SessionAttachment};
 
 #[cfg(unix)]
 const DEFAULT_DEADLINE: Duration = Duration::from_secs(5);
+#[cfg(unix)]
+const PAIRING_DEADLINE: Duration = Duration::from_secs(15);
 #[cfg(unix)]
 const DRAIN_GRACE: Duration = Duration::from_secs(30);
 #[cfg(unix)]
@@ -297,9 +308,8 @@ async fn handle_connection(
                 return;
             }
         };
-    let frame = first.frame.clone();
-    if frame.kind == WireKind::TerminalAttachRequest {
-        let deadline = limits.request_deadline(frame.deadline_ms);
+    if first.frame.kind == WireKind::TerminalAttachRequest {
+        let deadline = limits.request_deadline(first.frame.deadline_ms);
         let absolute_deadline = started + deadline;
         if let Err(error) =
             handle_attachment(stream, service, first, limits, absolute_deadline).await
@@ -308,20 +318,26 @@ async fn handle_connection(
         }
         return;
     }
-    let request_id = frame.request_id;
-    let deadline = limits.request_deadline(frame.deadline_ms);
+    // Only copy non-sensitive routing metadata. The decoded frame itself is
+    // moved through strict unary EOF validation and then into the dispatcher;
+    // pair/device request payloads are never cloned by the generic classifier.
+    let request_id = first.frame.request_id;
+    let deadline = limits.request_deadline(first.frame.deadline_ms);
     let absolute_deadline = started + deadline;
     let remaining = deadline.saturating_sub(started.elapsed());
     let unary_finished = tokio::time::timeout(remaining, finish_unary(&mut stream, first)).await;
-    if let Err(error) = unary_finished.unwrap_or_else(|_| {
+    let frame = match unary_finished.unwrap_or_else(|_| {
         Err(DaemonError::new(
             DomainErrorKind::DeadlineExceeded,
             "local unary request did not finish before its deadline",
         ))
     }) {
-        let _ = write_error(&mut stream, frame.request_id, &error).await;
-        return;
-    }
+        Ok(frame) => frame,
+        Err(error) => {
+            let _ = write_error(&mut stream, request_id, &error).await;
+            return;
+        }
+    };
     let remaining = deadline.saturating_sub(started.elapsed());
     let reply =
         match tokio::time::timeout(remaining, service.dispatch_until(frame, absolute_deadline))
@@ -356,7 +372,7 @@ struct FirstFrame {
 
 #[cfg(unix)]
 struct AttachmentOutbound {
-    bytes: Vec<u8>,
+    bytes: Zeroizing<Vec<u8>>,
     flushed: Option<oneshot::Sender<()>>,
 }
 
@@ -364,7 +380,7 @@ struct AttachmentOutbound {
 impl AttachmentOutbound {
     fn queued(bytes: Vec<u8>) -> Self {
         Self {
-            bytes,
+            bytes: Zeroizing::new(bytes),
             flushed: None,
         }
     }
@@ -373,10 +389,10 @@ impl AttachmentOutbound {
 #[cfg(unix)]
 async fn read_first(stream: &mut tokio::net::UnixStream) -> Result<FirstFrame, DaemonError> {
     let mut decoder = FrameDecoder::new();
-    let mut buffer = [0_u8; 16 * 1024];
+    let mut buffer = Zeroizing::new([0_u8; 16 * 1024]);
     loop {
         let read = stream
-            .read(&mut buffer)
+            .read(&mut *buffer)
             .await
             .map_err(|error| daemon_io("read local request", error))?;
         if read == 0 {
@@ -401,20 +417,21 @@ async fn read_first(stream: &mut tokio::net::UnixStream) -> Result<FirstFrame, D
 async fn finish_unary(
     stream: &mut tokio::net::UnixStream,
     mut first: FirstFrame,
-) -> Result<(), DaemonError> {
+) -> Result<DecodedFrame, DaemonError> {
     if !first.queued.is_empty() {
         return Err(malformed(
             "one unary connection may contain only one request",
         ));
     }
-    let mut buffer = [0_u8; 16 * 1024];
+    let mut buffer = Zeroizing::new([0_u8; 16 * 1024]);
     loop {
         let read = stream
-            .read(&mut buffer)
+            .read(&mut *buffer)
             .await
             .map_err(|error| daemon_io("finish local unary request", error))?;
         if read == 0 {
-            return first.decoder.finish().map_err(protocol_error);
+            first.decoder.finish().map_err(protocol_error)?;
+            return Ok(first.frame);
         }
         if !first
             .decoder
@@ -437,10 +454,12 @@ async fn handle_attachment(
     limits: LocalIpcLimits,
     deadline: Instant,
 ) -> Result<(), DaemonError> {
+    let view_id = local_view_id();
+    let principal = service.sessions().local_principal(view_id);
     let prepare_service = Arc::clone(&service);
     let prepare_frame = first.frame.clone();
     let prepared = match run_blocking_until(deadline, move || {
-        prepare_local_attachment(&prepare_service, &prepare_frame, deadline)
+        prepare_local_attachment(&prepare_service, principal, &prepare_frame, deadline)
     })
     .await
     {
@@ -463,9 +482,6 @@ async fn handle_attachment(
         .write_all(&initial)
         .await
         .map_err(|error| daemon_io("write initial terminal snapshot", error))?;
-
-    let view_id = local_view_id();
-    let principal = service.sessions().local_principal(view_id);
     let (reader, writer) = stream.into_split();
     let (outbound_sender, outbound_receiver) =
         mpsc::channel::<AttachmentOutbound>(ATTACHMENT_OUTBOUND_CAPACITY);
@@ -508,6 +524,7 @@ async fn handle_attachment(
 #[cfg(unix)]
 fn prepare_local_attachment(
     service: &DaemonService,
+    principal: zterm_core::AttachmentPrincipal,
     frame: &DecodedFrame,
     deadline: Instant,
 ) -> Result<crate::session::PreparedAttachment, DaemonError> {
@@ -522,6 +539,7 @@ fn prepare_local_attachment(
         .transpose()
         .map_err(protocol_error)?;
     service.sessions().prepare_attach_until(
+        principal,
         selector,
         create_main,
         request.takeover,
@@ -1631,11 +1649,11 @@ async fn write_error(
 #[cfg(unix)]
 async fn read_one(stream: &mut tokio::net::UnixStream) -> Result<DecodedFrame, DaemonError> {
     let mut decoder = FrameDecoder::new();
-    let mut buffer = [0_u8; 16 * 1024];
+    let mut buffer = Zeroizing::new([0_u8; 16 * 1024]);
     let mut completed = None;
     loop {
         let read = stream
-            .read(&mut buffer)
+            .read(&mut *buffer)
             .await
             .map_err(|error| daemon_io("read local request", error))?;
         if read == 0 {
@@ -1732,9 +1750,11 @@ impl LocalClient {
         let response: v1::LocalStatusResponse = decode_response(&frame)?;
         let device_id = response
             .device_id
+            .clone()
             .ok_or_else(|| malformed("status response omitted device_id"))?
             .try_into()
             .map_err(protocol_error)?;
+        let network = network_observation(&response, device_id)?;
         Ok(DaemonStatus {
             protocol: protocol_status(response.protocol)?,
             version: response.version,
@@ -1746,6 +1766,7 @@ impl LocalClient {
             started_at_unix: response.started_at_unix,
             active_session_count: response.active_session_count,
             active_session_names: response.active_session_names,
+            network,
         })
     }
 
@@ -2017,13 +2038,60 @@ impl LocalClient {
             })
             .map_err(|_| resource_error("local request ID exhausted"))?;
         let deadline_ms = u32::try_from(deadline.as_millis()).unwrap_or(u32::MAX);
-        let bytes = encode_message(request_kind, request_id, deadline_ms, message)
-            .map_err(protocol_error)?;
+        let bytes = Zeroizing::new(
+            encode_message(request_kind, request_id, deadline_ms, message)
+                .map_err(protocol_error)?,
+        );
+        self.request_preencoded(&bytes, request_id, response_kind, deadline, retry_ambiguous)
+            .await
+    }
+
+    #[cfg(unix)]
+    async fn request_pair_accept(
+        &self,
+        mut message: v1::LocalPairAcceptRequest,
+    ) -> Result<DecodedFrame, DaemonError> {
+        let request_id = self
+            .next_request_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| resource_error("local request ID exhausted"))?;
+        let deadline_ms = u32::try_from(PAIRING_DEADLINE.as_millis()).unwrap_or(u32::MAX);
+        let bytes = Zeroizing::new(
+            encode_message(
+                WireKind::LocalPairAcceptRequest,
+                request_id,
+                deadline_ms,
+                &message,
+            )
+            .map_err(protocol_error)?,
+        );
+        message.ticket.zeroize();
+        self.request_preencoded(
+            &bytes,
+            request_id,
+            WireKind::LocalPairAcceptResponse,
+            PAIRING_DEADLINE,
+            true,
+        )
+        .await
+    }
+
+    #[cfg(unix)]
+    async fn request_preencoded(
+        &self,
+        bytes: &[u8],
+        request_id: u64,
+        response_kind: WireKind,
+        deadline: Duration,
+        retry_ambiguous: bool,
+    ) -> Result<DecodedFrame, DaemonError> {
         let absolute_deadline = Instant::now() + deadline;
         let attempts = if retry_ambiguous { 2 } else { 1 };
         let mut last_error = None;
         for _ in 0..attempts {
-            match self.request_bytes_once(&bytes, absolute_deadline).await {
+            match self.request_bytes_once(bytes, absolute_deadline).await {
                 Ok(frame) => {
                     // Any complete response is definitive, including a typed
                     // OutcomeUnknown. Only transport ambiguity may consume the
@@ -2086,6 +2154,204 @@ impl LocalClient {
             .map_err(|error| daemon_io("finish local request", error))?;
         read_one(&mut stream).await
     }
+}
+
+/// Real same-UID unary device-management adapter used by daemon integration
+/// tests and the future M8 CLI composition. It never opens SQLite, reads the
+/// identity key, binds Iroh, or starts a daemon.
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct LocalDeviceClient {
+    client: LocalClient,
+}
+
+impl LocalDeviceClient {
+    /// Creates a non-spawning device client for one daemon socket.
+    #[must_use]
+    pub fn new(socket: impl Into<PathBuf>) -> Self {
+        Self {
+            client: LocalClient::new(socket),
+        }
+    }
+
+    /// Lists the directional outbound/inbound projection of every device.
+    #[cfg(unix)]
+    pub async fn list(&self) -> Result<Vec<DeviceSummary>, DaemonError> {
+        let frame = self
+            .client
+            .request(
+                WireKind::LocalDeviceListRequest,
+                WireKind::LocalDeviceListResponse,
+                &v1::LocalDeviceListRequest {},
+                DEFAULT_DEADLINE,
+            )
+            .await?;
+        let response: v1::LocalDeviceListResponse = decode_response(&frame)?;
+        response
+            .devices
+            .into_iter()
+            .map(|device| device.try_into().map_err(local_device_wire_error))
+            .collect()
+    }
+
+    /// Sets the exact outbound alias for one exact DeviceId.
+    #[cfg(unix)]
+    pub async fn rename(
+        &self,
+        device_id: DeviceId,
+        alias: &DeviceAlias,
+    ) -> Result<DeviceSummary, DaemonError> {
+        let frame = self
+            .client
+            .request_with_retry(
+                WireKind::LocalDeviceRenameRequest,
+                WireKind::LocalDeviceRenameResponse,
+                &v1::LocalDeviceRenameRequest {
+                    device_id: Some(device_id.into()),
+                    alias: alias.as_str().to_owned(),
+                },
+                DEFAULT_DEADLINE,
+            )
+            .await?;
+        let response: v1::LocalDeviceRenameResponse = decode_response(&frame)?;
+        response
+            .device
+            .ok_or_else(|| malformed("device rename response omitted device"))?
+            .try_into()
+            .map_err(local_device_wire_error)
+    }
+
+    /// Revokes only the inbound authorization for one exact DeviceId.
+    #[cfg(unix)]
+    pub async fn revoke(&self, device_id: DeviceId) -> Result<DeviceSummary, DaemonError> {
+        let frame = self
+            .client
+            .request_with_retry(
+                WireKind::LocalDeviceRevokeRequest,
+                WireKind::LocalDeviceRevokeResponse,
+                &v1::LocalDeviceRevokeRequest {
+                    device_id: Some(device_id.into()),
+                },
+                DEFAULT_DEADLINE,
+            )
+            .await?;
+        let response: v1::LocalDeviceRevokeResponse = decode_response(&frame)?;
+        response
+            .device
+            .ok_or_else(|| malformed("device revoke response omitted device"))?
+            .try_into()
+            .map_err(local_device_wire_error)
+    }
+
+    /// Returns the current platform limitation.
+    #[cfg(not(unix))]
+    pub async fn list(&self) -> Result<Vec<DeviceSummary>, DaemonError> {
+        Err(unsupported())
+    }
+
+    /// Returns the current platform limitation.
+    #[cfg(not(unix))]
+    pub async fn rename(
+        &self,
+        _device_id: DeviceId,
+        _alias: &DeviceAlias,
+    ) -> Result<DeviceSummary, DaemonError> {
+        Err(unsupported())
+    }
+
+    /// Returns the current platform limitation.
+    #[cfg(not(unix))]
+    pub async fn revoke(&self, _device_id: DeviceId) -> Result<DeviceSummary, DaemonError> {
+        Err(unsupported())
+    }
+}
+
+/// Hidden same-UID pairing adapter used by integration tests and future CLI
+/// composition. It never starts a daemon or opens an Iroh endpoint itself.
+#[cfg(unix)]
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct LocalPairingClient {
+    client: LocalClient,
+}
+
+#[cfg(unix)]
+impl LocalPairingClient {
+    /// Creates a non-spawning pairing client for one daemon socket.
+    #[must_use]
+    pub fn new(socket: impl Into<PathBuf>) -> Self {
+        Self {
+            client: LocalClient::new(socket),
+        }
+    }
+
+    /// Creates one replay-safe bearer ticket. A zero TTL selects the product
+    /// default before the semantic fingerprint is computed.
+    pub async fn create(&self, ttl_seconds: u32) -> Result<PairTicketText, DaemonError> {
+        let effective_ttl = if ttl_seconds == 0 {
+            DEFAULT_PAIR_TTL_SECONDS
+        } else {
+            u64::from(ttl_seconds)
+        };
+        let operation_id = random_pair_operation_id()?;
+        let fingerprint = PairFingerprint::for_create(effective_ttl);
+        let mut frame = self
+            .client
+            .request_with_retry(
+                WireKind::LocalPairCreateRequest,
+                WireKind::LocalPairCreateResponse,
+                &v1::LocalPairCreateRequest {
+                    ephemeral_operation_id: operation_id.as_bytes().to_vec(),
+                    fingerprint: fingerprint.as_bytes().to_vec(),
+                    ttl_seconds,
+                },
+                PAIRING_DEADLINE,
+            )
+            .await?;
+        let response = decode_response::<v1::LocalPairCreateResponse>(&frame);
+        frame.payload.zeroize();
+        let response = response?;
+        PairTicketText::from_local_response(response.ticket).map_err(DaemonError::from)
+    }
+
+    /// Accepts one bearer ticket in the outbound direction. The ticket and its
+    /// encoded request are zeroized after the byte-identical retry window.
+    pub async fn accept(
+        &self,
+        ticket: PairTicketText,
+        alias: Option<&DeviceAlias>,
+    ) -> Result<DeviceSummary, DaemonError> {
+        let operation_id = random_pair_operation_id()?;
+        let fingerprint = PairFingerprint::for_accept(ticket.expose().as_bytes(), alias);
+        let request = v1::LocalPairAcceptRequest {
+            ephemeral_operation_id: operation_id.as_bytes().to_vec(),
+            fingerprint: fingerprint.as_bytes().to_vec(),
+            ticket: ticket.expose().to_owned(),
+            alias: alias.map_or_else(String::new, |alias| alias.as_str().to_owned()),
+        };
+        let result = self.client.request_pair_accept(request).await;
+        drop(ticket);
+        let mut frame = result?;
+        let response = decode_response::<v1::LocalPairAcceptResponse>(&frame);
+        frame.payload.zeroize();
+        response?
+            .device
+            .ok_or_else(|| malformed("pair accept response omitted device"))?
+            .try_into()
+            .map_err(local_device_wire_error)
+    }
+}
+
+#[cfg(unix)]
+fn random_pair_operation_id() -> Result<EphemeralOperationId, DaemonError> {
+    let mut bytes = [0_u8; EphemeralOperationId::LENGTH];
+    SystemRandom::new().fill(&mut bytes).map_err(|_| {
+        DaemonError::new(
+            DomainErrorKind::TransportUnavailable,
+            "operating-system randomness is unavailable for a pairing operation",
+        )
+    })?;
+    Ok(EphemeralOperationId::from_array(bytes))
 }
 
 #[cfg(not(unix))]
@@ -2152,6 +2418,11 @@ impl LocalClient {
 }
 
 #[cfg(unix)]
+fn local_device_wire_error(error: zterm_proto::WireFieldError) -> DaemonError {
+    malformed(format!("invalid local device response: {error}"))
+}
+
+#[cfg(unix)]
 fn decode_response<Message>(frame: &DecodedFrame) -> Result<Message, DaemonError>
 where
     Message: prost::Message + Default,
@@ -2167,6 +2438,63 @@ fn protocol_status(protocol: Option<v1::ProtocolVersion>) -> Result<ProtocolStat
         state_schema: protocol.state_schema,
         capabilities: protocol.capabilities,
     })
+}
+
+#[cfg(unix)]
+fn network_observation(
+    response: &v1::LocalStatusResponse,
+    device_id: zterm_core::DeviceId,
+) -> Result<NetworkObservation, DaemonError> {
+    let state = match response.network_state.as_str() {
+        "" | "disabled" => NetworkState::Disabled,
+        "initializing" => NetworkState::Initializing,
+        "bound" => NetworkState::Bound,
+        "degraded" => NetworkState::Degraded,
+        "online" => NetworkState::Online,
+        "stopping" => NetworkState::Stopping,
+        "stopped" => NetworkState::Stopped,
+        _ => return Err(malformed("status response contained unknown network state")),
+    };
+    let publish = address_service_state(&response.address_publish_state)?;
+    let lookup = address_service_state(&response.address_lookup_state)?;
+    let diagnostic = match response.network_diagnostic.as_str() {
+        "" => None,
+        "endpoint_bind_failed" => Some(NetworkDiagnostic::EndpointBindFailed),
+        "endpoint_closed" => Some(NetworkDiagnostic::EndpointClosed),
+        "home_relay_unavailable" => Some(NetworkDiagnostic::HomeRelayUnavailable),
+        _ => {
+            return Err(malformed(
+                "status response contained unknown network diagnostic",
+            ));
+        }
+    };
+    Ok(NetworkObservation {
+        device_id,
+        state,
+        endpoint_bound: response.endpoint_bound,
+        bind_attempts: response.network_bind_attempts,
+        home_relay: (!response.home_relay.is_empty()).then(|| response.home_relay.clone()),
+        publish,
+        lookup,
+        authenticated_connection_count: response.authenticated_connection_count,
+        primary_connection_count: response.primary_connection_count,
+        active_stream_count: response.active_stream_count,
+        direct_path_count: response.direct_path_count,
+        relay_path_count: response.relay_path_count,
+        diagnostic,
+    })
+}
+
+#[cfg(unix)]
+fn address_service_state(value: &str) -> Result<AddressServiceState, DaemonError> {
+    match value {
+        "" | "disabled" => Ok(AddressServiceState::Disabled),
+        "configured" => Ok(AddressServiceState::Configured),
+        "degraded" => Ok(AddressServiceState::Degraded),
+        _ => Err(malformed(
+            "status response contained unknown address-service state",
+        )),
+    }
 }
 
 #[cfg(unix)]
