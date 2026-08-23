@@ -381,7 +381,7 @@ scope drifts into M8.
   localhost direct candidates；prove daemon-owned Endpoint复用，不添加production state override argv。
   The production `PairingService` self-spawn gate compiles on macOS but remains ignored before bind；
   its real pair/normal execution passed on Linux x86_64 and arm64 in CI run
-  `32608814512`。It composes the production
+  `32610795848`。It composes the production
   PairingService/BrokerPairTransport owners through private lib-test access；it does not claim
   `run_daemon`/`NetworkStartup` lifecycle evidence。
 - [ ] Reuse existing disposable self-hosted Relay/handshake fixture to prove ticket/cache remote Relay URL
@@ -418,6 +418,8 @@ user state or treats unavailable public Internet as a product-code retry require
   mobile/GUI/event/history/ACL/account/control-plane code。
 - [x] Validate every PRD acceptance item against a named automated/manual evidence artifact；remaining
   external environment gate must be explicit, not silently skipped。
+- [x] Record one clean hosted matrix on a single head：macOS arm64/Intel、Linux x86_64/arm64、
+  Windows shared boundary、dependency policy and Relay bundle all passed in CI run `32610795848`。
 - [ ] Update parent M5–M6 checklist/progress only after all task gates pass；do not mark M7/M8。
 - [ ] Run task validation and prepare finish-work/archive only after implementation approval scope is
   genuinely complete。
@@ -437,5 +439,6 @@ git diff --check
 ```
 
 Required hosted evidence：macOS arm64/Intel、Linux x86_64/arm64 full applicable jobs；Windows shared
-core/proto/daemon compile/tests。Only after these gates and review may `trellis-finish-work` archive the
-child and record M5–M6 complete。
+core/proto/daemon compile/tests。The clean matrix passed in CI run `32610795848`。Only after the
+remaining explicit environment gates and review may `trellis-finish-work` archive the child and record
+M5–M6 complete。

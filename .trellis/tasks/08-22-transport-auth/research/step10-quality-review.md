@@ -13,13 +13,11 @@ and task-validation clean. Cross-layer create/accept/revoke flows use one set of
 daemon owners, errors stay typed, sensitive values are redacted/zeroized, and
 the public CLI remains within the M5-M6 boundary.
 
-The task is **not ready to archive or mark M5-M6 complete**. The first hosted
-run executed the real-Iroh broker, two-daemon transport, and production
-`PairingService` gates successfully on Linux x86_64 and arm64. The follow-up run
-proved the corrected Windows shared boundary, but exposed a scheduler-dependent
-authorization test barrier on Linux arm64. A clean all-platform run on the
-first-poll fix, the Linux cross-UID gate, and the disposable/public Relay gate
-remain. This macOS review still did not execute an Endpoint locally.
+The task is **not ready to archive or mark M5-M6 complete**. A clean hosted run
+on commit `4b85260` passed Linux x86_64/arm64 (including real-Iroh gates),
+Windows, macOS arm64/Intel, dependency policy, and the Relay bundle. The Linux
+cross-UID gate and the explicit disposable/public Relay handshake remain. This
+macOS review still did not execute an Endpoint locally.
 
 ## Findings fixed during review
 
@@ -88,7 +86,8 @@ means the write guard is already held. The later reader uses the same barrier
 and explicitly asserts its first poll is `Pending`. Production lock paths are
 unchanged; Tokio still owns wake-up and cancellation behavior. Independent
 review found no issue, the failing regression passed 500/500 in isolated test
-processes, and the complete revoke-order race passed 50/50.
+processes, and the complete revoke-order race passed 50/50. The exact formerly
+failing test then passed in the clean Linux arm64 hosted run.
 
 No unresolved task-owned code finding remains from this review.
 
@@ -162,25 +161,25 @@ Linux execution.
 | --- | --- | --- |
 | [`32608814512`](https://github.com/leonfox28/zterm/actions/runs/32608814512), `193e008` | Linux x86_64 and arm64 both executed `connection_broker` (1/1), `two_daemon_transport` (2/2), and the two-process production `PairingService` gate; both macOS rows, dependency policy, and Relay bundle also passed | Windows alone failed on the three F5 dead-code boundaries |
 | [`32609483826`](https://github.com/leonfox28/zterm/actions/runs/32609483826), `80f8852` | Windows shared compile/tests/docs passed; Linux x86_64, both macOS rows, dependency policy, and Relay bundle passed | Linux arm64 alone exposed F6 in `revoke_waits_for_in_flight_commit_and_rejects_stale_generation`; a clean rerun on the first-poll fix is required |
+| [`32610795848`](https://github.com/leonfox28/zterm/actions/runs/32610795848), `4b85260` | All seven jobs passed on one head: Linux x86_64/arm64, Windows, macOS arm64/Intel, dependency policy, and Relay bundle. Both Linux rows executed the real broker/two-daemon/two-process pairing gates; arm64 also passed the exact F6 regression | clean hosted matrix achieved; only the separate cross-UID and public Relay environment gates remain |
 
-The two runs establish the real Linux transport behavior and Windows boundary
-individually, but they are not substituted for one clean matrix on the same
-head.
+The third run supplies the required clean matrix on one head; the first two are
+retained to document the task-owned failures and their fixes.
 
 ## Acceptance mapping and remaining gates
 
 | PRD acceptance area | Current evidence | Remaining evidence |
 | --- | --- | --- |
-| one endpoint, exact profiles/ALPNs, lifecycle | profile/injected lifecycle tests plus successful Linux x86_64/arm64 real Endpoint gates | clean hosted matrix on the fixed head; private harness is not `run_daemon` evidence |
-| singleflight and duplicate convergence | pure gates plus real `connection_broker` on Linux x86_64/arm64 | clean hosted matrix rerun |
-| resource isolation | pure permit/frame/deadline tests, local Session/PTY corpus, and real Linux broker streams | clean hosted matrix rerun |
-| directional pairing | fake-transport faults plus the two-process production gate on Linux x86_64/arm64 | clean hosted matrix rerun |
-| ticket/proof/replay/ambiguity secrecy | golden vectors, manager/service faults, proto/debug and SQLite sentinels across hosted Unix/Windows | clean hosted matrix rerun |
-| pre-frame authorization/current generation | registry/broker gates and real one-way normal ALPN on both Linux architectures | clean F6 authorization/revoke rerun |
-| durable revoke without Session loss | `revoke_races`, device IPC, principal detach, restart preload, and first-poll fairness stress | clean Linux arm64 rerun |
+| one endpoint, exact profiles/ALPNs, lifecycle | production composition/profile/injected lifecycle tests plus successful Linux x86_64/arm64 real Endpoint gates; the private pair router is not separately claimed as `run_daemon` evidence | — |
+| singleflight and duplicate convergence | pure gates plus real `connection_broker` on Linux x86_64/arm64 in the clean matrix | — |
+| resource isolation | pure permit/frame/deadline tests, local Session/PTY corpus, and real Linux broker streams in the clean matrix | — |
+| directional pairing | fake-transport faults plus the two-process production gate on Linux x86_64/arm64 in the clean matrix | — |
+| ticket/proof/replay/ambiguity secrecy | golden vectors, manager/service faults, proto/debug and SQLite sentinels across the clean Unix/Windows matrix | — |
+| pre-frame authorization/current generation | registry/broker gates and real one-way normal ALPN on both Linux architectures; F6 passed on arm64 | — |
+| durable revoke without Session loss | `revoke_races`, device IPC, principal detach, restart preload, first-poll fairness stress, and the clean arm64 rerun | — |
 | fresh/cache/ticket fallback and path safety | route/path pure tests including F1 regression | self-hosted/public Relay execution on Linux |
 | same-UID hidden adapters and no M8 CLI | local pair/device IPC and CLI source/help tests | Linux cross-UID gate |
-| full quality/platform matrix | every individual row has passed across the two hosted runs | one clean run on a single fixed head |
+| full quality/platform matrix | all seven jobs passed on one head in run `32610795848` | — |
 
 The existing `ci.yml` needs no task-owned wiring change: Unix matrix rows run
 the full workspace suite (so Linux executes the real-Iroh targets, including
@@ -199,4 +198,4 @@ sh tests/relay/public-handshake.sh https://relay.zenithconsulting.cn
 ```
 
 Do not run `trellis-finish-work`, archive this child task, or mark the parent
-M5-M6 complete until those gates and one clean hosted matrix are recorded.
+M5-M6 complete until the two remaining environment gates are recorded.
