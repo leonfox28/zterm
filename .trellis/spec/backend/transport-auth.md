@@ -56,6 +56,9 @@ AuthorizationRegistry::authorize_guard(device_id)
 AuthorizationRegistry::revoke_guard(device_id)
     -> Result<AuthorizationWriteGuard, DaemonError>
 
+LocalDeviceClient::new(socket: impl Into<PathBuf>) -> LocalDeviceClient
+LocalDeviceClient::{list, rename, revoke}(...) // Unix: IPC; non-Unix: UnsupportedPlatform
+
 // Linux-only lib-test acceptance target; not a production API.
 pairing_service::multiprocess_test::
     two_process_production_pairing_service_is_directional_and_reuses_one_endpoint
@@ -152,6 +155,22 @@ outbound-known and inbound-authorization directions explicit.
   do not spawn the daemon or bind an endpoint. Public clap still exposes no
   pair/device/connect/session commands or state/identity/socket override.
 
+### Platform compilation boundaries
+
+- A cross-platform hidden client may keep a stable constructor and typed
+  non-Unix `UnsupportedPlatform` methods, but its Unix socket-backed private
+  fields exist only under `#[cfg(unix)]`. Non-Unix construction consumes the
+  socket argument and produces a stateless value; it must not retain an unused
+  `LocalClient` merely to keep the struct shape identical.
+- When an actor query has only a Unix consumer, gate the whole private chain
+  together: service method, command variant, dispatch match arm, and helper.
+  Gating only the caller leaves dead private code in the Windows shared build.
+  Do not hide this drift with `allow(dead_code)` or `expect(dead_code)`.
+- Hosted Windows Clippy for workspace `--lib --bins --all-features` with
+  `-D warnings` is the authoritative boundary. A macOS cross-check may stop in
+  native C/assembly dependencies before project code and does not replace the
+  hosted result.
+
 ### Linux multi-process pairing evidence
 
 - The real-Iroh pairing acceptance target self-spawns exact ignored host and
@@ -197,6 +216,8 @@ outbound-known and inbound-authorization directions explicit.
 | multi-process gate on a non-Linux host | parent ignored; every callable helper fails before Endpoint bind |
 | control packet has wrong kind, zero/oversize length, timeout, or trailing bytes | fail the test locally; do not decode/use a ticket or continue the handshake |
 | pairing helper misses the shared exit deadline | kill, boundedly reap, and fail without emitting child output |
+| Unix-only private field or actor-query chain in a shared Windows module | gate every private owner/variant/arm/helper together; shared Clippy must have zero dead code |
+| non-Unix caller constructs or invokes `LocalDeviceClient` | construction succeeds without Unix state; operation returns typed `UnsupportedPlatform` |
 
 ## 5. Good / Base / Bad Cases
 
@@ -210,10 +231,13 @@ outbound-known and inbound-authorization directions explicit.
   retained Sessions remain responsive.
 - **Base:** macOS/other non-Linux hosts compile or list the multi-process target,
   but the target remains ignored and its helper guard precedes every bind.
+- **Base:** Windows compiles the shared hidden device-client surface without a
+  Unix socket field; invoking an operation returns `UnsupportedPlatform`.
 - **Bad:** cap the combined route list at four, accept unidirectional QUIC
   streams that no actor consumes, persist a direct address, roll back an
   outcome-unknown authorization, detach a PTY because one device was revoked,
-  or place a bearer ticket in child argv/env/output.
+  place a bearer ticket in child argv/env/output, or leave a Unix-only actor
+  command compiled and unused on Windows.
 
 ## 6. Tests Required
 
@@ -244,7 +268,13 @@ outbound-known and inbound-authorization directions explicit.
   confirmation, one normal primary with zero business streams, one Endpoint
   identity/socket per child, and no direct-route persistence. Linux also owns
   the disposable self-hosted relay/static/public handshake gates. Hosted
-  Windows owns shared core/proto/daemon compile evidence.
+  Windows owns shared core/proto/daemon compile evidence, including:
+
+  ```sh
+  cargo clippy --workspace --lib --bins --all-features -- -D warnings
+  cargo test -p zterm-core -p zterm-proto -p zterm-platform -p zterm-daemon \
+    --lib --all-features
+  ```
 - Every change runs workspace fmt, check, Clippy with `-D warnings`, tests,
   docs, dependency/source/version/secret policy, task validation, and
   `git diff --check`.
@@ -297,3 +327,28 @@ let status = finish_or_kill_until(child, shared_deadline)?;
 
 This prevents output backpressure from hanging Linux CI and prevents sensitive
 child diagnostics from being copied into the parent test result.
+
+For shared modules, leaving Unix-backed private state or commands compiled on
+Windows is also wrong:
+
+```rust
+pub struct LocalDeviceClient { client: LocalClient }
+enum SessionCommand { CountRemoteAttachments { /* ... */ } }
+```
+
+Keep the public unsupported surface while gating the complete private chain:
+
+```rust
+pub struct LocalDeviceClient {
+    #[cfg(unix)]
+    client: LocalClient,
+}
+
+enum SessionCommand {
+    #[cfg(unix)]
+    CountRemoteAttachments { /* ... */ },
+}
+```
+
+The corresponding service method, dispatch arm, and helper carry the same
+`cfg(unix)` boundary, so every compiled target has a real consumer.

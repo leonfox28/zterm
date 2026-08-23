@@ -27,7 +27,7 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Effective-User State Contract](./effective-user-state.md) | Per-user paths, configuration, identity, SQLite, and safe file operations | Active |
 | [Local Daemon and IPC Contract](./local-daemon-ipc.md) | Same-UID Unix IPC, single-instance lifecycle, detached spawn, and CLI side effects | Active |
 | [Persistent Session Service Contract](./session-service.md) | Daemon-lifetime sessions, attachments, controller leases, and resource admission | Active |
-| [Iroh Transport, Pairing, and Device Authorization Contract](./transport-auth.md) | Endpoint ownership, route fallback, pairing, directional authorization, revoke, security, and Linux evidence boundaries | Active |
+| [Iroh Transport, Pairing, and Device Authorization Contract](./transport-auth.md) | Endpoint ownership, route fallback, pairing, directional authorization, revoke, security, and platform evidence boundaries | Active |
 
 ---
 

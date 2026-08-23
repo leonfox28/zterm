@@ -2162,6 +2162,7 @@ impl LocalClient {
 #[derive(Debug)]
 #[doc(hidden)]
 pub struct LocalDeviceClient {
+    #[cfg(unix)]
     client: LocalClient,
 }
 
@@ -2169,8 +2170,16 @@ impl LocalDeviceClient {
     /// Creates a non-spawning device client for one daemon socket.
     #[must_use]
     pub fn new(socket: impl Into<PathBuf>) -> Self {
-        Self {
-            client: LocalClient::new(socket),
+        #[cfg(unix)]
+        {
+            Self {
+                client: LocalClient::new(socket),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = socket;
+            Self {}
         }
     }
 

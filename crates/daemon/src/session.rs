@@ -628,6 +628,7 @@ impl SessionService {
 
     /// Counts current attachments owned by one remote endpoint without
     /// detaching them, releasing controller leases, or changing Session state.
+    #[cfg(unix)]
     pub(crate) fn remote_attachment_count_until(
         &self,
         device_id: DeviceId,
@@ -2426,6 +2427,7 @@ enum SessionCommand {
         processed: Option<SyncSender<()>>,
         reply: SyncSender<Result<PrincipalDetachOutcome, DaemonError>>,
     },
+    #[cfg(unix)]
     CountRemoteAttachments {
         meta: CommandMeta,
         device_id: DeviceId,
@@ -3060,6 +3062,7 @@ fn dispatch_command(
             }
             Ok(outcome)
         }),
+        #[cfg(unix)]
         SessionCommand::CountRemoteAttachments {
             meta,
             device_id,
@@ -3539,6 +3542,7 @@ fn detach_remote_principal(
     outcome
 }
 
+#[cfg(unix)]
 fn count_remote_attachments(runtime: &SessionRuntime, device_id: DeviceId) -> usize {
     runtime
         .attachments
