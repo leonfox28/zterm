@@ -26,12 +26,22 @@ identity, SQLite state, setup, and managed files.
 - SQLite is bundled, single-owner, `foreign_keys=ON`, rollback journal,
   `synchronous=FULL`, and transactionally migrated. `PRAGMA user_version` is
   the only schema version.
+- A live daemon moves the sole `StateStore` into one `StoreActor`; async owners
+  share only its bounded `StoreHandle`. Network/pair/device code runs blocking
+  handle calls on a blocking worker with one absolute deadline and never opens
+  a second SQLite connection.
 - Before SQLite `NOFOLLOW` open, the already validated database path is
   canonicalized so macOS' system `/var` symlink is not mistaken for a managed
   database symlink; the final open still uses `SQLITE_OPEN_NOFOLLOW`.
 - State contains identity metadata, authorization tombstones/generations, and
   versioned route cache. It does not persist PTYs, terminal bytes, sessions,
   replay windows, pairing offers, or audit streams.
+- `device_auth` is inbound permission and `known_devices` is the outbound
+  address book; neither row implies the other. Authorization/revocation uses a
+  checked generation representable as SQLite `i64`. A route cache contains only
+  handshake-verified relay URLs; direct addresses, ticket secrets, proofs, and
+  pairing operation cells are never persisted. An unknown cache version is
+  ignored with a diagnostic rather than migrated or deleted.
 - Tests inject `UserPaths` below a temporary directory. Product code exposes no
   `ZTERM_HOME` or normal CLI state-path override.
 
@@ -42,7 +52,9 @@ identity, SQLite state, setup, and managed files.
 - Setup tests cover fresh, repeated, concurrent, resumable, missing-key, bad
   key, metadata mismatch, and invalid config states.
 - Persistence tests cover schema inventory, too-new schema, transaction
-  rollback, and identity consistency.
+  rollback, identity consistency, directional device rows, checked generation,
+  route-cache preservation/replacement, and pre-start versus started response
+  loss through `StoreActor`.
 - CLI setup tests prove first noninteractive validation failure leaves the
   entire task-private state root absent and successful setup creates 0700/0600
   nodes.

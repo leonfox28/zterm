@@ -17,10 +17,12 @@ SessionService::rename(&self, principal, operation_id, session_id, new_name)
     -> Result<SessionSummary, DaemonError>
 SessionService::close(&self, principal, operation_id, session_id)
     -> Result<SessionSummary, DaemonError>
-SessionService::prepare_attach(&self, selector, create_main, takeover, viewport)
+SessionService::prepare_attach(&self, principal, selector, create_main, takeover, viewport)
     -> Result<PreparedAttachment, DaemonError>
 SessionService::takeover(&self, principal, operation_id, attachment)
     -> Result<SessionSummary, DaemonError>
+SessionService::detach_remote_principal(&self, device_id: DeviceId)
+    -> Result<PrincipalDetachImpact, DaemonError>
 SessionService::shutdown(&self) -> Result<Vec<SessionSummary>, DaemonError>
 
 SessionAttachment::snapshot_applied(revision) -> Result<(), DaemonError>
@@ -54,6 +56,14 @@ they must not duplicate registry, replay, resource, or controller logic.
 - Session state is daemon-lifetime only. Disconnect and detach preserve the
   PTY; root-shell exit, explicit close, and daemon stop end it. No transcript,
   PTY, attachment, lease, or operation result is written to SQLite or disk.
+- Every prepared/live attachment and controller lease carries an explicit
+  `AttachmentPrincipal`; adapters never infer it from a session name or target.
+  `detach_remote_principal(_until)` fans out under one deadline and removes only
+  attachments, prepared takeover state, and the controller lease matching one
+  remote `DeviceId`. It does not signal the child, interrupt the driver, close
+  the Session, remove its model/registry entry, or affect local/other-remote
+  principals. The device-revoke coordinator calls it only after durable revoke,
+  registry publication, and broker close.
 - The default attach path reserves `main` once under the registry's atomic name
   slot and uses a per-name creation cell for singleflight. Normal create and
   rename cannot claim `main`; closing it permits the next default attach to
@@ -197,6 +207,9 @@ they must not duplicate registry, replay, resource, or controller logic.
 - `controller_lease` covers occupied, prepared takeover, lease loss, no stale
   write, same-operation continuation after controller detach, and rejection of
   a stale same-operation continuation without clobbering a later controller.
+- `principal_detach`, `local_device_ipc`, and `revoke_races` cover matching-only
+  detach across Sessions, stale-effect rejection, idempotence, preservation of
+  local/other-remote attachments, and survival of the same Session/PTY.
 - `session_limits` covers the eighth/ninth session, maximum viewport, aggregate
   projection, and failed-resize rollback.
 - `local_session_ipc` and `terminal_recovery` prove the same service through a

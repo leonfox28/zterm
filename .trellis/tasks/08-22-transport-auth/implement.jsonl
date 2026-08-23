@@ -1,0 +1,18 @@
+{"file":".trellis/spec/backend/index.md","reason":"Load the active backend contract index before changing the cross-layer daemon runtime."}
+{"file":".trellis/spec/guides/evidence-driven-simplicity.md","reason":"Give every limit, retry, recovery path and test a current consumer and one owner."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Carry device IDs, generations, routes, errors and secrets through core, proto, store, daemon and IPC without duplicate parsing."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Reuse the existing frame codec, StoreActor, SessionService, infrastructure profile and local IPC boundaries."}
+{"file":".trellis/spec/guides/cross-platform-thinking-guide.md","reason":"Preserve macOS/Linux runtime behavior, LF/source policy and the hosted Windows shared compile boundary."}
+{"file":".trellis/spec/backend/relay-deployment.md","reason":"Keep the exact Iroh 1.0.3 official production profile and explicit isolated self-hosted profile while adding runtime transport."}
+{"file":".trellis/spec/backend/core-wire-domain.md","reason":"Extend shared IDs, errors, limits and the one protobuf/frame registry without leaking adapter dependencies into core."}
+{"file":".trellis/spec/backend/effective-user-state.md","reason":"Preserve identity, SQLite v1, permissions and StoreActor ownership while adding device authorization operations."}
+{"file":".trellis/spec/backend/local-daemon-ipc.md","reason":"Add same-UID pair/device operations behind the existing peer gate and codec while keeping local readiness network-independent."}
+{"file":".trellis/spec/backend/session-service.md","reason":"Associate remote principals with attachments and detach them on revoke without ending Session or PTY ownership."}
+{"file":".trellis/spec/backend/pty-lifecycle.md","reason":"Ensure transport loss and authorization revoke never acquire PTY termination authority."}
+{"file":".trellis/spec/backend/terminal-driver.md","reason":"Keep PTY drain, terminal state and process lifetime independent from connections and attachments."}
+{"file":".trellis/tasks/08-22-transport-auth/research/current-boundary.md","reason":"Start from the exact M4 code owners and keep M7/M8 interfaces out of this child."}
+{"file":".trellis/tasks/08-22-transport-auth/research/iroh-1.0.3-runtime.md","reason":"Use verified pinned Endpoint, lookup, dynamic Relay route, path and shutdown APIs."}
+{"file":".trellis/tasks/08-22-transport-auth/research/pairing-auth-concurrency.md","reason":"Implement the selected ticket crypto, one-way device projection, duplicate arbitration and revoke gate."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/connection-multiplexing.md","reason":"Preserve one connection per device pair with isolated streams and transport-independent sessions."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/device-revocation.md","reason":"Persist revoke first, invalidate current and future access, and retain PTY/session state."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/authorization-scope.md","reason":"Keep pairing as honest host-level trust and avoid fake per-session authorization roles."}

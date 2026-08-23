@@ -18,6 +18,16 @@ LocalClient::create_session(&self, name, cwd, viewport)
 LocalClient::rename_session(&self, session_id, name)
     -> Result<SessionSummary, DaemonError>
 LocalClient::stop(&self, force: bool) -> Result<SessionImpact, DaemonError>
+
+LocalPairingClient::create(&self, ttl_seconds: u32)
+    -> Result<PairTicketText, DaemonError>
+LocalPairingClient::accept(&self, ticket: PairTicketText, alias: Option<&DeviceAlias>)
+    -> Result<DeviceSummary, DaemonError>
+LocalDeviceClient::list(&self) -> Result<Vec<DeviceSummary>, DaemonError>
+LocalDeviceClient::rename(&self, device_id: DeviceId, alias: &DeviceAlias)
+    -> Result<DeviceSummary, DaemonError>
+LocalDeviceClient::revoke(&self, device_id: DeviceId)
+    -> Result<DeviceSummary, DaemonError>
 ```
 
 Unary IPC is `varint length + WireFrame + write-half EOF -> one response`.
@@ -53,6 +63,14 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   current-thread Tokio runtime never waits inline for a full actor mailbox or
   a PTY effect. Timing out drops only the waiter—an already-started mutation
   continues and records its exact replay result.
+- Local pair/device kinds 12-21 use the same credential gate, decoder, strict
+  unary EOF, and typed service-error response. Pair dispatch remains async;
+  blocking Store/Directory/device projection work runs off the socket runtime.
+  Sensitive first frames are moved rather than cloned, and ticket/request/reply
+  buffers are zeroized after the one byte-identical retry window.
+- `LocalPairingClient` and `LocalDeviceClient` are doc-hidden daemon-internal /
+  test adapters. They never spawn a daemon, open SQLite, read `identity.key`, or
+  bind Iroh. Public clap does not expose them before the M8 security/UX task.
 - `SessionOperationLeaseRequest/Response` is the mutation-only control exchange
   for a daemon-issued lease. A logical `LocalClient` requests it lazily before
   its first mutation and caches it; readiness, status, and session list do not

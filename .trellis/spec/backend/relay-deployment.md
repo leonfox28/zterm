@@ -44,6 +44,9 @@ before adding another infrastructure profile or validation layer.
   ```
 
 - Each official entry retains QAD on Iroh's default UDP port 7842.
+- The endpoint accepts exactly the normal `zterm/1` and short-lived pairing
+  `zterm-pair/1` ALPNs. Adding pairing must not create a second endpoint or a
+  second infrastructure profile.
 - n0 DNS/Pkarr lookup and port mapping remain enabled. Address lookup
   publication is relay-only; peers still exchange and test direct candidates
   through Iroh's connection machinery.
@@ -170,7 +173,7 @@ before adding another infrastructure profile or validation layer.
 ### 6. Tests Required
 
 - `iroh_profile_gate`: assert the exact effective Iroh 1.0.3 production map,
-  QAD port 7842, N0 lookup/relay-only publication, port mapping, staging
+  QAD port 7842, both product ALPNs, N0 lookup/relay-only publication, port mapping, staging
   exclusion, self-hosted exclusion, and production lookup invariance under an
   isolated child process with `IROH_FORCE_STAGING_RELAYS` set.
 - `tests/foundation/network-gate.sh`: run fresh A/B/C labs; verify three

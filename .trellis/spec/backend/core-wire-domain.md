@@ -87,8 +87,10 @@ is `zterm/1`.
   allocation. Control payloads are capped at 1 MiB before concrete-message
   decoding. Unknown protobuf fields are compatible; unknown kind and wire
   major are explicit errors.
-- The product ALPN is `zterm/1`. This milestone defines the contract but does
-  not bind an Iroh endpoint.
+- The normal product ALPN is `zterm/1`; short-lived pairing uses
+  `zterm-pair/1`. Core defines transport-neutral values and never binds an Iroh
+  endpoint; daemon ownership and authorization sequencing follow the
+  [transport/auth contract](./transport-auth.md).
 
 ## 4. Validation & Error Matrix
 

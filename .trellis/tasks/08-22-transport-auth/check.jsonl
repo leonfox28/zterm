@@ -1,0 +1,18 @@
+{"file":".trellis/spec/backend/index.md","reason":"Verify every affected active backend contract has been considered and updated only to actual behavior."}
+{"file":".trellis/spec/guides/evidence-driven-simplicity.md","reason":"Audit limits, retries, cancellation and recovery against concrete failure models and deterministic evidence."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Check end-to-end identity, route, authorization generation, error and secret flow across every layer."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Detect duplicate codecs, registries, validators, stores, session services or infrastructure profiles."}
+{"file":".trellis/spec/guides/cross-platform-thinking-guide.md","reason":"Check platform cfg completeness, hosted matrix evidence and source checkout contracts."}
+{"file":".trellis/spec/backend/relay-deployment.md","reason":"Confirm both ALPNs retain exact production/default and isolated self-hosted Relay contracts with no staging or map mixing."}
+{"file":".trellis/spec/backend/core-wire-domain.md","reason":"Verify bounds, numeric kind uniqueness, compatibility, validated conversions and stable error codes."}
+{"file":".trellis/spec/backend/effective-user-state.md","reason":"Verify identity secrecy, SQLite v1 inventory, FULL persistence, checked generations and sole StoreActor ownership."}
+{"file":".trellis/spec/backend/local-daemon-ipc.md","reason":"Verify same-UID admission precedes decode, strict unary semantics remain, and local readiness/inspection stay network-passive."}
+{"file":".trellis/spec/backend/session-service.md","reason":"Verify principal detach and revoke preserve controller, replay, session and shutdown invariants."}
+{"file":".trellis/spec/backend/pty-lifecycle.md","reason":"Confirm no connection, stream, pairing or revoke path can close or signal a PTY."}
+{"file":".trellis/spec/backend/terminal-driver.md","reason":"Confirm PTY drain and host-authoritative terminal state remain independent of network backpressure and path loss."}
+{"file":".trellis/tasks/08-22-transport-auth/research/current-boundary.md","reason":"Check implementation scope against the exact pre-task M4 boundary and M7/M8 exclusions."}
+{"file":".trellis/tasks/08-22-transport-auth/research/iroh-1.0.3-runtime.md","reason":"Check pinned API use, fresh lookup ordering, dynamic route behavior, path observation and endpoint shutdown."}
+{"file":".trellis/tasks/08-22-transport-auth/research/pairing-auth-concurrency.md","reason":"Check ticket vectors, one-time CAS, one-way authorization, permit lifetime and revoke ordering."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/connection-multiplexing.md","reason":"Check per-device connection reuse and independent bounded streams without global head-of-line queues."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/device-revocation.md","reason":"Check current and future access is cut only after durable revoke while sessions remain live."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/authorization-scope.md","reason":"Check the product does not claim per-session or low-trust isolation that the OS-user shell cannot provide."}
