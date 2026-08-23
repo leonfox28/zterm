@@ -7,7 +7,9 @@ publish.workspace = true
 build = "build.rs"
 
 [dependencies]
+base64.workspace = true
 prost.workspace = true
+zeroize.workspace = true
 zterm-core.workspace = true
 
 [build-dependencies]

@@ -25,6 +25,18 @@ message LocalStatusResponse {
   uint64 started_at_unix = 8;
   uint32 active_session_count = 9;
   repeated string active_session_names = 10;
+  string network_state = 11;
+  bool endpoint_bound = 12;
+  uint64 network_bind_attempts = 13;
+  string home_relay = 14;
+  string address_publish_state = 15;
+  string address_lookup_state = 16;
+  uint32 authenticated_connection_count = 17;
+  uint32 primary_connection_count = 18;
+  uint32 active_stream_count = 19;
+  uint32 direct_path_count = 20;
+  uint32 relay_path_count = 21;
+  string network_diagnostic = 22;
 }
 
 message LocalValidateSetupRequest {

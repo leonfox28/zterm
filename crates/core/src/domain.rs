@@ -188,6 +188,26 @@ fixed_id!(
     16,
     "Identifier of one local or remote view attached to a session."
 );
+fixed_id!(
+    PairOfferId,
+    16,
+    "Random identifier of one one-time pairing offer."
+);
+fixed_id!(
+    PairNonce,
+    32,
+    "Random 256-bit challenge nonce in one pairing handshake."
+);
+fixed_id!(
+    ConnectionAttemptId,
+    16,
+    "Random identifier of one connection dial attempt."
+);
+fixed_id!(
+    EphemeralOperationId,
+    16,
+    "Client-generated identifier of one local pairing operation."
+);
 
 /// Error returned when a fixed-width identifier has the wrong byte length.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -208,6 +228,16 @@ impl IdLengthError {
     #[must_use]
     pub const fn actual(self) -> usize {
         self.actual
+    }
+
+    /// Constructs a length error for any fixed-width byte field.
+    #[must_use]
+    pub const fn new(identifier: &'static str, expected: usize, actual: usize) -> Self {
+        Self {
+            identifier,
+            expected,
+            actual,
+        }
     }
 }
 
@@ -544,6 +574,28 @@ pub enum DomainErrorKind {
     ResourceExhausted,
     /// A defined future service is not implemented in this milestone.
     ServiceNotImplemented,
+    /// No usable address or route can reach the target device.
+    AddressUnavailable,
+    /// The network transport cannot currently serve the request.
+    TransportUnavailable,
+    /// The remote peer is not authorized for the requested operation.
+    Unauthorized,
+    /// The remote peer's authorization has been revoked.
+    AuthorizationRevoked,
+    /// A pairing ticket failed its product validation contract.
+    PairTicketInvalid,
+    /// A pairing ticket has reached its expiry.
+    PairTicketExpired,
+    /// A pairing ticket was already consumed and cannot authorize again.
+    PairTicketConsumed,
+    /// A pairing effect committed or failed without a definitive local result.
+    PairOutcomeUnknown,
+    /// A device alias failed its product validation contract.
+    InvalidDeviceAlias,
+    /// A device alias is already claimed by another device.
+    DeviceAliasConflict,
+    /// The selected device has no local record.
+    DeviceNotFound,
 }
 
 impl DomainErrorKind {
@@ -586,6 +638,17 @@ impl DomainErrorKind {
             Self::LeaseLost => "lease_lost",
             Self::ResourceExhausted => "resource_exhausted",
             Self::ServiceNotImplemented => "service_not_implemented",
+            Self::AddressUnavailable => "address_unavailable",
+            Self::TransportUnavailable => "transport_unavailable",
+            Self::Unauthorized => "unauthorized",
+            Self::AuthorizationRevoked => "authorization_revoked",
+            Self::PairTicketInvalid => "pair_ticket_invalid",
+            Self::PairTicketExpired => "pair_ticket_expired",
+            Self::PairTicketConsumed => "pair_ticket_consumed",
+            Self::PairOutcomeUnknown => "pair_outcome_unknown",
+            Self::InvalidDeviceAlias => "invalid_device_alias",
+            Self::DeviceAliasConflict => "device_alias_conflict",
+            Self::DeviceNotFound => "device_not_found",
         }
     }
 
@@ -628,6 +691,17 @@ impl DomainErrorKind {
             "lease_lost" => Self::LeaseLost,
             "resource_exhausted" => Self::ResourceExhausted,
             "service_not_implemented" => Self::ServiceNotImplemented,
+            "address_unavailable" => Self::AddressUnavailable,
+            "transport_unavailable" => Self::TransportUnavailable,
+            "unauthorized" => Self::Unauthorized,
+            "authorization_revoked" => Self::AuthorizationRevoked,
+            "pair_ticket_invalid" => Self::PairTicketInvalid,
+            "pair_ticket_expired" => Self::PairTicketExpired,
+            "pair_ticket_consumed" => Self::PairTicketConsumed,
+            "pair_outcome_unknown" => Self::PairOutcomeUnknown,
+            "invalid_device_alias" => Self::InvalidDeviceAlias,
+            "device_alias_conflict" => Self::DeviceAliasConflict,
+            "device_not_found" => Self::DeviceNotFound,
             _ => return None,
         })
     }

@@ -10,6 +10,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         "wire.proto",
         "local.proto",
         "pairing.proto",
+        "device.proto",
+        "transport.proto",
         "session.proto",
         "terminal.proto",
     ]
@@ -22,6 +24,20 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut config = prost_build::Config::new();
     config.protoc_executable(protoc);
+    // These generated values carry bearer tickets, nonces, proofs, or an
+    // opaque payload which may contain any of them. Their Debug ownership is
+    // implemented manually in `src/lib.rs`; keep this exact list in sync with
+    // the pairing schema rather than suppressing diagnostics package-wide.
+    config.skip_debug([
+        ".zterm.v1.WireFrame",
+        ".zterm.v1.PairTicketV1",
+        ".zterm.v1.PairBegin",
+        ".zterm.v1.PairChallenge",
+        ".zterm.v1.PairProof",
+        ".zterm.v1.PairAccepted",
+        ".zterm.v1.LocalPairCreateResponse",
+        ".zterm.v1.LocalPairAcceptRequest",
+    ]);
     config.compile_protos(&schemas, &[proto_root])?;
 
     Ok(())

@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package zterm.v1;
+
+// First authenticated frame on a normal `zterm/1` connection.
+message ConnectionHello {
+  uint32 min_wire_major = 1;
+  uint32 max_wire_major = 2;
+  uint64 capabilities = 3;  // capability bits, unknown bits retained
+  bytes attempt_id = 4;     // exactly 16 bytes
+  string initiator_display = 5;
+  string initiator_build = 6;
+  string initiator_platform = 7;
+}
+
+// Responder half of the normal connection handshake.
+message ConnectionWelcome {
+  uint32 wire_major = 1;    // selected wire major
+  uint64 capabilities = 2;  // capability bits, unknown bits retained
+  string responder_display = 3;
+  string responder_build = 4;
+  string responder_platform = 5;
+  uint64 accepted_authorization_generation = 6; // receiver-side accepted auth
+}
+
+// Versioned relay-only route cache persisted for known devices.
+message RelayRouteCacheV1 {
+  uint32 format_version = 1;
+  repeated string relay_urls = 2;
+}

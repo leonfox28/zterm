@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package zterm.v1;
+
+import "zterm/v1/common.proto";
+
+// Directional inbound authorization status of one device on this host.
+enum DeviceAuthStatus {
+  DEVICE_AUTH_STATUS_UNSPECIFIED = 0;
+  DEVICE_AUTH_STATUS_NONE = 1;
+  DEVICE_AUTH_STATUS_AUTHORIZED = 2;
+  DEVICE_AUTH_STATUS_REVOKED = 3;
+}
+
+// Merged projection of one device across the outbound address book and the
+// inbound authorization registry. Alias and route fields describe what this
+// host knows about reaching the device; auth/generation describe whether the
+// device may control this host. Each direction is explicit so a consumer never
+// infers "known" from an empty alias sentinel.
+message DeviceSummary {
+  DeviceId device_id = 1;
+  bool outbound_known = 2;           // outbound known-device row is present
+  string alias = 3;                  // outbound local alias (may be empty)
+  string remote_name = 4;            // outbound remote display name
+  bool route_verified = 5;           // outbound relay route was verified
+  DeviceAuthStatus auth_status = 6;  // inbound authorization status
+  uint64 generation = 7;             // inbound authorization generation
+  uint64 paired_at_unix = 8;         // inbound pairing timestamp
+  uint64 last_seen_at_unix = 9;
+  bool online = 10;                  // live primary connection present
+  uint32 active_stream_count = 11;   // live stream count
+  uint32 remote_attachment_count = 12; // live remote attachment count
+}
+
+message LocalDeviceListRequest {}
+
+message LocalDeviceListResponse {
+  repeated DeviceSummary devices = 1;
+}
+
+message LocalDeviceRenameRequest {
+  DeviceId device_id = 1;
+  string alias = 2;
+}
+
+message LocalDeviceRenameResponse {
+  DeviceSummary device = 1;
+}
+
+message LocalDeviceRevokeRequest {
+  DeviceId device_id = 1;
+}
+
+message LocalDeviceRevokeResponse {
+  DeviceSummary device = 1;
+}

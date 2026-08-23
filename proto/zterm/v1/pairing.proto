@@ -3,14 +3,67 @@ syntax = "proto3";
 package zterm.v1;
 
 import "zterm/v1/common.proto";
+import "zterm/v1/device.proto";
 
-message PairOffer {
-  DeviceId host_device_id = 1;
-  bytes one_time_secret = 2;
-  uint64 expires_at_unix = 3;
+// Versioned one-time pairing ticket. This message is carried only as text
+// payload (`zterm-pair-v1:` + base64url-no-pad); it is never re-sent on the
+// pair connection itself.
+message PairTicketV1 {
+  uint32 format_version = 1;
+  DeviceId host_device_id = 2;
+  string host_name = 3;
+  repeated string relay_urls = 4;
+  bytes offer_id = 5;   // exactly 16 bytes
+  bytes secret = 6;     // exactly 32 bytes
+  uint64 expires_at_unix = 7;
 }
 
-message PairHandshake {
-  DeviceId controller_device_id = 1;
-  bytes proof = 2;
+// Controller opens the pair handshake with its offer identity and nonce.
+message PairBegin {
+  bytes offer_id = 1;          // exactly 16 bytes
+  string controller_name = 2;
+  bytes controller_nonce = 3;  // exactly 32 bytes
+  uint32 pair_protocol_version = 4;
+}
+
+// Host responds with its nonce and the selected protocol version.
+message PairChallenge {
+  bytes host_nonce = 1;        // exactly 32 bytes
+  uint32 selected_version = 2;
+  uint64 ticket_expiry_unix = 3;
+}
+
+// Controller proves possession of the ticket secret.
+message PairProof {
+  bytes controller_proof = 1;  // exactly 32 bytes
+}
+
+// Host confirms the committed authorization generation.
+message PairAccepted {
+  uint64 authorization_generation = 1;
+  bytes host_confirmation_proof = 2; // exactly 32 bytes
+  string host_diagnostic_version = 3;
+}
+
+// Local same-UID request to create a one-time pairing ticket.
+message LocalPairCreateRequest {
+  bytes ephemeral_operation_id = 1; // exactly 16 bytes
+  bytes fingerprint = 2;
+  uint32 ttl_seconds = 3;           // 0 selects the default TTL
+}
+
+message LocalPairCreateResponse {
+  string ticket = 1;                // `zterm-pair-v1:` ticket text
+}
+
+// Local same-UID request to accept a ticket and authorize the host.
+message LocalPairAcceptRequest {
+  bytes ephemeral_operation_id = 1; // exactly 16 bytes
+  bytes fingerprint = 2;
+  string ticket = 3;
+  string alias = 4;                 // optional local alias for the host
+}
+
+message LocalPairAcceptResponse {
+  DeviceSummary device = 1;
 }
