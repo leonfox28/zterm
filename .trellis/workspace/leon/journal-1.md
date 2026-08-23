@@ -123,3 +123,35 @@ Implemented and independently verified daemon-lifetime named terminal sessions, 
 ### Status
 
 [OK] **Completed**
+
+
+## Session 6: Complete M5-M6 transport and device authorization
+
+**Date**: 2026-08-23
+**Task**: Complete M5-M6 transport and device authorization
+**Branch**: `main`
+
+### Summary
+
+Implemented and independently verified daemon-owned Iroh transport, connection brokering, one-time directional pairing, device authorization/revocation, same-UID device IPC, lifecycle/resource/concurrency hardening, and Linux real-Iroh/cross-UID gates. Restored the accepted official n0 evidence boundary after removing an unnecessary self-hosted Relay workflow; all seven jobs passed on final head 4ec0cba in run 32615123176. Marked parent M5-M6 complete without advancing M7-M8 and archived the child task.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `62d7393` | (see git log) |
+| `7ebcb09` | (see git log) |
+| `47cece1` | (see git log) |
+| `193e008` | (see git log) |
+| `80f8852` | (see git log) |
+| `4b85260` | (see git log) |
+| `b1a08a6` | (see git log) |
+| `5e021cd` | (see git log) |
+| `bf3d313` | (see git log) |
+| `1d90b55` | (see git log) |
+| `4ec0cba` | (see git log) |
+| `3516b30` | (see git log) |
+
+### Status
+
+[OK] **Completed**

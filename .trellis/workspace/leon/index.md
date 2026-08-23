@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 5
-- **Last Active**: 2026-08-22
+- **Total Sessions**: 6
+- **Last Active**: 2026-08-23
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~125 | Active |
+| `journal-1.md` | ~157 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 6 | 2026-08-23 | Complete M5-M6 transport and device authorization | `62d7393`, `7ebcb09`, `47cece1`, `193e008`, `80f8852`, `4b85260`, `b1a08a6`, `5e021cd`, `bf3d313`, `1d90b55`, `4ec0cba`, `3516b30` | `main` |
 | 5 | 2026-08-22 | Complete M4 persistent local sessions | `70ae314`, `c4746c7`, `6a562ad`, `ffe169f`, `6ed5753` | `main` |
 | 4 | 2026-08-22 | Complete M2-M3 core and local daemon | `2eb16dc`, `0850435`, `38f9e78`, `e5050a4` | `main` |
 | 3 | 2026-08-22 | Complete Phase One Foundation Gate | `0026c4b`, `1b1fb8c` | `main` |
