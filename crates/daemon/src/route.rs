@@ -1,6 +1,7 @@
 //! Relay-only address resolution without mutating the configured Iroh profile.
 
 use std::collections::BTreeSet;
+use std::fmt;
 use std::time::Instant;
 
 use futures_util::StreamExt;
@@ -22,11 +23,30 @@ pub enum RouteSource {
 }
 
 /// One independently dialable route containing no direct IP address.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct RouteCandidate {
     source: RouteSource,
     relay_hint: RelayHint,
     endpoint_addr: EndpointAddr,
+}
+
+impl fmt::Debug for RouteCandidate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RouteCandidate")
+            .field("source", &self.source)
+            .field("relay_hint", &self.relay_hint)
+            .field("endpoint_id", &self.endpoint_addr.id)
+            .field(
+                "relay_address_count",
+                &self.endpoint_addr.relay_urls().count(),
+            )
+            .field(
+                "direct_address_count",
+                &self.endpoint_addr.ip_addrs().count(),
+            )
+            .finish()
+    }
 }
 
 impl RouteCandidate {
@@ -74,10 +94,20 @@ pub struct RouteResolver {
     limits: TransportLimits,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 struct CachedRouteFallback {
     relay_hints: Vec<RelayHint>,
     diagnostic: Option<RouteCacheDiagnostic>,
+}
+
+impl fmt::Debug for CachedRouteFallback {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CachedRouteFallback")
+            .field("relay_hint_count", &self.relay_hints.len())
+            .field("diagnostic", &self.diagnostic)
+            .finish()
+    }
 }
 
 impl RouteResolver {
@@ -377,6 +407,40 @@ mod tests {
         assert_eq!(candidate.endpoint_addr().id, remote);
         assert_eq!(candidate.endpoint_addr().relay_urls().count(), 1);
         assert_eq!(candidate.endpoint_addr().ip_addrs().count(), 0);
+    }
+
+    #[test]
+    fn route_debug_redacts_relay_and_direct_addresses_but_keeps_shape() {
+        let relay_sentinel = "https://ROUTE_CANDIDATE_SENTINEL_2a9c.example.test/private";
+        let direct_sentinel = "203.0.113.197:49152";
+        let remote = iroh::SecretKey::from_bytes(&[0x6e; 32]).public();
+        let relay_hint = relay(relay_sentinel);
+        let candidate = RouteCandidate {
+            source: RouteSource::TransientTicket,
+            relay_hint: relay_hint.clone(),
+            endpoint_addr: EndpointAddr::new(remote)
+                .with_relay_url(relay_sentinel.parse().expect("valid Relay URL"))
+                .with_ip_addr(
+                    direct_sentinel
+                        .parse()
+                        .expect("valid direct socket address"),
+                ),
+        };
+        let fallback = CachedRouteFallback {
+            relay_hints: vec![relay_hint],
+            diagnostic: None,
+        };
+
+        let rendered = format!("{candidate:?} {fallback:?}");
+        assert!(!rendered.contains(relay_sentinel));
+        assert!(!rendered.contains(direct_sentinel));
+        assert!(rendered.contains("TransientTicket"));
+        assert!(rendered.contains("relay_address_count: 1"));
+        assert!(rendered.contains("direct_address_count: 1"));
+        assert!(rendered.contains("relay_hint_count: 1"));
+        assert_eq!(candidate.relay_hint().as_str(), relay_sentinel);
+        assert_eq!(candidate.endpoint_addr().id, remote);
+        assert_eq!(candidate.endpoint_addr().ip_addrs().count(), 1);
     }
 
     #[test]

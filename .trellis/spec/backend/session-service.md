@@ -4,8 +4,8 @@
 
 Apply this contract to `zterm-daemon::session`, live-session resource
 admission, controller attachments, and daemon shutdown. The service is the
-single transport-independent owner used by same-UID local IPC now and by a
-future authenticated remote adapter.
+single transport-independent owner used by same-UID local IPC and the
+authenticated remote adapter.
 
 ## 2. Signatures
 
@@ -92,6 +92,9 @@ they must not duplicate registry, replay, resource, or controller logic.
   Missing viewport uses 120 columns by 40 rows. Resize reserves the projection
   delta before native/model resize and rolls it back on failure.
 - One controller is allowed per session. A normal second attach is occupied.
+  Principal kind has no priority: same-UID local cannot implicitly replace a
+  remote controller, and remote cannot implicitly replace local. Both must use
+  the same explicit takeover protocol against the same SessionId/PTY.
   Explicit takeover first creates and synchronizes a pending attachment, then
   atomically increments generation, invalidates the old lease, and activates
   the replacement. If its response is lost, a newly synchronized attachment
@@ -114,6 +117,15 @@ they must not duplicate registry, replay, resource, or controller logic.
   checkpoint capacity is fixed at `rows * columns * 2` cells independent of the
   configured 2,000 history rows. Main/alternate transitions, styles, Unicode,
   and resize-to-resync remain semantically equivalent to the latest snapshot.
+- An authenticated remote controller may move exactly one visible checkpoint
+  into the Session's bounded resume cell only when its authenticated reader
+  reaches clean EOF with no partial frame. The key binds the accepted principal
+  generation, SessionId, and daemon-issued resume-view ID. Transport I/O loss,
+  explicit detach, protocol failure, terminal lifecycle, generation mismatch,
+  and replacement discard instead of saving it. A reconnect with the exact
+  retained revision receives one merged delta; every mismatch or missing cell
+  receives the authoritative full snapshot. The resume cell retains no host
+  history, PTY bytes, per-revision queue, or disk state.
 - `SessionEnded` is terminal for an attachment. A stale snapshot acknowledgement,
   sync request, or prepared takeover must fail without replacing that lifecycle
   watermark or making the attachment live again. When revision and lifecycle
@@ -207,9 +219,14 @@ they must not duplicate registry, replay, resource, or controller logic.
 - `controller_lease` covers occupied, prepared takeover, lease loss, no stale
   write, same-operation continuation after controller detach, and rejection of
   a stale same-operation continuation without clobbering a later controller.
-- `principal_detach`, `local_device_ipc`, and `revoke_races` cover matching-only
-  detach across Sessions, stale-effect rejection, idempotence, preservation of
-  local/other-remote attachments, and survival of the same Session/PTY.
+  Its cross-principal PTY case performs remote -> local -> remote takeover on
+  one SessionId, preserves process/cwd/screen continuity, proves ordinary
+  attach never steals in either direction, and keeps another principal's
+  independent Session progressing.
+- `principal_detach`, `local_device_ipc`, and the `session_wire` revoke matrix
+  cover matching-only detach across Sessions, stale-effect rejection,
+  idempotence, preservation of local/other-remote attachments, durable restart
+  state, and survival of the same Session/PTY.
 - `session_limits` covers the eighth/ninth session, maximum viewport, aggregate
   projection, and failed-resize rollback.
 - `local_session_ipc` and `terminal_recovery` prove the same service through a
@@ -228,6 +245,10 @@ they must not duplicate registry, replay, resource, or controller logic.
   socket until stop is retryable, and failed bounded stop leaves the listener
   available. `local_ipc` proves byte-identical single-retry execution and that
   typed outcome unknown rotates only for a later operation.
+- `session_wire` drives a pure authenticated duplex/PTY fixture through active
+  snapshot acknowledgement and proves transport EOF moves the exact checkpoint,
+  while explicit detach and a typed protocol failure both force the next
+  reconnect to receive a full snapshot.
 - Concurrent shutdown evidence observes that every actor has received its end
   request before cleanup waiting, then separately requires all child PIDs and
   ownership to be released under the final absolute deadline. It must not use

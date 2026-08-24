@@ -75,12 +75,18 @@ is `zterm/1`.
   authorization generation zero therefore means the current daemon owner's
   trust boundary, not a remote ACL.
 - Readiness, status, and list allocate no lease and write no replay state. A
-  logical local client lazily caches a lease before its first mutation. Its one
-  automatic ambiguous-transport retry is limited to the same logical call and
-  reuses byte-identical request bytes and operation ID. There is no disk-backed
-  lease or automatic fresh-process recovery; only an API which explicitly
-  exports an opaque retry token may continue an ambiguous operation in another
-  client object.
+  logical local client lazily caches a lease before its first mutation. A local
+  target may retry its same-UID mutation once with byte-identical bytes and
+  operation ID. For a remote target, the daemon-owned `RemoteUnaryClient` is the
+  sole mutation retry owner: the outer same-UID envelope is sent once after any
+  bytes are written, while the daemon may open at most two Iroh service streams
+  under one deadline with the same target, request bytes, lease, and operation
+  ID. `SessionOperationLeaseRequest` is stateful control rather than read-only:
+  after a post-write transport/protocol ambiguity it returns that typed failure
+  and opens no second remote stream, so one logical allocation cannot silently
+  issue two leases. There is no disk-backed lease or automatic fresh-process
+  recovery; only an API which explicitly exports an opaque retry token may
+  continue an ambiguous operation in another client object.
 - `proto/zterm/v1/*.proto` is the wire source of truth. One numeric kind
   registry and one decoder own all message dispatch.
 - Frames are `varint length + WireFrame`, capped at 8 MiB before body
@@ -107,8 +113,9 @@ is `zterm/1`.
 
 ## 5. Good / Base / Bad Cases
 
-- **Good:** obtain a daemon lease lazily, encode one mutation once, and reuse
-  its exact bytes and operation ID for the single ambiguous-transport retry.
+- **Good:** obtain a daemon lease lazily, encode one mutation once, and let
+  exactly one transport layer reuse its exact bytes and operation ID for the
+  single ambiguous-transport retry.
 - **Base:** readiness/status/list use no operation lease and do not alter replay
   state.
 - **Bad:** derive an epoch from wall-clock time, accept a client-invented high

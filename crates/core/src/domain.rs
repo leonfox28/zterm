@@ -9,9 +9,21 @@ pub const DEFAULT_SESSION_NAME: &str = "main";
 pub const MAX_SESSION_NAME_BYTES: usize = 64;
 
 macro_rules! fixed_id {
+    ($name:ident, $length:expr, $description:literal, redacted_debug) => {
+        fixed_id!(@define $name, $length, $description, [Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd]);
+
+        impl fmt::Debug for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(concat!(stringify!($name), "([REDACTED])"))
+            }
+        }
+    };
     ($name:ident, $length:expr, $description:literal) => {
+        fixed_id!(@define $name, $length, $description, [Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd]);
+    };
+    (@define $name:ident, $length:expr, $description:literal, [$($derive:ident),+]) => {
         #[doc = $description]
-        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        #[derive($($derive),+)]
         pub struct $name([u8; $length]);
 
         impl $name {
@@ -51,6 +63,87 @@ macro_rules! fixed_id {
 }
 
 fixed_id!(DeviceId, 32, "Stable public identity of one zterm device.");
+
+impl DeviceId {
+    /// Number of lowercase hexadecimal ASCII bytes in the canonical text form.
+    pub const CANONICAL_TEXT_LENGTH: usize = Self::LENGTH * 2;
+}
+
+impl fmt::Display for DeviceId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.as_bytes() {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::str::FromStr for DeviceId {
+    type Err = DeviceIdTextError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != Self::CANONICAL_TEXT_LENGTH {
+            return Err(DeviceIdTextError::InvalidLength {
+                actual: value.len(),
+            });
+        }
+
+        let mut bytes = [0_u8; Self::LENGTH];
+        let (pairs, remainder) = value.as_bytes().as_chunks::<2>();
+        debug_assert!(remainder.is_empty());
+        for (index, pair) in pairs.iter().enumerate() {
+            let offset = index * 2;
+            let high = lowercase_hex_nibble(pair[0])
+                .ok_or(DeviceIdTextError::InvalidCharacter { index: offset })?;
+            let low = lowercase_hex_nibble(pair[1])
+                .ok_or(DeviceIdTextError::InvalidCharacter { index: offset + 1 })?;
+            bytes[index] = (high << 4) | low;
+        }
+        Ok(Self::from_array(bytes))
+    }
+}
+
+const fn lowercase_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+/// Failure while parsing the canonical lowercase hexadecimal [`DeviceId`] text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeviceIdTextError {
+    /// Text was not exactly [`DeviceId::CANONICAL_TEXT_LENGTH`] ASCII bytes.
+    InvalidLength {
+        /// Observed byte count.
+        actual: usize,
+    },
+    /// Text contained a byte outside lowercase hexadecimal ASCII.
+    InvalidCharacter {
+        /// Zero-based byte index of the invalid character.
+        index: usize,
+    },
+}
+
+impl fmt::Display for DeviceIdTextError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidLength { actual } => write!(
+                formatter,
+                "device ID text must contain exactly {} lowercase hexadecimal ASCII characters, got {actual} bytes",
+                DeviceId::CANONICAL_TEXT_LENGTH
+            ),
+            Self::InvalidCharacter { index } => write!(
+                formatter,
+                "device ID text contains a non-lowercase-hexadecimal byte at index {index}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DeviceIdTextError {}
+
 fixed_id!(
     DaemonIncarnation,
     16,
@@ -61,6 +154,78 @@ fixed_id!(
     16,
     "Stable identifier of one live terminal session."
 );
+
+impl SessionId {
+    /// Number of lowercase hexadecimal ASCII bytes in the canonical text form.
+    pub const CANONICAL_TEXT_LENGTH: usize = Self::LENGTH * 2;
+}
+
+impl fmt::Display for SessionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.as_bytes() {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::str::FromStr for SessionId {
+    type Err = SessionIdTextError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != Self::CANONICAL_TEXT_LENGTH {
+            return Err(SessionIdTextError::InvalidLength {
+                actual: value.len(),
+            });
+        }
+
+        let mut bytes = [0_u8; Self::LENGTH];
+        let (pairs, remainder) = value.as_bytes().as_chunks::<2>();
+        debug_assert!(remainder.is_empty());
+        for (index, pair) in pairs.iter().enumerate() {
+            let offset = index * 2;
+            let high = lowercase_hex_nibble(pair[0])
+                .ok_or(SessionIdTextError::InvalidCharacter { index: offset })?;
+            let low = lowercase_hex_nibble(pair[1])
+                .ok_or(SessionIdTextError::InvalidCharacter { index: offset + 1 })?;
+            bytes[index] = (high << 4) | low;
+        }
+        Ok(Self::from_array(bytes))
+    }
+}
+
+/// Failure while parsing the canonical lowercase hexadecimal [`SessionId`] text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionIdTextError {
+    /// Text was not exactly [`SessionId::CANONICAL_TEXT_LENGTH`] ASCII bytes.
+    InvalidLength {
+        /// Observed byte count.
+        actual: usize,
+    },
+    /// Text contained a byte outside lowercase hexadecimal ASCII.
+    InvalidCharacter {
+        /// Zero-based byte index of the invalid character.
+        index: usize,
+    },
+}
+
+impl fmt::Display for SessionIdTextError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidLength { actual } => write!(
+                formatter,
+                "session ID text must contain exactly {} lowercase hexadecimal ASCII characters, got {actual} bytes",
+                SessionId::CANONICAL_TEXT_LENGTH
+            ),
+            Self::InvalidCharacter { index } => write!(
+                formatter,
+                "session ID text contains a non-lowercase-hexadecimal byte at index {index}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SessionIdTextError {}
 
 /// Validated, case-sensitive name of one live terminal session.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -187,6 +352,12 @@ fixed_id!(
     AttachmentId,
     16,
     "Identifier of one local or remote view attached to a session."
+);
+fixed_id!(
+    ResumeViewId,
+    16,
+    "Random identity of one reconnectable remote terminal view.",
+    redacted_debug
 );
 fixed_id!(
     PairOfferId,
@@ -594,6 +765,10 @@ pub enum DomainErrorKind {
     InvalidDeviceAlias,
     /// A device alias is already claimed by another device.
     DeviceAliasConflict,
+    /// A daemon target selector is neither an exact alias nor a canonical ID.
+    InvalidTargetSelector,
+    /// The selected device exists only in the inbound authorization direction.
+    OutboundDirectionDenied,
     /// The selected device has no local record.
     DeviceNotFound,
 }
@@ -648,6 +823,8 @@ impl DomainErrorKind {
             Self::PairOutcomeUnknown => "pair_outcome_unknown",
             Self::InvalidDeviceAlias => "invalid_device_alias",
             Self::DeviceAliasConflict => "device_alias_conflict",
+            Self::InvalidTargetSelector => "invalid_target_selector",
+            Self::OutboundDirectionDenied => "outbound_direction_denied",
             Self::DeviceNotFound => "device_not_found",
         }
     }
@@ -701,6 +878,8 @@ impl DomainErrorKind {
             "pair_outcome_unknown" => Self::PairOutcomeUnknown,
             "invalid_device_alias" => Self::InvalidDeviceAlias,
             "device_alias_conflict" => Self::DeviceAliasConflict,
+            "invalid_target_selector" => Self::InvalidTargetSelector,
+            "outbound_direction_denied" => Self::OutboundDirectionDenied,
             "device_not_found" => Self::DeviceNotFound,
             _ => return None,
         })
@@ -750,6 +929,91 @@ mod tests {
     }
 
     #[test]
+    fn device_id_text_is_exact_lowercase_hex_and_round_trips() {
+        let device = DeviceId::from_array([
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
+        ]);
+        let canonical = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        assert_eq!(device.to_string(), canonical);
+        assert_eq!(canonical.parse::<DeviceId>(), Ok(device));
+
+        assert_eq!(
+            canonical[..DeviceId::CANONICAL_TEXT_LENGTH - 1].parse::<DeviceId>(),
+            Err(DeviceIdTextError::InvalidLength { actual: 63 })
+        );
+        assert_eq!(
+            format!("{canonical}0").parse::<DeviceId>(),
+            Err(DeviceIdTextError::InvalidLength { actual: 65 })
+        );
+        assert_eq!(
+            canonical.to_uppercase().parse::<DeviceId>(),
+            Err(DeviceIdTextError::InvalidCharacter { index: 21 })
+        );
+        assert_eq!(
+            format!("g{}", &canonical[1..]).parse::<DeviceId>(),
+            Err(DeviceIdTextError::InvalidCharacter { index: 0 })
+        );
+    }
+
+    #[test]
+    fn device_id_text_errors_do_not_echo_rejected_input() {
+        let short_input = "private-device-selector";
+        let short_error = short_input
+            .parse::<DeviceId>()
+            .expect_err("short selector is rejected");
+        let invalid_input = "g".repeat(DeviceId::CANONICAL_TEXT_LENGTH);
+        let invalid_error = invalid_input
+            .parse::<DeviceId>()
+            .expect_err("non-hexadecimal selector is rejected");
+
+        for (input, error) in [
+            (short_input, short_error),
+            (invalid_input.as_str(), invalid_error),
+        ] {
+            assert!(!error.to_string().contains(input));
+            assert!(!format!("{error:?}").contains(input));
+        }
+    }
+
+    #[test]
+    fn session_id_text_is_exact_lowercase_hex_and_round_trips() {
+        let session = SessionId::from_array([
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ]);
+        let canonical = "000102030405060708090a0b0c0d0e0f";
+        assert_eq!(session.to_string(), canonical);
+        assert_eq!(canonical.parse::<SessionId>(), Ok(session));
+        assert_eq!(
+            canonical[..SessionId::CANONICAL_TEXT_LENGTH - 1].parse::<SessionId>(),
+            Err(SessionIdTextError::InvalidLength { actual: 31 })
+        );
+        assert_eq!(
+            canonical.to_uppercase().parse::<SessionId>(),
+            Err(SessionIdTextError::InvalidCharacter { index: 21 })
+        );
+    }
+
+    #[test]
+    fn resume_view_id_debug_is_redacted_without_changing_identity_semantics() {
+        use std::collections::HashSet;
+
+        const SENTINEL: &[u8; ResumeViewId::LENGTH] = b"RESUME_VIEW_1a2b";
+        let view_id = ResumeViewId::from_array(*SENTINEL);
+        let rendered = format!("{view_id:?}");
+
+        assert_eq!(rendered, "ResumeViewId([REDACTED])");
+        assert!(!rendered.contains(std::str::from_utf8(SENTINEL).expect("ASCII sentinel")));
+        assert!(!rendered.contains(&format!("{SENTINEL:?}")));
+        assert_eq!(view_id.as_bytes(), SENTINEL);
+        assert_eq!(view_id.to_bytes(), *SENTINEL);
+        assert_eq!(ResumeViewId::from_bytes(SENTINEL), Ok(view_id));
+        assert!(HashSet::from([view_id]).contains(&view_id));
+    }
+
+    #[test]
     fn session_names_and_selectors_have_one_validation_owner() {
         let main = SessionName::main();
         assert!(main.is_main());
@@ -788,6 +1052,8 @@ mod tests {
             DomainErrorKind::NotSynchronized,
             DomainErrorKind::LeaseLost,
             DomainErrorKind::ResourceExhausted,
+            DomainErrorKind::InvalidTargetSelector,
+            DomainErrorKind::OutboundDirectionDenied,
         ] {
             assert_eq!(DomainErrorKind::from_code(kind.code()), Some(kind));
         }

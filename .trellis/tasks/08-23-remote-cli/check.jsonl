@@ -1,0 +1,27 @@
+{"file":".trellis/spec/backend/index.md","reason":"Verify every affected active backend contract was considered and updated only to implemented behavior."}
+{"file":".trellis/spec/guides/evidence-driven-simplicity.md","reason":"Audit reconnect, retry, cancellation, resource bounds and recovery against concrete consumers and deterministic tests."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Trace target, principal generation, operation bytes, attachment identity, revision and errors end to end."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Detect duplicate Session registries, codecs, replay windows, connection owners, terminal parsers or secret readers."}
+{"file":".trellis/spec/guides/cross-platform-thinking-guide.md","reason":"Check cfg completeness, macOS no-network enforcement, Linux runtime evidence and Windows shared compile cleanliness."}
+{"file":".trellis/spec/backend/directory-structure.md","reason":"Check new modules respect crate ownership and do not leak transport or platform details across layers."}
+{"file":".trellis/spec/backend/core-wire-domain.md","reason":"Verify kind uniqueness, compatibility, validation, bounds, canonical identifiers and redacted Debug surfaces."}
+{"file":".trellis/spec/backend/local-daemon-ipc.md","reason":"Verify same-UID admission, strict unary EOF, bounded duplex leftovers, autospawn policy and no secret or Endpoint leakage to CLI."}
+{"file":".trellis/spec/backend/session-service.md","reason":"Verify local and remote adapters share one SessionService and preserve controller, replay, resource and shutdown invariants."}
+{"file":".trellis/spec/backend/transport-auth.md","reason":"Verify normal versus pair ALPN separation, ConnectionDemand lifetime, generation rechecks, revoke fairness and stream isolation."}
+{"file":".trellis/spec/backend/effective-user-state.md","reason":"Verify directional device lookup and identity reset use exact managed state with safe lifecycle locking and no RevokeSelf."}
+{"file":".trellis/spec/backend/pty-lifecycle.md","reason":"Confirm connection loss, revoke, detach, CLI cancellation and adapter Drop cannot terminate or signal a PTY."}
+{"file":".trellis/spec/backend/terminal-driver.md","reason":"Confirm remote backpressure and reconnect do not block PTY drain, revision publication, resize or finalization."}
+{"file":".trellis/spec/backend/terminal-model.md","reason":"Verify snapshot and delta continuity, bounded projection, controlled ANSI and authoritative resynchronization."}
+{"file":".trellis/spec/backend/error-handling.md","reason":"Check stable domain error projection, peer-generic authorization failures and actionable local CLI diagnostics."}
+{"file":".trellis/spec/backend/logging-guidelines.md","reason":"Scan logging, Debug, JSON, errors and fixtures for ticket, terminal, cwd, key, route and direct-address leakage."}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Check focused and full gates, deterministic race evidence, hosted platform coverage and task validation."}
+{"file":".trellis/tasks/08-23-remote-cli/research/current-boundary.md","reason":"Compare the final implementation with the pre-task owners, seams, constraints and known risks."}
+{"file":".trellis/tasks/archive/2026-08/08-22-persistent-session-local-attach/research/current-boundary.md","reason":"Check the M4 local behavior and Session ownership handoff did not regress during shared-server extraction."}
+{"file":".trellis/tasks/archive/2026-08/08-22-transport-auth/research/current-boundary.md","reason":"Check the M5-M6 broker and authorization handoff was integrated without widening Endpoint or route ownership."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/connection-multiplexing.md","reason":"Verify multiple Session streams reuse one primary connection without cross-stream head-of-line blocking."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/local-self-attach.md","reason":"Verify local and remote clients reach the same SessionId and only explicit takeover changes controller."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/persistent-agent-session.md","reason":"Check persistence remains process-agnostic and no agent, tmux or program-name special case entered production."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/terminal-reconnect-state.md","reason":"Check reconnect never replays unsynchronized input and always falls back to an authoritative snapshot on gaps."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/device-revocation.md","reason":"Verify revoke cuts current and future remote effects only after durable ordering while host Sessions remain live."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/authorization-scope.md","reason":"Check public wording and implementation do not overclaim per-session or low-trust isolation."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/desktop-product-shape.md","reason":"Verify the public CLI matches the confirmed one-view shape and does not pull future tab or mobile scope forward."}

@@ -16,15 +16,19 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(unix)]
 use zterm_core::terminal::TerminalSize;
 #[cfg(unix)]
-use zterm_core::{DomainErrorKind, SessionName};
+use zterm_core::{DeviceAlias, DeviceId, DomainErrorKind, SessionName};
 #[cfg(unix)]
 use zterm_daemon::bootstrap::bootstrap;
 #[cfg(unix)]
 use zterm_daemon::config::{ValidatedInfrastructure, validate_setup_input};
 #[cfg(unix)]
+use zterm_daemon::lifecycle::run_local_only_daemon_for_test;
+#[cfg(unix)]
 use zterm_daemon::local_ipc::{LocalClient, LocalIpcLimits, serve_local_with_limits};
 #[cfg(unix)]
 use zterm_daemon::service::DaemonService;
+#[cfg(unix)]
+use zterm_daemon::store::StateStore;
 #[cfg(unix)]
 use zterm_platform::local_unix::{DaemonLock, bind_daemon_socket, remove_own_socket};
 #[cfg(unix)]
@@ -224,6 +228,156 @@ async fn same_uid_service_errors_are_connection_local_and_stop_ack_is_flushed() 
     server.await.expect("server task").expect("server result");
     remove_own_socket(&state.paths, &lock).expect("socket cleanup");
     assert!(!state.paths.socket().exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn local_only_daemon_resolves_exact_targets_but_never_touches_network() {
+    let state = TestState::new();
+    let requested = validate_setup_input(
+        "local-only-remote-session",
+        ValidatedInfrastructure::OfficialN0,
+    )
+    .expect("valid setup");
+    let setup = bootstrap(&state.paths, &requested).expect("bootstrap");
+    let target = DeviceId::from_array([0xd1; 32]);
+    let inbound_only = DeviceId::from_array([0xd2; 32]);
+    let short_hex_alias = DeviceId::from_array([0xd3; 32]);
+    let mut store = StateStore::open(&state.paths).expect("open committed state");
+    store
+        .upsert_known_device(
+            target,
+            &DeviceAlias::new("offline-host").expect("alias"),
+            "Offline host",
+            None,
+        )
+        .expect("known outbound target");
+    store
+        .upsert_known_device(
+            short_hex_alias,
+            &DeviceAlias::new("abc").expect("short hex-only alias"),
+            "Short alias host",
+            None,
+        )
+        .expect("known short-alias target");
+    store
+        .upsert_known_device(
+            setup.device_id,
+            &DeviceAlias::new("self-host").expect("self alias"),
+            "This device",
+            None,
+        )
+        .expect("self-shaped outbound fixture");
+    store
+        .authorize_device(inbound_only, "Inbound controller", 1)
+        .expect("inbound-only authorization");
+    drop(store);
+
+    let paths = state.paths.clone();
+    let daemon = std::thread::spawn(move || run_local_only_daemon_for_test(&paths));
+    let client = LocalClient::new(state.paths.socket());
+    let readiness_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match client.readiness().await {
+            Ok(_) => break,
+            Err(error)
+                if error.kind() == DomainErrorKind::DaemonStopped
+                    && tokio::time::Instant::now() < readiness_deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => panic!("local-only daemon did not become ready: {error}"),
+        }
+    }
+
+    let local = client
+        .resolve_session_target("local")
+        .await
+        .expect("reserved local target");
+    assert!(local.is_local());
+    assert!(
+        client
+            .list_sessions_at(local)
+            .await
+            .expect("local Session wire path remains available")
+            .is_empty()
+    );
+    let remote = client
+        .resolve_session_target("offline-host")
+        .await
+        .expect("daemon-owned exact alias resolution");
+    assert_eq!(remote.device_id(), Some(target));
+    assert_eq!(
+        client
+            .resolve_session_target("abc")
+            .await
+            .expect("an exact short hex-only alias is not parsed as an ID prefix")
+            .device_id(),
+        Some(short_hex_alias)
+    );
+    for self_selector in ["self-host".to_owned(), setup.device_id.to_string()] {
+        assert_eq!(
+            client
+                .resolve_session_target(&self_selector)
+                .await
+                .expect_err("the local identity must use the reserved local target")
+                .kind(),
+            DomainErrorKind::InvalidTargetSelector
+        );
+    }
+    assert_eq!(
+        client
+            .resolve_session_target(&target.to_string().to_uppercase())
+            .await
+            .expect_err("uppercase ID is invalid across local IPC")
+            .kind(),
+        DomainErrorKind::InvalidTargetSelector
+    );
+    assert_eq!(
+        client
+            .resolve_session_target(&target.to_string()[..8])
+            .await
+            .expect_err("prefix ID is invalid across local IPC")
+            .kind(),
+        DomainErrorKind::InvalidTargetSelector
+    );
+    assert_eq!(
+        client
+            .resolve_session_target(&inbound_only.to_string())
+            .await
+            .expect_err("inbound-only target remains directionally denied")
+            .kind(),
+        DomainErrorKind::OutboundDirectionDenied
+    );
+    assert_eq!(
+        client
+            .resolve_session_target("unknown-host")
+            .await
+            .expect_err("unknown exact alias remains not found")
+            .kind(),
+        DomainErrorKind::DeviceNotFound
+    );
+    assert_eq!(
+        client
+            .list_sessions_at(remote)
+            .await
+            .expect_err("local-only daemon has no remote transport owner")
+            .kind(),
+        DomainErrorKind::TransportUnavailable
+    );
+    assert!(
+        client
+            .list_sessions()
+            .await
+            .expect("remote failure does not poison local Session service")
+            .is_empty()
+    );
+
+    client.stop(false).await.expect("stop local-only daemon");
+    tokio::task::spawn_blocking(move || daemon.join().expect("daemon thread joins"))
+        .await
+        .expect("daemon join worker")
+        .expect("local-only daemon result");
 }
 
 #[cfg(unix)]

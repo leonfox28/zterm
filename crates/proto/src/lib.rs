@@ -17,7 +17,7 @@ use zterm_core::{
     IdLengthError, MAX_TICKET_TEXT_BYTES, OperationId, OperationLease, PairAccepted, PairBegin,
     PairChallenge, PairFingerprint, PairFingerprintError, PairNonce, PairOfferId, PairProof,
     PairSecret, PairSecretError, PairTicketError, PairTicketFields, RelayHint, RelayHintError,
-    SessionId,
+    ResumeViewId, SessionId,
 };
 
 /// Generated version-one protocol DTOs.
@@ -119,6 +119,175 @@ impl fmt::Debug for v1::LocalPairAcceptRequest {
     }
 }
 
+impl fmt::Debug for v1::LocalSessionUnaryRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LocalSessionUnaryRequest")
+            .field("target_device_id", &self.target_device_id)
+            .field("frame", &"[REDACTED]")
+            .field("frame_len", &self.frame.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for v1::LocalStatusResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LocalStatusResponse")
+            .field("protocol", &self.protocol)
+            .field("version", &self.version)
+            .field("phase", &self.phase)
+            .field("device_id", &self.device_id)
+            .field("endpoint_id", &self.endpoint_id)
+            .field("device_name", &self.device_name)
+            .field("infrastructure_profile", &self.infrastructure_profile)
+            .field("started_at_unix", &self.started_at_unix)
+            .field("active_session_count", &self.active_session_count)
+            .field("active_session_names", &self.active_session_names)
+            .field("network_state", &self.network_state)
+            .field("endpoint_bound", &self.endpoint_bound)
+            .field("network_bind_attempts", &self.network_bind_attempts)
+            .field("home_relay", &"[REDACTED]")
+            .field("home_relay_present", &!self.home_relay.is_empty())
+            .field("address_publish_state", &self.address_publish_state)
+            .field("address_lookup_state", &self.address_lookup_state)
+            .field(
+                "authenticated_connection_count",
+                &self.authenticated_connection_count,
+            )
+            .field("primary_connection_count", &self.primary_connection_count)
+            .field("active_stream_count", &self.active_stream_count)
+            .field("direct_path_count", &self.direct_path_count)
+            .field("relay_path_count", &self.relay_path_count)
+            .field("network_diagnostic", &self.network_diagnostic)
+            .finish()
+    }
+}
+
+impl fmt::Debug for v1::LocalValidateSetupRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LocalValidateSetupRequest")
+            .field("device_name", &self.device_name)
+            .field("infrastructure_profile", &self.infrastructure_profile)
+            .field("relay_url", &"[REDACTED]")
+            .field("relay_url_present", &!self.relay_url.is_empty())
+            .finish()
+    }
+}
+
+impl fmt::Debug for v1::RelayRouteCacheV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RelayRouteCacheV1")
+            .field("format_version", &self.format_version)
+            .field("relay_url_count", &self.relay_urls.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for v1::SessionSummary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionSummary")
+            .field("session_id", &self.session_id)
+            .field("name", &self.name)
+            .field("revision", &self.revision)
+            .field("has_controller", &self.has_controller)
+            .field("working_directory", &"[REDACTED]")
+            .field("working_directory_len", &self.working_directory.len())
+            .field("viewport", &self.viewport)
+            .finish()
+    }
+}
+
+impl fmt::Debug for v1::SessionCreateRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionCreateRequest")
+            .field("operation_id", &self.operation_id)
+            .field("target", &self.target)
+            .field("name", &self.name)
+            .field("working_directory", &"[REDACTED]")
+            .field("working_directory_len", &self.working_directory.len())
+            .field("viewport", &self.viewport)
+            .finish()
+    }
+}
+
+impl fmt::Debug for v1::ResumeViewId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ResumeViewId([REDACTED])")
+    }
+}
+
+impl fmt::Debug for v1::TerminalAttachRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalAttachRequest")
+            .field("target", &self.target)
+            .field("session_id", &self.session_id)
+            .field("takeover", &self.takeover)
+            .field("session_name", &self.session_name)
+            .field("create_main", &self.create_main)
+            .field("viewport", &self.viewport)
+            .field(
+                "resume_view_id",
+                &self.resume_view_id.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("known_revision", &self.known_revision)
+            .finish()
+    }
+}
+
+impl fmt::Debug for v1::TerminalSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalSnapshot")
+            .field("session_id", &self.session_id)
+            .field("attachment_id", &self.attachment_id)
+            .field("revision", &self.revision)
+            .field("rows", &self.rows)
+            .field("columns", &self.columns)
+            .field("screen_ansi", &"[REDACTED]")
+            .field("screen_ansi_len", &self.screen_ansi.len())
+            .field("recent_history_ansi", &"[REDACTED]")
+            .field("recent_history_ansi_len", &self.recent_history_ansi.len())
+            .field("active_screen", &self.active_screen)
+            .field("modes", &self.modes)
+            .finish()
+    }
+}
+
+impl fmt::Debug for v1::TerminalDelta {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalDelta")
+            .field("from_revision", &self.from_revision)
+            .field("to_revision", &self.to_revision)
+            .field("ansi", &"[REDACTED]")
+            .field("ansi_len", &self.ansi.len())
+            .field("rows", &self.rows)
+            .field("columns", &self.columns)
+            .field("active_screen", &self.active_screen)
+            .field("modes", &self.modes)
+            .field("attachment_id", &self.attachment_id)
+            .finish()
+    }
+}
+
+impl fmt::Debug for v1::TerminalInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalInput")
+            .field("operation_id", &self.operation_id)
+            .field("attachment_id", &self.attachment_id)
+            .field("bytes", &"[REDACTED]")
+            .field("input_len", &self.bytes.len())
+            .finish()
+    }
+}
+
 /// Product wire major shared by local IPC, `zterm/1`, and `zterm-pair/1`.
 pub const WIRE_MAJOR: u32 = 1;
 /// Current persistent-state schema exposed in readiness/status.
@@ -177,6 +346,12 @@ pub enum WireKind {
     LocalDeviceRevokeRequest = 20,
     /// Local inbound authorization revoke response.
     LocalDeviceRevokeResponse = 21,
+    /// Resolve one exact local daemon target selector.
+    LocalTargetResolveRequest = 22,
+    /// Frozen local/device target selected by the daemon.
+    LocalTargetResolveResponse = 23,
+    /// Same-UID envelope containing one preencoded remote Session unary.
+    LocalSessionUnaryRequest = 24,
     /// Controller opens a pairing handshake.
     PairBegin = 100,
     /// Host responds to a pairing handshake.
@@ -229,6 +404,8 @@ pub enum WireKind {
     TerminalLeaseLost = 309,
     /// The root shell and session have ended.
     TerminalSessionEnded = 310,
+    /// Latest daemon-owned remote attachment transport state for one local view.
+    TerminalTransportStateEvent = 311,
 }
 
 impl WireKind {
@@ -289,6 +466,9 @@ impl TryFrom<u32> for WireKind {
             19 => Self::LocalDeviceRenameResponse,
             20 => Self::LocalDeviceRevokeRequest,
             21 => Self::LocalDeviceRevokeResponse,
+            22 => Self::LocalTargetResolveRequest,
+            23 => Self::LocalTargetResolveResponse,
+            24 => Self::LocalSessionUnaryRequest,
             100 => Self::PairBegin,
             101 => Self::PairChallenge,
             102 => Self::PairProof,
@@ -315,6 +495,7 @@ impl TryFrom<u32> for WireKind {
             308 => Self::TerminalSyncRequired,
             309 => Self::TerminalLeaseLost,
             310 => Self::TerminalSessionEnded,
+            311 => Self::TerminalTransportStateEvent,
             unknown => return Err(ProtocolError::UnknownKind(unknown)),
         };
         Ok(kind)
@@ -700,6 +881,22 @@ impl TryFrom<v1::AttachmentId> for AttachmentId {
     }
 }
 
+impl From<ResumeViewId> for v1::ResumeViewId {
+    fn from(value: ResumeViewId) -> Self {
+        Self {
+            value: value.to_bytes().to_vec(),
+        }
+    }
+}
+
+impl TryFrom<v1::ResumeViewId> for ResumeViewId {
+    type Error = ProtocolError;
+
+    fn try_from(value: v1::ResumeViewId) -> Result<Self, Self::Error> {
+        Self::from_bytes(&value.value).map_err(ProtocolError::InvalidIdentifier)
+    }
+}
+
 impl From<OperationId> for v1::OperationId {
     fn from(value: OperationId) -> Self {
         Self {
@@ -833,7 +1030,10 @@ pub fn terminal_snapshot_message(
 
 /// Projects one merged host delta into its wire message.
 #[must_use]
-pub fn terminal_delta_message(delta: TerminalDelta) -> v1::TerminalDelta {
+pub fn terminal_delta_message(
+    attachment_id: AttachmentId,
+    delta: TerminalDelta,
+) -> v1::TerminalDelta {
     v1::TerminalDelta {
         from_revision: delta.from_revision.get(),
         to_revision: delta.to_revision.get(),
@@ -842,6 +1042,7 @@ pub fn terminal_delta_message(delta: TerminalDelta) -> v1::TerminalDelta {
         columns: u32::from(delta.size.columns),
         active_screen: v1::TerminalActiveScreen::from(delta.active_screen) as i32,
         modes: Some(delta.modes.into()),
+        attachment_id: Some(attachment_id.into()),
     }
 }
 
@@ -1566,6 +1767,28 @@ mod tests {
     }
 
     #[test]
+    fn local_session_forward_envelope_round_trips_and_redacts_inner_bytes() {
+        const SENTINEL: &[u8] = b"REMOTE-SESSION-INNER-FRAME-SENTINEL";
+        let message = v1::LocalSessionUnaryRequest {
+            target_device_id: Some(DeviceId::from_array([7; 32]).into()),
+            frame: SENTINEL.to_vec(),
+        };
+        let debug = format!("{message:?}");
+        assert!(!debug.contains("REMOTE-SESSION-INNER-FRAME-SENTINEL"));
+        assert!(debug.contains("frame_len"));
+        assert_message_round_trip(WireKind::LocalSessionUnaryRequest, message);
+
+        let bounded_tunnel = v1::LocalSessionUnaryRequest {
+            target_device_id: Some(DeviceId::from_array([8; 32]).into()),
+            frame: vec![0; MAX_CONTROL_PAYLOAD_BYTES],
+        };
+        assert!(matches!(
+            encode_message(WireKind::LocalSessionUnaryRequest, 2, 0, &bounded_tunnel,),
+            Err(ProtocolError::ControlPayloadTooLarge(_))
+        ));
+    }
+
+    #[test]
     fn encoder_and_decoder_enforce_control_and_total_frame_limits() {
         let exact_control = encode_payload(
             WireKind::LocalStatusResponse,
@@ -1754,6 +1977,18 @@ mod tests {
                 WireKind::LocalDeviceRevokeResponse,
                 v1::MessageKind::LocalDeviceRevokeResponse as u32,
             ),
+            (
+                WireKind::LocalTargetResolveRequest,
+                v1::MessageKind::LocalTargetResolveRequest as u32,
+            ),
+            (
+                WireKind::LocalTargetResolveResponse,
+                v1::MessageKind::LocalTargetResolveResponse as u32,
+            ),
+            (
+                WireKind::LocalSessionUnaryRequest,
+                v1::MessageKind::LocalSessionUnaryRequest as u32,
+            ),
             (WireKind::PairBegin, v1::MessageKind::PairBegin as u32),
             (
                 WireKind::PairChallenge,
@@ -1849,6 +2084,10 @@ mod tests {
                 WireKind::TerminalSessionEnded,
                 v1::MessageKind::TerminalSessionEnded as u32,
             ),
+            (
+                WireKind::TerminalTransportStateEvent,
+                v1::MessageKind::TerminalTransportStateEvent as u32,
+            ),
         ];
 
         for (kind, proto_number) in kinds {
@@ -1868,7 +2107,9 @@ mod tests {
             daemon_incarnation: vec![9; 16],
         });
         let target = Some(v1::TargetSelector {
-            target: Some(v1::target_selector::Target::Local(true)),
+            target: Some(v1::target_selector::Target::Device(v1::DeviceId {
+                value: vec![7; DeviceId::LENGTH],
+            })),
         });
         let session_id = Some(v1::SessionId { value: vec![3; 16] });
         let attachment_id = Some(v1::AttachmentId { value: vec![5; 16] });
@@ -1902,6 +2143,8 @@ mod tests {
                     rows: 40,
                     columns: 120,
                 }),
+                resume_view_id: Some(v1::ResumeViewId { value: vec![6; 16] }),
+                known_revision: Some(12),
             },
         );
         assert_message_round_trip(
@@ -1928,6 +2171,19 @@ mod tests {
             },
         );
         assert_message_round_trip(
+            WireKind::TerminalDelta,
+            v1::TerminalDelta {
+                from_revision: 12,
+                to_revision: 13,
+                ansi: b"safe fixture".to_vec(),
+                rows: 40,
+                columns: 120,
+                active_screen: v1::TerminalActiveScreen::Main as i32,
+                modes: Some(v1::TerminalModes::default()),
+                attachment_id: attachment_id.clone(),
+            },
+        );
+        assert_message_round_trip(
             WireKind::TerminalSyncRequired,
             v1::TerminalSyncRequired {
                 attachment_id,
@@ -1951,6 +2207,22 @@ mod tests {
                 signal: String::new(),
             },
         );
+        assert_message_round_trip(
+            WireKind::TerminalTransportStateEvent,
+            v1::TerminalTransportStateEvent {
+                attachment_id: Some(v1::AttachmentId { value: vec![5; 16] }),
+                state: v1::TerminalTransportState::Reconnecting as i32,
+            },
+        );
+        assert_eq!(
+            ResumeViewId::try_from(v1::ResumeViewId { value: vec![6; 16] })
+                .expect("fixed-width resume view ID"),
+            ResumeViewId::from_array([6; 16])
+        );
+        assert!(matches!(
+            ResumeViewId::try_from(v1::ResumeViewId { value: vec![6; 15] }),
+            Err(ProtocolError::InvalidIdentifier(_))
+        ));
         assert_eq!(
             TerminalSize::try_from(v1::TerminalViewport {
                 rows: 40,

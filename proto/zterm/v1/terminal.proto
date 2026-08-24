@@ -11,6 +11,8 @@ message TerminalAttachRequest {
   string session_name = 4;
   bool create_main = 5;
   TerminalViewport viewport = 6;
+  ResumeViewId resume_view_id = 7;
+  optional uint64 known_revision = 8;
 }
 
 enum TerminalActiveScreen {
@@ -48,6 +50,7 @@ message TerminalDelta {
   uint32 columns = 5;
   TerminalActiveScreen active_screen = 6;
   TerminalModes modes = 7;
+  AttachmentId attachment_id = 8;
 }
 
 message TerminalInput {
@@ -99,4 +102,19 @@ message TerminalSessionEnded {
   TerminalSessionEndReason reason = 3;
   uint32 exit_code = 4;
   string signal = 5;
+}
+
+enum TerminalTransportState {
+  TERMINAL_TRANSPORT_STATE_UNSPECIFIED = 0;
+  TERMINAL_TRANSPORT_STATE_PREPARING = 1;
+  TERMINAL_TRANSPORT_STATE_SYNCHRONIZING = 2;
+  TERMINAL_TRANSPORT_STATE_ACTIVE = 3;
+  TERMINAL_TRANSPORT_STATE_RECONNECTING = 4;
+}
+
+// Same-UID local IPC only. It is never accepted from or emitted to a remote
+// normal-ALPN service stream.
+message TerminalTransportStateEvent {
+  AttachmentId attachment_id = 1;
+  TerminalTransportState state = 2;
 }

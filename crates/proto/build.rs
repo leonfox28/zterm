@@ -24,10 +24,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut config = prost_build::Config::new();
     config.protoc_executable(protoc);
-    // These generated values carry bearer tickets, nonces, proofs, or an
-    // opaque payload which may contain any of them. Their Debug ownership is
-    // implemented manually in `src/lib.rs`; keep this exact list in sync with
-    // the pairing schema rather than suppressing diagnostics package-wide.
+    // These generated values carry bearer tickets, nonces, proofs, opaque
+    // payloads, terminal/input bytes, working directories, or route values.
+    // Their Debug ownership is implemented manually in `src/lib.rs`; keep this
+    // exact list in sync with the schemas rather than suppressing diagnostics
+    // package-wide.
     config.skip_debug([
         ".zterm.v1.WireFrame",
         ".zterm.v1.PairTicketV1",
@@ -37,6 +38,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         ".zterm.v1.PairAccepted",
         ".zterm.v1.LocalPairCreateResponse",
         ".zterm.v1.LocalPairAcceptRequest",
+        ".zterm.v1.LocalSessionUnaryRequest",
+        ".zterm.v1.LocalStatusResponse",
+        ".zterm.v1.LocalValidateSetupRequest",
+        ".zterm.v1.RelayRouteCacheV1",
+        ".zterm.v1.SessionSummary",
+        ".zterm.v1.SessionCreateRequest",
+        ".zterm.v1.ResumeViewId",
+        ".zterm.v1.TerminalAttachRequest",
+        ".zterm.v1.TerminalSnapshot",
+        ".zterm.v1.TerminalDelta",
+        ".zterm.v1.TerminalInput",
     ]);
     config.compile_protos(&schemas, &[proto_root])?;
 

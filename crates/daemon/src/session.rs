@@ -3,6 +3,7 @@
 #[cfg(test)]
 use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
@@ -21,8 +22,8 @@ use zterm_core::terminal::{
 };
 use zterm_core::{
     AttachmentId, AttachmentPrincipal, ControllerLease, DaemonIncarnation, DeviceId,
-    DomainErrorKind, OperationId, OperationLease, ResourceLimits, Revision, SessionEndReason,
-    SessionId, SessionName, SessionSelector,
+    DomainErrorKind, OperationId, OperationLease, ResourceLimits, ResumeViewId, Revision,
+    SessionEndReason, SessionId, SessionName, SessionSelector,
 };
 use zterm_platform::account::EffectiveAccount;
 use zterm_platform::pty::{PtyChildState, PtyError, PtyHost, PtyPathKind, PtySession, PtySize};
@@ -51,7 +52,7 @@ type FinalAttachmentUpdate = Result<Option<AttachmentUpdate>, DaemonError>;
 type FinalAttachmentUpdateSlot = Arc<Mutex<Option<FinalAttachmentUpdate>>>;
 
 /// Current user-visible state of one live session.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct SessionSummary {
     /// Stable daemon-lifetime identity.
     pub session_id: SessionId,
@@ -65,6 +66,24 @@ pub struct SessionSummary {
     pub working_directory: PathBuf,
     /// Last accepted terminal viewport.
     pub viewport: TerminalSize,
+}
+
+impl fmt::Debug for SessionSummary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionSummary")
+            .field("session_id", &self.session_id)
+            .field("name", &self.name)
+            .field("revision", &self.revision)
+            .field("has_controller", &self.has_controller)
+            .field("working_directory", &"[REDACTED]")
+            .field(
+                "working_directory_len",
+                &self.working_directory.as_os_str().len(),
+            )
+            .field("viewport", &self.viewport)
+            .finish()
+    }
 }
 
 /// Latest state transition of one attachment.
@@ -106,6 +125,24 @@ pub struct PreparedAttachment {
     pub attachment: Arc<SessionAttachment>,
     /// Initial full host-authoritative state.
     pub snapshot: TerminalSnapshot,
+    /// Initial merged resume update when an exact host checkpoint matched.
+    pub(crate) initial_delta: Option<TerminalDelta>,
+}
+
+/// Exact optional resume identity supplied by an authenticated remote view.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RemoteResumeRequest {
+    pub(crate) view_id: ResumeViewId,
+    pub(crate) known_revision: Option<Revision>,
+}
+
+/// Fully validated remote-only attachment preparation arguments.
+pub(crate) struct RemoteAttachmentRequest {
+    pub(crate) selector: Option<SessionSelector>,
+    pub(crate) create_main: bool,
+    pub(crate) takeover: bool,
+    pub(crate) initial_viewport: Option<TerminalSize>,
+    pub(crate) resume: RemoteResumeRequest,
 }
 
 /// Per-session impact of detaching one remote principal.
@@ -203,17 +240,19 @@ impl SessionAttachment {
 
     /// Produces the final drained terminal update before a terminal lifecycle event.
     #[cfg(unix)]
-    pub(crate) fn final_update(&self) -> Result<Option<AttachmentUpdate>, DaemonError> {
+    pub(crate) fn final_update_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<Option<AttachmentUpdate>, DaemonError> {
         if let Some(update) = lock(&self.final_update, "attachment final update")?.take() {
             return update;
         }
-        self.actor.request(default_deadline(), |meta, reply| {
-            SessionCommand::FinalUpdate {
+        self.actor
+            .request(deadline, |meta, reply| SessionCommand::FinalUpdate {
                 meta,
                 attachment_id: self.attachment_id,
                 reply,
-            }
-        })
+            })
     }
 
     /// Discards a client baseline and returns a fresh full snapshot.
@@ -276,6 +315,21 @@ impl SessionAttachment {
     /// Releases only this attachment; the session and PTY continue running.
     pub fn detach(&self) {
         self.detached.store(true, Ordering::Release);
+    }
+
+    /// Moves an active authenticated remote controller checkpoint into the
+    /// SessionActor's sole resume cell and releases its controller lease.
+    pub(crate) fn detach_for_remote_resume_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<bool, DaemonError> {
+        self.actor.request(deadline, |meta, reply| {
+            SessionCommand::DetachForRemoteResume {
+                meta,
+                attachment_id: self.attachment_id,
+                reply,
+            }
+        })
     }
 }
 
@@ -544,6 +598,44 @@ impl SessionService {
             meta,
             principal,
             takeover,
+            resume: None,
+            reply,
+        })
+    }
+
+    /// Prepares one authenticated remote attachment with an optional exact
+    /// latest-state resume baseline. Local adapters never call this path.
+    pub(crate) fn prepare_remote_attach_until(
+        &self,
+        principal: AttachmentPrincipal,
+        request: RemoteAttachmentRequest,
+        deadline: Instant,
+    ) -> Result<PreparedAttachment, DaemonError> {
+        ensure_before_deadline(deadline)?;
+        if !matches!(principal, AttachmentPrincipal::RemoteEndpoint { .. }) {
+            return Err(principal_mismatch());
+        }
+        if let Some(size) = request.initial_viewport {
+            validate_viewport(self.limits, size)?;
+        }
+        let actor = if request.create_main {
+            if request.selector.is_some() {
+                return Err(invalid_session(
+                    "default main attach must not include a selector",
+                ));
+            }
+            self.default_main(request.initial_viewport, deadline)?
+        } else {
+            let selector = request
+                .selector
+                .ok_or_else(|| invalid_session("session selector is required"))?;
+            self.resolve(&selector)?
+        };
+        actor.request(deadline, |meta, reply| SessionCommand::PrepareAttach {
+            meta,
+            principal,
+            takeover: request.takeover,
+            resume: Some(request.resume),
             reply,
         })
     }
@@ -1096,7 +1188,7 @@ impl SessionService {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 enum OperationFingerprint {
     Create {
         name: SessionName,
@@ -1113,6 +1205,40 @@ enum OperationFingerprint {
     Takeover {
         session_id: SessionId,
     },
+}
+
+impl fmt::Debug for OperationFingerprint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Create {
+                name,
+                working_directory,
+                viewport,
+            } => formatter
+                .debug_struct("Create")
+                .field("name", name)
+                .field("working_directory", &"[REDACTED]")
+                .field("working_directory_present", &working_directory.is_some())
+                .field("viewport", viewport)
+                .finish(),
+            Self::Rename {
+                session_id,
+                new_name,
+            } => formatter
+                .debug_struct("Rename")
+                .field("session_id", session_id)
+                .field("new_name", new_name)
+                .finish(),
+            Self::Close { session_id } => formatter
+                .debug_struct("Close")
+                .field("session_id", session_id)
+                .finish(),
+            Self::Takeover { session_id } => formatter
+                .debug_struct("Takeover")
+                .field("session_id", session_id)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2282,6 +2408,7 @@ enum CommandStart {
 struct SessionRuntime {
     driver: Option<TerminalDriver>,
     attachments: BTreeMap<AttachmentId, ActorAttachment>,
+    resume: Option<RemoteResumeCheckpoint>,
     controller: Option<ControllerLease>,
     controller_operation: Option<ReplayOperationKey>,
     next_generation: u64,
@@ -2292,11 +2419,20 @@ struct SessionRuntime {
 
 struct ActorAttachment {
     principal: AttachmentPrincipal,
+    resume_view_id: Option<ResumeViewId>,
     terminal: TerminalAttachment,
     sync: AttachmentSync,
     lifecycle: watch::Sender<AttachmentLifecycle>,
     detached: Arc<AtomicBool>,
     final_update: FinalAttachmentUpdateSlot,
+}
+
+struct RemoteResumeCheckpoint {
+    principal: AttachmentPrincipal,
+    session_id: SessionId,
+    view_id: ResumeViewId,
+    revision: Revision,
+    terminal: TerminalAttachment,
 }
 
 #[derive(Clone, Copy)]
@@ -2375,7 +2511,13 @@ enum SessionCommand {
         meta: CommandMeta,
         principal: AttachmentPrincipal,
         takeover: bool,
+        resume: Option<RemoteResumeRequest>,
         reply: SyncSender<Result<PreparedAttachment, DaemonError>>,
+    },
+    DetachForRemoteResume {
+        meta: CommandMeta,
+        attachment_id: AttachmentId,
+        reply: SyncSender<Result<bool, DaemonError>>,
     },
     SnapshotApplied {
         meta: CommandMeta,
@@ -2498,6 +2640,7 @@ impl SessionActor {
                 let mut runtime = SessionRuntime {
                     driver: Some(driver),
                     attachments: BTreeMap::new(),
+                    resume: None,
                     controller: None,
                     controller_operation: None,
                     next_generation: 0,
@@ -2949,6 +3092,7 @@ fn finish_runtime(
     if let Some(driver) = runtime.driver.as_ref() {
         runtime.last_revision = driver.latest_revision();
     }
+    runtime.resume = None;
     runtime.controller = None;
     runtime.controller_operation = None;
     let finalization = runtime
@@ -2984,9 +3128,17 @@ fn dispatch_command(
             meta,
             principal,
             takeover,
+            resume,
             reply,
         } => respond(actor, meta, reply, || {
-            prepare_attach(actor, runtime, principal, takeover)
+            prepare_attach(actor, runtime, principal, takeover, resume)
+        }),
+        SessionCommand::DetachForRemoteResume {
+            meta,
+            attachment_id,
+            reply,
+        } => respond(actor, meta, reply, || {
+            detach_for_remote_resume(actor, runtime, attachment_id)
         }),
         SessionCommand::SnapshotApplied {
             meta,
@@ -3114,8 +3266,11 @@ fn prepare_attach(
     runtime: &mut SessionRuntime,
     principal: AttachmentPrincipal,
     takeover: bool,
+    resume: Option<RemoteResumeRequest>,
 ) -> Result<PreparedAttachment, DaemonError> {
     reap_detached(actor, runtime);
+    let resume_view_id = resume.map(|request| request.view_id);
+    let resumed_terminal = take_resume_terminal(actor, runtime, principal, resume);
     if runtime.controller.is_some() && !takeover {
         return Err(DaemonError::new(
             DomainErrorKind::SessionOccupied,
@@ -3140,9 +3295,27 @@ fn prepare_attach(
     }
     let attachment_id = next_attachment_id(&runtime.attachments)?;
     let driver = runtime.driver.as_ref().ok_or_else(session_not_found)?;
-    let mut terminal = driver.attach();
+    let mut terminal = resumed_terminal.unwrap_or_else(|| driver.attach());
     let revisions = terminal.revision_watch();
-    let snapshot = full_sync(&mut terminal)?;
+    let (snapshot, initial_delta, initial_revision) =
+        if resume.is_some() && terminal.checkpoint_revision().is_some() {
+            match terminal.sync_latest().map_err(map_driver_error)? {
+                TerminalDeltaResult::Delta(delta) => {
+                    let revision = delta.to_revision;
+                    let snapshot = terminal.latest_snapshot().map_err(map_driver_error)?;
+                    (snapshot, Some(delta), revision)
+                }
+                TerminalDeltaResult::Resync(snapshot) => {
+                    let revision = snapshot.revision;
+                    (snapshot, None, revision)
+                }
+            }
+        } else {
+            terminal.discard_checkpoint();
+            let snapshot = full_sync(&mut terminal)?;
+            let revision = snapshot.revision;
+            (snapshot, None, revision)
+        };
     let target = if runtime.controller.is_none() {
         runtime.next_generation = runtime
             .next_generation
@@ -3159,7 +3332,7 @@ fn prepare_attach(
         SyncTarget::PreparedTakeover
     };
     let (lifecycle, lifecycle_receiver) = watch::channel(AttachmentLifecycle::AwaitingSnapshot {
-        revision: snapshot.revision,
+        revision: initial_revision,
     });
     let detached = Arc::new(AtomicBool::new(false));
     let final_update = Arc::new(Mutex::new(None));
@@ -3167,9 +3340,10 @@ fn prepare_attach(
         attachment_id,
         ActorAttachment {
             principal,
+            resume_view_id,
             terminal,
             sync: AttachmentSync::Awaiting {
-                revision: snapshot.revision,
+                revision: initial_revision,
                 target,
             },
             lifecycle,
@@ -3189,7 +3363,80 @@ fn prepare_attach(
             final_update,
         }),
         snapshot,
+        initial_delta,
     })
+}
+
+fn take_resume_terminal(
+    actor: &SessionActor,
+    runtime: &mut SessionRuntime,
+    principal: AttachmentPrincipal,
+    request: Option<RemoteResumeRequest>,
+) -> Option<TerminalAttachment> {
+    let Some(request) = request else {
+        runtime.resume = None;
+        return None;
+    };
+
+    let candidate = runtime.resume.take();
+    candidate.and_then(|candidate| {
+        (candidate.principal == principal
+            && candidate.session_id == actor.id
+            && candidate.view_id == request.view_id
+            && request.known_revision == Some(candidate.revision))
+        .then_some(candidate.terminal)
+    })
+}
+
+fn detach_for_remote_resume(
+    actor: &SessionActor,
+    runtime: &mut SessionRuntime,
+    attachment_id: AttachmentId,
+) -> Result<bool, DaemonError> {
+    let Some(attachment) = runtime.attachments.remove(&attachment_id) else {
+        return Err(lease_lost());
+    };
+    attachment.detached.store(true, Ordering::Release);
+    let active_controller = runtime
+        .controller
+        .is_some_and(|controller| controller.attachment_id == attachment_id)
+        && matches!(attachment.sync, AttachmentSync::Active { .. });
+    if runtime
+        .controller
+        .is_some_and(|controller| controller.attachment_id == attachment_id)
+    {
+        runtime.controller = None;
+        runtime.controller_operation = None;
+    }
+
+    let saved = match (
+        active_controller,
+        attachment.principal,
+        attachment.resume_view_id,
+        attachment.terminal.checkpoint_revision(),
+    ) {
+        (
+            true,
+            principal @ AttachmentPrincipal::RemoteEndpoint { .. },
+            Some(view_id),
+            Some(revision),
+        ) => {
+            runtime.resume = Some(RemoteResumeCheckpoint {
+                principal,
+                session_id: actor.id,
+                view_id,
+                revision,
+                terminal: attachment.terminal,
+            });
+            true
+        }
+        _ => {
+            runtime.resume = None;
+            false
+        }
+    };
+    actor.update_cached(runtime, false);
+    Ok(saved)
 }
 
 fn snapshot_applied(
@@ -3506,6 +3753,18 @@ fn detach_remote_principal(
     runtime: &mut SessionRuntime,
     device_id: DeviceId,
 ) -> PrincipalDetachOutcome {
+    let resume_removed = runtime.resume.as_ref().is_some_and(|resume| {
+        matches!(
+            resume.principal,
+            AttachmentPrincipal::RemoteEndpoint {
+                device_id: remote,
+                ..
+            } if remote == device_id
+        )
+    });
+    if resume_removed {
+        runtime.resume = None;
+    }
     let removed = runtime
         .attachments
         .iter()
@@ -3536,7 +3795,7 @@ fn detach_remote_principal(
             outcome.controller_released = true;
         }
     }
-    if outcome.attachments_removed > 0 {
+    if outcome.attachments_removed > 0 || resume_removed {
         actor.update_cached(runtime, false);
     }
     outcome
@@ -3640,15 +3899,19 @@ fn ensure_before_deadline(deadline: Instant) -> Result<(), DaemonError> {
 }
 
 fn map_pty_error(error: PtyError) -> DaemonError {
-    let kind = match &error {
+    match error {
         PtyError::InvalidPath {
             kind: PtyPathKind::WorkingDirectory,
             ..
-        } => DomainErrorKind::InvalidWorkingDirectory,
-        PtyError::UnsupportedPlatform { .. } => DomainErrorKind::UnsupportedPlatform,
-        _ => DomainErrorKind::StoreUnavailable,
-    };
-    DaemonError::new(kind, error.to_string())
+        } => DaemonError::new(
+            DomainErrorKind::InvalidWorkingDirectory,
+            "working directory is invalid or inaccessible",
+        ),
+        error @ PtyError::UnsupportedPlatform { .. } => {
+            DaemonError::new(DomainErrorKind::UnsupportedPlatform, error.to_string())
+        }
+        error => DaemonError::new(DomainErrorKind::StoreUnavailable, error.to_string()),
+    }
 }
 
 fn map_terminal_error(error: zterm_core::terminal::TerminalError) -> DaemonError {
@@ -3752,6 +4015,62 @@ mod tests {
     use zterm_platform::pty::ExplicitPtyCommand;
 
     #[test]
+    fn invalid_working_directory_error_redacts_the_host_path() {
+        let secret_path = "/private/host/project/secret-cwd";
+        let error = map_pty_error(PtyError::InvalidPath {
+            kind: PtyPathKind::WorkingDirectory,
+            path: secret_path.into(),
+            issue: zterm_platform::pty::PtyPathIssue::NotFound,
+        });
+
+        assert_eq!(error.kind(), DomainErrorKind::InvalidWorkingDirectory);
+        assert_eq!(
+            error.detail(),
+            "working directory is invalid or inaccessible"
+        );
+        assert!(!error.to_string().contains(secret_path));
+    }
+
+    #[test]
+    fn session_summary_debug_redacts_working_directory_and_keeps_metadata() {
+        let cwd_sentinel = "/private/tmp/DAEMON_CWD_SENTINEL_305e/project";
+        let summary = SessionSummary {
+            session_id: SessionId::from_array([0x5a; SessionId::LENGTH]),
+            name: SessionName::new("debug-safe-session").expect("valid session name"),
+            revision: Revision::new(59),
+            has_controller: true,
+            working_directory: cwd_sentinel.into(),
+            viewport: TerminalSize::new(47, 163),
+        };
+        let fingerprint = OperationFingerprint::Create {
+            name: summary.name.clone(),
+            working_directory: Some(PathBuf::from(cwd_sentinel)),
+            viewport: Some(summary.viewport),
+        };
+
+        let rendered = format!("{summary:?} {fingerprint:?}");
+        assert!(!rendered.contains(cwd_sentinel));
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(rendered.contains("debug-safe-session"));
+        assert!(rendered.contains("has_controller: true"));
+        assert!(rendered.contains("rows: 47"));
+        assert!(rendered.contains("columns: 163"));
+        assert!(rendered.contains("working_directory_present: true"));
+        assert_eq!(summary.working_directory, PathBuf::from(cwd_sentinel));
+        assert_eq!(summary, summary.clone());
+        assert_eq!(fingerprint, fingerprint.clone());
+        assert_ne!(
+            fingerprint,
+            OperationFingerprint::Create {
+                name: summary.name.clone(),
+                working_directory: Some(PathBuf::from("/private/tmp/a-different-cwd")),
+                viewport: Some(summary.viewport),
+            },
+            "redacted Debug must not change cwd-sensitive replay equality"
+        );
+    }
+
+    #[test]
     fn viewport_and_replay_identity_are_bounded() {
         let limits = ResourceLimits::default();
         assert!(validate_viewport(limits, TerminalSize::new(80, 240)).is_ok());
@@ -3777,6 +4096,133 @@ mod tests {
             3,
         );
         assert_eq!(first, second, "local views share one stable device epoch");
+    }
+
+    #[test]
+    fn replay_result_window_is_exact_and_recovers_after_oldest_completion() {
+        let epoch = ReplayEpoch::default();
+        let session_id = SessionId::from_array([0x31; SessionId::LENGTH]);
+        let mut in_flight = Vec::with_capacity(OPERATION_RESULTS_PER_EPOCH);
+        for sequence in 1..=OPERATION_RESULTS_PER_EPOCH {
+            let sequence = u64::try_from(sequence).expect("result-window sequence fits u64");
+            let ReplayRegistration::Execute(cell) = epoch
+                .register(sequence, OperationFingerprint::Close { session_id })
+                .expect("every production result slot is admitted")
+            else {
+                panic!("a fresh result slot must execute");
+            };
+            in_flight.push(cell);
+        }
+
+        let overflow_sequence =
+            u64::try_from(OPERATION_RESULTS_PER_EPOCH + 1).expect("overflow sequence fits u64");
+        let Err(error) = epoch.register(
+            overflow_sequence,
+            OperationFingerprint::Close { session_id },
+        ) else {
+            panic!("the next in-flight result must not exceed the exact window");
+        };
+        assert_eq!(error.kind(), DomainErrorKind::ResourceExhausted);
+
+        in_flight[0].complete(Err(DaemonError::new(
+            DomainErrorKind::Cancelled,
+            "completed oldest fixture result",
+        )));
+        let ReplayRegistration::Execute(recovered) = epoch
+            .register(
+                overflow_sequence,
+                OperationFingerprint::Close { session_id },
+            )
+            .expect("completing the oldest result recovers one exact slot")
+        else {
+            panic!("the recovered result slot must execute");
+        };
+        let state = epoch.state.lock().expect("result-window state");
+        assert_eq!(state.operations.len(), OPERATION_RESULTS_PER_EPOCH);
+        assert_eq!(state.low_water, 2);
+        drop(state);
+        let Err(evicted) = epoch.register(1, OperationFingerprint::Close { session_id }) else {
+            panic!("the reclaimed oldest result cannot execute again");
+        };
+        assert_eq!(evicted.kind(), DomainErrorKind::OperationOutcomeUnknown);
+        recovered.complete(Err(DaemonError::new(
+            DomainErrorKind::Cancelled,
+            "recovered fixture result",
+        )));
+    }
+
+    #[test]
+    fn replay_principal_limit_is_exact_and_a_new_incarnation_recovers_capacity() {
+        let principal = |byte| AttachmentPrincipal::RemoteEndpoint {
+            device_id: DeviceId::from_array([byte; DeviceId::LENGTH]),
+            auth_generation: 1,
+        };
+        let mut replay = ReplayRegistry::new();
+        let first_principal = principal(1);
+        let mut first_lease = None;
+        for index in 0..MAX_REPLAY_PRINCIPALS {
+            let byte = u8::try_from(index + 1).expect("principal fixture fits one byte");
+            let lease = replay
+                .issue(principal(byte))
+                .expect("every production replay-principal slot is admitted");
+            if index == 0 {
+                first_lease = Some(lease);
+            }
+        }
+        assert_eq!(replay.issued_through.len(), MAX_REPLAY_PRINCIPALS);
+
+        let overflow = principal(0xfe);
+        let error = replay
+            .issue(overflow)
+            .expect_err("the next replay principal exceeds the daemon-lifetime bound");
+        assert_eq!(error.kind(), DomainErrorKind::ResourceExhausted);
+        let first_lease = first_lease.expect("first daemon lease retained");
+        drop(replay);
+
+        let mut restarted = ReplayRegistry::new();
+        let mut restarted_incarnation = first_lease.daemon_incarnation.to_bytes();
+        restarted_incarnation[0] ^= 0xff;
+        restarted.incarnation = DaemonIncarnation::from_array(restarted_incarnation);
+        let restarted_lease = restarted
+            .issue(first_principal)
+            .expect("a new daemon incarnation starts with recovered principal capacity");
+        assert_eq!(restarted.issued_through.len(), 1);
+        assert_eq!(restarted_lease.ordinal, first_lease.ordinal);
+        assert_ne!(
+            restarted_lease.daemon_incarnation,
+            first_lease.daemon_incarnation,
+        );
+        let fingerprint = OperationFingerprint::Close {
+            session_id: SessionId::from_array([0x32; SessionId::LENGTH]),
+        };
+        let Err(old_daemon) = restarted.register(
+            ReplayKey::new(first_principal, first_lease.ordinal),
+            OperationId {
+                lease: first_lease,
+                sequence: 1,
+            },
+            fingerprint.clone(),
+        ) else {
+            panic!("capacity recovery must not revive an old-daemon operation");
+        };
+        assert_eq!(old_daemon.kind(), DomainErrorKind::OperationOutcomeUnknown);
+        let ReplayRegistration::Execute(restarted_cell) = restarted
+            .register(
+                ReplayKey::new(first_principal, restarted_lease.ordinal),
+                OperationId {
+                    lease: restarted_lease,
+                    sequence: 1,
+                },
+                fingerprint,
+            )
+            .expect("the new-incarnation lease remains executable")
+        else {
+            panic!("the new-incarnation operation must execute");
+        };
+        restarted_cell.complete(Err(DaemonError::new(
+            DomainErrorKind::Cancelled,
+            "new-incarnation fixture result",
+        )));
     }
 
     #[test]
@@ -4026,6 +4472,190 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_remote_resume_cell_moves_the_visible_checkpoint_or_falls_back_to_snapshot() {
+        use std::io::Write as _;
+
+        use nix::sys::stat::Mode;
+
+        let temporary = tempfile::tempdir().expect("temporary resume-cell fixture");
+        let gate = temporary.path().join("gate");
+        nix::unistd::mkfifo(&gate, Mode::S_IRUSR | Mode::S_IWUSR)
+            .expect("create child-output gate");
+        let service = unix_fixture_service(
+            DeviceId::from_array([0x81; 32]),
+            temporary.path().to_path_buf(),
+            "printf 'READY\\r\\n'; IFS= read -r _ < gate; printf 'LATER\\r\\n'; exec /bin/cat",
+        );
+        let local = service.local_principal(AttachmentId::from_array([0x81; 16]));
+        let lease = service
+            .issue_operation_lease(local)
+            .expect("fixture operation lease");
+        let summary = service
+            .create(
+                local,
+                OperationId { lease, sequence: 1 },
+                SessionName::new("resume-cell").expect("fixture session name"),
+                None,
+                None,
+            )
+            .expect("fixture session creates");
+        let remote = AttachmentPrincipal::RemoteEndpoint {
+            device_id: DeviceId::from_array([0x82; 32]),
+            auth_generation: 7,
+        };
+        let view_id = ResumeViewId::from_array([0x83; 16]);
+        let request = |known_revision| RemoteAttachmentRequest {
+            selector: Some(SessionSelector::Id(summary.session_id)),
+            create_main: false,
+            takeover: false,
+            initial_viewport: None,
+            resume: RemoteResumeRequest {
+                view_id,
+                known_revision,
+            },
+        };
+
+        let first = service
+            .prepare_remote_attach_until(
+                remote,
+                request(None),
+                Instant::now() + Duration::from_secs(2),
+            )
+            .expect("initial remote attachment");
+        assert!(first.initial_delta.is_none());
+        assert!(
+            first
+                .attachment
+                .snapshot_applied(first.snapshot.revision)
+                .expect("activate first remote attachment")
+                .is_none()
+        );
+        let baseline = wait_for_attachment_text(&first, b"READY").await;
+        let first_attachment_id = first.attachment.attachment_id();
+        let overlap_error = match service.prepare_remote_attach_until(
+            remote,
+            request(Some(baseline)),
+            Instant::now() + Duration::from_secs(2),
+        ) {
+            Ok(_) => panic!("a live view cannot be resumed before transport EOF"),
+            Err(error) => error,
+        };
+        assert_eq!(overlap_error.kind(), DomainErrorKind::SessionOccupied);
+        first
+            .attachment
+            .write_input(b"")
+            .expect("the original controller survives an overlapping resume request");
+        let mut revisions = first
+            .attachment
+            .revision_watch()
+            .expect("revision watermark");
+        let _ = revisions.borrow_and_update();
+        assert!(
+            first
+                .attachment
+                .detach_for_remote_resume_until(Instant::now() + Duration::from_secs(2))
+                .expect("transport EOF saves the exact remote controller checkpoint")
+        );
+        assert!(
+            !service
+                .list()
+                .expect("controller release observation")
+                .into_iter()
+                .find(|candidate| candidate.session_id == summary.session_id)
+                .expect("fixture session remains live")
+                .has_controller
+        );
+
+        let gate_write = tokio::task::spawn_blocking(move || {
+            let mut gate = std::fs::OpenOptions::new()
+                .write(true)
+                .open(gate)
+                .expect("open child-output gate");
+            gate.write_all(b"continue\n").expect("release child output");
+            gate.flush().expect("flush child-output gate");
+        });
+        tokio::time::timeout(Duration::from_secs(2), gate_write)
+            .await
+            .expect("child opened its output gate")
+            .expect("gate writer task");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while *revisions.borrow_and_update() <= baseline {
+                revisions
+                    .changed()
+                    .await
+                    .expect("driver revision remains open");
+            }
+        })
+        .await
+        .expect("post-disconnect output reached the authoritative model");
+
+        let resumed = service
+            .prepare_remote_attach_until(
+                remote,
+                request(Some(baseline)),
+                Instant::now() + Duration::from_secs(2),
+            )
+            .expect("matching remote checkpoint resumes");
+        assert_ne!(resumed.attachment.attachment_id(), first_attachment_id);
+        let delta = resumed
+            .initial_delta
+            .as_ref()
+            .expect("exact checkpoint produces one merged delta");
+        assert_eq!(delta.from_revision, baseline);
+        assert!(delta.to_revision > baseline);
+        assert!(
+            delta
+                .ansi
+                .windows(b"LATER".len())
+                .any(|bytes| bytes == b"LATER")
+        );
+        let resumed_revision = delta.to_revision;
+        assert!(
+            resumed
+                .attachment
+                .snapshot_applied(resumed_revision)
+                .expect("acknowledge resume delta")
+                .is_none()
+        );
+        assert!(
+            resumed
+                .attachment
+                .detach_for_remote_resume_until(Instant::now() + Duration::from_secs(2))
+                .expect("second transport EOF replaces the sole resume cell")
+        );
+
+        let mismatched = service
+            .prepare_remote_attach_until(
+                remote,
+                request(Some(Revision::ZERO)),
+                Instant::now() + Duration::from_secs(2),
+            )
+            .expect("a mismatched baseline falls back to an authoritative snapshot");
+        assert!(mismatched.initial_delta.is_none());
+        assert!(terminal_snapshot_contains(&mismatched.snapshot, b"LATER"));
+        assert!(
+            mismatched
+                .attachment
+                .snapshot_applied(mismatched.snapshot.revision)
+                .expect("activate fallback snapshot")
+                .is_none()
+        );
+        mismatched.attachment.detach();
+
+        let after_explicit_detach = service
+            .prepare_remote_attach_until(
+                remote,
+                request(Some(mismatched.snapshot.revision)),
+                Instant::now() + Duration::from_secs(2),
+            )
+            .expect("explicit detach leaves no resumable controller checkpoint");
+        assert!(after_explicit_detach.initial_delta.is_none());
+        after_explicit_detach.attachment.detach();
+        service.shutdown().expect("resume fixture shuts down");
+    }
+
+    #[cfg(unix)]
     #[test]
     fn remote_attachment_count_is_directional_and_read_only() {
         let temporary = tempfile::tempdir().expect("temporary attachment-count fixture");
@@ -4183,6 +4813,144 @@ mod tests {
                 .kind(),
             DomainErrorKind::OperationOutcomeUnknown
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn actor_mailbox_is_exactly_bounded_and_recovers_after_the_worker_drains() {
+        let temporary = tempfile::tempdir().expect("temporary actor-mailbox fixture");
+        let working_directory = temporary.path().to_path_buf();
+        let sleep = [Path::new("/bin/sleep"), Path::new("/usr/bin/sleep")]
+            .into_iter()
+            .find(|path| path.is_file())
+            .expect("sleep fixture")
+            .to_path_buf();
+        let service = SessionService::with_spawner(
+            DeviceId::from_array([0x33; DeviceId::LENGTH]),
+            ResourceLimits::default(),
+            move |size, requested| {
+                let cwd = requested.unwrap_or(&working_directory).to_path_buf();
+                let session = PtyHost::new()
+                    .spawn(
+                        ExplicitPtyCommand::new(&sleep, &cwd).arg("30"),
+                        PtySize::new(size.rows, size.columns),
+                    )
+                    .map_err(map_pty_error)?;
+                Ok((session, cwd))
+            },
+        );
+        let principal =
+            service.local_principal(AttachmentId::from_array([0x34; AttachmentId::LENGTH]));
+        let lease = service
+            .issue_operation_lease(principal)
+            .expect("mailbox fixture lease");
+        let summary = service
+            .create(
+                principal,
+                OperationId { lease, sequence: 1 },
+                SessionName::new("mailbox-bound").expect("mailbox fixture name"),
+                None,
+                None,
+            )
+            .expect("mailbox fixture creates");
+        let actor = service
+            .resolve(&SessionSelector::Id(summary.session_id))
+            .expect("mailbox fixture actor resolves");
+
+        let (entered, entered_receiver) = mpsc::sync_channel(1);
+        let (release, release_receiver) = mpsc::sync_channel(1);
+        let blocked_actor = Arc::clone(&actor);
+        let blocker = thread::spawn(move || {
+            blocked_actor.block_pty_effect_for_test(
+                Instant::now() + Duration::from_secs(5),
+                entered,
+                release_receiver,
+                Arc::new(AtomicUsize::new(0)),
+            )
+        });
+        entered_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("actor entered the deterministic blocking boundary");
+
+        let (queued_entered, queued_entered_receiver) = mpsc::sync_channel(1);
+        let (queued_release, queued_release_receiver) = mpsc::sync_channel(1);
+        let queued_executions = Arc::new(AtomicUsize::new(0));
+        let queued_deadline = Instant::now() + Duration::from_secs(5);
+        let queued_waiter = actor
+            .enqueue_command(queued_deadline, {
+                let queued_executions = Arc::clone(&queued_executions);
+                move |meta, reply| SessionCommand::BlockPtyEffect {
+                    meta,
+                    entered: queued_entered,
+                    release: queued_release_receiver,
+                    executions: queued_executions,
+                    reply,
+                }
+            })
+            .expect("the first production mailbox slot admits a deterministic barrier");
+        for _ in 1..SESSION_COMMAND_CAPACITY {
+            assert!(
+                actor.commands.try_send(SessionCommand::Wake).is_ok(),
+                "every production mailbox slot is admitted while the worker is blocked",
+            );
+        }
+        let Err(saturated) = actor.enqueue_command(Instant::now(), |meta, reply| {
+            SessionCommand::CountRemoteAttachments {
+                meta,
+                device_id: DeviceId::from_array([0x35; DeviceId::LENGTH]),
+                reply,
+            }
+        }) else {
+            panic!("the next actor command must be backpressured at the exact bound");
+        };
+        assert_eq!(saturated.kind(), DomainErrorKind::DeadlineExceeded);
+
+        release.send(()).expect("release blocked actor worker");
+        blocker
+            .join()
+            .expect("mailbox blocker thread joins")
+            .expect("mailbox blocker completes");
+
+        queued_entered_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the worker receives exactly the first queued command");
+        assert_eq!(queued_executions.load(Ordering::Acquire), 1);
+
+        let recovered_deadline = Instant::now() + Duration::from_secs(5);
+        let recovered = actor
+            .enqueue_command(recovered_deadline, |meta, reply| {
+                SessionCommand::CountRemoteAttachments {
+                    meta,
+                    device_id: DeviceId::from_array([0x36; DeviceId::LENGTH]),
+                    reply,
+                }
+            })
+            .expect("one receive recovers exactly one production mailbox slot");
+        let Err(full_again) = actor.enqueue_command(Instant::now(), |meta, reply| {
+            SessionCommand::CountRemoteAttachments {
+                meta,
+                device_id: DeviceId::from_array([0x37; DeviceId::LENGTH]),
+                reply,
+            }
+        }) else {
+            panic!("the recovered slot must restore the exact mailbox bound");
+        };
+        assert_eq!(full_again.kind(), DomainErrorKind::DeadlineExceeded);
+
+        queued_release
+            .send(())
+            .expect("release the first queued actor command");
+        queued_waiter
+            .wait(queued_deadline)
+            .expect("the queued barrier completes after release");
+        assert_eq!(
+            recovered
+                .wait(recovered_deadline)
+                .expect("the recovered mailbox command completes"),
+            0,
+        );
+
+        service.shutdown().expect("mailbox fixture shuts down");
     }
 
     #[cfg(unix)]
@@ -5393,6 +6161,52 @@ mod tests {
             .expect("shutdown path never deadlocks")
             .expect("shutdown releases all owners");
         assert_eq!(service.inner.reservation_count().expect("reservations"), 0);
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_attachment_text(prepared: &PreparedAttachment, expected: &[u8]) -> Revision {
+        if terminal_snapshot_contains(&prepared.snapshot, expected) {
+            return prepared.snapshot.revision;
+        }
+        let mut revisions = prepared
+            .attachment
+            .revision_watch()
+            .expect("fixture revision watermark");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while *revisions.borrow_and_update() <= prepared.snapshot.revision {
+                revisions
+                    .changed()
+                    .await
+                    .expect("driver revision stays open");
+            }
+        })
+        .await
+        .expect("fixture output reached the authoritative terminal");
+        let snapshot = prepared
+            .attachment
+            .sync_latest(prepared.snapshot.revision)
+            .expect("force one deterministic fixture snapshot");
+        assert!(
+            terminal_snapshot_contains(&snapshot, expected),
+            "fixture snapshot omitted the output synchronization marker"
+        );
+        assert!(
+            prepared
+                .attachment
+                .snapshot_applied(snapshot.revision)
+                .expect("acknowledge deterministic fixture snapshot")
+                .is_none()
+        );
+        snapshot.revision
+    }
+
+    #[cfg(unix)]
+    fn terminal_snapshot_contains(snapshot: &TerminalSnapshot, expected: &[u8]) -> bool {
+        snapshot
+            .recent_history_ansi
+            .windows(expected.len())
+            .chain(snapshot.screen_ansi.windows(expected.len()))
+            .any(|bytes| bytes == expected)
     }
 
     #[cfg(unix)]

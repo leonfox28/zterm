@@ -6,11 +6,24 @@ use std::path::PathBuf;
 use zterm_platform::user_state::UserPaths;
 
 const CHILD_PREFIX: &str = "--zterm-test-daemon=";
+const TERMINAL_CHILD_PREFIX: &str = "--zterm-test-terminal-daemon=";
 
 /// Encodes task-private paths into the one detached child harness argument.
+#[allow(dead_code)]
 pub fn child_argument(paths: &UserPaths) -> String {
+    format!("{CHILD_PREFIX}{}", encode_paths(paths))
+}
+
+/// Hidden detached-child argument for a daemon with a deterministic PTY fixture.
+#[allow(dead_code)]
+pub fn terminal_child_argument(paths: &UserPaths) -> String {
+    format!("{TERMINAL_CHILD_PREFIX}{}", encode_paths(paths))
+}
+
+/// Encodes task-private paths for another test-only child role.
+pub fn encode_paths(paths: &UserPaths) -> String {
     format!(
-        "{CHILD_PREFIX}{}:{}:{}:{}",
+        "{}:{}:{}:{}",
         paths.uid(),
         encode_path(paths.home()),
         encode_path(paths.state_root()),
@@ -23,9 +36,14 @@ pub fn run_child_if_requested() -> bool {
     let Some(argument) = std::env::args().nth(1) else {
         return false;
     };
-    let Some(encoded) = argument.strip_prefix(CHILD_PREFIX) else {
-        return false;
-    };
+    let (encoded, deterministic_terminal) =
+        if let Some(encoded) = argument.strip_prefix(CHILD_PREFIX) {
+            (encoded, false)
+        } else if let Some(encoded) = argument.strip_prefix(TERMINAL_CHILD_PREFIX) {
+            (encoded, true)
+        } else {
+            return false;
+        };
     let paths = match decode_paths(encoded) {
         Ok(paths) => paths,
         Err(detail) => {
@@ -33,20 +51,67 @@ pub fn run_child_if_requested() -> bool {
             std::process::exit(2);
         }
     };
-    if let Err(error) = zterm_platform::local_unix::detach_current_process()
+    let result = zterm_platform::local_unix::detach_current_process()
         .map_err(|error| error.to_string())
         .and_then(|()| {
-            zterm_daemon::lifecycle::run_local_only_daemon_for_test(&paths)
+            if deterministic_terminal {
+                let sessions = terminal_fixture_sessions(&paths)?;
+                zterm_daemon::lifecycle::run_local_only_daemon_with_sessions_for_test(
+                    &paths, sessions,
+                )
                 .map_err(|error| error.to_string())
-        })
-    {
+            } else {
+                zterm_daemon::lifecycle::run_local_only_daemon_for_test(&paths)
+                    .map_err(|error| error.to_string())
+            }
+        });
+    if let Err(error) = result {
         eprintln!("daemon harness failed: {error}");
         std::process::exit(1);
     }
     true
 }
 
-fn decode_paths(encoded: &str) -> Result<UserPaths, String> {
+fn terminal_fixture_sessions(
+    paths: &UserPaths,
+) -> Result<zterm_daemon::session::SessionService, String> {
+    let own_device_id = zterm_daemon::identity::DeviceIdentity::load(paths)
+        .map_err(|error| error.to_string())?
+        .device_id();
+    let shell = [PathBuf::from("/bin/sh"), PathBuf::from("/usr/bin/sh")]
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| "deterministic terminal fixture requires a POSIX shell".to_owned())?;
+    let default_working_directory = paths.home().to_path_buf();
+    Ok(zterm_daemon::session::SessionService::with_spawner(
+        own_device_id,
+        zterm_core::ResourceLimits::default(),
+        move |size, requested_working_directory| {
+            let working_directory = requested_working_directory
+                .map(PathBuf::from)
+                .unwrap_or_else(|| default_working_directory.clone());
+            let session = zterm_platform::pty::PtyHost::new()
+                .spawn(
+                    zterm_platform::pty::ExplicitPtyCommand::new(&shell, &working_directory)
+                        .arg("-c")
+                        .arg(
+                            "printf 'ZTERM_LOCAL_UI_SHELL_READY\\r\\n'; while IFS= read -r line; do printf '%s\\r\\n%s\\r\\n' \"$line\" \"$line\"; done",
+                        ),
+                    zterm_platform::pty::PtySize::new(size.rows, size.columns),
+                )
+                .map_err(|_| {
+                    zterm_daemon::error::DaemonError::new(
+                        zterm_core::DomainErrorKind::StoreUnavailable,
+                        "deterministic terminal fixture could not start",
+                    )
+                })?;
+            Ok((session, working_directory))
+        },
+    ))
+}
+
+/// Decodes task-private paths carried by a test-only child role.
+pub fn decode_paths(encoded: &str) -> Result<UserPaths, String> {
     let fields = encoded.split(':').collect::<Vec<_>>();
     if fields.len() != 4 {
         return Err("expected uid and three hex paths".to_owned());

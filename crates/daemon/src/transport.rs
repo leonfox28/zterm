@@ -1,5 +1,7 @@
 //! Iroh infrastructure selection for zterm endpoints.
 
+use std::fmt;
+
 use iroh::{
     Endpoint, RelayConfig, RelayMap, RelayMode, RelayUrl, SecretKey,
     address_lookup::{
@@ -18,7 +20,7 @@ pub const ZTERM_ALPN: &[u8] = b"zterm/1";
 pub const ZTERM_PAIR_ALPN: &[u8] = b"zterm-pair/1";
 
 /// Effective configuration of one Relay entry.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct RelayProfileSummary {
     /// Relay URL advertised and dialed by the endpoint.
     pub url: RelayUrl,
@@ -26,8 +28,18 @@ pub struct RelayProfileSummary {
     pub quic_address_discovery: bool,
 }
 
+impl fmt::Debug for RelayProfileSummary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RelayProfileSummary")
+            .field("url", &"[REDACTED]")
+            .field("quic_address_discovery", &self.quic_address_discovery)
+            .finish()
+    }
+}
+
 /// Read-only effective infrastructure choices exposed for diagnostics and tests.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct InfrastructureProfileSummary {
     /// All configured Relay entries.
     pub relays: Vec<RelayProfileSummary>,
@@ -45,8 +57,27 @@ pub struct InfrastructureProfileSummary {
     pub alpns: Vec<Vec<u8>>,
 }
 
+impl fmt::Debug for InfrastructureProfileSummary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InfrastructureProfileSummary")
+            .field("relay_count", &self.relays.len())
+            .field("relays", &self.relays)
+            .field("pkarr_publisher_url", &"[REDACTED]")
+            .field("pkarr_resolver_url", &"[REDACTED]")
+            .field("dns_lookup_origin", &"[REDACTED]")
+            .field(
+                "publishes_direct_addresses",
+                &self.publishes_direct_addresses,
+            )
+            .field("portmapper_enabled", &self.portmapper_enabled)
+            .field("alpns", &self.alpns)
+            .finish()
+    }
+}
+
 /// The infrastructure services used to build an Iroh endpoint.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq)]
 pub enum InfrastructureProfile {
     /// Iroh's pinned official n0 production map.
     #[default]
@@ -58,10 +89,32 @@ pub enum InfrastructureProfile {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+impl fmt::Debug for InfrastructureProfile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OfficialN0 => formatter.write_str("OfficialN0"),
+            Self::SelfHosted { .. } => formatter
+                .debug_struct("SelfHosted")
+                .field("relay_url", &"[REDACTED]")
+                .finish(),
+        }
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
 struct ProductionAddressLookups {
     pkarr_relay_url: RelayUrl,
     dns_origin: String,
+}
+
+impl fmt::Debug for ProductionAddressLookups {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProductionAddressLookups")
+            .field("pkarr_relay_url", &"[REDACTED]")
+            .field("dns_origin", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl ProductionAddressLookups {
@@ -159,5 +212,36 @@ impl InfrastructureProfile {
                 )]))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn infrastructure_debug_redacts_route_values_and_keeps_exact_accessors() {
+        let relay_sentinel = "https://TRANSPORT_RELAY_SENTINEL_61f8.example.test/private";
+        let profile = InfrastructureProfile::SelfHosted {
+            relay_url: relay_sentinel.parse().expect("valid self-hosted Relay URL"),
+        };
+        let summary = profile.summary();
+        let configured_relay = summary.relays[0].url.to_string();
+        let pkarr_relay = summary.pkarr_publisher_url.to_string();
+        let dns_origin = summary.dns_lookup_origin.clone();
+
+        let rendered = format!("{profile:?} {summary:?}");
+        for route in [&configured_relay, &pkarr_relay, &dns_origin] {
+            assert!(!rendered.contains(route));
+        }
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(rendered.contains("relay_count: 1"));
+        assert!(rendered.contains("quic_address_discovery: false"));
+        assert!(rendered.contains("publishes_direct_addresses: false"));
+        assert_eq!(
+            configured_relay,
+            "https://transport_relay_sentinel_61f8.example.test/private"
+        );
+        assert_eq!(summary, profile.summary());
     }
 }

@@ -107,11 +107,14 @@ zterm-core
        cli
 ```
 
-The dependency direction is now executable: core owns domain/terminal values,
-proto owns the wire codec, platform owns OS boundaries, daemon owns state and
-services (including the live session registry), and CLI owns parsing/rendering.
-Pairing/network adapters and the final terminal UI remain later milestones; do
-not move transport state into core or OS/session ownership into adapters.
+The dependency direction is executable: core owns domain/terminal values,
+proto owns the wire codec, platform owns OS boundaries, daemon owns state,
+pairing, network transport, and services (including the one live Session
+registry), and CLI owns parsing plus the raw-terminal renderer. The CLI reaches
+local and remote Sessions only through the daemon; do not move transport state
+into core, give the CLI an Endpoint or identity key, or move OS/Session
+ownership into adapters. Hosted Linux remote-runtime evidence remains a
+separate acceptance gate; see [Remote sessions and the public CLI](remote-cli.md).
 
 ## Quality gate
 

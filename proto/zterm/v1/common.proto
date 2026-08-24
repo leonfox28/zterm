@@ -5,6 +5,7 @@ package zterm.v1;
 message DeviceId { bytes value = 1; }
 message SessionId { bytes value = 1; }
 message AttachmentId { bytes value = 1; }
+message ResumeViewId { bytes value = 1; }
 
 message SessionSelector {
   oneof selector {

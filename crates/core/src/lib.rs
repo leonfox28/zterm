@@ -15,10 +15,11 @@ pub use device::{
 };
 pub use domain::{
     AttachmentId, AttachmentPrincipal, Capabilities, ConnectionAttemptId, ControllerLease,
-    DEFAULT_SESSION_NAME, DaemonIncarnation, DeviceId, DomainErrorKind, EphemeralOperationId,
-    IdLengthError, MAX_SESSION_NAME_BYTES, OperationId, OperationLease, OperationOutcome,
-    OperationWindow, OperationWindowError, PairNonce, PairOfferId, ResourceLimits, Revision,
-    SessionEndReason, SessionId, SessionName, SessionNameError, SessionSelector,
+    DEFAULT_SESSION_NAME, DaemonIncarnation, DeviceId, DeviceIdTextError, DomainErrorKind,
+    EphemeralOperationId, IdLengthError, MAX_SESSION_NAME_BYTES, OperationId, OperationLease,
+    OperationOutcome, OperationWindow, OperationWindowError, PairNonce, PairOfferId,
+    ResourceLimits, ResumeViewId, Revision, SessionEndReason, SessionId, SessionIdTextError,
+    SessionName, SessionNameError, SessionSelector,
 };
 pub use pairing::{
     DEFAULT_PAIR_TTL_SECONDS, MAX_DEVICE_NAME_BYTES, MAX_PAIR_TTL_SECONDS, MIN_PAIR_TTL_SECONDS,

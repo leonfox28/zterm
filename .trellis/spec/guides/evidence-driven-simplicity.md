@@ -56,6 +56,60 @@ depth” by itself is not sufficient.
 - Count maintenance cost, execution time, and service interruption as test
   costs, not as free thoroughness.
 
+## Execution budget and delegation
+
+- Start from the approved acceptance criteria. Classify every proposed extra
+  check as either a current blocker or deferred hardening; do not silently turn
+  an MVP into a security or platform-completeness audit.
+- Default to one implement worker followed by one independent check worker for
+  a coherent slice. At most two workers may run concurrently, and only with
+  disjoint file ownership. More workers or overlapping ownership require an
+  explicit user-approved reason.
+- Do not spawn another reviewer merely to repeat a green review. A follow-up
+  worker must name the new defect, missing acceptance criterion, or failed
+  gate it owns.
+- Run focused checks while iterating. Run the broad workspace gate once at the
+  end of a phase and once before commit, unless a concrete cross-workspace
+  regression requires another run.
+- At four hours of active work, report completed scope, remaining scope, and
+  the largest risk. At eight hours, stop and obtain explicit approval before
+  continuing hardening or widening the task.
+
+## Provider and billing boundary
+
+- An agent role such as `implement` or `check` does not identify its model or
+  billing account. Before launching a channel or local provider CLI, resolve
+  the actual provider, model, routing/base URL, worker count, and timeout.
+- A provider that can bill outside the current Codex session must never be
+  launched without explicit user approval for that task. Local configuration
+  or an agent-card default is not approval.
+- Prefer native Codex sub-agents when they are available. Do not silently fall
+  back from a native worker to `claude`, another CLI, or an externally routed
+  model.
+- Stop on the first authentication, quota, or unexpected-cost signal. Do not
+  add concurrent workers or allow automatic retry loops to amplify it.
+
+## Flaky tests and harnesses
+
+- First decide whether the failure is in production behavior or only in the
+  harness. Capture one content-free observation that distinguishes the two.
+- Time-box a harness-only flake to 60–90 minutes or two materially different
+  fixes. If neither works, simplify the scenario or record it as deferred;
+  do not keep adding barriers, production seams, or stress matrices.
+- A compile-only platform target proves compilation only. Keep its harness
+  minimal until the owning hosted platform can execute it.
+- Stress repetition is confirmation after a fix, not a substitute for a
+  causal model. Do not repeatedly run broad loops while the failure mechanism
+  is still unknown.
+
+## Persistence across compaction
+
+- Record decisions that change scope, provider/billing, delegation, test
+  strategy, or stop conditions in the active task artifact or this guide before
+  continuing. Commentary and chat history alone are not durable project state.
+- A session continuation must read the active task artifacts and applicable
+  guides before spawning workers or widening verification.
+
 ## Review examples
 
 Bad:
@@ -78,3 +132,6 @@ accepts the deployment.
 
 Once all observable acceptance criteria pass, stop. Additional checks require
 a newly identified risk or requirement, not a general desire to be exhaustive.
+If the remaining item cannot be executed on the current platform, record the
+exact external owner and command, then stop building local substitutes for that
+evidence.

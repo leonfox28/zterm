@@ -147,6 +147,7 @@ async fn unary_mutations_and_duplex_reconnect_share_one_live_registry() -> Resul
                 saw_final_output |= snapshot_contains(&snapshot, b"SOCKET-FINAL-MARKER");
             }
             LocalAttachmentEvent::SyncRequired(_) => {}
+            LocalAttachmentEvent::TransportState(_) => {}
             LocalAttachmentEvent::SessionEnded(ended) => {
                 assert_eq!(
                     ended.reason,
@@ -187,7 +188,8 @@ async fn unary_mutations_and_duplex_reconnect_share_one_live_registry() -> Resul
         {
             LocalAttachmentEvent::Snapshot(_)
             | LocalAttachmentEvent::Delta(_)
-            | LocalAttachmentEvent::SyncRequired(_) => {}
+            | LocalAttachmentEvent::SyncRequired(_)
+            | LocalAttachmentEvent::TransportState(_) => {}
             LocalAttachmentEvent::SessionEnded(ended) => break ended,
             LocalAttachmentEvent::LeaseLost(_) => {
                 return Err("controller lease was lost during daemon stop".into());
@@ -950,6 +952,7 @@ async fn wait_for_lease_lost(client: &mut LocalAttachmentClient) -> Result<(), S
             LocalAttachmentEvent::Delta(_)
             | LocalAttachmentEvent::Snapshot(_)
             | LocalAttachmentEvent::SyncRequired(_)
+            | LocalAttachmentEvent::TransportState(_)
             | LocalAttachmentEvent::Takeover(_) => {}
             LocalAttachmentEvent::SessionEnded(_) => {
                 return Err("session ended while waiting for controller lease loss".into());

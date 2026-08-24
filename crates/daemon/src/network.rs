@@ -1,6 +1,7 @@
 //! Typed observation and lifecycle owner for the daemon's sole Iroh Endpoint.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14,7 +15,9 @@ use tokio::task::{JoinHandle, JoinSet};
 use zterm_core::{DeviceId, DomainErrorKind, TransportLimits};
 
 use crate::authorization::AuthorizationRegistry;
-use crate::connection_broker::{ConnectionBroker, ConnectionIdentity, PairConnection};
+use crate::connection_broker::{
+    ConnectionBroker, ConnectionIdentity, PairConnection, RemoteServiceHandler,
+};
 use crate::error::DaemonError;
 use crate::identity::DeviceIdentity;
 use crate::store::StoreHandle;
@@ -126,7 +129,7 @@ impl PathKind {
 }
 
 /// Current redacted network observation shared by daemon status and broker users.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct NetworkObservation {
     /// Stable public identity retained across bind retries.
     pub device_id: DeviceId,
@@ -154,6 +157,31 @@ pub struct NetworkObservation {
     pub relay_path_count: u32,
     /// Most recent redacted degradation, if any.
     pub diagnostic: Option<NetworkDiagnostic>,
+}
+
+impl fmt::Debug for NetworkObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NetworkObservation")
+            .field("device_id", &self.device_id)
+            .field("state", &self.state)
+            .field("endpoint_bound", &self.endpoint_bound)
+            .field("bind_attempts", &self.bind_attempts)
+            .field("home_relay", &"[REDACTED]")
+            .field("home_relay_present", &self.home_relay.is_some())
+            .field("publish", &self.publish)
+            .field("lookup", &self.lookup)
+            .field(
+                "authenticated_connection_count",
+                &self.authenticated_connection_count,
+            )
+            .field("primary_connection_count", &self.primary_connection_count)
+            .field("active_stream_count", &self.active_stream_count)
+            .field("direct_path_count", &self.direct_path_count)
+            .field("relay_path_count", &self.relay_path_count)
+            .field("diagnostic", &self.diagnostic)
+            .finish()
+    }
 }
 
 impl NetworkObservation {
@@ -486,6 +514,17 @@ impl NetworkStartup {
         self
     }
 
+    /// Installs the single later-composed inbound normal service owner before
+    /// the supervisor can bind or admit a stream.
+    pub(crate) fn with_service_handler<H>(self, handler: H) -> Result<Self, DaemonError>
+    where
+        H: RemoteServiceHandler,
+    {
+        self.broker
+            .install_remote_service_handler(Arc::new(handler))?;
+        Ok(self)
+    }
+
     /// Spawns the single supervisor on the daemon's existing Tokio runtime.
     #[must_use]
     pub fn spawn(self, handle: NetworkHandle) -> NetworkSupervisor {
@@ -650,6 +689,9 @@ impl NetworkStartup {
                         apply_relay_status(&self.reporter, status);
                     }
                 }
+                joined = handlers.join_next(), if !handlers.is_empty() => {
+                    let _ = joined;
+                }
                 incoming = endpoint.accept() => {
                     let Some(incoming) = incoming else {
                         break BoundExit::Closed;
@@ -673,9 +715,6 @@ impl NetworkStartup {
                         ).await;
                     });
                 }
-                joined = handlers.join_next(), if !handlers.is_empty() => {
-                    let _ = joined;
-                }
             }
         };
         handlers.abort_all();
@@ -696,6 +735,9 @@ impl NetworkSupervisor {
         if self.shutdown_complete {
             return Ok(());
         }
+        // Stop new business-stream admission and reclaim every installed
+        // handler under the caller's lifecycle deadline before Endpoint close.
+        self.handle.broker.quiesce_until(deadline).await?;
         let Some(mut task) = self.task.take() else {
             return Err(DaemonError::new(
                 DomainErrorKind::TransportUnavailable,
@@ -1198,7 +1240,28 @@ fn mutex_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
+    use zterm_platform::account::EffectiveAccount;
+    use zterm_platform::user_state::UserPaths;
+
     use super::*;
+    use crate::connection_broker::{InboundAuthenticatedStream, RemoteServiceHandlerFuture};
+    use crate::identity::DeviceIdentity;
+    use crate::store::{StateStore, StoreActor};
+    use crate::transport::InfrastructureProfile;
+
+    struct NoopRemoteServiceHandler;
+
+    impl RemoteServiceHandler for NoopRemoteServiceHandler {
+        fn handle_service_stream(
+            &self,
+            _stream: InboundAuthenticatedStream,
+            _first_frame_deadline: Instant,
+        ) -> RemoteServiceHandlerFuture {
+            Box::pin(async { Ok(()) })
+        }
+    }
 
     fn compact_limits() -> TransportLimits {
         TransportLimits {
@@ -1242,6 +1305,78 @@ mod tests {
         });
         assert!(values.iter().all(|delay| *delay <= Duration::from_secs(10)));
         assert!(values[0] >= Duration::from_millis(250));
+    }
+
+    #[test]
+    fn network_observation_debug_redacts_home_relay_and_keeps_counters() {
+        let relay_sentinel = "https://NETWORK_HOME_RELAY_SENTINEL_d43a.example.test/private";
+        let observation = NetworkObservation {
+            device_id: DeviceId::from_array([0x67; DeviceId::LENGTH]),
+            state: NetworkState::Online,
+            endpoint_bound: true,
+            bind_attempts: 7,
+            home_relay: Some(relay_sentinel.to_owned()),
+            publish: AddressServiceState::Configured,
+            lookup: AddressServiceState::Configured,
+            authenticated_connection_count: 11,
+            primary_connection_count: 5,
+            active_stream_count: 13,
+            direct_path_count: 2,
+            relay_path_count: 3,
+            diagnostic: None,
+        };
+
+        let rendered = format!("{observation:?}");
+        assert!(!rendered.contains(relay_sentinel));
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(rendered.contains("home_relay_present: true"));
+        assert!(rendered.contains("state: Online"));
+        assert!(rendered.contains("bind_attempts: 7"));
+        assert!(rendered.contains("direct_path_count: 2"));
+        assert!(rendered.contains("relay_path_count: 3"));
+        assert_eq!(observation.home_relay.as_deref(), Some(relay_sentinel));
+        assert_eq!(observation, observation.clone());
+    }
+
+    #[test]
+    fn network_startup_installs_the_normal_service_handler_exactly_once_without_binding() {
+        let temporary = tempfile::tempdir().expect("temporary network composition root");
+        let account = EffectiveAccount::current().expect("effective account");
+        let home = temporary.path().join("home");
+        fs::create_dir(&home).expect("task-private home");
+        let paths = UserPaths::for_test(
+            account.uid(),
+            home,
+            temporary.path().join("state"),
+            temporary.path().join("runtime"),
+        );
+        paths
+            .prepare_state_directories()
+            .expect("prepare task-private state");
+        let identity = DeviceIdentity::create(&paths).expect("task-private identity");
+        let device_id = identity.device_id();
+        let store = StateStore::open(&paths).expect("task-private state store");
+        let store_actor = StoreActor::start(store).expect("task-private StoreActor");
+        let connection_identity =
+            ConnectionIdentity::product(device_id, "handler-fixture").expect("connection identity");
+        let (startup, _handle) = NetworkStartup::prepare(
+            identity,
+            InfrastructureProfile::zterm(),
+            connection_identity,
+            store_actor.handle(),
+            AuthorizationRegistry::new(),
+            TransportLimits::default(),
+        )
+        .expect("prepare network without binding");
+
+        let startup = startup
+            .with_service_handler(NoopRemoteServiceHandler)
+            .expect("install first normal service handler");
+        let error = startup
+            .with_service_handler(NoopRemoteServiceHandler)
+            .expect_err("normal service handler cannot be replaced");
+        assert_eq!(error.kind(), DomainErrorKind::IdentityStateMismatch);
+        drop(store_actor);
     }
 
     #[test]

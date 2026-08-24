@@ -277,7 +277,7 @@ impl std::error::Error for DeviceAliasError {}
 /// the product-admitted shape: a bounded `https://` string without control or
 /// whitespace bytes. The owning Iroh adapter performs the real `RelayUrl`
 /// parse, and canonicalization always retains the exact bytes stored here.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct RelayHint(String);
 
 impl RelayHint {
@@ -309,6 +309,16 @@ impl RelayHint {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl fmt::Debug for RelayHint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RelayHint")
+            .field("url", &"[REDACTED]")
+            .field("url_len", &self.0.len())
+            .finish()
     }
 }
 
@@ -685,5 +695,15 @@ mod tests {
                 maximum: MAX_RELAY_URL_BYTES
             })
         );
+
+        let sentinel = "https://relay-route-sentinel-7b31.example.test/path";
+        let hint = RelayHint::new(sentinel).expect("sentinel is a valid Relay hint");
+        let rendered = format!("{hint:?}");
+        assert!(rendered.contains("RelayHint"));
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(rendered.contains(&format!("url_len: {}", sentinel.len())));
+        assert!(!rendered.contains(sentinel));
+        assert_eq!(hint.as_str(), sentinel);
+        assert_eq!(hint.to_string(), sentinel);
     }
 }

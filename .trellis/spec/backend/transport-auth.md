@@ -9,8 +9,9 @@ device IPC, or remote-principal revocation. These paths cross `zterm-core`,
 service, so their order and ownership are product contracts rather than adapter
 details.
 
-This contract implements the M5-M6 foundation. It does not expose the M7 remote
-Session RPC adapter or M8 public pair/device CLI.
+This contract includes the M5-M6 foundation, M7 remote Session adapters, and
+the M8 same-UID `LocalRuntime` CLI. The CLI owns no Endpoint, store, route, or
+identity state.
 
 ## 2. Signatures
 
@@ -42,6 +43,26 @@ ConnectionDemand::confirm_authorization(deadline: Instant)
 ConnectionDemand::open_bi(purpose: StreamPurpose, deadline: Instant)
     -> Result<AuthenticatedBiStream, DaemonError>
 
+RemoteSessionService::resolve(selector, deadline)
+    -> Result<ResolvedSessionTarget, DaemonError>
+RemoteSessionService::forward_preencoded(target, request_id, bytes, deadline)
+    -> Result<DecodedFrame, DaemonError>
+
+trait RemoteServiceHandler {
+    fn handle_service_stream(
+        &self,
+        stream: InboundAuthenticatedStream,
+        first_frame_deadline: Instant,
+    ) -> RemoteServiceHandlerFuture;
+}
+NetworkStartup::with_service_handler(handler: impl RemoteServiceHandler)
+    -> Result<NetworkStartup, DaemonError>
+RemoteSessionServiceHandler::new(
+    sessions: SessionService,
+    own_device_id: DeviceId,
+    authorization: AuthorizationRegistry,
+) -> RemoteSessionServiceHandler
+
 PairingService::create_until(input: LocalPairCreateInput, deadline: Instant)
     -> Result<PairOfferCreated, DaemonError>
 PairingService::accept_until(input: LocalPairAcceptInput, deadline: Instant)
@@ -65,10 +86,6 @@ AuthorizationRegistry::revoke_guard_after_first_poll_for_test(
 
 LocalDeviceClient::new(socket: impl Into<PathBuf>) -> LocalDeviceClient
 LocalDeviceClient::{list, rename, revoke}(...) // Unix: IPC; non-Unix: UnsupportedPlatform
-
-// Linux-only lib-test acceptance target; not a production API.
-pairing_service::multiprocess_test::
-    two_process_production_pairing_service_is_directional_and_reuses_one_endpoint
 ```
 
 Wire kinds 12-21 are same-UID local pair/device requests and responses. Pairing
@@ -111,6 +128,41 @@ outbound-known and inbound-authorization directions explicit.
   candidates, deterministic primary selection, transient-route leases, and
   terminal/retryable error state. Dropping demand or stream permits releases
   exact capacity; duplicate/path loss never ends a Session.
+- Outbound Session unary resolution accepts the reserved `local` selector, an
+  exact case-sensitive alias, or one canonical lowercase full DeviceId. Exact
+  aliases are checked before rejecting short hexadecimal text; full-ID/alias
+  ambiguity, self targeting, and inbound-only direction fail explicitly. A
+  frozen DeviceId is rechecked against the outbound known-device row on a
+  blocking Store worker immediately before demand acquisition.
+- One `RemoteUnaryClient` holds one `ConnectionDemand` and owns the only remote
+  mutation retry. Session list is read-only and may retry once. A logical
+  mutation sends one preencoded frame on at most two independent service streams
+  under one absolute deadline; target, request bytes, request ID, operation
+  lease, and operation ID remain identical. Lease allocation is stateful control:
+  a post-write ambiguity returns its typed transport/protocol failure after one
+  service stream and never silently allocates a second replay lease. A fully
+  validated expected response or correlated known `ServiceError` is terminal.
+  The latter preserves only the stable error kind and correlation; peer-authored
+  message text is untrusted, zeroized after decoding, and replaced by one stable
+  content-free local detail before unary or attachment projection.
+  Framing, EOF, correlation, kind, or typed-payload failure after a write is
+  ambiguous; after the second remote attempt a mutation becomes outcome unknown.
+  The outer same-UID mutation envelope never adds another retry.
+- One `RemoteAttachmentBridge` holds one `ConnectionDemand` for one same-UID
+  desired view and opens a fresh bounded service stream for each reconnect
+  epoch. The stable local view ID is never sent as the host attachment ID.
+  Initial attach write/flush, snapshot-or-delta exchange, inconsistent-delta
+  `TerminalSyncRequired` plus same-attachment full-snapshot fallback, and all
+  outbound controls use absolute attempt/operation deadlines. A stalled peer
+  therefore cannot retain the demand indefinitely, while active remote reads
+  remain long-lived. The bridge freezes the first SessionId and never recreates
+  a same-named Session after daemon restart or terminal loss. After the view has
+  reached `Active`, an initial `SessionOccupied` on a replacement stream may mean
+  the old authenticated host reader has not observed EOF yet. Only for that
+  frozen SessionId, the bridge drops the rejected epoch, remains `Reconnecting`,
+  drains input and coalesces viewport through one fixed 250 ms cancellable delay,
+  then retries with `create_main = false`. First-ever occupancy and every other
+  typed initial attach error remain terminal.
 - Apply normal QUIC limits immediately after connect/accept and before
   Hello/Welcome: advertise `max_bi_streams_per_connection` and zero
   unidirectional streams. Pair connections advertise one bidirectional and zero
@@ -120,6 +172,19 @@ outbound-known and inbound-authorization directions explicit.
   registration is followed by an exact-generation recheck so a queued revoke
   cannot publish stale access. Each business side effect holds an
   `AuthorizedCommitContext` read permit through its blocking commit.
+- The broker hands an installed `RemoteServiceHandler` owned, unread stream
+  halves plus the mutually authenticated remote ID, receiver-owned accepted
+  generation, and one absolute first-frame deadline. Only the shared
+  `SessionWireServer` classifies/decodes the first frame. It requires a nonzero,
+  non-self principal and a request target equal to the host DeviceId; every
+  Session/PTY effect reacquires the same generation through
+  `AuthorizedCommitContext`, while network I/O and revision waits hold no
+  authorization permit.
+- Biased accept loops place `JoinSet::join_next` before the always-ready accept
+  branch. Live semaphores alone do not bound retained completed task handles;
+  completed connection/service tasks must be reaped before admitting more work.
+  Handler drop or panic releases only its stream/task permits and may detach one
+  attachment; it never closes a Session or signals a PTY.
 
 ### Pairing and authorization
 
@@ -169,8 +234,12 @@ outbound-known and inbound-authorization directions explicit.
   nonce, bearer, or proof bytes.
 - Pair/device local IPC remains behind the same-UID gate, strict unary EOF, one
   shared frame decoder, and byte-identical ambiguous retry. The hidden clients
-  do not spawn the daemon or bind an endpoint. Public clap still exposes no
-  pair/device/connect/session commands or state/identity/socket override.
+  never spawn or bind. Public clap reaches them only through `LocalRuntime` and
+  exposes no ticket argv/env input, state/identity/socket override, Endpoint,
+  or route. Pair accept defaults to zeroizing no-echo TTY input and requires
+  `--stdin` for automation. Device output keeps `outbound_known` and
+  `inbound_status` distinct; rename changes only the former alias and revoke
+  only the latter authorization.
 
 ### Platform compilation boundaries
 
@@ -186,33 +255,26 @@ outbound-known and inbound-authorization directions explicit.
 - Hosted Windows Clippy for workspace `--lib --bins --all-features` with
   `-D warnings` is the authoritative boundary. A macOS cross-check may stop in
   native C/assembly dependencies before project code and does not replace the
-  hosted result.
+  hosted result. Current interactive attachment is Unix-only; the shared
+  Windows command surface must compile cleanly and return typed
+  `UnsupportedPlatform`, not imply Named Pipe or ConPTY runtime support.
 
 ### Linux and compositional transport evidence
 
-- The real-Iroh pairing acceptance target self-spawns exact ignored host and
-  controller helper tests as distinct OS processes. Each helper owns its own
-  task-private `UserPaths`, identity, StoreActor, authorization/device owners,
-  one loopback-only Endpoint, broker, and production
-  `PairingService`/`BrokerPairTransport` composition.
-- Test environment keys carry only the helper role and the task-private Unix
-  control-socket path. The bearer ticket travels only in a bounded control
-  packet over that socket; it must never enter argv, environment values, files,
-  snapshots, panic text, stdout, or stderr. The temporary control root is mode
-  `0700`, each socket is mode `0600`, and decoded ticket-bearing packet owners
-  are dropped or zeroized immediately after transfer.
-- Every control read/write and child exit has a deadline. Helper stdout/stderr
-  go to the null device rather than a pipe; on timeout or parent unwind, the
-  parent kills and boundedly polls/reaps each child. Never combine piped output
-  with an unbounded `wait`/`wait_with_output` in this bearer-adjacent gate.
-- The parent is ignored on every non-Linux platform, and the parent plus both
-  helper entrypoints assert Linux before constructing or binding an Endpoint.
-  macOS development runs may compile/list this target but must not execute it.
-- This target is evidence for two-process production `PairingService`,
-  `BrokerPairTransport`, pair/normal ALPN behavior, directional persistence,
-  and one-Endpoint reuse. Its private test-only ALPN router is not evidence for
-  `run_daemon`, `NetworkStartup`, the future public CLI, or full daemon
-  lifecycle recovery.
+- The single real-Iroh loopback fixture is `two_daemon_transport`. It owns two
+  task-private `UserPaths`, identities, stores, authorization registries,
+  brokers, and one Endpoint per owner. Committed config remains `OfficialN0`,
+  while runtime Endpoints use `RelayMode::Disabled`, IPv4 loopback, and
+  task-only direct routes.
+- Its real target checks Linux before bind and is ignored elsewhere. It proves
+  pair/normal ALPN isolation, one-Endpoint reuse, normal-primary reuse,
+  directional authorization, and direct-route non-persistence. It does not
+  prove pairing-service workflows, remote Session workflows, `run_daemon`, the
+  public CLI, Relay, Internet, DNS/Pkarr, or M10 paths.
+- Do not keep a second daemon-like real-Iroh fixture merely for compile-only
+  evidence. A future end-to-end pairing or remote Session acceptance target
+  must first have a hosted Linux job owner, then reuse or extend the shared
+  fixture and record its commit and run URL.
 - Cross-UID evidence is the Linux `cross_uid` harness-false test itself. Under
   `CI=true`, missing noninteractive `sudo -u nobody` is a hard failure rather
   than a skip; a successful Linux workspace job therefore records the peer-
@@ -221,9 +283,9 @@ outbound-known and inbound-authorization directions explicit.
   owns official-n0 runtime evidence: with endpoint non-DNS UDP blocked, three
   encrypted bidirectional streams completed over the official WSS/TCP Relay.
   Current `iroh_profile_gate` owns the exact production-map/QAD/lookups/ALPN
-  regression, while Linux `connection_broker`, `two_daemon_transport`, and the
-  two-process pairing target exercise the current M5-M6 code on real Iroh
-  loopback endpoints. Those loopback targets are not described as public-n0
+  regression, while Linux `connection_broker` and `two_daemon_transport`
+  exercise the current M5-M6 code on real Iroh loopback endpoints. Those
+  loopback targets are not described as public-n0
   runtime tests. The optional self-hosted Relay has no M5-M6 completion gate;
   representative two-network automatic discovery remains parent M10 work.
 
@@ -243,9 +305,17 @@ outbound-known and inbound-authorization directions explicit.
 | StoreActor response loss after mutation starts | `operation_outcome_unknown`; reconcile durable state before deciding rollback |
 | revoke SQLite failure | return error; registry, connections, attachments, and generation unchanged |
 | network shutdown while pairing/dial/stream waits | `cancelled`/`transport_unavailable`; release every RAII permit |
-| multi-process gate on a non-Linux host | parent ignored; every callable helper fails before Endpoint bind |
-| control packet has wrong kind, zero/oversize length, timeout, or trailing bytes | fail the test locally; do not decode/use a ticket or continue the handshake |
-| pairing helper misses the shared exit deadline | kill, boundedly reap, and fail without emitting child output |
+| remote target is short/noncanonical, self, ambiguous, missing, or inbound-only | exact typed selector/direction error; do not acquire connection demand |
+| remote operation-lease allocation loses a validated response after write | return the typed transport/protocol failure after one service stream; do not allocate again |
+| first/second remote mutation service stream loses a validated response | retry once with identical bytes / return `operation_outcome_unknown`; never allocate a fresh lease for that operation |
+| remote unary fully validated expected response or correlated known service error | terminal response; do not retry |
+| post-`Active` frozen-session attachment receives initial `session_occupied` before old host reader EOF | drop the rejected epoch, remain reconnecting, drain/drop input and coalesce viewport for 250 ms, then retry the same SessionId with `create_main = false`; first-ever occupancy is terminal |
+| remote Session context is self, generation zero/stale, or targets local/wrong DeviceId | generic `unauthorized`; no Session/PTY effect |
+| malformed, trailing, oversized, stalled, or panicking remote service stream | close/fail only that stream; retain primary connection, Session, PTY, and other streams |
+| reconnect delta baseline is inconsistent | consume and validate `TerminalSyncRequired`, then require a same-attachment snapshot at its declared revision |
+| active epoch changes to a full snapshot | emit one local `Synchronizing` event before snapshot bytes; suppress duplicates until the view becomes active again |
+| remote write/control peer stops reading | operation deadline releases the stream epoch and eventually the desired-view demand |
+| continuously ready accept branch with completed handler tasks | reap completed `JoinSet` entries before the next accept; retained task ownership stays bounded |
 | Unix-only private field or actor-query chain in a shared Windows module | gate every private owner/variant/arm/helper together; shared Clippy must have zero dead code |
 | non-Unix caller constructs or invokes `LocalDeviceClient` | construction succeeds without Unix state; operation returns typed `UnsupportedPlatform` |
 | writer test observer fires before the lock future's first poll | invalid scheduling evidence; do not infer queue order |
@@ -263,20 +333,27 @@ outbound-known and inbound-authorization directions explicit.
   controller's outbound known-device row exactly once.
 - **Base:** endpoint bind is degraded while same-UID status, StoreActor, and
   retained Sessions remain responsive.
-- **Base:** macOS/other non-Linux hosts compile or list the multi-process target,
-  but the target remains ignored and its helper guard precedes every bind.
+- **Base:** macOS/other non-Linux hosts compile the real-Iroh integration target,
+  but its real case remains ignored and its platform guard precedes every bind.
 - **Base:** Windows compiles the shared hidden device-client surface without a
   Unix socket field; invoking an operation returns `UnsupportedPlatform`.
 - **Good:** a held authorization reader forces the revoke writer's first real
   poll to `Pending`; only then is a later commit reader started, and its own
   first poll is also `Pending` behind the writer.
+- **Good:** one authenticated normal stream reaches the installed handler
+  untouched, the shared Session decoder validates the exact host target, and a
+  synchronous effect runs under the accepted generation while response I/O
+  occurs after the permit is released.
+- **Good:** retain a correlated peer error's kind/request ID, zeroize its
+  message, and re-encode one stable local detail.
 - **Bad:** cap the combined route list at four, accept unidirectional QUIC
   streams that no actor consumes, persist a direct address, roll back an
   outcome-unknown authorization, detach a PTY because one device was revoked,
   place a bearer ticket in child argv/env/output, or leave a Unix-only actor
   command compiled and unused on Windows. It is also invalid to signal "writer
-  started" before polling the lock and assume multi-thread scheduling preserves
-  source order.
+  started" before polling the lock, assume multi-thread scheduling preserves
+  source order, or place a continuously-ready accept branch ahead of completed
+  task reaping in a biased select.
 
 ## 6. Tests Required
 
@@ -287,36 +364,54 @@ outbound-known and inbound-authorization directions explicit.
   deterministic candidates, per-source fallback, early bi/zero-uni limits,
   deadlines, cancellation, offer state, ambiguity reconciliation, alias-before-
   transport, and secret redaction without opening a socket.
-- Unix IPC: `local_pair_ipc`, `local_device_ipc`, `revoke_races`, `local_ipc`,
-  and `local_session_ipc` cover strict EOF, exact retry, ordered revoke, matching-
+- `remote_session` pure tests cover one demand, at most two byte-identical
+  service-stream attempts for list/mutation, one post-write lease-allocation
+  attempt, stable target/lease/operation identity, strict one response plus EOF,
+  typed terminal responses, malformed response ambiguity, and final outcome
+  unknown without opening an Endpoint. Peer-message sentinels must be absent
+  from both the local error and re-encoded attachment frame.
+- `session_wire` plus broker/network unit tests cover untouched first-frame
+  ownership, exact target/generation, authorization at every effect, queued
+  revoke fairness, transport-neutral diagnostics, stream-local malformed/stall/
+  panic failure, single handler installation, bounded task reaping, and
+  quiesce-before-Endpoint ordering without creating an Endpoint.
+- `remote_attachment` pure fake-stream tests cover one demand across fresh
+  stream/attachment epochs, stable local identity, state ordering, input drop,
+  latest viewport coalescing, marker-plus-snapshot fallback, bounded stalled
+  writes, pending lease/takeover completion, post-active half-open occupancy
+  retry under paused time, first-ever occupancy termination, and other terminal
+  classifications. The authenticated `session_wire` PTY regression proves
+  EOF-only checkpoint move versus explicit/protocol discard without opening an
+  Endpoint.
+- Unix IPC: `local_pair_ipc`, `local_device_ipc`, `local_ipc`, and
+  `local_session_ipc` cover strict EOF, exact retry, ordered revoke, matching-
   principal detach, response loss, and listener/session independence.
 - Named transport gates: `duplicate_connection`, `stream_limits`,
   `authorization`, `path_migration`, and `network_lifecycle` must be
   deterministic and socket-free where possible.
-- `authorization` and `revoke_races` must establish writer-before-later-reader
-  ordering from observed first polls, with `unconstrained` excluding Tokio
-  cooperative-budget false `Pending`. Assert the later reader's first result is
-  `Pending`, then assert it receives the revoked/current generation only after
-  the original reader releases and the writer publishes. Do not replace these
-  assertions with timing sleeps, yields, or start notifications.
+- `authorization` establishes writer-before-later-reader ordering from observed
+  first polls, with `unconstrained` excluding Tokio cooperative-budget false
+  `Pending`. The `session_wire` revoke matrix then proves durable publication,
+  close, matching detach, stale-effect denial, unaffected principals, and
+  restart state through the production coordinator. Do not duplicate that
+  matrix in a second integration target or replace either barrier with sleeps,
+  yields, or start notifications.
 - Real Iroh targets are compiled on developer macOS but not executed there.
-  Linux CI owns execution of `connection_broker` and `two_daemon_transport`,
-  and this exact two-process production pairing target:
+  Linux CI owns execution of `connection_broker` and the one two-owner
+  integration fixture:
 
   ```sh
-  cargo test -p zterm-daemon --lib --all-features \
-    pairing_service::multiprocess_test::two_process_production_pairing_service_is_directional_and_reuses_one_endpoint -- --exact
+  cargo test -p zterm-daemon --test two_daemon_transport --all-features \
+    two_daemon_owners_reuse_endpoint_for_pair_and_normal_confirmation -- --exact
   ```
 
-  Its assertions include distinct process IDs/owners, ticket-only private
-  control transport, directional durable/registry state, pair-to-normal
-  confirmation, one normal primary with zero business streams, one Endpoint
-  identity/socket per child, and no direct-route persistence. These loopback
-  targets prove the current broker/pairing/authorization composition; the
-  accepted Foundation Case C separately owns official-n0 Relay runtime
-  evidence, and `iroh_profile_gate` connects that retained evidence to the
-  current exact production profile. Hosted Windows owns shared core/proto/
-  daemon compile evidence, including:
+  Its assertions include distinct owners, pair-to-normal confirmation, one
+  normal primary with zero business streams, one Endpoint identity/socket per
+  owner, directional durable state, and no direct-route persistence. Pure
+  pairing and remote Session suites retain workflow, replay, response-loss,
+  reconnect, no-HOL, revoke, and cleanup evidence without duplicating Endpoint
+  owners. Foundation Case C separately owns official-n0 Relay runtime evidence.
+  Hosted Windows owns shared compile evidence, including:
 
   ```sh
   cargo clippy --workspace --lib --bins --all-features -- -D warnings
@@ -357,27 +452,6 @@ for source in [fresh, cache, ticket] {
 
 Each independently validated source stays bounded, deduplication preserves the
 fallback order, and later sources remain reachable after earlier dial failures.
-
-For the multi-process acceptance harness, piping bearer-adjacent child output
-and waiting without a deadline is likewise wrong:
-
-```rust
-let child = Command::new(current_exe).stdout(Stdio::piped()).spawn()?;
-let output = child.wait_with_output()?; // pipe backpressure and wait are unbounded
-```
-
-Use null output plus one parent-owned deadline and bounded kill/reap instead:
-
-```rust
-let child = Command::new(current_exe)
-    .stdout(Stdio::null())
-    .stderr(Stdio::null())
-    .spawn()?;
-let status = finish_or_kill_until(child, shared_deadline)?;
-```
-
-This prevents output backpressure from hanging Linux CI and prevents sensitive
-child diagnostics from being copied into the parent test result.
 
 For shared modules, leaving Unix-backed private state or commands compiled on
 Windows is also wrong:
@@ -430,3 +504,8 @@ let guard = poll_fn(|cx| {
 
 This keeps Tokio's real queue, waker, and cancellation semantics while making
 the barrier independent of which runtime worker runs next.
+
+In a biased accept loop, keep shutdown/authentication signals first,
+`JoinSet::join_next` second, and path/accept work last. This complements live
+semaphore bounds by bounding retained completed-task owners even when incoming
+work is continuously ready.

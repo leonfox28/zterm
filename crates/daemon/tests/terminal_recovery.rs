@@ -94,6 +94,8 @@ async fn future_snapshot_ack_recovers_and_wrong_kind_is_stream_local() -> Result
             session_name: String::new(),
             create_main: false,
             viewport: None,
+            resume_view_id: None,
+            known_revision: None,
         },
     )
     .map_err(session_fixture::display)?;

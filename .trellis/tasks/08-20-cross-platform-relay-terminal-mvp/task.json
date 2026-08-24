@@ -24,7 +24,8 @@
     "08-21-foundation-gate",
     "08-22-core-local-daemon",
     "08-22-persistent-session-local-attach",
-    "08-22-transport-auth"
+    "08-22-transport-auth",
+    "08-23-remote-cli"
   ],
   "parent": null,
   "relatedFiles": [

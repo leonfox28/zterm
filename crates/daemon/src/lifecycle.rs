@@ -1,12 +1,13 @@
 //! Per-user daemon singleflight launch, detached entry, and graceful cleanup.
 
+use std::fmt;
 #[cfg(unix)]
 use std::fs;
 #[cfg(unix)]
 use std::path::Path;
 use std::time::Duration;
 #[cfg(unix)]
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use zterm_core::DomainErrorKind;
 use zterm_platform::account::EffectiveAccount;
@@ -41,10 +42,21 @@ enum DaemonNetworkMode {
 }
 
 /// Executable and one hidden argument used by explicit lifecycle operations.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct DaemonLauncher {
     executable: std::path::PathBuf,
     internal_argument: String,
+}
+
+impl fmt::Debug for DaemonLauncher {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DaemonLauncher")
+            .field("executable", &"[REDACTED]")
+            .field("internal_argument", &"[REDACTED]")
+            .field("internal_argument_len", &self.internal_argument.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl DaemonLauncher {
@@ -181,7 +193,7 @@ pub fn run_internal_daemon() -> Result<(), DaemonError> {
 #[cfg(unix)]
 #[doc(hidden)]
 pub fn run_daemon(paths: &UserPaths) -> Result<(), DaemonError> {
-    run_daemon_with_network_mode(paths, DaemonNetworkMode::Production)
+    run_daemon_with_network_mode(paths, DaemonNetworkMode::Production, None)
 }
 
 /// Runs an already-detached test daemon with only same-UID local IPC.
@@ -191,13 +203,28 @@ pub fn run_daemon(paths: &UserPaths) -> Result<(), DaemonError> {
 #[cfg(unix)]
 #[doc(hidden)]
 pub fn run_local_only_daemon_for_test(paths: &UserPaths) -> Result<(), DaemonError> {
-    run_daemon_with_network_mode(paths, DaemonNetworkMode::LocalOnlyTest)
+    run_daemon_with_network_mode(paths, DaemonNetworkMode::LocalOnlyTest, None)
+}
+
+/// Runs an already-detached same-UID daemon with a deterministic test Session owner.
+///
+/// The injected service changes only PTY spawning. This entry retains the
+/// production local IPC, Session registry, terminal driver, and cleanup paths,
+/// and never prepares or binds an Iroh Endpoint.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn run_local_only_daemon_with_sessions_for_test(
+    paths: &UserPaths,
+    sessions: crate::session::SessionService,
+) -> Result<(), DaemonError> {
+    run_daemon_with_network_mode(paths, DaemonNetworkMode::LocalOnlyTest, Some(sessions))
 }
 
 #[cfg(unix)]
 fn run_daemon_with_network_mode(
     paths: &UserPaths,
     network_mode: DaemonNetworkMode,
+    test_sessions: Option<crate::session::SessionService>,
 ) -> Result<(), DaemonError> {
     use std::sync::Arc;
 
@@ -209,7 +236,9 @@ fn run_daemon_with_network_mode(
     use crate::network::NetworkStartup;
     use crate::pairing::PairingManager;
     use crate::pairing_service::PairingService;
+    use crate::remote_session::RemoteSessionService;
     use crate::service::{BrokerRemoteDeviceAccess, DeviceManagement};
+    use crate::session_wire::RemoteSessionServiceHandler;
     use crate::store::{StateStore, StoreActor};
     use crate::transport::InfrastructureProfile;
 
@@ -264,8 +293,22 @@ fn run_daemon_with_network_mode(
                 connection_identity,
                 limits,
             )?;
-            let network_startup = network_startup.with_pair_handler(pairing.clone());
-            let service = DaemonService::with_network(setup, network_handle.observe());
+            let own_device_id = setup.device_id;
+            let remote_sessions = RemoteSessionService::production(
+                own_device_id,
+                directory.clone(),
+                network_handle.broker(),
+            );
+            let service = DaemonService::with_network(setup, network_handle.observe())
+                .with_remote_sessions(remote_sessions);
+            let session_handler = RemoteSessionServiceHandler::new(
+                service.sessions().clone(),
+                own_device_id,
+                authorization.clone(),
+            );
+            let network_startup = network_startup
+                .with_pair_handler(pairing.clone())
+                .with_service_handler(session_handler)?;
             let remote_access = Arc::new(BrokerRemoteDeviceAccess::new(
                 network_handle.broker(),
                 service.sessions().clone(),
@@ -282,13 +325,29 @@ fn run_daemon_with_network_mode(
                 Some(store_actor),
             )
         }
-        None => (
-            Arc::new(DaemonService::new(setup)),
-            None,
-            Some(StoreActor::start(store)?),
-        ),
+        None => {
+            let store_actor = StoreActor::start(store)?;
+            let directory = DeviceDirectory::new(store_actor.handle());
+            let own_device_id = setup.device_id;
+            let remote_sessions = RemoteSessionService::local_only(own_device_id, directory);
+            let service = match test_sessions {
+                Some(sessions) => DaemonService::with_sessions(
+                    setup,
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_or(0, |duration| duration.as_secs()),
+                    sessions,
+                ),
+                None => DaemonService::new(setup),
+            };
+            (
+                Arc::new(service.with_remote_sessions(remote_sessions)),
+                None,
+                Some(store_actor),
+            )
+        }
     };
-    tracing::info!(socket = %paths.socket().display(), "local daemon ready");
+    tracing::info!("local daemon ready");
 
     run_owned_daemon_listener(
         paths,
@@ -366,12 +425,18 @@ fn run_owned_daemon_listener(
                 if let Some(pairing) = service.pairing()
                     && let Err(error) = runtime.block_on(pairing.shutdown_until(cleanup_deadline))
                 {
-                    tracing::warn!(%error, "pairing cleanup failed after fatal local listener exit");
+                    tracing::warn!(
+                        error_kind = error.kind().code(),
+                        "pairing cleanup failed after fatal local listener exit"
+                    );
                 }
                 if let Some(network) = network.as_mut()
                     && let Err(error) = runtime.block_on(network.shutdown_until(cleanup_deadline))
                 {
-                    tracing::warn!(%error, "network cleanup failed after fatal local listener exit");
+                    tracing::warn!(
+                        error_kind = error.kind().code(),
+                        "network cleanup failed after fatal local listener exit"
+                    );
                 }
                 zterm_platform::local_unix::remove_owned_daemon_socket(
                     paths,
@@ -388,12 +453,12 @@ fn run_owned_daemon_listener(
                 // path again before replacing it.
                 match server_result {
                     Ok(()) => tracing::warn!(
-                        error = %cleanup_error,
+                        error_kind = cleanup_error.kind().code(),
                         "listener stopped before owned sessions were released; rebinding"
                     ),
                     Err(server_error) => tracing::warn!(
-                        error = %server_error,
-                        cleanup = %cleanup_error,
+                        error_kind = server_error.kind().code(),
+                        cleanup_kind = cleanup_error.kind().code(),
                         "fatal listener exit retained owned sessions; rebinding"
                     ),
                 }
@@ -406,13 +471,16 @@ fn run_owned_daemon_listener(
                     ) {
                         Ok(rebound) => break rebound,
                         Err(error) => {
-                            tracing::warn!(%error, "unable to rebind owned daemon socket; retrying");
+                            tracing::warn!(
+                                error_kind = platform_error_kind(&error).code(),
+                                "unable to rebind owned daemon socket; retrying"
+                            );
                             std::thread::sleep(RECOVERY_REBIND_BACKOFF);
                         }
                     }
                 };
                 (listener, socket_ownership) = rebound;
-                tracing::info!(socket = %paths.socket().display(), "local daemon listener recovered");
+                tracing::info!("local daemon listener recovered");
             }
         }
     }
@@ -527,8 +595,14 @@ fn init_lifecycle_logging() {
 
 #[cfg(unix)]
 fn platform_error(error: zterm_platform::local_unix::LocalPlatformError) -> DaemonError {
+    let kind = platform_error_kind(&error);
+    DaemonError::new(kind, error.to_string())
+}
+
+#[cfg(unix)]
+fn platform_error_kind(error: &zterm_platform::local_unix::LocalPlatformError) -> DomainErrorKind {
     use zterm_platform::local_unix::LocalPlatformError;
-    let kind = match error {
+    match error {
         LocalPlatformError::Path(_) | LocalPlatformError::UnsafeSocket(_) => {
             DomainErrorKind::PathUnsafe
         }
@@ -536,8 +610,7 @@ fn platform_error(error: zterm_platform::local_unix::LocalPlatformError) -> Daem
         LocalPlatformError::PeerUidMismatch { .. } => DomainErrorKind::PeerUidMismatch,
         LocalPlatformError::UnsupportedPlatform => DomainErrorKind::UnsupportedPlatform,
         LocalPlatformError::Io(_) => DomainErrorKind::DaemonStopped,
-    };
-    DaemonError::new(kind, error.to_string())
+    }
 }
 
 #[cfg(not(unix))]

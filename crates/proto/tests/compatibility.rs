@@ -34,6 +34,15 @@ fn hex(input: &str) -> Vec<u8> {
         .collect()
 }
 
+fn assert_message_round_trip<MessageType>(message: &MessageType)
+where
+    MessageType: Message + Default + PartialEq + std::fmt::Debug,
+{
+    let bytes = message.encode_to_vec();
+    let decoded = MessageType::decode(bytes.as_slice()).expect("generated message round trips");
+    assert_eq!(&decoded, message);
+}
+
 fn ticket() -> PairTicketFields {
     PairTicketFields::new(
         PAIR_TICKET_FORMAT_VERSION,
@@ -419,6 +428,9 @@ fn wire_kind_registry_is_unique_and_centrally_mapped() {
         WireKind::LocalDeviceRenameResponse,
         WireKind::LocalDeviceRevokeRequest,
         WireKind::LocalDeviceRevokeResponse,
+        WireKind::LocalTargetResolveRequest,
+        WireKind::LocalTargetResolveResponse,
+        WireKind::LocalSessionUnaryRequest,
         WireKind::PairBegin,
         WireKind::PairChallenge,
         WireKind::PairProof,
@@ -454,9 +466,12 @@ fn wire_kind_registry_is_unique_and_centrally_mapped() {
         assert_eq!(WireKind::try_from(number).expect("mapped kind"), kind);
     }
 
-    // New local pair/device kinds occupy 12..=21 and pair/transport 100..=105.
+    // Local pair/device kinds occupy 12..=21, target/session forwarding uses
+    // 22..=24, and pair/transport remains 100..=105.
     assert_eq!(WireKind::LocalPairCreateRequest as u32, 12);
     assert_eq!(WireKind::LocalDeviceRevokeResponse as u32, 21);
+    assert_eq!(WireKind::LocalTargetResolveRequest as u32, 22);
+    assert_eq!(WireKind::LocalSessionUnaryRequest as u32, 24);
     assert_eq!(WireKind::PairBegin as u32, 100);
     assert_eq!(WireKind::ConnectionWelcome as u32, 105);
 }
@@ -540,65 +555,222 @@ fn handshake_adapters_reject_zero_protocol_and_authorization_sentinels() {
 
 #[test]
 fn generated_pair_messages_and_decoded_frames_redact_sensitive_payloads() {
-    let proof_sentinel = vec![0xa7; 32];
-    let raw_proof = format!("{proof_sentinel:?}");
-    let ticket_sentinel = "zterm-pair-v1:PAIR_TICKET_SENTINEL";
+    const FRAME_SENTINEL: &[u8] = b"PAIR_FRAME_SENTINEL_c5e7";
+    const OFFER_SENTINEL: &[u8; 16] = b"OFFER_SENTINEL_1";
+    const NONCE_SENTINEL: &[u8; 32] = b"PAIR_NONCE_SENTINEL_0123456789AB";
+    const PROOF_SENTINEL: &[u8; 32] = b"PAIR_PROOF_SENTINEL_0123456789AB";
+    const KEY_SENTINEL: &[u8; 32] = b"PAIR_KEY_SENTINEL_0123456789ABCD";
+    const TICKET_SENTINEL: &str = "zterm-pair-v1:PAIR_TICKET_SENTINEL_470b";
+
+    let wire = v1::WireFrame {
+        wire_major: WIRE_MAJOR,
+        kind: WireKind::PairProof as u32,
+        payload: FRAME_SENTINEL.to_vec(),
+        request_id: 7,
+        deadline_ms: 8,
+    };
+    let decoded = DecodedFrame {
+        kind: WireKind::PairProof,
+        request_id: 7,
+        deadline_ms: 8,
+        payload: FRAME_SENTINEL.to_vec(),
+    };
+    let ticket = v1::PairTicketV1 {
+        format_version: PAIR_TICKET_FORMAT_VERSION,
+        host_device_id: None,
+        host_name: "host".to_owned(),
+        relay_urls: vec!["https://relay.example.test".to_owned()],
+        offer_id: OFFER_SENTINEL.to_vec(),
+        secret: KEY_SENTINEL.to_vec(),
+        expires_at_unix: EXPIRES_AT_UNIX,
+    };
+    let begin = v1::PairBegin {
+        offer_id: OFFER_SENTINEL.to_vec(),
+        controller_name: "controller".to_owned(),
+        controller_nonce: NONCE_SENTINEL.to_vec(),
+        pair_protocol_version: PAIR_PROTOCOL_VERSION,
+    };
+    let challenge = v1::PairChallenge {
+        host_nonce: NONCE_SENTINEL.to_vec(),
+        selected_version: PAIR_PROTOCOL_VERSION,
+        ticket_expiry_unix: EXPIRES_AT_UNIX,
+    };
+    let proof = v1::PairProof {
+        controller_proof: PROOF_SENTINEL.to_vec(),
+    };
+    let accepted = v1::PairAccepted {
+        authorization_generation: 1,
+        host_confirmation_proof: PROOF_SENTINEL.to_vec(),
+        host_diagnostic_version: "test-build".to_owned(),
+    };
+    let local_create = v1::LocalPairCreateResponse {
+        ticket: TICKET_SENTINEL.to_owned(),
+    };
+    let local_accept = v1::LocalPairAcceptRequest {
+        ephemeral_operation_id: OFFER_SENTINEL.to_vec(),
+        fingerprint: KEY_SENTINEL.to_vec(),
+        ticket: TICKET_SENTINEL.to_owned(),
+        alias: "host".to_owned(),
+    };
     let rendered = format!(
         "{:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}",
-        v1::WireFrame {
-            wire_major: WIRE_MAJOR,
-            kind: WireKind::PairProof as u32,
-            payload: proof_sentinel.clone(),
-            request_id: 7,
-            deadline_ms: 8,
-        },
-        DecodedFrame {
-            kind: WireKind::PairProof,
-            request_id: 7,
-            deadline_ms: 8,
-            payload: proof_sentinel.clone(),
-        },
-        v1::PairTicketV1 {
-            format_version: PAIR_TICKET_FORMAT_VERSION,
-            host_device_id: None,
-            host_name: "host".to_owned(),
-            relay_urls: vec!["https://relay.example.test".to_owned()],
-            offer_id: proof_sentinel.clone(),
-            secret: proof_sentinel.clone(),
-            expires_at_unix: EXPIRES_AT_UNIX,
-        },
-        v1::PairBegin {
-            offer_id: proof_sentinel.clone(),
-            controller_name: "controller".to_owned(),
-            controller_nonce: proof_sentinel.clone(),
-            pair_protocol_version: PAIR_PROTOCOL_VERSION,
-        },
-        v1::PairChallenge {
-            host_nonce: proof_sentinel.clone(),
-            selected_version: PAIR_PROTOCOL_VERSION,
-            ticket_expiry_unix: EXPIRES_AT_UNIX,
-        },
-        v1::PairProof {
-            controller_proof: proof_sentinel.clone(),
-        },
-        v1::PairAccepted {
-            authorization_generation: 1,
-            host_confirmation_proof: proof_sentinel,
-            host_diagnostic_version: "test-build".to_owned(),
-        },
-        v1::LocalPairCreateResponse {
-            ticket: ticket_sentinel.to_owned(),
-        },
-        v1::LocalPairAcceptRequest {
-            ephemeral_operation_id: vec![0x44; 16],
-            fingerprint: vec![0x55; 32],
-            ticket: ticket_sentinel.to_owned(),
-            alias: "host".to_owned(),
-        },
+        wire, decoded, ticket, begin, challenge, proof, accepted, local_create, local_accept,
     );
     assert!(rendered.contains("[REDACTED]"));
-    assert!(!rendered.contains(&raw_proof));
-    assert!(!rendered.contains(ticket_sentinel));
+    for bytes in [
+        FRAME_SENTINEL,
+        OFFER_SENTINEL,
+        NONCE_SENTINEL,
+        PROOF_SENTINEL,
+        KEY_SENTINEL,
+    ] {
+        assert!(!rendered.contains(std::str::from_utf8(bytes).expect("ASCII sentinel")));
+        assert!(!rendered.contains(&format!("{bytes:?}")));
+    }
+    assert!(!rendered.contains(TICKET_SENTINEL));
+
+    assert_message_round_trip(&wire);
+    assert_message_round_trip(&ticket);
+    assert_message_round_trip(&begin);
+    assert_message_round_trip(&challenge);
+    assert_message_round_trip(&proof);
+    assert_message_round_trip(&accepted);
+    assert_message_round_trip(&local_create);
+    assert_message_round_trip(&local_accept);
+}
+
+#[test]
+fn generated_session_terminal_and_route_debug_is_redacted_without_wire_changes() {
+    const CWD_SENTINEL: &str = "/private/tmp/CWD_SENTINEL_8b62/project";
+    const RELAY_SENTINEL: &str = "https://RELAY_ROUTE_SENTINEL_60e4.example.test/path";
+    const HOME_RELAY_SENTINEL: &str = "https://HOME_RELAY_SENTINEL_19a5.example.test";
+    const SCREEN_SENTINEL: &[u8] = b"PROTO_SCREEN_SENTINEL_e357";
+    const HISTORY_SENTINEL: &[u8] = b"PROTO_HISTORY_SENTINEL_4d18";
+    const DELTA_SENTINEL: &[u8] = b"PROTO_DELTA_SENTINEL_729a";
+    const INPUT_SENTINEL: &[u8] = b"PROTO_INPUT_SENTINEL_b84f";
+    const RESUME_SENTINEL: &[u8; 16] = b"RESUME_PROTO_4d2";
+
+    let summary = v1::SessionSummary {
+        session_id: Some(v1::SessionId {
+            value: vec![0x31; 16],
+        }),
+        name: "build".to_owned(),
+        revision: 37,
+        has_controller: true,
+        working_directory: CWD_SENTINEL.to_owned(),
+        viewport: Some(v1::TerminalViewport {
+            rows: 43,
+            columns: 151,
+        }),
+    };
+    let create = v1::SessionCreateRequest {
+        operation_id: None,
+        target: None,
+        name: "build".to_owned(),
+        working_directory: CWD_SENTINEL.to_owned(),
+        viewport: summary.viewport,
+    };
+    let snapshot = v1::TerminalSnapshot {
+        session_id: summary.session_id.clone(),
+        attachment_id: Some(v1::AttachmentId {
+            value: vec![0x32; 16],
+        }),
+        revision: 41,
+        rows: 43,
+        columns: 151,
+        screen_ansi: SCREEN_SENTINEL.to_vec(),
+        recent_history_ansi: HISTORY_SENTINEL.to_vec(),
+        active_screen: v1::TerminalActiveScreen::Main as i32,
+        modes: Some(v1::TerminalModes::default()),
+    };
+    let delta = v1::TerminalDelta {
+        from_revision: 41,
+        to_revision: 47,
+        ansi: DELTA_SENTINEL.to_vec(),
+        rows: 43,
+        columns: 151,
+        active_screen: v1::TerminalActiveScreen::Main as i32,
+        modes: Some(v1::TerminalModes::default()),
+        attachment_id: snapshot.attachment_id.clone(),
+    };
+    let input = v1::TerminalInput {
+        operation_id: None,
+        attachment_id: snapshot.attachment_id.clone(),
+        bytes: INPUT_SENTINEL.to_vec(),
+    };
+    let resume_view_id = v1::ResumeViewId {
+        value: RESUME_SENTINEL.to_vec(),
+    };
+    let attach = v1::TerminalAttachRequest {
+        target: None,
+        session_id: summary.session_id.clone(),
+        takeover: false,
+        session_name: "build".to_owned(),
+        create_main: false,
+        viewport: summary.viewport,
+        resume_view_id: Some(resume_view_id.clone()),
+        known_revision: Some(37),
+    };
+    let route_cache = v1::RelayRouteCacheV1 {
+        format_version: RELAY_ROUTE_CACHE_VERSION,
+        relay_urls: vec![RELAY_SENTINEL.to_owned()],
+    };
+    let status = v1::LocalStatusResponse {
+        home_relay: HOME_RELAY_SENTINEL.to_owned(),
+        active_session_count: 1,
+        active_session_names: vec!["build".to_owned()],
+        direct_path_count: 2,
+        relay_path_count: 3,
+        ..v1::LocalStatusResponse::default()
+    };
+    let validate_setup = v1::LocalValidateSetupRequest {
+        device_name: "host".to_owned(),
+        infrastructure_profile: "self-hosted".to_owned(),
+        relay_url: RELAY_SENTINEL.to_owned(),
+    };
+    let list = v1::SessionListResponse {
+        sessions: vec![summary.clone()],
+    };
+    let mutate = v1::SessionMutateResponse {
+        session: Some(summary.clone()),
+    };
+
+    let rendered = format!(
+        "{summary:?} {create:?} {resume_view_id:?} {attach:?} {snapshot:?} {delta:?} \
+         {input:?} {route_cache:?} {status:?} {validate_setup:?} {list:?} {mutate:?}"
+    );
+    for text in [CWD_SENTINEL, RELAY_SENTINEL, HOME_RELAY_SENTINEL] {
+        assert!(!rendered.contains(text));
+    }
+    for bytes in [
+        SCREEN_SENTINEL,
+        HISTORY_SENTINEL,
+        DELTA_SENTINEL,
+        INPUT_SENTINEL,
+        RESUME_SENTINEL,
+    ] {
+        assert!(!rendered.contains(std::str::from_utf8(bytes).expect("ASCII sentinel")));
+        assert!(!rendered.contains(&format!("{bytes:?}")));
+    }
+    assert!(rendered.contains("[REDACTED]"));
+    assert!(rendered.contains("revision: 37"));
+    assert!(rendered.contains("rows: 43"));
+    assert!(rendered.contains("columns: 151"));
+    assert!(rendered.contains("relay_url_count: 1"));
+    assert!(rendered.contains(&format!("input_len: {}", INPUT_SENTINEL.len())));
+    assert!(rendered.contains("direct_path_count: 2"));
+    assert!(rendered.contains("relay_path_count: 3"));
+
+    assert_message_round_trip(&summary);
+    assert_message_round_trip(&create);
+    assert_message_round_trip(&resume_view_id);
+    assert_message_round_trip(&attach);
+    assert_message_round_trip(&snapshot);
+    assert_message_round_trip(&delta);
+    assert_message_round_trip(&input);
+    assert_message_round_trip(&route_cache);
+    assert_message_round_trip(&status);
+    assert_message_round_trip(&validate_setup);
 }
 
 #[test]

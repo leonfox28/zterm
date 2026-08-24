@@ -529,6 +529,12 @@ pub struct TerminalAttachment {
 }
 
 impl TerminalAttachment {
+    /// Returns the revision retained by this view's latest checkpoint.
+    #[must_use]
+    pub(crate) fn checkpoint_revision(&self) -> Option<Revision> {
+        self.checkpoint.as_ref().map(TerminalCheckpoint::revision)
+    }
+
     /// Subscribes to the driver's latest-only revision watermark.
     #[must_use]
     pub fn revision_watch(&self) -> watch::Receiver<Revision> {

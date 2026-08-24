@@ -1,5 +1,6 @@
 //! Versioned daemon configuration and infrastructure profile validation.
 
+use std::fmt;
 use std::fs;
 
 use iroh::RelayUrl;
@@ -25,7 +26,7 @@ pub struct ConfigV1 {
 }
 
 /// Serializable infrastructure selection; mixed maps are unrepresentable.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case", tag = "profile")]
 pub enum InfrastructureConfig {
     /// Iroh's pinned official n0 production map.
@@ -35,6 +36,19 @@ pub enum InfrastructureConfig {
         /// HTTPS Iroh Relay URL.
         relay_url: String,
     },
+}
+
+impl fmt::Debug for InfrastructureConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OfficialN0 => formatter.write_str("OfficialN0"),
+            Self::SelfHosted { relay_url } => formatter
+                .debug_struct("SelfHosted")
+                .field("relay_url", &"[REDACTED]")
+                .field("relay_url_len", &relay_url.len())
+                .finish(),
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for InfrastructureConfig {
@@ -68,12 +82,24 @@ impl<'de> Deserialize<'de> for InfrastructureConfig {
 }
 
 /// Infrastructure selection after semantic validation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum ValidatedInfrastructure {
     /// Official n0 production map.
     OfficialN0,
     /// One explicit self-hosted Relay URL.
     SelfHosted(RelayUrl),
+}
+
+impl fmt::Debug for ValidatedInfrastructure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OfficialN0 => formatter.write_str("OfficialN0"),
+            Self::SelfHosted(_) => formatter
+                .debug_tuple("SelfHosted")
+                .field(&"[REDACTED]")
+                .finish(),
+        }
+    }
 }
 
 impl ValidatedInfrastructure {
@@ -241,5 +267,45 @@ fn validate_device_name(name: &str) -> Result<(), DaemonError> {
         ))
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configuration_debug_redacts_relay_url_without_changing_access_or_serde() {
+        let relay_sentinel = "https://CONFIG_RELAY_SENTINEL_b952.example.test/private";
+        let raw = ConfigV1 {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            device_name: "config-debug-host".to_owned(),
+            infrastructure: InfrastructureConfig::SelfHosted {
+                relay_url: relay_sentinel.to_owned(),
+            },
+        };
+        let serialized = toml::to_string(&raw).expect("configuration serializes");
+        let validated = raw.clone().validate().expect("sentinel Relay validates");
+        let canonical_relay = "https://config_relay_sentinel_b952.example.test/private";
+
+        let rendered = format!("{raw:?} {validated:?}");
+        assert!(!rendered.contains(relay_sentinel));
+        assert!(!rendered.contains(canonical_relay));
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(rendered.contains("config-debug-host"));
+        assert!(serialized.contains(relay_sentinel));
+        assert_eq!(
+            validated
+                .infrastructure
+                .relay_url()
+                .map(ToString::to_string),
+            Some(canonical_relay.to_owned())
+        );
+
+        let invalid_sentinel = "https://CONFIG_INVALID_RELAY_SENTINEL_843d .example.test";
+        let error =
+            validate_setup_profile("config-debug-host", "self-hosted", Some(invalid_sentinel))
+                .expect_err("invalid Relay URL is rejected");
+        assert!(!error.to_string().contains(invalid_sentinel));
     }
 }

@@ -16,7 +16,7 @@ const MAX_SOCKET_PATH_BYTES: usize = 100;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// All persistent and runtime paths owned by one effective user.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct UserPaths {
     uid: u32,
     home: PathBuf,
@@ -32,6 +32,17 @@ pub struct UserPaths {
     daemon_lock: PathBuf,
     runtime_dir: PathBuf,
     socket: PathBuf,
+}
+
+impl fmt::Debug for UserPaths {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UserPaths")
+            .field("uid", &self.uid)
+            .field("managed_paths", &"[REDACTED]")
+            .field("managed_path_count", &13)
+            .finish_non_exhaustive()
+    }
 }
 
 impl UserPaths {
@@ -219,6 +230,15 @@ pub enum PathError {
         /// Stable operation detail.
         detail: String,
     },
+    /// A state-root child is not part of the fixed managed inventory.
+    UnexpectedManagedEntry(PathBuf),
+    /// Destructive state removal did not receive the exact lifecycle lock.
+    LifecycleLockMismatch {
+        /// Required lifecycle lock path.
+        expected: PathBuf,
+        /// Lock path actually held by the caller.
+        actual: PathBuf,
+    },
 }
 
 impl fmt::Display for PathError {
@@ -270,6 +290,17 @@ impl fmt::Display for PathError {
                 formatter,
                 "filesystem operation failed for {}: {detail}",
                 path.display()
+            ),
+            Self::UnexpectedManagedEntry(path) => write!(
+                formatter,
+                "managed state contains an unexpected entry: {}",
+                path.display()
+            ),
+            Self::LifecycleLockMismatch { expected, actual } => write!(
+                formatter,
+                "managed state removal requires lifecycle lock {}, got {}",
+                expected.display(),
+                actual.display()
             ),
         }
     }
@@ -372,6 +403,151 @@ pub fn inspect_existing_lock(path: &Path, uid: u32) -> Result<ExistingLockState,
         Err(std::fs::TryLockError::WouldBlock) => Ok(ExistingLockState::Locked),
         Err(std::fs::TryLockError::Error(error)) => Err(io_error(path, error)),
     }
+}
+
+/// Removes the exact managed state root while the caller holds its lifecycle lock.
+///
+/// The complete tree is validated before the first unlink. Unknown entries,
+/// symlinks, unexpected directories, wrong ownership, or unsafe modes therefore
+/// fail without deleting any committed state. Each unlink targets either a
+/// validated regular file or an empty validated directory and never follows a
+/// symbolic link. A missing root is a retry-safe success.
+pub fn remove_managed_state_root(
+    paths: &UserPaths,
+    lifecycle_lock: &FileLock,
+) -> Result<(), PathError> {
+    remove_managed_state_root_with(paths, lifecycle_lock, remove_validated_file)
+}
+
+fn remove_managed_state_root_with(
+    paths: &UserPaths,
+    lifecycle_lock: &FileLock,
+    mut remove_file: impl FnMut(&Path) -> Result<(), PathError>,
+) -> Result<(), PathError> {
+    if lifecycle_lock.path() != paths.lifecycle_lock() {
+        return Err(PathError::LifecycleLockMismatch {
+            expected: paths.lifecycle_lock().to_path_buf(),
+            actual: lifecycle_lock.path().to_path_buf(),
+        });
+    }
+    match fs::symlink_metadata(paths.state_root()) {
+        Ok(_) => validate_directory(paths.state_root(), paths.uid())?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(io_error(paths.state_root(), error)),
+    }
+
+    let mut files = Vec::new();
+    let mut directories = Vec::new();
+    let entries =
+        fs::read_dir(paths.state_root()).map_err(|error| io_error(paths.state_root(), error))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| io_error(paths.state_root(), error))?;
+        let path = entry.path();
+        if path == paths.logs() {
+            validate_directory(&path, paths.uid())?;
+            inspect_managed_logs(paths, &mut files)?;
+            directories.push(path);
+        } else if is_managed_state_file(paths, &path) || is_managed_temporary_file(paths, &path) {
+            validate_regular_file(&path, paths.uid())?;
+            files.push(path);
+        } else {
+            return Err(PathError::UnexpectedManagedEntry(path));
+        }
+    }
+
+    files.sort();
+    let lifecycle_position = files
+        .iter()
+        .position(|path| path == paths.lifecycle_lock())
+        .map(|position| files.remove(position));
+    for path in files {
+        remove_file(&path)?;
+    }
+    for path in directories {
+        fs::remove_dir(&path).map_err(|error| io_error(&path, error))?;
+    }
+    if let Some(path) = lifecycle_position {
+        remove_file(&path)?;
+    }
+    fs::remove_dir(paths.state_root()).map_err(|error| io_error(paths.state_root(), error))?;
+    let parent = paths
+        .state_root()
+        .parent()
+        .ok_or_else(|| PathError::NotAbsolute(paths.state_root().to_path_buf()))?;
+    sync_directory(parent)
+}
+
+fn inspect_managed_logs(paths: &UserPaths, files: &mut Vec<PathBuf>) -> Result<(), PathError> {
+    let archive = paths.logs().join("daemon.log.1");
+    let entries = fs::read_dir(paths.logs()).map_err(|error| io_error(paths.logs(), error))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| io_error(paths.logs(), error))?;
+        let path = entry.path();
+        if path != paths.daemon_log() && path != archive {
+            return Err(PathError::UnexpectedManagedEntry(path));
+        }
+        validate_regular_file(&path, paths.uid())?;
+        files.push(path);
+    }
+    Ok(())
+}
+
+fn is_managed_state_file(paths: &UserPaths, path: &Path) -> bool {
+    let journal = database_journal_path(paths.database());
+    [
+        paths.config(),
+        paths.identity(),
+        paths.database(),
+        paths.install_metadata(),
+        paths.lifecycle_lock(),
+        paths.daemon_lock(),
+        journal.as_path(),
+    ]
+    .contains(&path)
+}
+
+fn database_journal_path(database: &Path) -> PathBuf {
+    let mut journal = database.as_os_str().to_os_string();
+    journal.push("-journal");
+    PathBuf::from(journal)
+}
+
+fn is_managed_temporary_file(paths: &UserPaths, path: &Path) -> bool {
+    [
+        paths.config(),
+        paths.identity(),
+        paths.database(),
+        paths.install_metadata(),
+    ]
+    .into_iter()
+    .any(|managed| temporary_name_matches(managed, path))
+}
+
+fn temporary_name_matches(managed: &Path, candidate: &Path) -> bool {
+    if managed.parent() != candidate.parent() {
+        return false;
+    }
+    let Some(managed_name) = managed.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(candidate_name) = candidate.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let prefix = format!(".{managed_name}.tmp-");
+    let Some(suffix) = candidate_name.strip_prefix(&prefix) else {
+        return false;
+    };
+    let Some((process, sequence)) = suffix.split_once('-') else {
+        return false;
+    };
+    !process.is_empty()
+        && !sequence.is_empty()
+        && process.bytes().all(|byte| byte.is_ascii_digit())
+        && sequence.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn remove_validated_file(path: &Path) -> Result<(), PathError> {
+    fs::remove_file(path).map_err(|error| io_error(path, error))
 }
 
 fn atomic_write_inner(
@@ -648,6 +824,31 @@ mod tests {
         (temporary, paths)
     }
 
+    #[test]
+    fn user_paths_debug_redacts_every_managed_path_without_changing_accessors() {
+        const HOME_SENTINEL: &str = "/private/tmp/USER_PATH_HOME_SENTINEL_f31d";
+        const STATE_SENTINEL: &str = "/private/tmp/USER_PATH_STATE_SENTINEL_72a9";
+        const RUNTIME_SENTINEL: &str = "/private/tmp/USER_PATH_RUNTIME_SENTINEL_c604";
+        let paths = UserPaths::for_test(
+            1_234,
+            HOME_SENTINEL.into(),
+            STATE_SENTINEL.into(),
+            RUNTIME_SENTINEL.into(),
+        );
+        let rendered = format!("{paths:?}");
+
+        for sentinel in [HOME_SENTINEL, STATE_SENTINEL, RUNTIME_SENTINEL] {
+            assert!(!rendered.contains(sentinel));
+        }
+        assert!(rendered.contains("uid: 1234"));
+        assert!(rendered.contains("managed_paths: \"[REDACTED]\""));
+        assert!(rendered.contains("managed_path_count: 13"));
+        assert_eq!(paths.home(), Path::new(HOME_SENTINEL));
+        assert_eq!(paths.state_root(), Path::new(STATE_SENTINEL));
+        assert_eq!(paths.runtime_dir(), Path::new(RUNTIME_SENTINEL));
+        assert_eq!(paths, paths.clone());
+    }
+
     #[cfg(unix)]
     #[test]
     fn directories_files_atomic_failure_and_locks_obey_the_user_boundary() {
@@ -753,6 +954,215 @@ mod tests {
             symlink_paths.prepare_state_directories(),
             Err(PathError::Symlink(_))
         ));
+    }
+
+    #[test]
+    fn managed_state_removal_is_inventory_bounded_and_retry_safe() {
+        let (_temporary, paths) = isolated_paths();
+        paths.prepare_state_directories().expect("state dirs");
+        let journal = database_journal_path(paths.database());
+        for path in [
+            paths.config().to_path_buf(),
+            paths.identity().to_path_buf(),
+            paths.database().to_path_buf(),
+            paths.install_metadata().to_path_buf(),
+            journal,
+        ] {
+            atomic_write(&path, paths.uid(), |file| file.write_all(b"managed"))
+                .expect("managed file");
+        }
+        for managed in [
+            paths.config(),
+            paths.identity(),
+            paths.database(),
+            paths.install_metadata(),
+        ] {
+            let residue = paths.state_root().join(format!(
+                ".{}.tmp-123-456",
+                managed
+                    .file_name()
+                    .expect("managed file name")
+                    .to_string_lossy()
+            ));
+            atomic_write(&residue, paths.uid(), |file| file.write_all(b"residue"))
+                .expect("managed temporary residue");
+        }
+        let mut log = open_append(paths.daemon_log(), paths.uid()).expect("managed log");
+        log.write_all(b"safe diagnostic\n").expect("log bytes");
+        drop(log);
+        let mut archive = open_append(&paths.logs().join("daemon.log.1"), paths.uid())
+            .expect("managed log archive");
+        archive
+            .write_all(b"older diagnostic\n")
+            .expect("archive bytes");
+        drop(archive);
+        drop(
+            FileLock::try_acquire(paths.daemon_lock(), paths.uid())
+                .expect("daemon lock probe")
+                .expect("daemon lock"),
+        );
+        let lifecycle = FileLock::try_acquire(paths.lifecycle_lock(), paths.uid())
+            .expect("lifecycle lock probe")
+            .expect("lifecycle lock");
+
+        let mut removal_order = Vec::new();
+        remove_managed_state_root_with(&paths, &lifecycle, |path| {
+            removal_order.push(path.to_path_buf());
+            remove_validated_file(path)
+        })
+        .expect("managed state removal");
+        assert_eq!(
+            removal_order.last().map(PathBuf::as_path),
+            Some(paths.lifecycle_lock()),
+            "the held lifecycle lock is always the final unlinked file"
+        );
+        assert!(!paths.state_root().exists());
+        remove_managed_state_root(&paths, &lifecycle).expect("retry after complete removal");
+    }
+
+    #[test]
+    fn managed_state_removal_retries_after_identity_and_config_are_partially_removed() {
+        let (_temporary, paths) = isolated_paths();
+        paths.prepare_state_directories().expect("state dirs");
+        for path in [paths.config(), paths.identity(), paths.database()] {
+            atomic_write(path, paths.uid(), |file| file.write_all(b"managed"))
+                .expect("managed file");
+        }
+        let lifecycle = FileLock::try_acquire(paths.lifecycle_lock(), paths.uid())
+            .expect("lifecycle lock probe")
+            .expect("lifecycle lock");
+        let mut identity_removed = false;
+
+        let error = remove_managed_state_root_with(&paths, &lifecycle, |path| {
+            if identity_removed {
+                return Err(PathError::Io {
+                    path: path.to_path_buf(),
+                    detail: "injected partial-removal failure".to_owned(),
+                });
+            }
+            remove_validated_file(path)?;
+            if path == paths.identity() {
+                identity_removed = true;
+            }
+            Ok(())
+        })
+        .expect_err("direct removal fault");
+        assert!(matches!(error, PathError::Io { .. }));
+        assert!(!paths.config().exists());
+        assert!(!paths.identity().exists());
+        assert!(paths.database().exists());
+        assert!(paths.state_root().exists());
+
+        remove_managed_state_root(&paths, &lifecycle)
+            .expect("retry without intact setup or identity");
+        assert!(!paths.state_root().exists());
+    }
+
+    #[test]
+    fn managed_state_removal_rejects_unknown_type_owner_mode_and_symlink_before_unlink() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::symlink;
+
+        let (_temporary, paths) = isolated_paths();
+        paths.prepare_state_directories().expect("state dirs");
+        atomic_write(paths.identity(), paths.uid(), |file| {
+            file.write_all(b"identity")
+        })
+        .expect("identity file");
+        let unexpected = paths.state_root().join("user-notes");
+        atomic_write(&unexpected, paths.uid(), |file| file.write_all(b"keep me"))
+            .expect("unexpected regular file");
+        let lifecycle = FileLock::try_acquire(paths.lifecycle_lock(), paths.uid())
+            .expect("lifecycle lock probe")
+            .expect("lifecycle lock");
+        assert!(matches!(
+            remove_managed_state_root(&paths, &lifecycle),
+            Err(PathError::UnexpectedManagedEntry(path)) if path == unexpected
+        ));
+        assert!(
+            paths.identity().exists(),
+            "validation precedes every unlink"
+        );
+        assert!(unexpected.exists());
+        drop(lifecycle);
+
+        fs::remove_file(&unexpected).expect("remove unexpected fixture");
+        let outside = paths.home().join("outside.log");
+        fs::write(&outside, b"outside").expect("outside target");
+        symlink(&outside, paths.daemon_log()).expect("unsafe log symlink");
+        let lifecycle = FileLock::try_acquire(paths.lifecycle_lock(), paths.uid())
+            .expect("lifecycle lock probe")
+            .expect("lifecycle lock");
+        assert!(matches!(
+            remove_managed_state_root(&paths, &lifecycle),
+            Err(PathError::Symlink(path)) if path == paths.daemon_log()
+        ));
+        assert_eq!(fs::read(&outside).expect("outside bytes"), b"outside");
+        assert!(paths.identity().exists(), "unsafe tree remains untouched");
+        drop(lifecycle);
+
+        let (_temporary, paths) = isolated_paths();
+        paths.prepare_state_directories().expect("state dirs");
+        atomic_write(paths.identity(), paths.uid(), |file| {
+            file.write_all(b"identity")
+        })
+        .expect("identity file");
+        fs::create_dir(paths.config()).expect("wrong-type managed entry");
+        fs::set_permissions(paths.config(), fs::Permissions::from_mode(0o700))
+            .expect("wrong-type directory mode");
+        let lifecycle = FileLock::try_acquire(paths.lifecycle_lock(), paths.uid())
+            .expect("lifecycle lock probe")
+            .expect("lifecycle lock");
+        assert!(matches!(
+            remove_managed_state_root(&paths, &lifecycle),
+            Err(PathError::WrongType(path)) if path == paths.config()
+        ));
+        assert!(paths.identity().exists());
+        drop(lifecycle);
+
+        let (_temporary, paths) = isolated_paths();
+        paths.prepare_state_directories().expect("state dirs");
+        atomic_write(paths.identity(), paths.uid(), |file| {
+            file.write_all(b"identity")
+        })
+        .expect("identity file");
+        atomic_write(paths.config(), paths.uid(), |file| {
+            file.write_all(b"config")
+        })
+        .expect("config file");
+        fs::set_permissions(paths.config(), fs::Permissions::from_mode(0o644))
+            .expect("unsafe config mode");
+        let lifecycle = FileLock::try_acquire(paths.lifecycle_lock(), paths.uid())
+            .expect("lifecycle lock probe")
+            .expect("lifecycle lock");
+        assert!(matches!(
+            remove_managed_state_root(&paths, &lifecycle),
+            Err(PathError::WrongMode { path, .. }) if path == paths.config()
+        ));
+        assert!(paths.identity().exists());
+        drop(lifecycle);
+
+        let (_temporary, paths) = isolated_paths();
+        paths.prepare_state_directories().expect("state dirs");
+        atomic_write(paths.identity(), paths.uid(), |file| {
+            file.write_all(b"identity")
+        })
+        .expect("identity file");
+        let lifecycle = FileLock::try_acquire(paths.lifecycle_lock(), paths.uid())
+            .expect("lifecycle lock probe")
+            .expect("lifecycle lock");
+        let other_uid = paths.uid().checked_add(1).unwrap_or(paths.uid() - 1);
+        let wrong_owner = UserPaths::for_test(
+            other_uid,
+            paths.home().to_path_buf(),
+            paths.state_root().to_path_buf(),
+            paths.runtime_dir().to_path_buf(),
+        );
+        assert!(matches!(
+            remove_managed_state_root(&wrong_owner, &lifecycle),
+            Err(PathError::WrongOwner { path, .. }) if path == paths.state_root()
+        ));
+        assert!(paths.identity().exists());
     }
 
     #[cfg(unix)]

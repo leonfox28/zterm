@@ -11,8 +11,17 @@ use crate::Revision;
 
 const PRIMARY_DEVICE_ATTRIBUTES_REPLY: &[u8] = b"\x1b[?1;2c";
 const DEVICE_STATUS_OK_REPLY: &[u8] = b"\x1b[0n";
-const MAIN_SCREEN: &[u8] = b"\x1b[?1049l";
-const ALTERNATE_SCREEN: &[u8] = b"\x1b[?1049h";
+/// Exact selector prefixed to daemon-authored ANSI for the main screen.
+///
+/// A renderer which already owns its outer alternate screen may consume this
+/// prefix as zterm metadata instead of forwarding it to the physical terminal.
+pub const MAIN_SCREEN_SELECTION_ANSI: &[u8] = b"\x1b[?1049l";
+
+/// Exact selector prefixed to daemon-authored ANSI for the alternate screen.
+///
+/// This is paired with [`MAIN_SCREEN_SELECTION_ANSI`] and is not a general
+/// terminal-parser surface.
+pub const ALTERNATE_SCREEN_SELECTION_ANSI: &[u8] = b"\x1b[?1049h";
 const FOCUS_REPORTING_ON: &[u8] = b"\x1b[?1004h";
 const FOCUS_REPORTING_OFF: &[u8] = b"\x1b[?1004l";
 
@@ -81,7 +90,7 @@ pub struct TerminalStyle {
 }
 
 /// Semantic content of one visible terminal cell.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq)]
 pub struct TerminalCell {
     /// Text held by the cell, including any combining characters.
     pub contents: String,
@@ -91,6 +100,19 @@ pub struct TerminalCell {
     pub wide_continuation: bool,
     /// Drawing attributes for the cell.
     pub style: TerminalStyle,
+}
+
+impl fmt::Debug for TerminalCell {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalCell")
+            .field("contents", &"[REDACTED]")
+            .field("contents_len", &self.contents.len())
+            .field("wide", &self.wide)
+            .field("wide_continuation", &self.wide_continuation)
+            .field("style", &self.style)
+            .finish()
+    }
 }
 
 /// Semantic cursor state.
@@ -152,7 +174,7 @@ pub struct TerminalModes {
 }
 
 /// Zterm-owned semantic projection used to compare terminal states.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct TerminalState {
     /// Viewport size.
     pub size: TerminalSize,
@@ -164,6 +186,19 @@ pub struct TerminalState {
     pub modes: TerminalModes,
     /// Visible cells in row-major order.
     pub cells: Vec<TerminalCell>,
+}
+
+impl fmt::Debug for TerminalState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalState")
+            .field("size", &self.size)
+            .field("active_screen", &self.active_screen)
+            .field("cursor", &self.cursor)
+            .field("modes", &self.modes)
+            .field("cell_count", &self.cells.len())
+            .finish()
+    }
 }
 
 /// A side effect which zterm deliberately refuses to execute.
@@ -191,7 +226,7 @@ pub enum UnsupportedSequenceKind {
 }
 
 /// A bounded, non-rendering event produced while ingesting terminal output.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum TerminalSideEvent {
     /// An audible bell was requested.
     AudibleBell,
@@ -224,8 +259,48 @@ pub enum TerminalSideEvent {
     },
 }
 
+impl fmt::Debug for TerminalSideEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AudibleBell => formatter.write_str("AudibleBell"),
+            Self::VisualBell => formatter.write_str("VisualBell"),
+            Self::ResizeRequested(size) => formatter
+                .debug_tuple("ResizeRequested")
+                .field(size)
+                .finish(),
+            Self::TitleChanged { title, truncated } => formatter
+                .debug_struct("TitleChanged")
+                .field("title", &"[REDACTED]")
+                .field("title_len", &title.len())
+                .field("truncated", truncated)
+                .finish(),
+            Self::IconNameChanged {
+                icon_name,
+                truncated,
+            } => formatter
+                .debug_struct("IconNameChanged")
+                .field("icon_name", &"[REDACTED]")
+                .field("icon_name_len", &icon_name.len())
+                .field("truncated", truncated)
+                .finish(),
+            Self::EffectRejected(effect) => formatter
+                .debug_tuple("EffectRejected")
+                .field(effect)
+                .finish(),
+            Self::UnsupportedSequence(kind) => formatter
+                .debug_tuple("UnsupportedSequence")
+                .field(kind)
+                .finish(),
+            Self::EventsDropped { count } => formatter
+                .debug_struct("EventsDropped")
+                .field("count", count)
+                .finish(),
+        }
+    }
+}
+
 /// Output produced by one ordered ingest or resize operation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct TerminalUpdate {
     /// Model revision after the operation.
     pub revision: Revision,
@@ -233,6 +308,18 @@ pub struct TerminalUpdate {
     pub replies: Vec<u8>,
     /// Bounded non-rendering side events.
     pub events: Vec<TerminalSideEvent>,
+}
+
+impl fmt::Debug for TerminalUpdate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalUpdate")
+            .field("revision", &self.revision)
+            .field("replies", &"[REDACTED]")
+            .field("reply_len", &self.replies.len())
+            .field("events", &self.events)
+            .finish()
+    }
 }
 
 /// Structural projection of fixed cell slots reserved by a terminal model.
@@ -254,7 +341,7 @@ pub struct TerminalResourceProjection {
 }
 
 /// Full reconnect state at a specific revision.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct TerminalSnapshot {
     /// Revision represented by the snapshot.
     pub revision: Revision,
@@ -273,6 +360,22 @@ pub struct TerminalSnapshot {
     pub recent_history_ansi: Vec<u8>,
     /// Input modes represented by the snapshot.
     pub modes: TerminalModes,
+}
+
+impl fmt::Debug for TerminalSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalSnapshot")
+            .field("revision", &self.revision)
+            .field("size", &self.size)
+            .field("active_screen", &self.active_screen)
+            .field("screen_ansi", &"[REDACTED]")
+            .field("screen_ansi_len", &self.screen_ansi.len())
+            .field("recent_history_ansi", &"[REDACTED]")
+            .field("recent_history_ansi_len", &self.recent_history_ansi.len())
+            .field("modes", &self.modes)
+            .finish()
+    }
 }
 
 impl TerminalSnapshot {
@@ -300,7 +403,7 @@ impl TerminalSnapshot {
 }
 
 /// A merged current-screen delta from one checkpoint to the latest revision.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct TerminalDelta {
     /// Checkpoint revision used as the baseline.
     pub from_revision: Revision,
@@ -314,6 +417,21 @@ pub struct TerminalDelta {
     pub ansi: Vec<u8>,
     /// Input modes represented after applying the delta.
     pub modes: TerminalModes,
+}
+
+impl fmt::Debug for TerminalDelta {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalDelta")
+            .field("from_revision", &self.from_revision)
+            .field("to_revision", &self.to_revision)
+            .field("size", &self.size)
+            .field("active_screen", &self.active_screen)
+            .field("ansi", &"[REDACTED]")
+            .field("ansi_len", &self.ansi.len())
+            .field("modes", &self.modes)
+            .finish()
+    }
 }
 
 impl TerminalDelta {
@@ -356,6 +474,13 @@ impl fmt::Debug for TerminalCheckpoint {
 }
 
 impl TerminalCheckpoint {
+    /// Returns the exact authoritative revision represented by this baseline.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn revision(&self) -> Revision {
+        self.revision
+    }
+
     /// Returns the fixed visible-cell capacity retained by this checkpoint.
     ///
     /// A checkpoint keeps only main and alternate visible grids. Host
@@ -860,9 +985,9 @@ fn visible_screen_ansi(
     focus_reporting: bool,
 ) -> Vec<u8> {
     let mut ansi = Vec::new();
-    ansi.extend_from_slice(MAIN_SCREEN);
+    ansi.extend_from_slice(MAIN_SCREEN_SELECTION_ANSI);
     if active_screen == ActiveScreen::Alternate {
-        ansi.extend_from_slice(ALTERNATE_SCREEN);
+        ansi.extend_from_slice(ALTERNATE_SCREEN_SELECTION_ANSI);
     }
     ansi.extend_from_slice(&screen.state_formatted());
     ansi.extend_from_slice(focus_reporting_ansi(focus_reporting));
@@ -922,8 +1047,8 @@ fn single_param(params: &[&[u16]], expected: u16) -> bool {
 
 const fn screen_selection_ansi(active_screen: ActiveScreen) -> &'static [u8] {
     match active_screen {
-        ActiveScreen::Main => MAIN_SCREEN,
-        ActiveScreen::Alternate => ALTERNATE_SCREEN,
+        ActiveScreen::Main => MAIN_SCREEN_SELECTION_ANSI,
+        ActiveScreen::Alternate => ALTERNATE_SCREEN_SELECTION_ANSI,
     }
 }
 
@@ -1066,5 +1191,98 @@ mod tests {
         assert!(!snapshot.limit_ansi_payload(screen.len() - 1));
         assert_eq!(snapshot.screen_ansi, screen);
         assert!(snapshot.recent_history_ansi.is_empty());
+    }
+
+    #[test]
+    fn terminal_debug_redacts_content_and_retains_structural_metadata() {
+        const CELL_SENTINEL: &str = "TERM_CELL_SENTINEL_7f0d";
+        const TITLE_SENTINEL: &str = "TERM_TITLE_SENTINEL_154c";
+        const ICON_SENTINEL: &str = "TERM_ICON_SENTINEL_861a";
+        const REPLY_SENTINEL: &[u8] = b"TERM_REPLY_SENTINEL_23d9";
+        const SCREEN_SENTINEL: &[u8] = b"TERM_SCREEN_SENTINEL_3ba7";
+        const HISTORY_SENTINEL: &[u8] = b"TERM_HISTORY_SENTINEL_9ca2";
+        const DELTA_SENTINEL: &[u8] = b"TERM_DELTA_SENTINEL_c156";
+
+        let cell = TerminalCell {
+            contents: CELL_SENTINEL.to_owned(),
+            wide: true,
+            wide_continuation: false,
+            style: TerminalStyle {
+                bold: true,
+                ..TerminalStyle::default()
+            },
+        };
+        let state = TerminalState {
+            size: TerminalSize::new(41, 137),
+            active_screen: ActiveScreen::Alternate,
+            cursor: TerminalCursor {
+                row: 3,
+                column: 5,
+                visible: true,
+                style: TerminalStyle::default(),
+            },
+            modes: TerminalModes::default(),
+            cells: vec![cell.clone()],
+        };
+        let update = TerminalUpdate {
+            revision: Revision::new(43),
+            replies: REPLY_SENTINEL.to_vec(),
+            events: vec![
+                TerminalSideEvent::TitleChanged {
+                    title: TITLE_SENTINEL.to_owned(),
+                    truncated: false,
+                },
+                TerminalSideEvent::IconNameChanged {
+                    icon_name: ICON_SENTINEL.to_owned(),
+                    truncated: true,
+                },
+            ],
+        };
+        let snapshot = TerminalSnapshot {
+            revision: Revision::new(47),
+            size: TerminalSize::new(41, 137),
+            active_screen: ActiveScreen::Main,
+            screen_ansi: SCREEN_SENTINEL.to_vec(),
+            recent_history_ansi: HISTORY_SENTINEL.to_vec(),
+            modes: TerminalModes::default(),
+        };
+        let delta = TerminalDelta {
+            from_revision: Revision::new(47),
+            to_revision: Revision::new(53),
+            size: TerminalSize::new(41, 137),
+            active_screen: ActiveScreen::Main,
+            ansi: DELTA_SENTINEL.to_vec(),
+            modes: TerminalModes::default(),
+        };
+
+        let rendered = format!(
+            "{cell:?} {state:?} {update:?} {snapshot:?} {delta:?} {:?} {:?}",
+            TerminalDeltaResult::Delta(delta.clone()),
+            TerminalDeltaResult::Resync(snapshot.clone()),
+        );
+        for text in [CELL_SENTINEL, TITLE_SENTINEL, ICON_SENTINEL] {
+            assert!(!rendered.contains(text));
+        }
+        for bytes in [
+            REPLY_SENTINEL,
+            SCREEN_SENTINEL,
+            HISTORY_SENTINEL,
+            DELTA_SENTINEL,
+        ] {
+            assert!(!rendered.contains(std::str::from_utf8(bytes).expect("ASCII sentinel")));
+            assert!(!rendered.contains(&format!("{bytes:?}")));
+        }
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(rendered.contains("cell_count: 1"));
+        assert!(rendered.contains("rows: 41"));
+        assert!(rendered.contains("columns: 137"));
+        assert!(rendered.contains(&format!("reply_len: {}", REPLY_SENTINEL.len())));
+        assert!(rendered.contains(&format!("ansi_len: {}", DELTA_SENTINEL.len())));
+
+        assert_eq!(cell, cell.clone());
+        assert_eq!(state, state.clone());
+        assert_eq!(update, update.clone());
+        assert_eq!(snapshot, snapshot.clone());
+        assert_eq!(delta, delta.clone());
     }
 }

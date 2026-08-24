@@ -329,9 +329,19 @@ Session adapter 与 M8 public CLI 仍保持未完成，未在本次完成状态�
     cargo test -p zterm-core --test pairing_vectors
     cargo test -p zterm-daemon --test pairing_protocol
     cargo test -p zterm-daemon --test authorization
-    cargo test -p zterm-daemon --test revoke_races
+    cargo test -p zterm-daemon --test local_device_ipc
+    cargo test -p zterm-daemon --lib \
+      session_wire::tests::real_revoke_writer_orders_remote_effect_matrix_and_preserves_sessions
 
 ### M7. 远程 Session 协议与断线恢复
+
+状态：**代码与本机安全证据已完成，hosted Linux runtime 待完成**。共享
+`SessionWireServer`、daemon-owned remote unary/attachment bridge、generation commit gate、exact
+replay、reconnect/snapshot/input-drop、no-HOL 与 local/remote 双向 takeover 已由 pure、Unix 与真实 PTY
+门禁直接覆盖。Linux-only real-Iroh target 已在 macOS 仅编译/列出；尚无 Linux 实际执行与 run URL，
+且没有 public CLI OS 多进程证据，因此本里程碑不标记为最终完成。该 hermetic target 使用
+`RelayMode::Disabled`、IPv4 loopback 与 task-only direct route，不是 official-n0 Relay、公网、
+self-hosted Relay 或 M10 discovery/path 证据。
 
 工作内容：
 
@@ -363,13 +373,19 @@ Session adapter 与 M8 public CLI 仍保持未完成，未在本次完成状态�
 
 ### M8. CLI 产品面
 
+状态：**公开命令与 Unix raw-terminal 实现/本机门禁已完成，hosted 平台与远端多进程验收待完成**。
+当前 clap help、side-effect/autospawn、no-echo ticket、方向化 device、bare/local-main、confirmation、
+identity reset、raw-mode/renderer、SIGWINCH、signal/unwind 恢复与 prefix 均有直接测试。Windows runtime
+仍不支持，hosted Windows shared compile 结果尚待记录；Linux public CLI 多进程与真实 run URL 同样
+待 Step 9 hosted gate，不能用 macOS compile-only 替代。
+
 工作内容：
 
 - 实现 setup、pair create/accept、device list/rename/revoke、connect、session list/new/attach/rename/close、status、doctor、logs、daemon status/stop/restart 与 `reset --identity`；`connect/session` 的 device selector 接受保留值 `local`。
 - `pair accept` 默认从不回显的交互式 TTY prompt 读取 ticket，自动化显式使用 stdin；不提供 ticket 作为位置参数，不让它进入 argv、shell history、日志或错误文本。
 - connect 默认 attach main；每个交互 CLI 进程只显示一个 session，切换通过退出当前 attach 后执行另一个命令完成。
 - `zterm connect local` 与 `zterm session ... local` 只经 local IPC；`local` 不能注册为设备 alias。setup 后裸 `zterm` 等价于 `zterm connect local --session main`；未 setup 时只提示 `zterm setup`，不静默创建身份；`zterm --help` 保持帮助入口。
-- attachment 开始时即在 RAII guard 下进入 raw mode；同步期 drain/丢弃普通按键但仍处理本地 Ctrl+] 前缀，发送 `SnapshotApplied` 后才转发按键与最新 resize。前缀提供 detach、帮助、takeover 和必要控制动作。
+- attachment 开始时即在 RAII guard 下进入 raw mode；同步期 drain/丢弃普通按键但仍处理本地 Ctrl+] 前缀，发送 `SnapshotApplied` 后才转发按键与最新 resize。`Ctrl+] .` 只 detach，`Ctrl+] Ctrl+]` 发送一个原始前缀；takeover 只由显式 `--takeover` 请求，不存在 prefix help/takeover 菜单。
 - 使用 RAII/signal handling 保证正常退出、错误、Ctrl-C 和终止信号都恢复本地 TTY。
 - 所有本地 CLI 经 IPC 复用 daemon 持有的 remote connection，不自行创建 Endpoint 或读取 key。
 - 人类输出保持简洁，status/doctor 提供稳定 JSON 供诊断；错误区分本地 daemon、寻址、授权、relay、协议与 session 状态。

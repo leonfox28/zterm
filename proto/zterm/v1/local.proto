@@ -68,3 +68,19 @@ message LocalUpdatePreflightResponse {
   repeated string active_session_names = 2;
   bool interruption_required = 3;
 }
+
+// Same-UID-only resolution boundary. The daemon returns a frozen canonical
+// target; callers never place an alias in a Session request.
+message LocalTargetResolveRequest { string selector = 1; }
+message LocalTargetResolveResponse { TargetSelector target = 1; }
+
+// Same-UID-only envelope for one already encoded Session unary frame. The
+// complete envelope remains subject to the ordinary 1 MiB control-payload
+// ceiling; it is not a generic 8 MiB byte tunnel. The daemon validates one
+// allowed Session control frame, forwards `frame` byte-for-byte, and returns
+// the remote Session reply directly, preserving the inner request ID, kind,
+// payload and unknown fields.
+message LocalSessionUnaryRequest {
+  DeviceId target_device_id = 1;
+  bytes frame = 2;
+}

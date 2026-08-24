@@ -1,37 +1,58 @@
 # zterm
 
-zterm is a new cross-platform remote-terminal project. The intended product
-will prefer direct NAT-traversed connections and fall back to an end-to-end
-encrypted Iroh relay path, while keeping remote terminal sessions alive across
-client disconnects.
+zterm is a cross-platform remote-terminal project built around daemon-lifetime
+terminal Sessions and end-to-end encrypted Iroh connections. The current tree
+contains the shared terminal/domain model, versioned protobuf contract, secure
+per-user state, one same-UID daemon, pairing and directional authorization, a
+daemon-owned connection broker, local and remote Session adapters, and the
+public raw-terminal CLI.
 
-Phase Zero and the Phase One Foundation/Core/Local-Daemon/Persistent-Session
-milestones are complete. The repository now contains the shared terminal/domain
-model, versioned protobuf contract, secure per-user state, one same-UID local
-daemon, daemon-lifetime multi-session registry, and a real local attachment
-adapter. The final raw-terminal CLI is not connected yet, and there is still no
-remote pairing or bound Iroh endpoint, so M4's session interfaces are currently
-service/test-facing rather than public commands.
+This is still a development build. The Linux real-Iroh remote Session target
+exists but its hosted runtime result and public multi-process CLI evidence are
+pending; macOS development runs compile that target without executing it.
+Windows is not a terminal runtime in this milestone.
 
 Current public commands are:
 
 ```text
-zterm setup --name <name> --profile official-n0
+zterm setup [--name <name>] [--profile <official-n0|self-hosted>]
+            [--relay-url <https-url>]
 zterm status [--json]
 zterm doctor [--json]
+zterm pair create [--ttl <duration-with-s|m|h-suffix>]
+zterm pair accept [--stdin] [--name <alias>]
+zterm device list [--json]
+zterm device rename <device> <alias>
+zterm device revoke <device> [--yes]
+zterm connect <device|local> [--session <name-or-id>] [--takeover]
+              [--escape <ctrl-@..ctrl-_|ctrl-?|none>]
+zterm session list <device|local> [--json]
+zterm session new <device|local> <name> [--cwd <host-path>]
+                   [--escape <ctrl-@..ctrl-_|ctrl-?|none>]
+zterm session attach <device|local> <session> [--takeover]
+                      [--escape <ctrl-@..ctrl-_|ctrl-?|none>]
+zterm session rename <device|local> <session> <new-name>
+zterm session close <device|local> <session> [--yes]
 zterm daemon status [--json]
 zterm daemon stop [--force]
 zterm daemon restart [--force]
 zterm logs [--lines <n>]
+zterm reset --identity [--yes] [--force]
 ```
 
-Only `setup` and `daemon restart` may start the daemon. Inspection and stop
-commands never start it. See [Core and local daemon](docs/core-local-daemon.md)
-for exact behavior and current limits.
+`setup` and `daemon restart` explicitly start the daemon. Pair, device,
+connect, and Session commands start it on demand only after validating an
+existing setup. Inspection, logs, stop, help/version, and parse failures never
+start it. With setup complete, bare `zterm` is equivalent to
+`zterm connect local --session main`; before setup it only prints setup
+guidance.
 
-The [persistent session engine](docs/persistent-sessions.md) documents `main`,
-detach/reconnect, takeover, synchronization, and resource boundaries that the
-later local/remote user interfaces will consume.
+See [Remote sessions and the public CLI](docs/remote-cli.md) for the exact
+command, target, pairing, reconnect, takeover, raw-terminal, ambiguity, and
+identity-reset contracts. [Persistent session engine](docs/persistent-sessions.md)
+documents the daemon-lifetime PTY and resource boundaries, while
+[Core and local daemon](docs/core-local-daemon.md) documents local state and
+lifecycle ownership.
 
 ## Version policy
 
@@ -62,6 +83,7 @@ their own non-product version.
 - `docs/phase-zero-verification.md` — evidence from the completed local gate.
 - `docs/core-local-daemon.md` — current M2–M3 behavior, state, CLI, and exclusions.
 - `docs/persistent-sessions.md` — M4 daemon-lifetime session and local attachment contracts.
+- `docs/remote-cli.md` — M7–M8 public commands, directional trust, remote attachment, and evidence boundaries.
 
 ## Local checks
 
@@ -82,6 +104,6 @@ sh tests/relay/smoke.sh
 sh tests/secret-scan.sh
 ```
 
-The local daemon/readiness path deliberately does not bind Iroh or require DNS,
-Relay, or Internet access. Never place SSH private keys, identity keys, or real
-deployment credentials in this repository.
+Local readiness and status do not initiate or wait on Iroh, DNS, Relay, or
+Internet work; a running daemon owns its Endpoint separately. Never place SSH
+private keys, identity keys, or real deployment credentials in this repository.

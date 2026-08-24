@@ -1,6 +1,7 @@
 //! Bundled SQLite schema, validated row projections, and the single-owner
 //! bounded store actor.
 
+use std::fmt;
 use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -65,12 +66,22 @@ pub struct DeviceAuthorization {
 }
 
 /// Validated relay-only route cache for one known device.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct RelayRouteCache {
     /// Ordered relay hint URLs retained for future dials.
     pub relay_hints: Vec<RelayHint>,
     /// Unix timestamp when this route was verified by a handshake.
     pub verified_at_unix: i64,
+}
+
+impl fmt::Debug for RelayRouteCache {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RelayRouteCache")
+            .field("relay_hint_count", &self.relay_hints.len())
+            .field("verified_at_unix", &self.verified_at_unix)
+            .finish()
+    }
 }
 
 /// Non-fatal reason a persisted route cache was ignored.
@@ -88,7 +99,7 @@ pub enum RouteCacheDiagnostic {
 }
 
 /// Validated projection of one outbound known-device row.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct KnownDevice {
     /// Remote device public identity.
     pub device_id: DeviceId,
@@ -100,6 +111,19 @@ pub struct KnownDevice {
     pub route_cache: Option<RelayRouteCache>,
     /// Non-fatal reason the persisted cache was ignored.
     pub route_cache_diagnostic: Option<RouteCacheDiagnostic>,
+}
+
+impl fmt::Debug for KnownDevice {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("KnownDevice")
+            .field("device_id", &self.device_id)
+            .field("local_alias", &self.local_alias)
+            .field("remote_name", &self.remote_name)
+            .field("route_cache", &self.route_cache)
+            .field("route_cache_diagnostic", &self.route_cache_diagnostic)
+            .finish()
+    }
 }
 
 /// Synchronous SQLite owner used during bootstrap and moved into `StoreActor`.
@@ -1854,5 +1878,29 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM device_auth", [], |row| row.get(0))
             .expect("row count");
         assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn persisted_route_debug_redacts_urls_and_retains_cache_metadata() {
+        let relay_sentinel = "https://STORE_ROUTE_SENTINEL_854d.example.test/private";
+        let route_cache = RelayRouteCache {
+            relay_hints: vec![RelayHint::new(relay_sentinel).expect("valid Relay hint")],
+            verified_at_unix: 1_700_000_123,
+        };
+        let known = KnownDevice {
+            device_id: DeviceId::from_array([0x4d; DeviceId::LENGTH]),
+            local_alias: DeviceAlias::new("store-debug-peer").expect("valid alias"),
+            remote_name: DeviceDisplayName::new("Store Debug Peer").expect("valid display name"),
+            route_cache: Some(route_cache.clone()),
+            route_cache_diagnostic: None,
+        };
+
+        let rendered = format!("{route_cache:?} {known:?}");
+        assert!(!rendered.contains(relay_sentinel));
+        assert!(rendered.contains("relay_hint_count: 1"));
+        assert!(rendered.contains("verified_at_unix: 1700000123"));
+        assert!(rendered.contains("store-debug-peer"));
+        assert_eq!(route_cache.relay_hints[0].as_str(), relay_sentinel);
+        assert_eq!(known.route_cache, Some(route_cache));
     }
 }

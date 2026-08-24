@@ -1,9 +1,12 @@
 //! Bounded same-UID unary and terminal IPC over Unix-domain sockets.
 
 #[cfg(unix)]
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::Mutex as StdMutex;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(unix)]
@@ -16,7 +19,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 #[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(unix)]
-use tokio::sync::{Mutex as AsyncMutex, Semaphore, mpsc, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, Semaphore, mpsc};
 #[cfg(unix)]
 use tokio::task::JoinSet;
 #[cfg(unix)]
@@ -31,18 +34,23 @@ use zterm_core::{DeviceAlias, DeviceId, DeviceSummary, DomainErrorKind, SessionI
 use zterm_proto::{DecodedFrame, FrameDecoder, WireKind, encode_message, v1};
 
 use crate::config::ValidatedConfig;
+use crate::device_directory::ResolvedSessionTarget;
 use crate::error::DaemonError;
 #[cfg(unix)]
 use crate::network::{AddressServiceState, NetworkDiagnostic, NetworkObservation, NetworkState};
 #[cfg(unix)]
 use crate::pairing::PairTicketText;
+#[cfg(unix)]
+use crate::remote_session::{
+    SessionUnaryResponseStatus, session_summary_from_wire, validate_session_unary_response,
+};
 use crate::service::{
     DaemonReadiness, DaemonService, DaemonStatus, SessionImpact, ValidatedSetupStatus,
 };
 #[cfg(unix)]
 use crate::service::{ProtocolStatus, ServiceReply, protocol_error};
 #[cfg(unix)]
-use crate::session::{AttachmentLifecycle, AttachmentUpdate, SessionAttachment};
+use crate::session_wire::{SessionWireLimits, SessionWireServer, finish_unary, read_first};
 
 #[cfg(unix)]
 const DEFAULT_DEADLINE: Duration = Duration::from_secs(5);
@@ -51,8 +59,8 @@ const PAIRING_DEADLINE: Duration = Duration::from_secs(15);
 #[cfg(unix)]
 const DRAIN_GRACE: Duration = Duration::from_secs(30);
 #[cfg(unix)]
-const ATTACHMENT_OUTBOUND_CAPACITY: usize = 8;
-
+const MAX_MUTATION_TARGETS_PER_CLIENT: usize = 64;
+#[cfg(unix)]
 /// Fixed production limits with a reduced test constructor for deadline evidence.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
@@ -146,6 +154,14 @@ impl LocalIpcLimits {
             Duration::from_millis(u64::from(requested_ms)).min(self.maximum_request_deadline)
         }
     }
+
+    fn session_wire_limits(self) -> SessionWireLimits {
+        SessionWireLimits::new(
+            self.default_request_deadline,
+            self.maximum_request_deadline,
+            DEFAULT_DEADLINE,
+        )
+    }
 }
 
 /// Runs one local listener until a flushed stop response requests shutdown.
@@ -167,6 +183,25 @@ pub async fn serve_local_with_limits(
     service: Arc<DaemonService>,
     limits: LocalIpcLimits,
 ) -> Result<(), DaemonError> {
+    serve_local_inner(
+        listener,
+        expected_uid,
+        service,
+        limits,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+#[cfg(unix)]
+async fn serve_local_inner(
+    listener: std::os::unix::net::UnixListener,
+    expected_uid: u32,
+    service: Arc<DaemonService>,
+    limits: LocalIpcLimits,
+    #[cfg(test)] handler_reaped_for_test: Option<mpsc::UnboundedSender<usize>>,
+) -> Result<(), DaemonError> {
     listener
         .set_nonblocking(true)
         .map_err(|error| daemon_io("configure local listener", error))?;
@@ -186,6 +221,13 @@ pub async fn serve_local_with_limits(
             stop = stop_receiver.recv() => {
                 if stop.is_some() {
                     break;
+                }
+            }
+            joined = handlers.join_next(), if !handlers.is_empty() => {
+                observe_local_handler_completion(joined);
+                #[cfg(test)]
+                if let Some(observer) = &handler_reaped_for_test {
+                    let _ = observer.send(handlers.len());
                 }
             }
             accepted = async {
@@ -218,7 +260,10 @@ pub async fn serve_local_with_limits(
                         if recoverable_accept_error(&error) {
                             // Per-connection accept failures do not transfer or
                             // invalidate daemon/session ownership.
-                            tracing::warn!(%error, "local listener accept failed; retrying");
+                            tracing::warn!(
+                                error_kind = ?error.kind(),
+                                "local listener accept failed; retrying"
+                            );
                             tokio::time::sleep(Duration::from_millis(10)).await;
                             continue;
                         }
@@ -246,12 +291,31 @@ pub async fn serve_local_with_limits(
         handlers.abort_all();
         while handlers.join_next().await.is_some() {}
     } else {
-        let drain = async { while handlers.join_next().await.is_some() {} };
+        let drain = async {
+            while let Some(joined) = handlers.join_next().await {
+                observe_local_handler_completion(Some(joined));
+            }
+        };
         if tokio::time::timeout(DRAIN_GRACE, drain).await.is_err() {
             handlers.abort_all();
         }
     }
     fatal_error.map_or(Ok(()), Err)
+}
+
+#[cfg(unix)]
+fn observe_local_handler_completion(joined: Option<Result<(), tokio::task::JoinError>>) {
+    match joined {
+        Some(Ok(())) => {}
+        Some(Err(error)) => tracing::warn!(
+            cancelled = error.is_cancelled(),
+            panicked = error.is_panic(),
+            "local connection handler task ended unexpectedly"
+        ),
+        None => {
+            tracing::warn!("local connection handler ownership ended without a join result");
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -311,10 +375,49 @@ async fn handle_connection(
     if first.frame.kind == WireKind::TerminalAttachRequest {
         let deadline = limits.request_deadline(first.frame.deadline_ms);
         let absolute_deadline = started + deadline;
-        if let Err(error) =
-            handle_attachment(stream, service, first, limits, absolute_deadline).await
-        {
-            tracing::debug!(error = %error, "local terminal attachment closed");
+        let target = match terminal_attach_target(&first.frame) {
+            Ok(target) => target,
+            Err(error) => {
+                let _ = write_error(&mut stream, first.frame.request_id, &error).await;
+                return;
+            }
+        };
+        let local_view_id = local_view_id();
+        let result = if let Some(target) = target {
+            match service.remote_sessions() {
+                Some(remote) => {
+                    remote
+                        .bridge_attachment(
+                            target,
+                            local_view_id,
+                            stream,
+                            first,
+                            limits.session_wire_limits(),
+                            absolute_deadline,
+                        )
+                        .await
+                }
+                None => Err(DaemonError::new(
+                    DomainErrorKind::TransportUnavailable,
+                    "remote Session transport is not composed into this daemon",
+                )),
+            }
+        } else {
+            SessionWireServer::new(service.sessions().clone())
+                .handle_local_attachment(
+                    stream,
+                    first,
+                    local_view_id,
+                    limits.session_wire_limits(),
+                    absolute_deadline,
+                )
+                .await
+        };
+        if let Err(error) = result {
+            tracing::debug!(
+                error_kind = error.kind().code(),
+                "local terminal attachment closed"
+            );
         }
         return;
     }
@@ -339,19 +442,27 @@ async fn handle_connection(
         }
     };
     let remaining = deadline.saturating_sub(started.elapsed());
-    let reply =
-        match tokio::time::timeout(remaining, service.dispatch_until(frame, absolute_deadline))
-            .await
-        {
-            Ok(reply) => reply,
-            Err(_) => ServiceReply::error(
-                request_id,
-                &DaemonError::new(
-                    DomainErrorKind::DeadlineExceeded,
-                    "local request exceeded its deadline",
-                ),
+    let session_wire = SessionWireServer::new(service.sessions().clone());
+    let reply = match tokio::time::timeout(remaining, async {
+        if SessionWireServer::handles_unary(frame.kind) {
+            session_wire
+                .dispatch_local_unary_until(frame, absolute_deadline)
+                .await
+        } else {
+            service.dispatch_until(frame, absolute_deadline).await
+        }
+    })
+    .await
+    {
+        Ok(reply) => reply,
+        Err(_) => ServiceReply::error(
+            request_id,
+            &DaemonError::new(
+                DomainErrorKind::DeadlineExceeded,
+                "local request exceeded its deadline",
             ),
-        };
+        ),
+    };
     if stream.write_all(&reply.bytes).await.is_err() {
         return;
     }
@@ -364,752 +475,6 @@ async fn handle_connection(
 }
 
 #[cfg(unix)]
-struct FirstFrame {
-    frame: DecodedFrame,
-    decoder: FrameDecoder,
-    queued: VecDeque<DecodedFrame>,
-}
-
-#[cfg(unix)]
-struct AttachmentOutbound {
-    bytes: Zeroizing<Vec<u8>>,
-    flushed: Option<oneshot::Sender<()>>,
-}
-
-#[cfg(unix)]
-impl AttachmentOutbound {
-    fn queued(bytes: Vec<u8>) -> Self {
-        Self {
-            bytes: Zeroizing::new(bytes),
-            flushed: None,
-        }
-    }
-}
-
-#[cfg(unix)]
-async fn read_first(stream: &mut tokio::net::UnixStream) -> Result<FirstFrame, DaemonError> {
-    let mut decoder = FrameDecoder::new();
-    let mut buffer = Zeroizing::new([0_u8; 16 * 1024]);
-    loop {
-        let read = stream
-            .read(&mut *buffer)
-            .await
-            .map_err(|error| daemon_io("read local request", error))?;
-        if read == 0 {
-            decoder.finish().map_err(protocol_error)?;
-            return Err(DaemonError::new(
-                DomainErrorKind::Cancelled,
-                "local client closed before sending a request",
-            ));
-        }
-        let mut frames = VecDeque::from(decoder.feed(&buffer[..read]).map_err(protocol_error)?);
-        if let Some(frame) = frames.pop_front() {
-            return Ok(FirstFrame {
-                frame,
-                decoder,
-                queued: frames,
-            });
-        }
-    }
-}
-
-#[cfg(unix)]
-async fn finish_unary(
-    stream: &mut tokio::net::UnixStream,
-    mut first: FirstFrame,
-) -> Result<DecodedFrame, DaemonError> {
-    if !first.queued.is_empty() {
-        return Err(malformed(
-            "one unary connection may contain only one request",
-        ));
-    }
-    let mut buffer = Zeroizing::new([0_u8; 16 * 1024]);
-    loop {
-        let read = stream
-            .read(&mut *buffer)
-            .await
-            .map_err(|error| daemon_io("finish local unary request", error))?;
-        if read == 0 {
-            first.decoder.finish().map_err(protocol_error)?;
-            return Ok(first.frame);
-        }
-        if !first
-            .decoder
-            .feed(&buffer[..read])
-            .map_err(protocol_error)?
-            .is_empty()
-        {
-            return Err(malformed(
-                "one unary connection may contain only one request",
-            ));
-        }
-    }
-}
-
-#[cfg(unix)]
-async fn handle_attachment(
-    mut stream: tokio::net::UnixStream,
-    service: Arc<DaemonService>,
-    first: FirstFrame,
-    limits: LocalIpcLimits,
-    deadline: Instant,
-) -> Result<(), DaemonError> {
-    let view_id = local_view_id();
-    let principal = service.sessions().local_principal(view_id);
-    let prepare_service = Arc::clone(&service);
-    let prepare_frame = first.frame.clone();
-    let prepared = match run_blocking_until(deadline, move || {
-        prepare_local_attachment(&prepare_service, principal, &prepare_frame, deadline)
-    })
-    .await
-    {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            write_error(&mut stream, first.frame.request_id, &error)
-                .await
-                .map_err(|write| daemon_io("write terminal attach error", write))?;
-            return Err(error);
-        }
-    };
-    let attachment = prepared.attachment;
-    let initial = encode_snapshot(
-        first.frame.request_id,
-        attachment.session_id(),
-        attachment.attachment_id(),
-        prepared.snapshot,
-    )?;
-    stream
-        .write_all(&initial)
-        .await
-        .map_err(|error| daemon_io("write initial terminal snapshot", error))?;
-    let (reader, writer) = stream.into_split();
-    let (outbound_sender, outbound_receiver) =
-        mpsc::channel::<AttachmentOutbound>(ATTACHMENT_OUTBOUND_CAPACITY);
-    let reader_attachment = Arc::clone(&attachment);
-    let reader_service = Arc::clone(&service);
-    let mut reader_task = tokio::spawn(async move {
-        attachment_reader(
-            reader,
-            first.decoder,
-            first.queued,
-            AttachmentReaderContext {
-                service: reader_service,
-                attachment: reader_attachment,
-                principal,
-                outbound: outbound_sender,
-                limits,
-            },
-        )
-        .await
-    });
-    let writer_attachment = Arc::clone(&attachment);
-    let mut writer_task = tokio::spawn(async move {
-        attachment_writer(writer, writer_attachment, outbound_receiver).await
-    });
-
-    let result = tokio::select! {
-        result = &mut reader_task => {
-            writer_task.abort();
-            flatten_attachment_task(result)
-        }
-        result = &mut writer_task => {
-            reader_task.abort();
-            flatten_attachment_task(result)
-        }
-    };
-    attachment.detach();
-    result
-}
-
-#[cfg(unix)]
-fn prepare_local_attachment(
-    service: &DaemonService,
-    principal: zterm_core::AttachmentPrincipal,
-    frame: &DecodedFrame,
-    deadline: Instant,
-) -> Result<crate::session::PreparedAttachment, DaemonError> {
-    let request: v1::TerminalAttachRequest = frame
-        .decode_message(WireKind::TerminalAttachRequest)
-        .map_err(protocol_error)?;
-    require_local_target(request.target.clone())?;
-    let (selector, create_main) = terminal_selector(&request)?;
-    let viewport = request
-        .viewport
-        .map(TryInto::try_into)
-        .transpose()
-        .map_err(protocol_error)?;
-    service.sessions().prepare_attach_until(
-        principal,
-        selector,
-        create_main,
-        request.takeover,
-        viewport,
-        deadline,
-    )
-}
-
-#[cfg(unix)]
-fn flatten_attachment_task(
-    result: Result<Result<(), DaemonError>, tokio::task::JoinError>,
-) -> Result<(), DaemonError> {
-    result.map_err(|error| {
-        DaemonError::new(
-            DomainErrorKind::Cancelled,
-            format!("local attachment task ended unexpectedly: {error}"),
-        )
-    })?
-}
-
-#[cfg(unix)]
-async fn run_blocking_until<T, F>(deadline: Instant, operation: F) -> Result<T, DaemonError>
-where
-    T: Send + 'static,
-    F: FnOnce() -> Result<T, DaemonError> + Send + 'static,
-{
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    match tokio::time::timeout(remaining, tokio::task::spawn_blocking(operation)).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(error)) => Err(DaemonError::new(
-            DomainErrorKind::Cancelled,
-            format!("blocking local session worker ended unexpectedly: {error}"),
-        )),
-        Err(_) => Err(DaemonError::new(
-            DomainErrorKind::DeadlineExceeded,
-            "local session operation exceeded its absolute deadline",
-        )),
-    }
-}
-
-#[cfg(unix)]
-struct AttachmentReaderContext {
-    service: Arc<DaemonService>,
-    attachment: Arc<SessionAttachment>,
-    principal: zterm_core::AttachmentPrincipal,
-    outbound: mpsc::Sender<AttachmentOutbound>,
-    limits: LocalIpcLimits,
-}
-
-#[cfg(unix)]
-async fn attachment_reader(
-    mut reader: tokio::net::unix::OwnedReadHalf,
-    mut decoder: FrameDecoder,
-    mut queued: VecDeque<DecodedFrame>,
-    context: AttachmentReaderContext,
-) -> Result<(), DaemonError> {
-    let mut buffer = [0_u8; 16 * 1024];
-    loop {
-        if let Some(frame) = queued.pop_front() {
-            match process_attachment_frame(
-                frame.clone(),
-                &context.service,
-                &context.attachment,
-                context.principal,
-                &context.outbound,
-                context.limits,
-            )
-            .await
-            {
-                Ok(false) => continue,
-                Ok(true) => return Ok(()),
-                Err(error) => {
-                    flush_attachment_error(&context.outbound, frame.request_id, &error).await;
-                    return Err(error);
-                }
-            }
-        }
-
-        let read = reader
-            .read(&mut buffer)
-            .await
-            .map_err(|error| daemon_io("read local terminal stream", error))?;
-        if read == 0 {
-            if let Err(error) = decoder.finish() {
-                let error = protocol_error(error);
-                flush_attachment_error(&context.outbound, 0, &error).await;
-                return Err(error);
-            }
-            return Ok(());
-        }
-        match decoder.feed(&buffer[..read]) {
-            Ok(frames) => queued.extend(frames),
-            Err(error) => {
-                let error = protocol_error(error);
-                flush_attachment_error(&context.outbound, 0, &error).await;
-                return Err(error);
-            }
-        }
-    }
-}
-
-#[cfg(unix)]
-async fn flush_attachment_error(
-    outbound: &mpsc::Sender<AttachmentOutbound>,
-    request_id: u64,
-    error: &DaemonError,
-) {
-    let (flushed, wait_for_flush) = oneshot::channel();
-    let flush = async {
-        outbound
-            .send(AttachmentOutbound {
-                bytes: ServiceReply::error(request_id, error).bytes,
-                flushed: Some(flushed),
-            })
-            .await
-            .map_err(|_| ())?;
-        wait_for_flush.await.map_err(|_| ())
-    };
-    let _ = tokio::time::timeout(DEFAULT_DEADLINE, flush).await;
-}
-
-#[cfg(unix)]
-async fn process_attachment_frame(
-    frame: DecodedFrame,
-    service: &Arc<DaemonService>,
-    attachment: &Arc<SessionAttachment>,
-    principal: zterm_core::AttachmentPrincipal,
-    outbound: &mpsc::Sender<AttachmentOutbound>,
-    limits: LocalIpcLimits,
-) -> Result<bool, DaemonError> {
-    let deadline = Instant::now() + limits.request_deadline(frame.deadline_ms);
-    match frame.kind {
-        WireKind::TerminalSnapshotApplied => {
-            let request: v1::TerminalSnapshotApplied = frame
-                .decode_message(WireKind::TerminalSnapshotApplied)
-                .map_err(protocol_error)?;
-            require_attachment_id(request.attachment_id, attachment)?;
-            let attachment_worker = Arc::clone(attachment);
-            let revision = Revision::new(request.revision);
-            let snapshot = run_blocking_until(deadline, move || {
-                attachment_worker.snapshot_applied_until(revision, deadline)
-            })
-            .await?;
-            if let Some(snapshot) = snapshot {
-                send_resync(frame.request_id, attachment, snapshot, outbound).await?;
-            }
-            Ok(false)
-        }
-        WireKind::TerminalSyncRequest => {
-            let request: v1::TerminalSyncRequest = frame
-                .decode_message(WireKind::TerminalSyncRequest)
-                .map_err(protocol_error)?;
-            require_attachment_id(request.attachment_id, attachment)?;
-            let attachment_worker = Arc::clone(attachment);
-            let known_revision = Revision::new(request.known_revision);
-            let snapshot = run_blocking_until(deadline, move || {
-                attachment_worker.sync_latest_until(known_revision, deadline)
-            })
-            .await?;
-            send_resync(frame.request_id, attachment, snapshot, outbound).await?;
-            Ok(false)
-        }
-        WireKind::TerminalInput => {
-            let request: v1::TerminalInput = frame
-                .decode_message(WireKind::TerminalInput)
-                .map_err(protocol_error)?;
-            require_attachment_id(request.attachment_id, attachment)?;
-            let attachment_worker = Arc::clone(attachment);
-            run_blocking_until(deadline, move || {
-                attachment_worker.write_input_until(&request.bytes, deadline)
-            })
-            .await?;
-            Ok(false)
-        }
-        WireKind::TerminalResize => {
-            let request: v1::TerminalResize = frame
-                .decode_message(WireKind::TerminalResize)
-                .map_err(protocol_error)?;
-            require_attachment_id(request.attachment_id, attachment)?;
-            let size = v1::TerminalViewport {
-                rows: request.rows,
-                columns: request.columns,
-            }
-            .try_into()
-            .map_err(protocol_error)?;
-            let attachment_worker = Arc::clone(attachment);
-            run_blocking_until(deadline, move || {
-                attachment_worker.resize_until(size, deadline)
-            })
-            .await?;
-            Ok(false)
-        }
-        WireKind::TerminalDetach => {
-            let request: v1::TerminalDetach = frame
-                .decode_message(WireKind::TerminalDetach)
-                .map_err(protocol_error)?;
-            require_attachment_id(request.attachment_id, attachment)?;
-            Ok(true)
-        }
-        WireKind::SessionOperationLeaseRequest => {
-            let request: v1::SessionOperationLeaseRequest = frame
-                .decode_message(WireKind::SessionOperationLeaseRequest)
-                .map_err(protocol_error)?;
-            require_local_target(request.target)?;
-            let lease = service.sessions().issue_operation_lease(principal)?;
-            outbound
-                .send(AttachmentOutbound::queued(
-                    encode_message(
-                        WireKind::SessionOperationLeaseResponse,
-                        frame.request_id,
-                        0,
-                        &v1::SessionOperationLeaseResponse {
-                            lease: Some(lease.into()),
-                        },
-                    )
-                    .map_err(protocol_error)?,
-                ))
-                .await
-                .map_err(|_| attachment_cancelled())?;
-            Ok(false)
-        }
-        WireKind::SessionTakeoverRequest => {
-            let request: v1::SessionTakeoverRequest = frame
-                .decode_message(WireKind::SessionTakeoverRequest)
-                .map_err(protocol_error)?;
-            require_local_target(request.target.clone())?;
-            let session_id: SessionId = request
-                .session_id
-                .clone()
-                .ok_or_else(|| malformed("takeover omitted session_id"))?
-                .try_into()
-                .map_err(protocol_error)?;
-            if session_id != attachment.session_id() {
-                return Err(malformed("takeover session_id does not match this stream"));
-            }
-            require_attachment_id(request.attachment_id.clone(), attachment)?;
-            let operation_id = request
-                .operation_id
-                .ok_or_else(|| malformed("takeover omitted operation_id"))?
-                .try_into()
-                .map_err(protocol_error)?;
-            let service_worker = Arc::clone(service);
-            let attachment_worker = Arc::clone(attachment);
-            let summary = run_blocking_until(deadline, move || {
-                service_worker.sessions().takeover_until(
-                    principal,
-                    operation_id,
-                    &attachment_worker,
-                    deadline,
-                )
-            })
-            .await?;
-            let message = v1::SessionMutateResponse {
-                session: Some(v1::SessionSummary {
-                    session_id: Some(summary.session_id.into()),
-                    name: summary.name.to_string(),
-                    revision: summary.revision.get(),
-                    has_controller: summary.has_controller,
-                    working_directory: summary.working_directory.to_string_lossy().into_owned(),
-                    viewport: Some(summary.viewport.into()),
-                }),
-            };
-            outbound
-                .send(AttachmentOutbound::queued(
-                    encode_message(
-                        WireKind::SessionMutateResponse,
-                        frame.request_id,
-                        0,
-                        &message,
-                    )
-                    .map_err(protocol_error)?,
-                ))
-                .await
-                .map_err(|_| attachment_cancelled())?;
-            Ok(false)
-        }
-        _ => Err(malformed(format!(
-            "wire kind {:?} is invalid on a terminal attachment",
-            frame.kind
-        ))),
-    }
-}
-
-#[cfg(unix)]
-async fn attachment_writer(
-    mut writer: tokio::net::unix::OwnedWriteHalf,
-    attachment: Arc<SessionAttachment>,
-    mut outbound: mpsc::Receiver<AttachmentOutbound>,
-) -> Result<(), DaemonError> {
-    let mut revisions = attachment.revision_watch()?;
-    let mut lifecycle = attachment.lifecycle_watch()?;
-    let mut revisions_open = true;
-    let initial_lifecycle = lifecycle.borrow().clone();
-    if write_lifecycle_event(&mut writer, &attachment, initial_lifecycle).await? {
-        return Ok(());
-    }
-    loop {
-        tokio::select! {
-            biased;
-            message = outbound.recv() => {
-                let Some(message) = message else {
-                    return Ok(());
-                };
-                writer.write_all(&message.bytes).await.map_err(|error| daemon_io("write terminal response", error))?;
-                if let Some(flushed) = message.flushed {
-                    let _ = flushed.send(());
-                }
-            }
-            changed = lifecycle.changed() => {
-                changed.map_err(|_| attachment_cancelled())?;
-                let event = lifecycle.borrow_and_update().clone();
-                if write_lifecycle_event(&mut writer, &attachment, event).await? {
-                    return Ok(());
-                }
-            }
-            changed = revisions.changed(), if revisions_open => {
-                if changed.is_err() {
-                    // Driver finalization closes its revision watch before the actor publishes
-                    // the final drained update and SessionEnded lifecycle value. Keep the stream
-                    // alive for that authoritative terminal event instead of reporting a
-                    // connection-local cancellation.
-                    revisions_open = false;
-                } else {
-                    match attachment_next_update(Arc::clone(&attachment)).await {
-                        Ok(Some(update)) => {
-                            write_terminal_update(&mut writer, &attachment, update).await?;
-                        }
-                        Ok(None) => {}
-                        Err(error) if error.kind() == DomainErrorKind::SessionNotFound => {
-                            // A revision notification can race the actor's transition into final
-                            // drain. The lifecycle channel owns the terminal event and final
-                            // checkpoint, so stop polling revisions and wait for it.
-                            revisions_open = false;
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[cfg(unix)]
-async fn write_lifecycle_event(
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
-    attachment: &Arc<SessionAttachment>,
-    event: AttachmentLifecycle,
-) -> Result<bool, DaemonError> {
-    match event {
-        AttachmentLifecycle::AwaitingSnapshot { .. } => Ok(false),
-        AttachmentLifecycle::Active { .. } | AttachmentLifecycle::PreparedTakeover => {
-            if let Some(update) = attachment_next_update(Arc::clone(attachment)).await? {
-                write_terminal_update(writer, attachment, update).await?;
-            }
-            Ok(false)
-        }
-        AttachmentLifecycle::LeaseLost { generation } => {
-            let message = v1::TerminalLeaseLost {
-                attachment_id: Some(attachment.attachment_id().into()),
-                generation,
-            };
-            let bytes = encode_message(WireKind::TerminalLeaseLost, 0, 0, &message)
-                .map_err(protocol_error)?;
-            writer
-                .write_all(&bytes)
-                .await
-                .map_err(|error| daemon_io("write lease-lost event", error))?;
-            Ok(true)
-        }
-        AttachmentLifecycle::SessionEnded(reason) => {
-            let final_attachment = Arc::clone(attachment);
-            let deadline = Instant::now() + DEFAULT_DEADLINE;
-            if let Ok(Some(update)) =
-                run_blocking_until(deadline, move || final_attachment.final_update()).await
-            {
-                write_terminal_update(writer, attachment, update).await?;
-            }
-            let message = session_ended_message(attachment, reason);
-            let bytes = encode_message(WireKind::TerminalSessionEnded, 0, 0, &message)
-                .map_err(protocol_error)?;
-            writer
-                .write_all(&bytes)
-                .await
-                .map_err(|error| daemon_io("write session-ended event", error))?;
-            Ok(true)
-        }
-    }
-}
-
-#[cfg(unix)]
-async fn attachment_next_update(
-    attachment: Arc<SessionAttachment>,
-) -> Result<Option<AttachmentUpdate>, DaemonError> {
-    let deadline = Instant::now() + DEFAULT_DEADLINE;
-    run_blocking_until(deadline, move || attachment.next_update_until(deadline)).await
-}
-
-#[cfg(unix)]
-async fn write_terminal_update(
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
-    attachment: &SessionAttachment,
-    update: AttachmentUpdate,
-) -> Result<(), DaemonError> {
-    match update {
-        AttachmentUpdate::Delta(delta) => {
-            let message = zterm_proto::terminal_delta_message(delta);
-            let bytes =
-                encode_message(WireKind::TerminalDelta, 0, 0, &message).map_err(protocol_error)?;
-            writer
-                .write_all(&bytes)
-                .await
-                .map_err(|error| daemon_io("write terminal delta", error))
-        }
-        AttachmentUpdate::Snapshot(snapshot) => {
-            let required = v1::TerminalSyncRequired {
-                attachment_id: Some(attachment.attachment_id().into()),
-                latest_revision: snapshot.revision.get(),
-            };
-            let required = encode_message(WireKind::TerminalSyncRequired, 0, 0, &required)
-                .map_err(protocol_error)?;
-            writer
-                .write_all(&required)
-                .await
-                .map_err(|error| daemon_io("write terminal resync requirement", error))?;
-            let snapshot = encode_snapshot(
-                0,
-                attachment.session_id(),
-                attachment.attachment_id(),
-                snapshot,
-            )?;
-            writer
-                .write_all(&snapshot)
-                .await
-                .map_err(|error| daemon_io("write terminal resync snapshot", error))
-        }
-    }
-}
-
-#[cfg(unix)]
-async fn send_resync(
-    request_id: u64,
-    attachment: &SessionAttachment,
-    snapshot: zterm_core::terminal::TerminalSnapshot,
-    outbound: &mpsc::Sender<AttachmentOutbound>,
-) -> Result<(), DaemonError> {
-    let required = v1::TerminalSyncRequired {
-        attachment_id: Some(attachment.attachment_id().into()),
-        latest_revision: snapshot.revision.get(),
-    };
-    outbound
-        .send(AttachmentOutbound::queued(
-            encode_message(WireKind::TerminalSyncRequired, request_id, 0, &required)
-                .map_err(protocol_error)?,
-        ))
-        .await
-        .map_err(|_| attachment_cancelled())?;
-    outbound
-        .send(AttachmentOutbound::queued(encode_snapshot(
-            request_id,
-            attachment.session_id(),
-            attachment.attachment_id(),
-            snapshot,
-        )?))
-        .await
-        .map_err(|_| attachment_cancelled())
-}
-
-#[cfg(unix)]
-fn encode_snapshot(
-    request_id: u64,
-    session_id: SessionId,
-    attachment_id: AttachmentId,
-    snapshot: zterm_core::terminal::TerminalSnapshot,
-) -> Result<Vec<u8>, DaemonError> {
-    let message = zterm_proto::terminal_snapshot_message(session_id, attachment_id, snapshot);
-    encode_message(WireKind::TerminalSnapshot, request_id, 0, &message).map_err(protocol_error)
-}
-
-#[cfg(unix)]
-fn terminal_selector(
-    request: &v1::TerminalAttachRequest,
-) -> Result<(Option<SessionSelector>, bool), DaemonError> {
-    let has_id = request.session_id.is_some();
-    let has_name = !request.session_name.is_empty();
-    let selections = usize::from(has_id) + usize::from(has_name) + usize::from(request.create_main);
-    if selections != 1 {
-        return Err(malformed(
-            "terminal attach requires exactly one session_id, session_name, or create_main",
-        ));
-    }
-    if request.create_main {
-        return Ok((None, true));
-    }
-    if let Some(session_id) = request.session_id.clone() {
-        return Ok((
-            Some(SessionSelector::Id(
-                session_id.try_into().map_err(protocol_error)?,
-            )),
-            false,
-        ));
-    }
-    let name = SessionName::new(request.session_name.clone()).map_err(|error| {
-        DaemonError::new(DomainErrorKind::InvalidSessionName, error.to_string())
-    })?;
-    Ok((Some(SessionSelector::Name(name)), false))
-}
-
-#[cfg(unix)]
-fn require_local_target(target: Option<v1::TargetSelector>) -> Result<(), DaemonError> {
-    match target.and_then(|target| target.target) {
-        Some(v1::target_selector::Target::Local(true)) => Ok(()),
-        _ => Err(malformed(
-            "local terminal stream requires target.local=true",
-        )),
-    }
-}
-
-#[cfg(unix)]
-fn require_attachment_id(
-    attachment_id: Option<v1::AttachmentId>,
-    attachment: &SessionAttachment,
-) -> Result<(), DaemonError> {
-    let attachment_id: AttachmentId = attachment_id
-        .ok_or_else(|| malformed("terminal message omitted attachment_id"))?
-        .try_into()
-        .map_err(protocol_error)?;
-    if attachment_id == attachment.attachment_id() {
-        Ok(())
-    } else {
-        Err(malformed(
-            "terminal message attachment_id does not match this stream",
-        ))
-    }
-}
-
-#[cfg(unix)]
-fn session_ended_message(
-    attachment: &SessionAttachment,
-    reason: zterm_core::SessionEndReason,
-) -> v1::TerminalSessionEnded {
-    let (reason, exit_code, signal) = match reason {
-        zterm_core::SessionEndReason::NaturalExit { exit_code, signal } => (
-            v1::TerminalSessionEndReason::NaturalExit,
-            exit_code,
-            signal.unwrap_or_default(),
-        ),
-        zterm_core::SessionEndReason::ExplicitClose => (
-            v1::TerminalSessionEndReason::ExplicitClose,
-            0,
-            String::new(),
-        ),
-        zterm_core::SessionEndReason::DaemonStop => {
-            (v1::TerminalSessionEndReason::DaemonStop, 0, String::new())
-        }
-        zterm_core::SessionEndReason::DriverFailure => (
-            v1::TerminalSessionEndReason::DriverFailure,
-            0,
-            String::new(),
-        ),
-    };
-    v1::TerminalSessionEnded {
-        session_id: Some(attachment.session_id().into()),
-        attachment_id: Some(attachment.attachment_id().into()),
-        reason: reason as i32,
-        exit_code,
-        signal,
-    }
-}
-
-#[cfg(unix)]
 fn local_view_id() -> AttachmentId {
     let secret = SecretKey::generate().to_bytes();
     let mut bytes = [0_u8; 16];
@@ -1117,11 +482,29 @@ fn local_view_id() -> AttachmentId {
     AttachmentId::from_array(bytes)
 }
 
+#[cfg(unix)]
+fn terminal_attach_target(frame: &DecodedFrame) -> Result<Option<DeviceId>, DaemonError> {
+    let request: v1::TerminalAttachRequest = frame
+        .decode_message(WireKind::TerminalAttachRequest)
+        .map_err(protocol_error)?;
+    match request.target.and_then(|target| target.target) {
+        Some(v1::target_selector::Target::Local(true)) => Ok(None),
+        Some(v1::target_selector::Target::Device(device)) => {
+            device.try_into().map(Some).map_err(protocol_error)
+        }
+        _ => Err(malformed(
+            "terminal attach requires either target.local=true or one full device target",
+        )),
+    }
+}
+
 /// One typed server message received on a local terminal attachment.
 #[cfg(unix)]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 #[doc(hidden)]
 pub enum LocalAttachmentEvent {
+    /// Latest daemon-owned connection state for a remote desired view.
+    TransportState(v1::TerminalTransportStateEvent),
     /// A full host-authoritative replacement state.
     Snapshot(v1::TerminalSnapshot),
     /// A merged revision update from the acknowledged checkpoint.
@@ -1136,21 +519,69 @@ pub enum LocalAttachmentEvent {
     SessionEnded(v1::TerminalSessionEnded),
 }
 
+#[cfg(unix)]
+impl fmt::Debug for LocalAttachmentEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TransportState(state) => formatter
+                .debug_struct("TransportState")
+                .field("state", &state.state)
+                .finish_non_exhaustive(),
+            Self::Snapshot(snapshot) => formatter
+                .debug_struct("Snapshot")
+                .field("revision", &snapshot.revision)
+                .field("screen_ansi_len", &snapshot.screen_ansi.len())
+                .field(
+                    "recent_history_ansi_len",
+                    &snapshot.recent_history_ansi.len(),
+                )
+                .finish_non_exhaustive(),
+            Self::Delta(delta) => formatter
+                .debug_struct("Delta")
+                .field("from_revision", &delta.from_revision)
+                .field("to_revision", &delta.to_revision)
+                .field("ansi_len", &delta.ansi.len())
+                .finish_non_exhaustive(),
+            Self::SyncRequired(required) => formatter
+                .debug_struct("SyncRequired")
+                .field("latest_revision", &required.latest_revision)
+                .finish_non_exhaustive(),
+            Self::Takeover(summary) => formatter.debug_tuple("Takeover").field(summary).finish(),
+            Self::LeaseLost(lost) => formatter
+                .debug_struct("LeaseLost")
+                .field("generation", &lost.generation)
+                .finish_non_exhaustive(),
+            Self::SessionEnded(ended) => formatter
+                .debug_struct("SessionEnded")
+                .field("reason", &ended.reason)
+                .field("exit_code", &ended.exit_code)
+                .field("has_signal", &!ended.signal.is_empty())
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
 /// Opaque same-daemon retry token for one takeover whose response was lost.
 ///
 /// It is intentionally process-memory only in M4. Callers must export and
 /// retain it explicitly if they need fresh-process ambiguity recovery.
 #[cfg(unix)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 #[doc(hidden)]
 pub struct LocalTakeoverRetryToken {
     operation_id: OperationId,
     session_id: SessionId,
 }
 
+#[cfg(unix)]
+impl fmt::Debug for LocalTakeoverRetryToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LocalTakeoverRetryToken([REDACTED])")
+    }
+}
+
 /// Real same-UID duplex socket adapter used before the final raw-terminal UI exists.
 #[cfg(unix)]
-#[derive(Debug)]
 #[doc(hidden)]
 pub struct LocalAttachmentClient {
     stream: tokio::net::UnixStream,
@@ -1159,20 +590,70 @@ pub struct LocalAttachmentClient {
     deferred: VecDeque<DecodedFrame>,
     session_id: SessionId,
     attachment_id: AttachmentId,
+    target: ResolvedSessionTarget,
     initial_snapshot: v1::TerminalSnapshot,
     next_request_id: u64,
     operation_lease: Option<OperationLease>,
     next_operation_sequence: u64,
+    pending_takeover_request_id: Option<u64>,
+}
+
+#[cfg(unix)]
+impl fmt::Debug for LocalAttachmentClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LocalAttachmentClient")
+            .field("session_id", &self.session_id)
+            .field("attachment_id", &self.attachment_id)
+            .field("initial_revision", &self.initial_snapshot.revision)
+            .field("queued_frames", &self.queued.len())
+            .field("deferred_frames", &self.deferred.len())
+            .field("has_operation_lease", &self.operation_lease.is_some())
+            .field(
+                "has_pending_takeover",
+                &self.pending_takeover_request_id.is_some(),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(unix)]
 impl LocalAttachmentClient {
+    /// Opens one already-resolved local or remote view for the high-level
+    /// command runtime without exposing the socket or target token to the CLI.
+    pub(crate) async fn connect_resolved(
+        socket: impl AsRef<Path>,
+        target: ResolvedSessionTarget,
+        selector: Option<SessionSelector>,
+        create_main: bool,
+        takeover: bool,
+        viewport: Option<zterm_core::terminal::TerminalSize>,
+    ) -> Result<Self, DaemonError> {
+        Self::connect_inner(
+            socket.as_ref(),
+            target,
+            selector,
+            create_main,
+            takeover,
+            viewport,
+        )
+        .await
+    }
+
     /// Attaches to the daemon-lifetime default `main` session, creating it if absent.
     pub async fn connect_main(
         socket: impl AsRef<Path>,
         viewport: Option<zterm_core::terminal::TerminalSize>,
     ) -> Result<Self, DaemonError> {
-        Self::connect_inner(socket.as_ref(), None, true, false, viewport).await
+        Self::connect_inner(
+            socket.as_ref(),
+            ResolvedSessionTarget::local(),
+            None,
+            true,
+            false,
+            viewport,
+        )
+        .await
     }
 
     /// Attaches to an existing session selected by stable ID or exact name.
@@ -1182,11 +663,58 @@ impl LocalAttachmentClient {
         takeover: bool,
         viewport: Option<zterm_core::terminal::TerminalSize>,
     ) -> Result<Self, DaemonError> {
-        Self::connect_inner(socket.as_ref(), Some(selector), false, takeover, viewport).await
+        Self::connect_inner(
+            socket.as_ref(),
+            ResolvedSessionTarget::local(),
+            Some(selector),
+            false,
+            takeover,
+            viewport,
+        )
+        .await
+    }
+
+    /// Opens one daemon-bridged remote default view without exposing Iroh.
+    #[doc(hidden)]
+    pub async fn connect_remote_main(
+        socket: impl AsRef<Path>,
+        target: DeviceId,
+        viewport: Option<zterm_core::terminal::TerminalSize>,
+    ) -> Result<Self, DaemonError> {
+        Self::connect_inner(
+            socket.as_ref(),
+            ResolvedSessionTarget::device(target),
+            None,
+            true,
+            false,
+            viewport,
+        )
+        .await
+    }
+
+    /// Opens one daemon-bridged remote named/ID view without exposing Iroh.
+    #[doc(hidden)]
+    pub async fn connect_remote_session(
+        socket: impl AsRef<Path>,
+        target: DeviceId,
+        selector: SessionSelector,
+        takeover: bool,
+        viewport: Option<zterm_core::terminal::TerminalSize>,
+    ) -> Result<Self, DaemonError> {
+        Self::connect_inner(
+            socket.as_ref(),
+            ResolvedSessionTarget::device(target),
+            Some(selector),
+            false,
+            takeover,
+            viewport,
+        )
+        .await
     }
 
     async fn connect_inner(
         socket: &Path,
+        target: ResolvedSessionTarget,
         selector: Option<SessionSelector>,
         create_main: bool,
         takeover: bool,
@@ -1203,55 +731,106 @@ impl LocalAttachmentClient {
             request_id,
             u32::try_from(DEFAULT_DEADLINE.as_millis()).unwrap_or(u32::MAX),
             &v1::TerminalAttachRequest {
-                target: Some(local_target()),
+                target: Some(resolved_target_wire(target)),
                 session_id,
                 takeover,
                 session_name,
                 create_main,
                 viewport: viewport.map(Into::into),
+                resume_view_id: None,
+                known_revision: None,
             },
         )
         .map_err(protocol_error)?;
         let mut stream = tokio::net::UnixStream::connect(socket)
             .await
             .map_err(connect_error)?;
-        stream
-            .write_all(&bytes)
-            .await
-            .map_err(|error| daemon_io("write local attach request", error))?;
-        let first = tokio::time::timeout(DEFAULT_DEADLINE, read_first(&mut stream))
-            .await
-            .map_err(|_| {
-                DaemonError::new(
-                    DomainErrorKind::DeadlineExceeded,
-                    "timed out waiting for initial terminal snapshot",
-                )
-            })??;
-        if first.frame.kind == WireKind::ServiceErrorResponse {
-            return Err(service_error(&first.frame)?);
+        if let Err(error) = stream.write_all(&bytes).await {
+            let error = daemon_io("write local attach request", error);
+            return Err(if create_main {
+                create_main_outcome_unknown()
+            } else {
+                error
+            });
         }
-        if first.frame.request_id != request_id {
-            return Err(malformed("initial terminal snapshot request_id mismatch"));
-        }
-        let initial_snapshot: v1::TerminalSnapshot = first
-            .frame
-            .decode_message(WireKind::TerminalSnapshot)
-            .map_err(protocol_error)?;
-        let session_id = required_snapshot_session_id(&initial_snapshot)?;
-        let attachment_id = required_snapshot_attachment_id(&initial_snapshot)?;
-        validate_snapshot_viewport(&initial_snapshot)?;
-        Ok(Self {
-            stream,
-            decoder: first.decoder,
-            queued: first.queued,
-            deferred: VecDeque::new(),
-            session_id,
-            attachment_id,
-            initial_snapshot,
-            next_request_id: request_id + 1,
-            operation_lease: None,
-            next_operation_sequence: 1,
+
+        // The outer result owns post-write ambiguity. The inner result is
+        // reserved for a decoded, correlated ServiceError, which is already a
+        // definitive result and must retain its exact domain category.
+        let response = tokio::time::timeout(DEFAULT_DEADLINE, async {
+            let first = read_first(&mut stream).await?;
+            let mut decoder = first.decoder;
+            let mut queued = first.queued;
+            let mut current = Some(first.frame);
+            let mut pre_snapshot_states = Vec::new();
+            let initial_snapshot = loop {
+                let frame = match current.take() {
+                    Some(frame) => frame,
+                    None => read_frame_parts(&mut stream, &mut decoder, &mut queued).await?,
+                };
+                if frame.kind == WireKind::ServiceErrorResponse {
+                    if frame.request_id != request_id {
+                        return Err(malformed("initial terminal error correlation mismatch"));
+                    }
+                    return Ok(Err(service_error(&frame)?));
+                }
+                if frame.kind == WireKind::TerminalTransportStateEvent {
+                    let state: v1::TerminalTransportStateEvent = frame
+                        .decode_message(WireKind::TerminalTransportStateEvent)
+                        .map_err(protocol_error)?;
+                    v1::TerminalTransportState::try_from(state.state)
+                        .map_err(|_| malformed("unknown terminal transport state"))?;
+                    pre_snapshot_states.push(state);
+                    continue;
+                }
+                if frame.kind != WireKind::TerminalSnapshot || frame.request_id != request_id {
+                    return Err(malformed("initial terminal snapshot correlation mismatch"));
+                }
+                break frame
+                    .decode_message(WireKind::TerminalSnapshot)
+                    .map_err(protocol_error)?;
+            };
+            let session_id = required_snapshot_session_id(&initial_snapshot)?;
+            let attachment_id = required_snapshot_attachment_id(&initial_snapshot)?;
+            validate_snapshot_viewport(&initial_snapshot)?;
+            for state in &pre_snapshot_states {
+                let state_attachment: AttachmentId = state
+                    .attachment_id
+                    .clone()
+                    .ok_or_else(|| malformed("transport state omitted attachment_id"))?
+                    .try_into()
+                    .map_err(protocol_error)?;
+                if state_attachment != attachment_id {
+                    return Err(malformed("transport state attachment_id mismatch"));
+                }
+            }
+            Ok(Ok(Self {
+                stream,
+                decoder,
+                queued,
+                deferred: VecDeque::new(),
+                session_id,
+                attachment_id,
+                target,
+                initial_snapshot,
+                next_request_id: request_id + 1,
+                operation_lease: None,
+                next_operation_sequence: 1,
+                pending_takeover_request_id: None,
+            }))
         })
+        .await;
+
+        match response {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) if create_main => Err(create_main_outcome_unknown()),
+            Ok(Err(error)) => Err(error),
+            Err(_) if create_main => Err(create_main_outcome_unknown()),
+            Err(_) => Err(DaemonError::new(
+                DomainErrorKind::DeadlineExceeded,
+                "timed out waiting for initial terminal snapshot",
+            )),
+        }
     }
 
     /// Returns the attached daemon-lifetime session identity.
@@ -1266,10 +845,53 @@ impl LocalAttachmentClient {
         self.attachment_id
     }
 
+    /// Whether this local socket is backed by a daemon-owned remote bridge.
+    #[must_use]
+    pub const fn is_remote(&self) -> bool {
+        self.target.device_id().is_some()
+    }
+
     /// Returns the initial full state which must be acknowledged before input.
     #[must_use]
     pub const fn initial_snapshot(&self) -> &v1::TerminalSnapshot {
         &self.initial_snapshot
+    }
+
+    #[cfg(test)]
+    pub(crate) fn terminal_driver_test_pair(
+        target: ResolvedSessionTarget,
+        session_id: SessionId,
+        attachment_id: AttachmentId,
+    ) -> (Self, tokio::net::UnixStream) {
+        let (stream, peer) =
+            tokio::net::UnixStream::pair().expect("test-private terminal driver Unix stream pair");
+        (
+            Self {
+                stream,
+                decoder: FrameDecoder::new(),
+                queued: VecDeque::new(),
+                deferred: VecDeque::new(),
+                session_id,
+                attachment_id,
+                target,
+                initial_snapshot: v1::TerminalSnapshot {
+                    session_id: Some(session_id.into()),
+                    attachment_id: Some(attachment_id.into()),
+                    revision: 1,
+                    rows: 24,
+                    columns: 80,
+                    screen_ansi: Vec::new(),
+                    recent_history_ansi: Vec::new(),
+                    active_screen: v1::TerminalActiveScreen::Main as i32,
+                    modes: Some(v1::TerminalModes::default()),
+                },
+                next_request_id: 2,
+                operation_lease: None,
+                next_operation_sequence: 1,
+                pending_takeover_request_id: None,
+            },
+            peer,
+        )
     }
 
     /// Atomically acknowledges the exact full snapshot revision.
@@ -1282,6 +904,7 @@ impl LocalAttachmentClient {
             },
         )
         .await
+        .map(|_| ())
     }
 
     /// Sends controller input without waiting for a redundant success ACK.
@@ -1295,6 +918,7 @@ impl LocalAttachmentClient {
             },
         )
         .await
+        .map(|_| ())
     }
 
     /// Requests one validated native/model viewport change.
@@ -1312,6 +936,7 @@ impl LocalAttachmentClient {
             },
         )
         .await
+        .map(|_| ())
     }
 
     /// Discards the client baseline and requests a fresh snapshot.
@@ -1324,6 +949,7 @@ impl LocalAttachmentClient {
             },
         )
         .await
+        .map(|_| ())
     }
 
     /// Commits a previously prepared and acknowledged takeover attachment.
@@ -1335,12 +961,15 @@ impl LocalAttachmentClient {
     /// response loss.
     #[doc(hidden)]
     pub async fn begin_takeover(&mut self) -> Result<LocalTakeoverRetryToken, DaemonError> {
+        if self.pending_takeover_request_id.is_some() {
+            return Err(malformed("a takeover response is already pending"));
+        }
         let operation_id = self.next_operation_id().await?;
         let receipt = LocalTakeoverRetryToken {
             operation_id,
             session_id: self.session_id,
         };
-        self.send_takeover(operation_id).await?;
+        self.pending_takeover_request_id = Some(self.send_takeover(operation_id).await?);
         Ok(receipt)
     }
 
@@ -1354,15 +983,19 @@ impl LocalAttachmentClient {
         if token.session_id != self.session_id {
             return Err(malformed("takeover retry token belongs to another session"));
         }
-        self.send_takeover(token.operation_id).await
+        if self.pending_takeover_request_id.is_some() {
+            return Err(malformed("a takeover response is already pending"));
+        }
+        self.pending_takeover_request_id = Some(self.send_takeover(token.operation_id).await?);
+        Ok(())
     }
 
-    async fn send_takeover(&mut self, operation_id: OperationId) -> Result<(), DaemonError> {
+    async fn send_takeover(&mut self, operation_id: OperationId) -> Result<u64, DaemonError> {
         self.send(
             WireKind::SessionTakeoverRequest,
             &v1::SessionTakeoverRequest {
                 operation_id: Some(operation_id.into()),
-                target: Some(local_target()),
+                target: Some(resolved_target_wire(self.target)),
                 session_id: Some(self.session_id.into()),
                 attachment_id: Some(self.attachment_id.into()),
             },
@@ -1375,16 +1008,27 @@ impl LocalAttachmentClient {
         &mut self,
         deadline: Duration,
     ) -> Result<LocalAttachmentEvent, DaemonError> {
-        let frame = tokio::time::timeout(deadline, self.read_frame())
+        tokio::time::timeout(deadline, self.read_next_event())
             .await
             .map_err(|_| {
                 DaemonError::new(
                     DomainErrorKind::DeadlineExceeded,
                     "timed out waiting for local terminal event",
                 )
-            })??;
+            })?
+    }
+
+    /// Reads the next event without imposing a timeout on an active view.
+    ///
+    /// The owner may cancel and repoll this future: decoder and queued-byte
+    /// state stay in this same client object.
+    pub(crate) async fn read_next_event(&mut self) -> Result<LocalAttachmentEvent, DaemonError> {
+        let frame = self.read_frame().await?;
         if frame.kind == WireKind::ServiceErrorResponse {
             let error = service_error(&frame)?;
+            if self.pending_takeover_request_id == Some(frame.request_id) {
+                self.pending_takeover_request_id = None;
+            }
             if error.kind() == DomainErrorKind::OperationOutcomeUnknown {
                 self.operation_lease = None;
                 self.next_operation_sequence = 1;
@@ -1392,6 +1036,15 @@ impl LocalAttachmentClient {
             return Err(error);
         }
         match frame.kind {
+            WireKind::TerminalTransportStateEvent => {
+                let state: v1::TerminalTransportStateEvent = frame
+                    .decode_message(WireKind::TerminalTransportStateEvent)
+                    .map_err(protocol_error)?;
+                self.require_attachment(state.attachment_id.clone())?;
+                v1::TerminalTransportState::try_from(state.state)
+                    .map_err(|_| malformed("unknown terminal transport state"))?;
+                Ok(LocalAttachmentEvent::TransportState(state))
+            }
             WireKind::TerminalSnapshot => {
                 let snapshot: v1::TerminalSnapshot = frame
                     .decode_message(WireKind::TerminalSnapshot)
@@ -1400,11 +1053,13 @@ impl LocalAttachmentClient {
                 validate_snapshot_viewport(&snapshot)?;
                 Ok(LocalAttachmentEvent::Snapshot(snapshot))
             }
-            WireKind::TerminalDelta => Ok(LocalAttachmentEvent::Delta(
-                frame
+            WireKind::TerminalDelta => {
+                let delta: v1::TerminalDelta = frame
                     .decode_message(WireKind::TerminalDelta)
-                    .map_err(protocol_error)?,
-            )),
+                    .map_err(protocol_error)?;
+                self.require_attachment(delta.attachment_id.clone())?;
+                Ok(LocalAttachmentEvent::Delta(delta))
+            }
             WireKind::TerminalSyncRequired => {
                 let required: v1::TerminalSyncRequired = frame
                     .decode_message(WireKind::TerminalSyncRequired)
@@ -1413,6 +1068,10 @@ impl LocalAttachmentClient {
                 Ok(LocalAttachmentEvent::SyncRequired(required))
             }
             WireKind::SessionMutateResponse => {
+                if self.pending_takeover_request_id != Some(frame.request_id) {
+                    return Err(malformed("takeover response correlation mismatch"));
+                }
+                self.pending_takeover_request_id = None;
                 Ok(LocalAttachmentEvent::Takeover(mutate_response(frame)?))
             }
             WireKind::TerminalLeaseLost => {
@@ -1463,7 +1122,7 @@ impl LocalAttachmentClient {
         &mut self,
         kind: WireKind,
         message: &Message,
-    ) -> Result<(), DaemonError> {
+    ) -> Result<u64, DaemonError> {
         let request_id = self.next_request_id;
         self.next_request_id = self
             .next_request_id
@@ -1473,7 +1132,8 @@ impl LocalAttachmentClient {
         self.stream
             .write_all(&bytes)
             .await
-            .map_err(|error| daemon_io("write local terminal message", error))
+            .map_err(|error| daemon_io("write local terminal message", error))?;
+        Ok(request_id)
     }
 
     async fn read_frame(&mut self) -> Result<DecodedFrame, DaemonError> {
@@ -1514,7 +1174,7 @@ impl LocalAttachmentClient {
             self.send(
                 WireKind::SessionOperationLeaseRequest,
                 &v1::SessionOperationLeaseRequest {
-                    target: Some(local_target()),
+                    target: Some(resolved_target_wire(self.target)),
                 },
             )
             .await?;
@@ -1602,6 +1262,34 @@ fn service_error(frame: &DecodedFrame) -> Result<DaemonError, DaemonError> {
 }
 
 #[cfg(unix)]
+async fn read_frame_parts(
+    stream: &mut tokio::net::UnixStream,
+    decoder: &mut FrameDecoder,
+    queued: &mut VecDeque<DecodedFrame>,
+) -> Result<DecodedFrame, DaemonError> {
+    if let Some(frame) = queued.pop_front() {
+        return Ok(frame);
+    }
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = stream
+            .read(&mut buffer)
+            .await
+            .map_err(|error| daemon_io("read local terminal event", error))?;
+        if read == 0 {
+            std::mem::replace(decoder, FrameDecoder::new())
+                .finish()
+                .map_err(protocol_error)?;
+            return Err(attachment_cancelled());
+        }
+        queued.extend(decoder.feed(&buffer[..read]).map_err(protocol_error)?);
+        if let Some(frame) = queued.pop_front() {
+            return Ok(frame);
+        }
+    }
+}
+
+#[cfg(unix)]
 fn required_snapshot_session_id(snapshot: &v1::TerminalSnapshot) -> Result<SessionId, DaemonError> {
     snapshot
         .session_id
@@ -1679,35 +1367,103 @@ async fn read_one(stream: &mut tokio::net::UnixStream) -> Result<DecodedFrame, D
 }
 
 /// Same-UID local daemon unary client. It never starts a daemon.
-#[derive(Debug)]
 pub struct LocalClient {
     socket: PathBuf,
     #[cfg(unix)]
     next_request_id: AtomicU64,
     #[cfg(unix)]
-    mutation: AsyncMutex<LocalMutationState>,
+    mutation_targets:
+        StdMutex<BTreeMap<ResolvedSessionTarget, Arc<AsyncMutex<LocalMutationState>>>>,
+}
+
+impl fmt::Debug for LocalClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("LocalClient");
+        debug.field("socket", &"[REDACTED]");
+        #[cfg(unix)]
+        {
+            let mutation_target_count = self
+                .mutation_targets
+                .try_lock()
+                .ok()
+                .map(|targets| targets.len());
+            debug
+                .field(
+                    "next_request_id",
+                    &self.next_request_id.load(Ordering::Relaxed),
+                )
+                .field("mutation_target_count", &mutation_target_count);
+        }
+        debug.finish_non_exhaustive()
+    }
 }
 
 #[cfg(unix)]
-#[derive(Debug)]
 struct LocalMutationState {
     lease: Option<OperationLease>,
     next_sequence: u64,
+}
+
+#[cfg(unix)]
+impl fmt::Debug for LocalMutationState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LocalMutationState")
+            .field("has_lease", &self.lease.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(unix)]
+enum LocalRemoteAttemptError {
+    PreWrite(DaemonError),
+    PostWrite(DaemonError),
+    Complete(DaemonError),
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalRemoteRequestClass {
+    ReadOnly,
+    StatefulControl,
+    Mutation,
+}
+
+#[cfg(unix)]
+impl LocalRemoteRequestClass {
+    fn for_kind(kind: WireKind) -> Result<Self, DaemonError> {
+        match kind {
+            WireKind::SessionListRequest => Ok(Self::ReadOnly),
+            WireKind::SessionOperationLeaseRequest => Ok(Self::StatefulControl),
+            WireKind::SessionCreateRequest
+            | WireKind::SessionRenameRequest
+            | WireKind::SessionCloseRequest
+            | WireKind::SessionTakeoverRequest => Ok(Self::Mutation),
+            _ => Err(malformed(
+                "local remote-Session envelope contains a non-unary Session kind",
+            )),
+        }
+    }
 }
 
 impl LocalClient {
     /// Creates a non-spawning client for one effective user's daemon socket.
     #[must_use]
     pub fn new(socket: impl Into<PathBuf>) -> Self {
+        #[cfg(unix)]
+        let mutation_targets = BTreeMap::from([(
+            ResolvedSessionTarget::local(),
+            Arc::new(AsyncMutex::new(LocalMutationState {
+                lease: None,
+                next_sequence: 1,
+            })),
+        )]);
         Self {
             socket: socket.into(),
             #[cfg(unix)]
             next_request_id: AtomicU64::new(1),
             #[cfg(unix)]
-            mutation: AsyncMutex::new(LocalMutationState {
-                lease: None,
-                next_sequence: 1,
-            }),
+            mutation_targets: StdMutex::new(mutation_targets),
         }
     }
 
@@ -1846,24 +1602,56 @@ impl LocalClient {
         })
     }
 
-    /// Lists live sessions through one strict unary request.
+    /// Resolves one exact user selector inside the daemon and returns a frozen
+    /// target token containing no alias.
     #[cfg(unix)]
-    pub async fn list_sessions(&self) -> Result<Vec<crate::session::SessionSummary>, DaemonError> {
+    pub async fn resolve_session_target(
+        &self,
+        selector: &str,
+    ) -> Result<ResolvedSessionTarget, DaemonError> {
         let frame = self
             .request(
+                WireKind::LocalTargetResolveRequest,
+                WireKind::LocalTargetResolveResponse,
+                &v1::LocalTargetResolveRequest {
+                    selector: selector.to_owned(),
+                },
+                DEFAULT_DEADLINE,
+            )
+            .await?;
+        let response: v1::LocalTargetResolveResponse = decode_response(&frame)?;
+        resolved_target_from_wire(response.target)
+    }
+
+    /// Lists live sessions on the local daemon through one strict unary request.
+    #[cfg(unix)]
+    pub async fn list_sessions(&self) -> Result<Vec<crate::session::SessionSummary>, DaemonError> {
+        self.list_sessions_at(ResolvedSessionTarget::local()).await
+    }
+
+    /// Lists live sessions on one already-resolved exact target.
+    #[cfg(unix)]
+    pub async fn list_sessions_at(
+        &self,
+        target: ResolvedSessionTarget,
+    ) -> Result<Vec<crate::session::SessionSummary>, DaemonError> {
+        let frame = self
+            .session_request(
+                target,
                 WireKind::SessionListRequest,
                 WireKind::SessionListResponse,
                 &v1::SessionListRequest {
-                    target: Some(local_target()),
+                    target: Some(resolved_target_wire(target)),
                 },
                 DEFAULT_DEADLINE,
+                false,
             )
             .await?;
         let response: v1::SessionListResponse = decode_response(&frame)?;
         response
             .sessions
             .into_iter()
-            .map(session_from_wire)
+            .map(session_summary_from_wire)
             .collect()
     }
 
@@ -1875,11 +1663,29 @@ impl LocalClient {
         working_directory: Option<&Path>,
         viewport: Option<zterm_core::terminal::TerminalSize>,
     ) -> Result<crate::session::SessionSummary, DaemonError> {
+        self.create_session_at(
+            ResolvedSessionTarget::local(),
+            name,
+            working_directory,
+            viewport,
+        )
+        .await
+    }
+
+    /// Creates a named account-login-shell session on one exact target.
+    #[cfg(unix)]
+    pub async fn create_session_at(
+        &self,
+        target: ResolvedSessionTarget,
+        name: &SessionName,
+        working_directory: Option<&Path>,
+        viewport: Option<zterm_core::terminal::TerminalSize>,
+    ) -> Result<crate::session::SessionSummary, DaemonError> {
         let frame = self
-            .mutation_request(WireKind::SessionCreateRequest, |operation_id| {
+            .mutation_request(target, WireKind::SessionCreateRequest, |operation_id| {
                 v1::SessionCreateRequest {
                     operation_id: Some(operation_id.into()),
-                    target: Some(local_target()),
+                    target: Some(resolved_target_wire(target)),
                     name: name.to_string(),
                     working_directory: working_directory
                         .map_or_else(String::new, |path| path.to_string_lossy().into_owned()),
@@ -1897,11 +1703,23 @@ impl LocalClient {
         session_id: SessionId,
         name: &SessionName,
     ) -> Result<crate::session::SessionSummary, DaemonError> {
+        self.rename_session_at(ResolvedSessionTarget::local(), session_id, name)
+            .await
+    }
+
+    /// Renames a live session on one exact target without changing its identity.
+    #[cfg(unix)]
+    pub async fn rename_session_at(
+        &self,
+        target: ResolvedSessionTarget,
+        session_id: SessionId,
+        name: &SessionName,
+    ) -> Result<crate::session::SessionSummary, DaemonError> {
         let frame = self
-            .mutation_request(WireKind::SessionRenameRequest, |operation_id| {
+            .mutation_request(target, WireKind::SessionRenameRequest, |operation_id| {
                 v1::SessionRenameRequest {
                     operation_id: Some(operation_id.into()),
-                    target: Some(local_target()),
+                    target: Some(resolved_target_wire(target)),
                     session_id: Some(session_id.into()),
                     name: name.to_string(),
                 }
@@ -1916,11 +1734,22 @@ impl LocalClient {
         &self,
         session_id: SessionId,
     ) -> Result<crate::session::SessionSummary, DaemonError> {
+        self.close_session_at(ResolvedSessionTarget::local(), session_id)
+            .await
+    }
+
+    /// Explicitly closes one live session on an exact target.
+    #[cfg(unix)]
+    pub async fn close_session_at(
+        &self,
+        target: ResolvedSessionTarget,
+        session_id: SessionId,
+    ) -> Result<crate::session::SessionSummary, DaemonError> {
         let frame = self
-            .mutation_request(WireKind::SessionCloseRequest, |operation_id| {
+            .mutation_request(target, WireKind::SessionCloseRequest, |operation_id| {
                 v1::SessionCloseRequest {
                     operation_id: Some(operation_id.into()),
-                    target: Some(local_target()),
+                    target: Some(resolved_target_wire(target)),
                     session_id: Some(session_id.into()),
                 }
             })
@@ -1931,6 +1760,7 @@ impl LocalClient {
     #[cfg(unix)]
     async fn mutation_request<Message, Build>(
         &self,
+        target: ResolvedSessionTarget,
         request_kind: WireKind,
         build: Build,
     ) -> Result<DecodedFrame, DaemonError>
@@ -1938,12 +1768,12 @@ impl LocalClient {
         Message: prost::Message,
         Build: FnOnce(OperationId) -> Message,
     {
-        // Serializing one logical client's mutation stream keeps lease rotation
-        // and poison handling exact; unrelated clients/operation keys still run
-        // concurrently in the daemon.
-        let mut mutation = self.mutation.lock().await;
+        // Only one exact target is serialized. No remote await holds the map
+        // mutex or blocks local/other-device lease streams.
+        let state = self.mutation_target_state(target)?;
+        let mut mutation = state.lock().await;
         if mutation.lease.is_none() {
-            mutation.lease = Some(self.issue_operation_lease().await?);
+            mutation.lease = Some(self.issue_operation_lease(target).await?);
             mutation.next_sequence = 1;
         }
         let sequence = mutation.next_sequence;
@@ -1960,11 +1790,13 @@ impl LocalClient {
             sequence,
         };
         let result = self
-            .request_with_retry(
+            .session_request(
+                target,
                 request_kind,
                 WireKind::SessionMutateResponse,
                 &build(operation_id),
                 DEFAULT_DEADLINE,
+                true,
             )
             .await;
         if result
@@ -1979,15 +1811,20 @@ impl LocalClient {
     }
 
     #[cfg(unix)]
-    async fn issue_operation_lease(&self) -> Result<OperationLease, DaemonError> {
+    async fn issue_operation_lease(
+        &self,
+        target: ResolvedSessionTarget,
+    ) -> Result<OperationLease, DaemonError> {
         let frame = self
-            .request_with_retry(
+            .session_request(
+                target,
                 WireKind::SessionOperationLeaseRequest,
                 WireKind::SessionOperationLeaseResponse,
                 &v1::SessionOperationLeaseRequest {
-                    target: Some(local_target()),
+                    target: Some(resolved_target_wire(target)),
                 },
                 DEFAULT_DEADLINE,
+                true,
             )
             .await?;
         let response: v1::SessionOperationLeaseResponse = decode_response(&frame)?;
@@ -1996,6 +1833,257 @@ impl LocalClient {
             .ok_or_else(|| malformed("operation lease response omitted lease"))?
             .try_into()
             .map_err(protocol_error)
+    }
+
+    #[cfg(unix)]
+    fn mutation_target_state(
+        &self,
+        target: ResolvedSessionTarget,
+    ) -> Result<Arc<AsyncMutex<LocalMutationState>>, DaemonError> {
+        let mut states = self
+            .mutation_targets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(state) = states.get(&target) {
+            return Ok(Arc::clone(state));
+        }
+        if states.len() >= MAX_MUTATION_TARGETS_PER_CLIENT {
+            // The map is the only source of new Arcs while this mutex is held.
+            // A strong count of one therefore proves that no logical mutation
+            // or waiter can still use this target state; cached inactive leases
+            // may be discarded, but in-flight operation identity is never evicted.
+            let inactive = states
+                .iter()
+                .find_map(|(target, state)| (Arc::strong_count(state) == 1).then_some(*target));
+            let Some(inactive) = inactive else {
+                return Err(resource_error(
+                    "local client mutation-target capacity is exhausted by active operations",
+                ));
+            };
+            states.remove(&inactive);
+        }
+        let state = Arc::new(AsyncMutex::new(LocalMutationState {
+            lease: None,
+            next_sequence: 1,
+        }));
+        states.insert(target, Arc::clone(&state));
+        Ok(state)
+    }
+
+    #[cfg(unix)]
+    async fn session_request<Message: prost::Message>(
+        &self,
+        target: ResolvedSessionTarget,
+        request_kind: WireKind,
+        response_kind: WireKind,
+        message: &Message,
+        deadline: Duration,
+        mutation_or_lease_retry: bool,
+    ) -> Result<DecodedFrame, DaemonError> {
+        let request_id = self
+            .next_request_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| resource_error("local request ID exhausted"))?;
+        let deadline_ms = u32::try_from(deadline.as_millis()).unwrap_or(u32::MAX);
+        let bytes = Zeroizing::new(
+            encode_message(request_kind, request_id, deadline_ms, message)
+                .map_err(protocol_error)?,
+        );
+        match target.device_id() {
+            None => {
+                self.request_preencoded(
+                    &bytes,
+                    request_id,
+                    response_kind,
+                    deadline,
+                    mutation_or_lease_retry,
+                )
+                .await
+            }
+            Some(device_id) => {
+                let request_class = LocalRemoteRequestClass::for_kind(request_kind)?;
+                self.request_remote_preencoded(
+                    device_id,
+                    &bytes,
+                    request_id,
+                    response_kind,
+                    deadline,
+                    request_class,
+                )
+                .await
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    async fn request_remote_preencoded(
+        &self,
+        target: DeviceId,
+        bytes: &[u8],
+        request_id: u64,
+        response_kind: WireKind,
+        deadline: Duration,
+        request_class: LocalRemoteRequestClass,
+    ) -> Result<DecodedFrame, DaemonError> {
+        let mut envelope = v1::LocalSessionUnaryRequest {
+            target_device_id: Some(target.into()),
+            frame: bytes.to_vec(),
+        };
+        let deadline_ms = u32::try_from(deadline.as_millis()).unwrap_or(u32::MAX);
+        let outer = Zeroizing::new(
+            encode_message(
+                WireKind::LocalSessionUnaryRequest,
+                request_id,
+                deadline_ms,
+                &envelope,
+            )
+            .map_err(protocol_error)?,
+        );
+        envelope.frame.zeroize();
+        let absolute_deadline = Instant::now() + deadline;
+        let first = self
+            .request_remote_attempt(&outer, request_id, response_kind, absolute_deadline)
+            .await;
+        match first {
+            Ok(frame) => Ok(frame),
+            Err(
+                LocalRemoteAttemptError::PreWrite(error) | LocalRemoteAttemptError::Complete(error),
+            ) => Err(error),
+            Err(LocalRemoteAttemptError::PostWrite(first_error)) => match request_class {
+                LocalRemoteRequestClass::Mutation => Err(DaemonError::new(
+                    DomainErrorKind::OperationOutcomeUnknown,
+                    "remote Session mutation may have committed but no complete local reply was received",
+                )),
+                LocalRemoteRequestClass::StatefulControl => Err(first_error),
+                LocalRemoteRequestClass::ReadOnly => match self
+                    .request_remote_attempt(&outer, request_id, response_kind, absolute_deadline)
+                    .await
+                {
+                    Ok(frame) => Ok(frame),
+                    Err(LocalRemoteAttemptError::Complete(error)) => Err(error),
+                    Err(
+                        LocalRemoteAttemptError::PreWrite(error)
+                        | LocalRemoteAttemptError::PostWrite(error),
+                    ) => Err(error),
+                },
+            },
+        }
+    }
+
+    #[cfg(unix)]
+    async fn request_remote_attempt(
+        &self,
+        bytes: &[u8],
+        request_id: u64,
+        response_kind: WireKind,
+        absolute_deadline: Instant,
+    ) -> Result<DecodedFrame, LocalRemoteAttemptError> {
+        let frame = self
+            .request_remote_bytes_once(bytes, absolute_deadline)
+            .await?;
+        match validate_session_unary_response(&frame, request_id, response_kind)
+            .map_err(LocalRemoteAttemptError::PostWrite)?
+        {
+            SessionUnaryResponseStatus::Expected => Ok(frame),
+            SessionUnaryResponseStatus::ServiceError(error) => {
+                Err(LocalRemoteAttemptError::Complete(error))
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    async fn request_remote_bytes_once(
+        &self,
+        bytes: &[u8],
+        absolute_deadline: Instant,
+    ) -> Result<DecodedFrame, LocalRemoteAttemptError> {
+        let remaining = absolute_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(LocalRemoteAttemptError::PreWrite(DaemonError::new(
+                DomainErrorKind::DeadlineExceeded,
+                "local forwarding deadline elapsed before connect",
+            )));
+        }
+        let mut stream =
+            tokio::time::timeout(remaining, tokio::net::UnixStream::connect(&self.socket))
+                .await
+                .map_err(|_| {
+                    LocalRemoteAttemptError::PreWrite(DaemonError::new(
+                        DomainErrorKind::DeadlineExceeded,
+                        "local forwarding deadline elapsed before connect",
+                    ))
+                })?
+                .map_err(|error| LocalRemoteAttemptError::PreWrite(connect_error(error)))?;
+
+        let mut written = 0;
+        while written < bytes.len() {
+            let remaining = absolute_deadline.saturating_duration_since(Instant::now());
+            let write = tokio::time::timeout(remaining, stream.write(&bytes[written..]))
+                .await
+                .map_err(|_| {
+                    let error = DaemonError::new(
+                        DomainErrorKind::DeadlineExceeded,
+                        "local forwarding request write exceeded its deadline",
+                    );
+                    if written == 0 {
+                        LocalRemoteAttemptError::PreWrite(error)
+                    } else {
+                        LocalRemoteAttemptError::PostWrite(error)
+                    }
+                })?
+                .map_err(|error| {
+                    let error = daemon_io("write local forwarding request", error);
+                    if written == 0 {
+                        LocalRemoteAttemptError::PreWrite(error)
+                    } else {
+                        LocalRemoteAttemptError::PostWrite(error)
+                    }
+                })?;
+            if write == 0 {
+                let error = daemon_io(
+                    "write local forwarding request",
+                    std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "local socket accepted zero request bytes",
+                    ),
+                );
+                return Err(if written == 0 {
+                    LocalRemoteAttemptError::PreWrite(error)
+                } else {
+                    LocalRemoteAttemptError::PostWrite(error)
+                });
+            }
+            written += write;
+        }
+
+        let remaining = absolute_deadline.saturating_duration_since(Instant::now());
+        tokio::time::timeout(remaining, stream.shutdown())
+            .await
+            .map_err(|_| {
+                LocalRemoteAttemptError::PostWrite(DaemonError::new(
+                    DomainErrorKind::DeadlineExceeded,
+                    "local forwarding request finish exceeded its deadline",
+                ))
+            })?
+            .map_err(|error| {
+                LocalRemoteAttemptError::PostWrite(daemon_io(
+                    "finish local forwarding request",
+                    error,
+                ))
+            })?;
+
+        let remaining = absolute_deadline.saturating_duration_since(Instant::now());
+        tokio::time::timeout(remaining, read_one(&mut stream))
+            .await
+            .map_err(|_| {
+                LocalRemoteAttemptError::PostWrite(DaemonError::new(
+                    DomainErrorKind::DeadlineExceeded,
+                    "local forwarding response exceeded its deadline",
+                ))
+            })?
+            .map_err(LocalRemoteAttemptError::PostWrite)
     }
 
     #[cfg(unix)]
@@ -2157,7 +2245,7 @@ impl LocalClient {
 }
 
 /// Real same-UID unary device-management adapter used by daemon integration
-/// tests and the future M8 CLI composition. It never opens SQLite, reads the
+/// tests and the high-level command runtime. It never opens SQLite, reads the
 /// identity key, binds Iroh, or starts a daemon.
 #[derive(Debug)]
 #[doc(hidden)]
@@ -2275,7 +2363,7 @@ impl LocalDeviceClient {
     }
 }
 
-/// Hidden same-UID pairing adapter used by integration tests and future CLI
+/// Hidden same-UID pairing adapter used by integration tests and the command
 /// composition. It never starts a daemon or opens an Iroh endpoint itself.
 #[cfg(unix)]
 #[derive(Debug)]
@@ -2394,13 +2482,40 @@ impl LocalClient {
     }
 
     /// Returns the current platform limitation.
+    pub async fn resolve_session_target(
+        &self,
+        _selector: &str,
+    ) -> Result<ResolvedSessionTarget, DaemonError> {
+        Err(unsupported())
+    }
+
+    /// Returns the current platform limitation.
     pub async fn list_sessions(&self) -> Result<Vec<crate::session::SessionSummary>, DaemonError> {
+        Err(unsupported())
+    }
+
+    /// Returns the current platform limitation.
+    pub async fn list_sessions_at(
+        &self,
+        _target: ResolvedSessionTarget,
+    ) -> Result<Vec<crate::session::SessionSummary>, DaemonError> {
         Err(unsupported())
     }
 
     /// Returns the current platform limitation.
     pub async fn create_session(
         &self,
+        _name: &SessionName,
+        _working_directory: Option<&Path>,
+        _viewport: Option<zterm_core::terminal::TerminalSize>,
+    ) -> Result<crate::session::SessionSummary, DaemonError> {
+        Err(unsupported())
+    }
+
+    /// Returns the current platform limitation.
+    pub async fn create_session_at(
+        &self,
+        _target: ResolvedSessionTarget,
         _name: &SessionName,
         _working_directory: Option<&Path>,
         _viewport: Option<zterm_core::terminal::TerminalSize>,
@@ -2418,8 +2533,27 @@ impl LocalClient {
     }
 
     /// Returns the current platform limitation.
+    pub async fn rename_session_at(
+        &self,
+        _target: ResolvedSessionTarget,
+        _session_id: SessionId,
+        _name: &SessionName,
+    ) -> Result<crate::session::SessionSummary, DaemonError> {
+        Err(unsupported())
+    }
+
+    /// Returns the current platform limitation.
     pub async fn close_session(
         &self,
+        _session_id: SessionId,
+    ) -> Result<crate::session::SessionSummary, DaemonError> {
+        Err(unsupported())
+    }
+
+    /// Returns the current platform limitation.
+    pub async fn close_session_at(
+        &self,
+        _target: ResolvedSessionTarget,
         _session_id: SessionId,
     ) -> Result<crate::session::SessionSummary, DaemonError> {
         Err(unsupported())
@@ -2509,7 +2643,7 @@ fn address_service_state(value: &str) -> Result<AddressServiceState, DaemonError
 #[cfg(unix)]
 fn mutate_response(frame: DecodedFrame) -> Result<crate::session::SessionSummary, DaemonError> {
     let response: v1::SessionMutateResponse = decode_response(&frame)?;
-    session_from_wire(
+    session_summary_from_wire(
         response
             .session
             .ok_or_else(|| malformed("session mutation response omitted session"))?,
@@ -2517,35 +2651,29 @@ fn mutate_response(frame: DecodedFrame) -> Result<crate::session::SessionSummary
 }
 
 #[cfg(unix)]
-fn session_from_wire(
-    summary: v1::SessionSummary,
-) -> Result<crate::session::SessionSummary, DaemonError> {
-    let session_id = summary
-        .session_id
-        .ok_or_else(|| malformed("session summary omitted session_id"))?
-        .try_into()
-        .map_err(protocol_error)?;
-    let name = SessionName::new(summary.name)
-        .map_err(|error| DaemonError::new(DomainErrorKind::MalformedFrame, error.to_string()))?;
-    let viewport = summary
-        .viewport
-        .ok_or_else(|| malformed("session summary omitted viewport"))?
-        .try_into()
-        .map_err(protocol_error)?;
-    Ok(crate::session::SessionSummary {
-        session_id,
-        name,
-        revision: Revision::new(summary.revision),
-        has_controller: summary.has_controller,
-        working_directory: PathBuf::from(summary.working_directory),
-        viewport,
-    })
+fn resolved_target_wire(target: ResolvedSessionTarget) -> v1::TargetSelector {
+    let target = match target.device_id() {
+        Some(device_id) => v1::target_selector::Target::Device(device_id.into()),
+        None => v1::target_selector::Target::Local(true),
+    };
+    v1::TargetSelector {
+        target: Some(target),
+    }
 }
 
 #[cfg(unix)]
-fn local_target() -> v1::TargetSelector {
-    v1::TargetSelector {
-        target: Some(v1::target_selector::Target::Local(true)),
+fn resolved_target_from_wire(
+    target: Option<v1::TargetSelector>,
+) -> Result<ResolvedSessionTarget, DaemonError> {
+    match target.and_then(|target| target.target) {
+        Some(v1::target_selector::Target::Local(true)) => Ok(ResolvedSessionTarget::local()),
+        Some(v1::target_selector::Target::Device(device_id)) => {
+            let device_id = device_id.try_into().map_err(protocol_error)?;
+            Ok(ResolvedSessionTarget::device(device_id))
+        }
+        _ => Err(malformed(
+            "target resolution response omitted a valid frozen target",
+        )),
     }
 }
 
@@ -2563,6 +2691,14 @@ fn daemon_io(operation: &str, error: std::io::Error) -> DaemonError {
     DaemonError::new(
         DomainErrorKind::DaemonStopped,
         format!("{operation}: {error}"),
+    )
+}
+
+#[cfg(unix)]
+fn create_main_outcome_unknown() -> DaemonError {
+    DaemonError::new(
+        DomainErrorKind::OperationOutcomeUnknown,
+        "the default Session may have been created, but no complete correlated initial attachment result was received",
     )
 }
 
@@ -2586,7 +2722,66 @@ fn unsupported() -> DaemonError {
 
 #[cfg(all(test, unix))]
 mod tests {
+    use std::time::Duration;
+
+    use zterm_core::DaemonIncarnation;
+
     use super::*;
+
+    #[tokio::test]
+    async fn completed_handlers_are_reaped_before_subsequent_connection_churn() {
+        let temporary = tempfile::tempdir().expect("temporary handler-reap fixture");
+        let socket = temporary.path().join("handler-reap.sock");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket).expect("bind handler-reap listener");
+        let config = crate::config::validate_setup_input(
+            "handler-reap",
+            crate::config::ValidatedInfrastructure::OfficialN0,
+        )
+        .expect("valid handler-reap setup");
+        let setup = crate::bootstrap::BootstrapResult {
+            device_id: DeviceId::from_array([0x71; DeviceId::LENGTH]),
+            endpoint_id: "handler-reap-endpoint".to_owned(),
+            config,
+        };
+        let service = Arc::new(DaemonService::with_started_at(setup, 1));
+        let (reaped, mut reaped_observations) = mpsc::unbounded_channel();
+        let server = tokio::spawn(serve_local_inner(
+            listener,
+            nix::unistd::Uid::effective().as_raw(),
+            service,
+            LocalIpcLimits::for_test(Duration::from_secs(2)),
+            Some(reaped),
+        ));
+        let client = LocalClient::new(&socket);
+
+        for request_index in 0..4 {
+            client
+                .readiness()
+                .await
+                .expect("readiness handler completes");
+            let retained = tokio::time::timeout(Duration::from_secs(2), reaped_observations.recv())
+                .await
+                .expect("completed handler is observed without polling")
+                .expect("handler-reap observer remains installed");
+            assert_eq!(
+                retained, 0,
+                "request {request_index} returned JoinSet ownership to baseline before the next request",
+            );
+        }
+
+        assert!(
+            client
+                .stop(false)
+                .await
+                .expect("stop empty fixture")
+                .stopping
+        );
+        server
+            .await
+            .expect("handler-reap server task")
+            .expect("handler-reap server result");
+    }
 
     #[test]
     fn local_attachment_views_are_fresh_fixed_width_ids() {
@@ -2594,5 +2789,1016 @@ mod tests {
         let second = local_view_id();
         assert_ne!(first, second);
         assert_eq!(first.to_bytes().len(), AttachmentId::LENGTH);
+    }
+
+    #[test]
+    fn local_client_and_takeover_token_debug_redact_private_owners() {
+        const SOCKET_SENTINEL: &str = "/private/tmp/LOCAL_SOCKET_SENTINEL_91c7/daemon.sock";
+        const INCARNATION_SENTINEL: &[u8; 16] = b"TAKEOVER_TOKEN_1";
+        const SESSION_SENTINEL: &[u8; 16] = b"SESSION_TOKEN_01";
+
+        let client = LocalClient::new(SOCKET_SENTINEL);
+        let retry_owner = LocalTakeoverRetryToken {
+            operation_id: OperationId {
+                lease: OperationLease {
+                    daemon_incarnation: DaemonIncarnation::from_array(*INCARNATION_SENTINEL),
+                    ordinal: 8_675_309,
+                },
+                sequence: 2_434_117,
+            },
+            session_id: SessionId::from_array(*SESSION_SENTINEL),
+        };
+        let mutation_state = LocalMutationState {
+            lease: Some(retry_owner.operation_id.lease),
+            next_sequence: retry_owner.operation_id.sequence,
+        };
+        let rendered = format!("{client:?} {retry_owner:?} {mutation_state:?}");
+
+        for sentinel in [
+            SOCKET_SENTINEL,
+            std::str::from_utf8(INCARNATION_SENTINEL).expect("ASCII sentinel"),
+            std::str::from_utf8(SESSION_SENTINEL).expect("ASCII sentinel"),
+            "8675309",
+            "2434117",
+        ] {
+            assert!(!rendered.contains(sentinel));
+        }
+        assert!(rendered.contains("socket: \"[REDACTED]\""));
+        assert!(rendered.contains("mutation_target_count: Some(1)"));
+        assert!(rendered.contains("LocalTakeoverRetryToken([REDACTED])"));
+        assert!(rendered.contains("has_lease: true"));
+        assert_eq!(client.socket(), Path::new(SOCKET_SENTINEL));
+        assert_eq!(
+            retry_owner.operation_id.lease.daemon_incarnation.as_bytes(),
+            INCARNATION_SENTINEL
+        );
+        assert_eq!(retry_owner.operation_id.lease.ordinal, 8_675_309);
+        assert_eq!(retry_owner.operation_id.sequence, 2_434_117);
+        assert_eq!(retry_owner.session_id.as_bytes(), SESSION_SENTINEL);
+        assert_eq!(mutation_state.lease, Some(retry_owner.operation_id.lease));
+        assert_eq!(mutation_state.next_sequence, 2_434_117);
+    }
+
+    #[test]
+    fn local_session_end_debug_never_formats_the_signal_text() {
+        let event = LocalAttachmentEvent::SessionEnded(v1::TerminalSessionEnded {
+            session_id: Some(SessionId::from_array([0x90; SessionId::LENGTH]).into()),
+            attachment_id: Some(AttachmentId::from_array([0x91; AttachmentId::LENGTH]).into()),
+            reason: v1::TerminalSessionEndReason::NaturalExit as i32,
+            exit_code: 1,
+            signal: "SENSITIVE_LOCAL_SIGNAL_SENTINEL".to_owned(),
+        });
+        let debug = format!("{event:?}");
+        assert!(debug.contains("has_signal: true"));
+        assert!(!debug.contains("SENSITIVE_LOCAL_SIGNAL_SENTINEL"));
+    }
+
+    #[test]
+    fn terminal_first_frame_router_separates_local_and_exact_device_targets() {
+        let target = DeviceId::from_array([0x91; DeviceId::LENGTH]);
+        let local = decoded_attach_target(v1::TargetSelector {
+            target: Some(v1::target_selector::Target::Local(true)),
+        });
+        assert_eq!(
+            terminal_attach_target(&local).expect("local target routes"),
+            None
+        );
+
+        let remote =
+            decoded_attach_target(resolved_target_wire(ResolvedSessionTarget::device(target)));
+        assert_eq!(
+            terminal_attach_target(&remote).expect("device target routes"),
+            Some(target)
+        );
+
+        let false_local = decoded_attach_target(v1::TargetSelector {
+            target: Some(v1::target_selector::Target::Local(false)),
+        });
+        assert_eq!(
+            terminal_attach_target(&false_local)
+                .expect_err("false local selector is not a routing target")
+                .kind(),
+            DomainErrorKind::MalformedFrame
+        );
+    }
+
+    #[tokio::test]
+    async fn local_attachment_consumes_validated_transport_state_over_unix_duplex() {
+        let session_id = SessionId::from_array([0x92; SessionId::LENGTH]);
+        let attachment_id = AttachmentId::from_array([0x93; AttachmentId::LENGTH]);
+        let (mut client, mut daemon_stream) = LocalAttachmentClient::terminal_driver_test_pair(
+            ResolvedSessionTarget::local(),
+            session_id,
+            attachment_id,
+        );
+        let event = v1::TerminalTransportStateEvent {
+            attachment_id: Some(attachment_id.into()),
+            state: v1::TerminalTransportState::Reconnecting as i32,
+        };
+        daemon_stream
+            .write_all(
+                &encode_message(WireKind::TerminalTransportStateEvent, 0, 0, &event)
+                    .expect("bounded transport-state event"),
+            )
+            .await
+            .expect("write transport-state event");
+        match client
+            .read_event(Duration::from_secs(1))
+            .await
+            .expect("validated transport-state event")
+        {
+            LocalAttachmentEvent::TransportState(actual) => assert_eq!(actual, event),
+            event => panic!("unexpected local attachment event: {event:?}"),
+        }
+
+        let invalid = v1::TerminalTransportStateEvent {
+            attachment_id: Some(attachment_id.into()),
+            state: i32::MAX,
+        };
+        daemon_stream
+            .write_all(
+                &encode_message(WireKind::TerminalTransportStateEvent, 0, 0, &invalid)
+                    .expect("bounded invalid transport-state event"),
+            )
+            .await
+            .expect("write invalid transport-state event");
+        assert_eq!(
+            client
+                .read_event(Duration::from_secs(1))
+                .await
+                .expect_err("unknown transport state is rejected")
+                .kind(),
+            DomainErrorKind::MalformedFrame
+        );
+    }
+
+    #[tokio::test]
+    async fn local_attachment_discards_stale_pre_snapshot_transport_states() {
+        let temporary = tempfile::tempdir().expect("temporary socket root");
+        let socket_path = temporary.path().join("terminal.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("local listener");
+        let session_id = SessionId::from_array([0x94; SessionId::LENGTH]);
+        let attachment_id = AttachmentId::from_array([0x95; AttachmentId::LENGTH]);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept local view");
+            let states = [
+                v1::TerminalTransportState::Preparing,
+                v1::TerminalTransportState::Synchronizing,
+            ];
+            for state in states {
+                stream
+                    .write_all(
+                        &encode_message(
+                            WireKind::TerminalTransportStateEvent,
+                            0,
+                            0,
+                            &v1::TerminalTransportStateEvent {
+                                attachment_id: Some(attachment_id.into()),
+                                state: state as i32,
+                            },
+                        )
+                        .expect("bounded pre-snapshot state"),
+                    )
+                    .await
+                    .expect("write pre-snapshot state");
+            }
+            stream
+                .write_all(
+                    &encode_message(
+                        WireKind::TerminalSnapshot,
+                        1,
+                        0,
+                        &v1::TerminalSnapshot {
+                            session_id: Some(session_id.into()),
+                            attachment_id: Some(attachment_id.into()),
+                            revision: 1,
+                            rows: 24,
+                            columns: 80,
+                            screen_ansi: Vec::new(),
+                            recent_history_ansi: Vec::new(),
+                            active_screen: v1::TerminalActiveScreen::Main as i32,
+                            modes: Some(v1::TerminalModes::default()),
+                        },
+                    )
+                    .expect("bounded initial snapshot"),
+                )
+                .await
+                .expect("write initial snapshot");
+            stream
+                .write_all(
+                    &encode_message(
+                        WireKind::TerminalTransportStateEvent,
+                        0,
+                        0,
+                        &v1::TerminalTransportStateEvent {
+                            attachment_id: Some(attachment_id.into()),
+                            state: v1::TerminalTransportState::Active as i32,
+                        },
+                    )
+                    .expect("bounded post-snapshot state"),
+                )
+                .await
+                .expect("write post-snapshot state");
+        });
+
+        let mut client = LocalAttachmentClient::connect_resolved(
+            &socket_path,
+            ResolvedSessionTarget::local(),
+            None,
+            true,
+            false,
+            None,
+        )
+        .await
+        .expect("connect through pre-snapshot states");
+        assert_eq!(client.initial_snapshot().revision, 1);
+        let event = client
+            .read_event(Duration::from_secs(1))
+            .await
+            .expect("post-snapshot state");
+        assert!(matches!(
+            event,
+            LocalAttachmentEvent::TransportState(state)
+                if state.state == v1::TerminalTransportState::Active as i32
+        ));
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn create_main_post_submit_response_loss_is_outcome_unknown_for_every_target() {
+        let remote = DeviceId::from_array([0x96; DeviceId::LENGTH]);
+        for target in [
+            ResolvedSessionTarget::local(),
+            ResolvedSessionTarget::device(remote),
+        ] {
+            let error = run_fake_create_main(target, FakeCreateMainReply::DropAfterSubmit)
+                .await
+                .expect_err("post-submit response loss has an unknown create outcome");
+            assert_eq!(error.kind(), DomainErrorKind::OperationOutcomeUnknown);
+        }
+    }
+
+    #[tokio::test]
+    async fn create_main_preserves_exact_snapshot_and_correlated_error_for_every_target() {
+        let remote = DeviceId::from_array([0x97; DeviceId::LENGTH]);
+        for (index, target) in [
+            ResolvedSessionTarget::local(),
+            ResolvedSessionTarget::device(remote),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let session_id = SessionId::from_array(
+                [0x98 + u8::try_from(index).expect("two target fixtures fit u8");
+                    SessionId::LENGTH],
+            );
+            let attachment_id = AttachmentId::from_array(
+                [0xa8 + u8::try_from(index).expect("two target fixtures fit u8");
+                    AttachmentId::LENGTH],
+            );
+            let client = run_fake_create_main(
+                target,
+                FakeCreateMainReply::Snapshot {
+                    session_id,
+                    attachment_id,
+                },
+            )
+            .await
+            .expect("a complete correlated snapshot is an exact committed result");
+            assert_eq!(client.session_id(), session_id);
+            assert_eq!(client.attachment_id(), attachment_id);
+            assert_eq!(client.is_remote(), !target.is_local());
+
+            let error = run_fake_create_main(
+                target,
+                FakeCreateMainReply::ServiceError {
+                    request_id: 1,
+                    kind: DomainErrorKind::SessionOccupied,
+                    detail: "exact occupied fixture",
+                },
+            )
+            .await
+            .expect_err("a correlated typed service error is definitive");
+            assert_eq!(error.kind(), DomainErrorKind::SessionOccupied);
+            assert_eq!(error.detail(), "exact occupied fixture");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_main_prewrite_failure_stays_definitive_and_wrong_error_id_is_unknown() {
+        let temporary = tempfile::tempdir().expect("temporary missing socket root");
+        let remote = DeviceId::from_array([0x9a; DeviceId::LENGTH]);
+        for target in [
+            ResolvedSessionTarget::local(),
+            ResolvedSessionTarget::device(remote),
+        ] {
+            let error = LocalAttachmentClient::connect_resolved(
+                temporary.path().join("missing.sock"),
+                target,
+                None,
+                true,
+                false,
+                None,
+            )
+            .await
+            .expect_err("connect failure occurs before any request write");
+            assert_eq!(error.kind(), DomainErrorKind::DaemonStopped);
+
+            let error = run_fake_create_main(
+                target,
+                FakeCreateMainReply::ServiceError {
+                    request_id: 2,
+                    kind: DomainErrorKind::SessionOccupied,
+                    detail: "uncorrelated occupied fixture",
+                },
+            )
+            .await
+            .expect_err("an uncorrelated service error cannot prove the create outcome");
+            assert_eq!(error.kind(), DomainErrorKind::OperationOutcomeUnknown);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initial_attachment_deadline_covers_states_before_the_snapshot() {
+        let create_main = run_fake_initial_state_stall(true).await;
+        assert_eq!(
+            create_main.kind(),
+            DomainErrorKind::OperationOutcomeUnknown,
+            "a stalled post-write create cannot be reported as definitively absent"
+        );
+
+        let existing = run_fake_initial_state_stall(false).await;
+        assert_eq!(
+            existing.kind(),
+            DomainErrorKind::DeadlineExceeded,
+            "an existing-session attach retains its bounded transport failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_mutation_outer_malformed_or_truncated_reply_sends_once() {
+        let request_id = 501;
+        let target = DeviceId::from_array([0xa1; DeviceId::LENGTH]);
+        let mut truncated = encode_message(
+            WireKind::SessionMutateResponse,
+            request_id,
+            0,
+            &v1::SessionMutateResponse {
+                session: Some(fake_session_summary(0xa1)),
+            },
+        )
+        .expect("bounded mutation response");
+        truncated.pop().expect("truncate local reply");
+
+        for response in [vec![0x80, 0x00], truncated] {
+            assert_remote_mutation_outer_failure_sends_once(request_id, target, response).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_mutation_outer_wrong_kind_or_request_id_sends_once() {
+        let request_id = 511;
+        let target = DeviceId::from_array([0xa2; DeviceId::LENGTH]);
+        let wrong_kind = encode_message(
+            WireKind::SessionListResponse,
+            request_id,
+            0,
+            &v1::SessionListResponse { sessions: vec![] },
+        )
+        .expect("bounded wrong-kind reply");
+        let wrong_id = encode_message(
+            WireKind::SessionMutateResponse,
+            request_id + 1,
+            0,
+            &v1::SessionMutateResponse {
+                session: Some(fake_session_summary(0xa2)),
+            },
+        )
+        .expect("bounded wrong-ID reply");
+
+        for response in [wrong_kind, wrong_id] {
+            assert_remote_mutation_outer_failure_sends_once(request_id, target, response).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_mutation_outer_invalid_typed_payload_sends_once() {
+        let request_id = 516;
+        let target = DeviceId::from_array([0xa4; DeviceId::LENGTH]);
+        let missing_session = encode_message(
+            WireKind::SessionMutateResponse,
+            request_id,
+            0,
+            &v1::SessionMutateResponse { session: None },
+        )
+        .expect("well-framed incomplete mutation response");
+        let unknown_error_code = encode_message(
+            WireKind::ServiceErrorResponse,
+            request_id,
+            0,
+            &v1::ServiceError {
+                code: "unknown_remote_error".to_owned(),
+                message: "invalid typed error fixture".to_owned(),
+            },
+        )
+        .expect("well-framed invalid typed service error");
+
+        for response in [missing_session, unknown_error_code] {
+            assert_remote_mutation_outer_failure_sends_once(request_id, target, response).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_read_only_outer_post_write_failure_retries_once_but_prewrite_does_not() {
+        let temporary = tempfile::tempdir().expect("temporary outer read fixture");
+        let socket = temporary.path().join("outer-read.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind fake local daemon");
+        let request_id = 521;
+        let target = DeviceId::from_array([0xa3; DeviceId::LENGTH]);
+        let response = encode_message(
+            WireKind::SessionListResponse,
+            request_id,
+            0,
+            &v1::SessionListResponse { sessions: vec![] },
+        )
+        .expect("bounded list reply");
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.expect("accept first outer request");
+            let first_bytes = read_fake_unary(&mut first).await;
+            first
+                .write_all(&[0x80, 0x00])
+                .await
+                .expect("write malformed first reply");
+            first.shutdown().await.expect("finish malformed reply");
+
+            let (mut second, _) = listener.accept().await.expect("accept safe replay");
+            let second_bytes = read_fake_unary(&mut second).await;
+            second.write_all(&response).await.expect("write list reply");
+            second.shutdown().await.expect("finish list reply");
+            (first_bytes, second_bytes)
+        });
+
+        let client = LocalClient::new(&socket);
+        let inner = encode_message(
+            WireKind::SessionListRequest,
+            request_id,
+            1_000,
+            &v1::SessionListRequest {
+                target: Some(resolved_target_wire(ResolvedSessionTarget::device(target))),
+            },
+        )
+        .expect("bounded list request");
+        let frame = client
+            .request_remote_preencoded(
+                target,
+                &inner,
+                request_id,
+                WireKind::SessionListResponse,
+                Duration::from_secs(1),
+                LocalRemoteRequestClass::ReadOnly,
+            )
+            .await
+            .expect("safe read-only request retries one unresolved local reply");
+        assert_eq!(frame.kind, WireKind::SessionListResponse);
+        let (first, second) = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("fake local daemon completed")
+            .expect("fake local daemon task");
+        assert_eq!(first, second, "safe retry preserves exact envelope bytes");
+
+        let missing_socket = temporary.path().join("missing.sock");
+        let prewrite = LocalClient::new(missing_socket)
+            .request_remote_preencoded(
+                target,
+                &inner,
+                request_id,
+                WireKind::SessionListResponse,
+                Duration::from_secs(1),
+                LocalRemoteRequestClass::ReadOnly,
+            )
+            .await
+            .expect_err("pre-connect failure remains typed without ambiguity projection");
+        assert_eq!(prewrite.kind(), DomainErrorKind::DaemonStopped);
+    }
+
+    #[tokio::test]
+    async fn remote_operation_lease_outer_post_write_failure_sends_once() {
+        let request_id = 526;
+        let target = DeviceId::from_array([0xa5; DeviceId::LENGTH]);
+        let inner = encode_message(
+            WireKind::SessionOperationLeaseRequest,
+            request_id,
+            1_000,
+            &v1::SessionOperationLeaseRequest {
+                target: Some(resolved_target_wire(ResolvedSessionTarget::device(target))),
+            },
+        )
+        .expect("bounded remote lease request");
+        let valid_second_response = encode_message(
+            WireKind::SessionOperationLeaseResponse,
+            request_id,
+            0,
+            &v1::SessionOperationLeaseResponse {
+                lease: Some(v1::OperationLease {
+                    daemon_incarnation: vec![5; DaemonIncarnation::LENGTH],
+                    ordinal: 9,
+                }),
+            },
+        )
+        .expect("bounded fallback lease response");
+        let (result, requests) = run_remote_outer_failure(
+            request_id,
+            target,
+            inner,
+            WireKind::SessionOperationLeaseResponse,
+            LocalRemoteRequestClass::StatefulControl,
+            vec![0x80, 0x00],
+            valid_second_response,
+        )
+        .await;
+
+        assert_eq!(
+            result
+                .expect_err("stateful lease allocation is not an outer read-only retry")
+                .kind(),
+            DomainErrorKind::MalformedFrame
+        );
+        assert_eq!(
+            requests.len(),
+            1,
+            "the outer lease-allocation envelope must not add a second retry layer"
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum FakeCreateMainReply {
+        DropAfterSubmit,
+        ServiceError {
+            request_id: u64,
+            kind: DomainErrorKind,
+            detail: &'static str,
+        },
+        Snapshot {
+            session_id: SessionId,
+            attachment_id: AttachmentId,
+        },
+    }
+
+    async fn run_fake_initial_state_stall(create_main: bool) -> DaemonError {
+        let temporary = tempfile::tempdir().expect("temporary initial-state stall fixture");
+        let socket = temporary.path().join("initial-state-stall.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind fake local daemon");
+        let attachment_id = AttachmentId::from_array([0x9b; AttachmentId::LENGTH]);
+        let (state_written_sender, state_written_receiver) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept attach request");
+            let first = read_first(&mut stream)
+                .await
+                .expect("decode complete attach request");
+            assert_eq!(first.frame.kind, WireKind::TerminalAttachRequest);
+            stream
+                .write_all(
+                    &encode_message(
+                        WireKind::TerminalTransportStateEvent,
+                        0,
+                        0,
+                        &v1::TerminalTransportStateEvent {
+                            attachment_id: Some(attachment_id.into()),
+                            state: v1::TerminalTransportState::Preparing as i32,
+                        },
+                    )
+                    .expect("bounded pre-snapshot state"),
+                )
+                .await
+                .expect("write pre-snapshot state");
+            let _ = state_written_sender.send(());
+            std::future::pending::<()>().await;
+        });
+
+        let client_socket = socket.clone();
+        let client = tokio::spawn(async move {
+            LocalAttachmentClient::connect_resolved(
+                &client_socket,
+                ResolvedSessionTarget::local(),
+                None,
+                create_main,
+                false,
+                None,
+            )
+            .await
+        });
+        state_written_receiver
+            .await
+            .expect("server crossed the complete pre-snapshot-state write barrier");
+        let result = tokio::time::timeout(
+            DEFAULT_DEADLINE
+                .checked_mul(2)
+                .expect("fixture watchdog deadline fits Duration"),
+            client,
+        )
+        .await
+        .expect("the production initial-response deadline fires before the fixture watchdog")
+        .expect("initial-state client task")
+        .expect_err("the initial snapshot never arrived");
+        server.abort();
+        let _ = server.await;
+        result
+    }
+
+    async fn run_fake_create_main(
+        target: ResolvedSessionTarget,
+        reply: FakeCreateMainReply,
+    ) -> Result<LocalAttachmentClient, DaemonError> {
+        let temporary = tempfile::tempdir().expect("temporary create-main fixture");
+        let socket = temporary.path().join("create-main.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind fake local daemon");
+        let expected_target = target.device_id();
+        let (submitted_tx, submitted_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept create-main request");
+            let first = tokio::time::timeout(Duration::from_secs(2), read_first(&mut stream))
+                .await
+                .expect("create-main request reached the write boundary")
+                .expect("decode create-main request");
+            assert_eq!(first.frame.kind, WireKind::TerminalAttachRequest);
+            assert_eq!(
+                terminal_attach_target(&first.frame).expect("valid target"),
+                expected_target
+            );
+            let request: v1::TerminalAttachRequest = first
+                .frame
+                .decode_message(WireKind::TerminalAttachRequest)
+                .expect("decode create-main payload");
+            assert!(request.create_main);
+            submitted_tx
+                .send(())
+                .expect("observe request only after a complete frame was read");
+            release_rx
+                .await
+                .expect("release fake response after submission barrier");
+
+            match reply {
+                FakeCreateMainReply::DropAfterSubmit => {}
+                FakeCreateMainReply::ServiceError {
+                    request_id,
+                    kind,
+                    detail,
+                } => {
+                    stream
+                        .write_all(
+                            &encode_message(
+                                WireKind::ServiceErrorResponse,
+                                request_id,
+                                0,
+                                &v1::ServiceError {
+                                    code: kind.code().to_owned(),
+                                    message: detail.to_owned(),
+                                },
+                            )
+                            .expect("bounded typed create-main error"),
+                        )
+                        .await
+                        .expect("write typed create-main error");
+                }
+                FakeCreateMainReply::Snapshot {
+                    session_id,
+                    attachment_id,
+                } => {
+                    stream
+                        .write_all(
+                            &encode_message(
+                                WireKind::TerminalSnapshot,
+                                1,
+                                0,
+                                &v1::TerminalSnapshot {
+                                    session_id: Some(session_id.into()),
+                                    attachment_id: Some(attachment_id.into()),
+                                    revision: 1,
+                                    rows: 24,
+                                    columns: 80,
+                                    screen_ansi: Vec::new(),
+                                    recent_history_ansi: Vec::new(),
+                                    active_screen: v1::TerminalActiveScreen::Main as i32,
+                                    modes: Some(v1::TerminalModes::default()),
+                                },
+                            )
+                            .expect("bounded committed create-main snapshot"),
+                        )
+                        .await
+                        .expect("write committed create-main snapshot");
+                }
+            }
+            let _ = stream.shutdown().await;
+        });
+
+        let client_socket = socket.clone();
+        let client = tokio::spawn(async move {
+            LocalAttachmentClient::connect_resolved(client_socket, target, None, true, false, None)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), submitted_rx)
+            .await
+            .expect("create-main submission barrier is bounded")
+            .expect("fake server reports create-main submission");
+        release_tx
+            .send(())
+            .expect("release response-loss or exact-result fixture");
+        let result = tokio::time::timeout(Duration::from_secs(2), client)
+            .await
+            .expect("create-main client completion is bounded")
+            .expect("create-main client task");
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("fake create-main server completion is bounded")
+            .expect("fake create-main server task");
+        result
+    }
+
+    async fn assert_remote_mutation_outer_failure_sends_once(
+        request_id: u64,
+        target: DeviceId,
+        first_response: Vec<u8>,
+    ) {
+        let inner = fake_remote_create_request(target, request_id);
+        let valid_second_response = encode_message(
+            WireKind::SessionMutateResponse,
+            request_id,
+            0,
+            &v1::SessionMutateResponse {
+                session: Some(fake_session_summary(0xaf)),
+            },
+        )
+        .expect("bounded fallback response");
+        let (result, requests) = run_remote_outer_failure(
+            request_id,
+            target,
+            inner,
+            WireKind::SessionMutateResponse,
+            LocalRemoteRequestClass::Mutation,
+            first_response,
+            valid_second_response,
+        )
+        .await;
+        let error = result.expect_err("an unresolved outer mutation reply is outcome unknown");
+        assert_eq!(error.kind(), DomainErrorKind::OperationOutcomeUnknown);
+        assert_eq!(
+            requests.len(),
+            1,
+            "the outer Unix mutation envelope must never be replayed after any bytes were written"
+        );
+    }
+
+    async fn run_remote_outer_failure(
+        request_id: u64,
+        target: DeviceId,
+        inner: Vec<u8>,
+        response_kind: WireKind,
+        request_class: LocalRemoteRequestClass,
+        first_response: Vec<u8>,
+        valid_second_response: Vec<u8>,
+    ) -> (Result<DecodedFrame, DaemonError>, Vec<Vec<u8>>) {
+        let temporary = tempfile::tempdir().expect("temporary outer one-send fixture");
+        let socket = temporary.path().join("outer-one-send.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind fake local daemon");
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            let (mut first, _) = listener.accept().await.expect("accept outer request");
+            requests.push(read_fake_unary(&mut first).await);
+            first
+                .write_all(&first_response)
+                .await
+                .expect("write injected outer reply");
+            let _ = first.shutdown().await;
+
+            tokio::select! {
+                _ = finished_rx => {}
+                accepted = listener.accept() => {
+                    let (mut replayed, _) = accepted.expect("accept unexpected outer replay");
+                    requests.push(read_fake_unary(&mut replayed).await);
+                    replayed
+                        .write_all(&valid_second_response)
+                        .await
+                        .expect("write fallback response to unexpected replay");
+                    let _ = replayed.shutdown().await;
+                }
+            }
+            requests
+        });
+
+        let client = LocalClient::new(&socket);
+        let result = client
+            .request_remote_preencoded(
+                target,
+                &inner,
+                request_id,
+                response_kind,
+                Duration::from_secs(1),
+                request_class,
+            )
+            .await;
+        let _ = finished_tx.send(());
+        let requests = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("fake local daemon completed")
+            .expect("fake local daemon task");
+        (result, requests)
+    }
+
+    async fn read_fake_unary(stream: &mut tokio::net::UnixStream) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        stream
+            .read_to_end(&mut bytes)
+            .await
+            .expect("read fake local unary request");
+        bytes
+    }
+
+    fn decoded_attach_target(target: v1::TargetSelector) -> DecodedFrame {
+        let bytes = encode_message(
+            WireKind::TerminalAttachRequest,
+            1,
+            0,
+            &v1::TerminalAttachRequest {
+                target: Some(target),
+                session_id: None,
+                takeover: false,
+                session_name: String::new(),
+                create_main: true,
+                viewport: None,
+                resume_view_id: None,
+                known_revision: None,
+            },
+        )
+        .expect("bounded attach routing fixture");
+        let mut decoder = FrameDecoder::new();
+        let mut frames = decoder.feed(&bytes).expect("decode attach routing fixture");
+        decoder.finish().expect("complete attach routing fixture");
+        assert_eq!(frames.len(), 1);
+        frames.remove(0)
+    }
+
+    fn fake_remote_create_request(target: DeviceId, request_id: u64) -> Vec<u8> {
+        encode_message(
+            WireKind::SessionCreateRequest,
+            request_id,
+            1_000,
+            &v1::SessionCreateRequest {
+                operation_id: Some(
+                    OperationId {
+                        lease: OperationLease {
+                            daemon_incarnation: DaemonIncarnation::from_array([4; 16]),
+                            ordinal: 7,
+                        },
+                        sequence: 3,
+                    }
+                    .into(),
+                ),
+                target: Some(resolved_target_wire(ResolvedSessionTarget::device(target))),
+                name: "outer-ambiguity".to_owned(),
+                working_directory: String::new(),
+                viewport: None,
+            },
+        )
+        .expect("bounded remote mutation request")
+    }
+
+    fn fake_session_summary(byte: u8) -> v1::SessionSummary {
+        v1::SessionSummary {
+            session_id: Some(v1::SessionId {
+                value: vec![byte; SessionId::LENGTH],
+            }),
+            name: "outer-ambiguity".to_owned(),
+            revision: 2,
+            has_controller: false,
+            working_directory: "/tmp".to_owned(),
+            viewport: Some(v1::TerminalViewport {
+                rows: 24,
+                columns: 80,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn mutation_lease_state_is_isolated_and_serialized_only_per_exact_target() {
+        let client = LocalClient::new("/unused/test.sock");
+        let target_a = ResolvedSessionTarget::device(DeviceId::from_array([0xe1; 32]));
+        let target_b = ResolvedSessionTarget::device(DeviceId::from_array([0xe2; 32]));
+        let state_a = client
+            .mutation_target_state(target_a)
+            .expect("target A state");
+        let state_b = client
+            .mutation_target_state(target_b)
+            .expect("target B state");
+        {
+            let mut a = state_a.lock().await;
+            a.lease = Some(OperationLease {
+                daemon_incarnation: DaemonIncarnation::from_array([1; 16]),
+                ordinal: 11,
+            });
+            let mut b = state_b.lock().await;
+            b.lease = Some(OperationLease {
+                daemon_incarnation: DaemonIncarnation::from_array([2; 16]),
+                ordinal: 22,
+            });
+        }
+
+        let mut held_a = state_a.lock().await;
+        held_a.lease = None;
+        held_a.next_sequence = 1;
+        let b = tokio::time::timeout(Duration::from_millis(100), state_b.lock())
+            .await
+            .expect("target B does not wait for target A's mutation lock");
+        assert_eq!(b.lease.expect("target B lease retained").ordinal, 22);
+        drop(b);
+        drop(held_a);
+
+        assert!(state_a.lock().await.lease.is_none());
+        assert_eq!(
+            state_b
+                .lock()
+                .await
+                .lease
+                .expect("target B remains unpoisoned")
+                .ordinal,
+            22
+        );
+    }
+
+    #[test]
+    fn mutation_target_cache_evicts_only_inactive_state_and_stays_hard_bounded() {
+        let client = LocalClient::new("/unused/test.sock");
+        let active_target =
+            ResolvedSessionTarget::device(DeviceId::from_array([0xe1; DeviceId::LENGTH]));
+        let active = client
+            .mutation_target_state(active_target)
+            .expect("active target state");
+
+        for byte in 1_u8..=61 {
+            client
+                .mutation_target_state(ResolvedSessionTarget::device(DeviceId::from_array(
+                    [byte; 32],
+                )))
+                .expect("bounded target slot");
+        }
+        client
+            .mutation_target_state(ResolvedSessionTarget::device(DeviceId::from_array(
+                [62; DeviceId::LENGTH],
+            )))
+            .expect("last bounded target slot");
+
+        let replacement =
+            ResolvedSessionTarget::device(DeviceId::from_array([0xfe; DeviceId::LENGTH]));
+        client
+            .mutation_target_state(replacement)
+            .expect("inactive cached lease state is safely evicted");
+        let states = client
+            .mutation_targets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(states.len(), MAX_MUTATION_TARGETS_PER_CLIENT);
+        assert!(Arc::ptr_eq(
+            states
+                .get(&active_target)
+                .expect("externally retained state is never evicted"),
+            &active
+        ));
+        drop(states);
+
+        let saturated = LocalClient::new("/unused/saturated.sock");
+        let mut active_states = vec![
+            saturated
+                .mutation_target_state(ResolvedSessionTarget::local())
+                .expect("retain local target"),
+        ];
+        for index in 1..MAX_MUTATION_TARGETS_PER_CLIENT {
+            let byte = u8::try_from(index).expect("test target index fits one byte");
+            active_states.push(
+                saturated
+                    .mutation_target_state(ResolvedSessionTarget::device(DeviceId::from_array(
+                        [byte; DeviceId::LENGTH],
+                    )))
+                    .expect("retain every bounded target slot"),
+            );
+        }
+        assert_eq!(
+            saturated
+                .mutation_target_state(ResolvedSessionTarget::device(DeviceId::from_array(
+                    [0xfe; DeviceId::LENGTH]
+                )))
+                .expect_err("in-flight target states cannot be evicted")
+                .kind(),
+            DomainErrorKind::ResourceExhausted
+        );
+        assert_eq!(
+            saturated
+                .mutation_targets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            MAX_MUTATION_TARGETS_PER_CLIENT
+        );
+        drop(active_states);
     }
 }

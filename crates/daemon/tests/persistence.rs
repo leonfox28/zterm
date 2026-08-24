@@ -757,6 +757,129 @@ fn directory_merge_does_not_conflate_directions() {
 }
 
 #[test]
+fn session_target_resolution_is_exact_directional_and_frozen_across_rename() {
+    let state = TestState::new();
+    state.paths.prepare_state_directories().expect("state dirs");
+    let actor = StoreActor::start(StateStore::open(&state.paths).expect("store")).expect("actor");
+    let handle = actor.handle();
+    let directory = DeviceDirectory::new(handle.clone());
+    let deadline = deadline();
+
+    let outbound = DeviceId::from_array([0xc1; 32]);
+    handle
+        .upsert_known_device(
+            outbound,
+            DeviceAlias::new("Workstation").expect("alias"),
+            "Workstation".to_owned(),
+            None,
+            deadline,
+        )
+        .expect("outbound row");
+    let inbound_only = DeviceId::from_array([0xc2; 32]);
+    handle
+        .authorize(inbound_only, "controller", 1, deadline)
+        .expect("inbound authorization");
+    let unknown = DeviceId::from_array([0xc3; 32]);
+
+    let local = directory
+        .resolve_session_target("local", deadline)
+        .expect("reserved local target");
+    assert!(local.is_local());
+    let alias_target = directory
+        .resolve_session_target("Workstation", deadline)
+        .expect("exact case-sensitive alias");
+    assert_eq!(alias_target.device_id(), Some(outbound));
+    assert_eq!(
+        directory
+            .resolve_session_target(&outbound.to_string(), deadline)
+            .expect("canonical full device ID")
+            .device_id(),
+        Some(outbound)
+    );
+
+    for invalid in [
+        outbound.to_string().to_uppercase(),
+        outbound.to_string()[..12].to_owned(),
+    ] {
+        assert_eq!(
+            directory
+                .resolve_session_target(&invalid, deadline)
+                .expect_err("non-canonical IDs are rejected")
+                .kind(),
+            DomainErrorKind::InvalidTargetSelector
+        );
+    }
+    assert_eq!(
+        directory
+            .resolve_session_target("workstation", deadline)
+            .expect_err("alias comparison is case-sensitive")
+            .kind(),
+        DomainErrorKind::DeviceNotFound
+    );
+    assert_eq!(
+        directory
+            .resolve_session_target(&inbound_only.to_string(), deadline)
+            .expect_err("inbound permission is not an outbound address-book row")
+            .kind(),
+        DomainErrorKind::OutboundDirectionDenied
+    );
+    assert_eq!(
+        directory
+            .resolve_session_target(&unknown.to_string(), deadline)
+            .expect_err("unknown canonical ID")
+            .kind(),
+        DomainErrorKind::DeviceNotFound
+    );
+
+    directory
+        .rename(
+            outbound,
+            DeviceAlias::new("renamed").expect("renamed alias"),
+            deadline,
+        )
+        .expect("rename outbound alias");
+    assert_eq!(
+        alias_target.device_id(),
+        Some(outbound),
+        "the consumed resolved target contains no mutable alias"
+    );
+    assert_eq!(
+        directory
+            .resolve_session_target("Workstation", deadline)
+            .expect_err("old alias no longer resolves")
+            .kind(),
+        DomainErrorKind::DeviceNotFound
+    );
+    assert_eq!(
+        directory
+            .resolve_session_target("renamed", deadline)
+            .expect("new exact alias")
+            .device_id(),
+        Some(outbound)
+    );
+
+    let ambiguous_alias_owner = DeviceId::from_array([0xc4; 32]);
+    handle
+        .upsert_known_device(
+            ambiguous_alias_owner,
+            DeviceAlias::new(unknown.to_string()).expect("ID-shaped alias"),
+            "Ambiguous".to_owned(),
+            None,
+            deadline,
+        )
+        .expect("ID-shaped alias row");
+    assert_eq!(
+        directory
+            .resolve_session_target(&unknown.to_string(), deadline)
+            .expect_err("canonical ID and another device alias are ambiguous")
+            .kind(),
+        DomainErrorKind::InvalidTargetSelector
+    );
+
+    actor.shutdown();
+}
+
+#[test]
 fn rename_touches_only_outbound_and_revoke_only_inbound() {
     let state = TestState::new();
     state.paths.prepare_state_directories().expect("state dirs");

@@ -1,15 +1,15 @@
 # Persistent session engine and local attachment
 
 Phase One M4 adds the terminal-session engine inside each user's daemon. It is
-now possible at the service and real-socket adapter layers to create multiple
-login-shell sessions, disconnect, and later attach to the same PTY and current
-terminal state. The final interactive `zterm connect`/raw-terminal CLI is a
-later milestone, so these interfaces are not yet exposed as public commands.
+used by the public `zterm connect` and `zterm session` commands through both
+same-UID local IPC and authenticated remote Iroh streams. See
+[Remote sessions and the public CLI](remote-cli.md) for the command and
+reconnect UX.
 
 ## What “persistent” means
 
-A session belongs to the daemon, not to a socket or client process. Losing a
-local attachment leaves its login shell, foreground process, working directory,
+A session belongs to the daemon, not to a socket or client process. Losing an
+attachment leaves its login shell, foreground process, working directory,
 viewport, bounded recent history, and authoritative terminal model running.
 Reattaching returns the same daemon-lifetime `SessionId` and a full current
 snapshot before incremental updates resume.
@@ -77,17 +77,18 @@ RSS is exactly predictable. Snapshot encoding always preserves the current
 screen; when necessary it removes only the oldest complete history lines at an
 ANSI reset/line boundary to remain within the frame ceiling.
 
-## Local trust and architecture boundary
+## Trust and architecture boundary
 
 The local adapter reuses the daemon's Unix socket and authorizes the peer's
 effective UID before decoding bytes (`SO_PEERCRED` on Linux, `getpeereid` on
 macOS). Short session mutations remain one-frame unary connections. A terminal
 attachment is one bounded duplex stream selected by its first frame.
 
-Both paths call the same transport-independent `SessionService`. M4 does not
-bind an Iroh endpoint, self-dial, pair the machine with itself, or implement
-remote transport. Future authenticated QUIC and the local adapter must remain
-thin callers of this same service rather than creating a second registry.
+Both local and authenticated remote paths call the same transport-independent
+`SessionService`. The production daemon owns Iroh and translates each remote
+stream into the same service calls; the CLI never owns an Endpoint. The local
+target does not self-dial, pair the machine with itself, perform discovery, or
+use a Relay. Neither adapter creates a second Session registry.
 
 The service API is synchronous, but each `SessionActor` owns its mutable runtime
 on a dedicated OS thread behind a fixed 16-command mailbox. Every command has

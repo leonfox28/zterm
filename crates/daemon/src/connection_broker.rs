@@ -2,9 +2,10 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::future::pending;
+use std::future::{Future, pending};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
@@ -15,9 +16,9 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use zterm_core::{
-    AuthGeneration, AuthorizationStatus, Capabilities, ConnectionAttemptId, ConnectionCandidateKey,
-    ConnectionHello, ConnectionWelcome, DeviceDisplayName, DeviceId, DomainErrorKind, RelayHint,
-    TransportLimits, designated_primary,
+    AuthGeneration, AuthorizationSnapshot, AuthorizationStatus, Capabilities, ConnectionAttemptId,
+    ConnectionCandidateKey, ConnectionHello, ConnectionWelcome, DeviceDisplayName, DeviceId,
+    DomainErrorKind, RelayHint, TransportLimits, designated_primary,
 };
 use zterm_proto::{DecodedFrame, FrameDecoder, WireKind, encode_message, v1};
 
@@ -247,11 +248,91 @@ pub struct ConnectionBroker {
     inner: Arc<BrokerInner>,
 }
 
+/// Boxed future returned by the narrow inbound normal-service callback.
+pub(crate) type RemoteServiceHandlerFuture =
+    Pin<Box<dyn Future<Output = Result<(), DaemonError>> + Send + 'static>>;
+
+/// Object-safe owner of one authenticated inbound normal service stream.
+///
+/// The callback cannot reach Endpoint, candidate, route, profile, or peer-slot
+/// state. It receives only the owned stream, verified peer identity, accepted
+/// receiver generation, and the first-frame deadline.
+pub(crate) trait RemoteServiceHandler: Send + Sync + 'static {
+    fn handle_service_stream(
+        &self,
+        stream: InboundAuthenticatedStream,
+        first_frame_deadline: Instant,
+    ) -> RemoteServiceHandlerFuture;
+}
+
+/// Owned Iroh halves and receiver-owned authorization identity for one
+/// inbound normal service stream.
+pub(crate) struct InboundAuthenticatedStream {
+    send: SendStream,
+    recv: RecvStream,
+    remote_device_id: DeviceId,
+    accepted_generation: AuthGeneration,
+}
+
+impl fmt::Debug for InboundAuthenticatedStream {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InboundAuthenticatedStream")
+            .field("remote_device_id", &self.remote_device_id)
+            .field("accepted_generation", &self.accepted_generation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl InboundAuthenticatedStream {
+    #[must_use]
+    pub(crate) const fn remote_device_id(&self) -> DeviceId {
+        self.remote_device_id
+    }
+
+    #[must_use]
+    pub(crate) const fn accepted_generation(&self) -> AuthGeneration {
+        self.accepted_generation
+    }
+
+    pub(crate) fn into_parts(self) -> (SendStream, RecvStream) {
+        (self.send, self.recv)
+    }
+}
+
+#[derive(Default)]
+struct RemoteServiceHandlerSlot {
+    handler: OnceLock<Arc<dyn RemoteServiceHandler>>,
+}
+
+impl RemoteServiceHandlerSlot {
+    fn install(&self, handler: Arc<dyn RemoteServiceHandler>) -> Result<(), DaemonError> {
+        self.handler.set(handler).map_err(|_| {
+            DaemonError::new(
+                DomainErrorKind::IdentityStateMismatch,
+                "remote service handler is already installed",
+            )
+        })
+    }
+
+    fn get(&self) -> Option<Arc<dyn RemoteServiceHandler>> {
+        self.handler.get().cloned()
+    }
+
+    fn is_installed(&self) -> bool {
+        self.handler.get().is_some()
+    }
+}
+
 impl fmt::Debug for ConnectionBroker {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ConnectionBroker")
             .field("local_device_id", &self.inner.identity.device_id)
+            .field(
+                "service_handler_installed",
+                &self.inner.service_handler.is_installed(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -269,6 +350,7 @@ struct BrokerInner {
     observer: NetworkObserver,
     lifecycle: BrokerLifecycle,
     pairing: PairHandshakeAdmission,
+    service_handler: RemoteServiceHandlerSlot,
     test_routes: Mutex<BTreeMap<DeviceId, EndpointAddr>>,
 }
 
@@ -330,6 +412,12 @@ struct CandidateAdmission {
     handlers: Arc<Semaphore>,
 }
 
+#[derive(Debug)]
+struct ServiceHandlerPermits {
+    _connection: OwnedSemaphorePermit,
+    _global: OwnedSemaphorePermit,
+}
+
 #[derive(Default)]
 struct BrokerLifecycle {
     shutting_down: AtomicBool,
@@ -346,6 +434,7 @@ struct Candidate {
     remote: DeviceId,
     connection: Connection,
     side: CandidateSide,
+    inbound_authorization: Option<AuthorizationSnapshot>,
     verified_relay: Option<RelayHint>,
     cancel: watch::Sender<bool>,
     actor_started: AtomicBool,
@@ -363,6 +452,7 @@ impl fmt::Debug for Candidate {
             .field("key", &self.key)
             .field("remote", &self.remote)
             .field("side", &self.side)
+            .field("inbound_authorization", &self.inbound_authorization)
             .field("verified_relay", &self.verified_relay)
             .finish_non_exhaustive()
     }
@@ -837,6 +927,46 @@ impl CandidateAdmission {
     }
 }
 
+fn try_admit_service_handler(
+    lifecycle: &BrokerLifecycle,
+    connection: &Arc<Semaphore>,
+    global: &Arc<Semaphore>,
+) -> Result<ServiceHandlerPermits, DaemonError> {
+    if lifecycle.is_quiescing() {
+        return Err(transport_unavailable("network transport is stopping"));
+    }
+    let connection = Arc::clone(connection)
+        .try_acquire_owned()
+        .map_err(|_| resource_exhausted("connection handler limit reached"))?;
+    let global = Arc::clone(global)
+        .try_acquire_owned()
+        .map_err(|_| resource_exhausted("global handler limit reached"))?;
+    if lifecycle.is_quiescing() {
+        return Err(transport_unavailable("network transport is stopping"));
+    }
+    Ok(ServiceHandlerPermits {
+        _connection: connection,
+        _global: global,
+    })
+}
+
+async fn wait_for_service_handlers_until(
+    handlers: Arc<Semaphore>,
+    maximum: usize,
+    deadline: Instant,
+) -> Result<(), DaemonError> {
+    if handlers.available_permits() == maximum {
+        return Ok(());
+    }
+    let maximum = u32::try_from(maximum)
+        .map_err(|_| resource_exhausted("global handler limit exceeds the semaphore boundary"))?;
+    let permits = timeout_until(deadline, handlers.acquire_many_owned(maximum))
+        .await?
+        .map_err(|_| transport_unavailable("global handler admission is unavailable"))?;
+    drop(permits);
+    Ok(())
+}
+
 impl BrokerLifecycle {
     fn is_quiescing(&self) -> bool {
         self.shutting_down.load(Ordering::Acquire)
@@ -903,6 +1033,7 @@ impl ConnectionBroker {
                 observer,
                 lifecycle: BrokerLifecycle::default(),
                 pairing,
+                service_handler: RemoteServiceHandlerSlot::default(),
                 test_routes: Mutex::new(BTreeMap::new()),
             }),
         })
@@ -912,6 +1043,17 @@ impl ConnectionBroker {
     /// transient dial path.
     pub(crate) fn pair_handshake_admission(&self) -> PairHandshakeAdmission {
         self.inner.pairing.clone()
+    }
+
+    /// Installs the single inbound normal-service owner before Endpoint spawn.
+    pub(crate) fn install_remote_service_handler(
+        &self,
+        handler: Arc<dyn RemoteServiceHandler>,
+    ) -> Result<(), DaemonError> {
+        if self.inner.lifecycle.is_quiescing() {
+            return Err(transport_unavailable("network transport is stopping"));
+        }
+        self.inner.service_handler.install(handler)
     }
 
     /// Creates a broker around a task-private already-bound Endpoint.
@@ -1293,11 +1435,24 @@ impl ConnectionBroker {
 
     /// Permanently refuses new work and closes every current connection.
     pub async fn quiesce(&self) {
+        let deadline = Instant::now() + self.inner.limits.first_frame_deadline;
+        let _ = self.quiesce_until(deadline).await;
+    }
+
+    /// Permanently refuses new work and reclaims every admitted service
+    /// handler before the caller closes the owning Endpoint.
+    pub(crate) async fn quiesce_until(&self, deadline: Instant) -> Result<(), DaemonError> {
         self.inner.lifecycle.begin_quiesce();
         self.inner.pairing.begin_quiesce();
         self.inner.endpoint.send_replace(None);
         self.close_all(ConnectionCloseReason::ShuttingDown).await;
         self.wake_all_peers();
+        wait_for_service_handlers_until(
+            Arc::clone(&self.inner.admission.global_stream_handlers),
+            self.inner.limits.max_stream_handlers_global,
+            deadline,
+        )
+        .await
     }
 
     /// Closes all current candidates for one endpoint without touching Session state.
@@ -1725,6 +1880,7 @@ impl ConnectionBroker {
             slot.remote,
             connection,
             CandidateSide::Outbound,
+            None,
             verified_relay,
             connection_permit,
             Arc::clone(&self.inner.metrics),
@@ -1865,6 +2021,7 @@ impl ConnectionBroker {
             remote,
             connection,
             CandidateSide::Inbound,
+            Some(admission.snapshot),
             verified_relay,
             connection_permit,
             Arc::clone(&self.inner.metrics),
@@ -2024,7 +2181,12 @@ impl ConnectionBroker {
             .authorization
             .admit(candidate.remote)
             .ok()
-            .map(|admission| (admission.snapshot, admission.changes));
+            .and_then(|admission| {
+                candidate
+                    .inbound_authorization
+                    .is_none_or(|accepted| accepted == admission.snapshot)
+                    .then_some((admission.snapshot, admission.changes))
+            });
         if *cancel.borrow() || (candidate.side == CandidateSide::Inbound && auth_changes.is_none())
         {
             candidate.cancel(ConnectionCloseReason::Unauthorized);
@@ -2050,6 +2212,9 @@ impl ConnectionBroker {
                     }
                 }
                 _ = candidate.connection.closed() => break,
+                joined = handlers.join_next(), if !handlers.is_empty() => {
+                    let _ = joined;
+                }
                 event = path_events.next() => {
                     match event {
                         Some(event) => self.observe_path_event(&candidate, event),
@@ -2060,19 +2225,12 @@ impl ConnectionBroker {
                     let Ok((mut send, mut recv)) = accepted else {
                         break;
                     };
-                    let connection_permit = candidate
-                        .admission
-                        .handlers
-                        .clone()
-                        .try_acquire_owned();
-                    let global_permit = self
-                        .inner
-                        .admission
-                        .global_stream_handlers
-                        .clone()
-                        .try_acquire_owned();
-                    match (connection_permit, global_permit) {
-                        (Ok(connection_permit), Ok(global_permit)) => {
+                    match try_admit_service_handler(
+                        &self.inner.lifecycle,
+                        &candidate.admission.handlers,
+                        &self.inner.admission.global_stream_handlers,
+                    ) {
+                        Ok(handler_permits) => {
                             let metric = StreamMetricGuard::new(
                                 Arc::clone(&self.inner.metrics),
                                 Arc::clone(&slot.active_streams),
@@ -2083,18 +2241,24 @@ impl ConnectionBroker {
                             };
                             let broker = self.clone();
                             let remote = candidate.remote;
+                            let connection_generation = candidate
+                                .inbound_authorization
+                                .map(|snapshot| snapshot.generation);
                             handlers.spawn(async move {
-                                let _connection_permit = connection_permit;
-                                let _global_permit = global_permit;
+                                let _handler_permits = handler_permits;
                                 let _metric = metric;
-                                broker.handle_service_stream(remote, &mut send, &mut recv).await;
+                                broker
+                                    .handle_service_stream(
+                                        remote,
+                                        connection_generation,
+                                        send,
+                                        recv,
+                                    )
+                                    .await;
                             });
                         }
-                        _ => reject_stream(&mut send, &mut recv, b"stream overloaded"),
+                        Err(_) => reject_stream(&mut send, &mut recv, b"stream overloaded"),
                     }
-                }
-                joined = handlers.join_next(), if !handlers.is_empty() => {
-                    let _ = joined;
                 }
             }
         }
@@ -2106,25 +2270,54 @@ impl ConnectionBroker {
     async fn handle_service_stream(
         &self,
         remote: DeviceId,
-        send: &mut SendStream,
-        recv: &mut RecvStream,
+        connection_generation: Option<AuthGeneration>,
+        mut send: SendStream,
+        mut recv: RecvStream,
     ) {
-        // Receiver-side directionality: an outbound-only known device is not
-        // implicitly authorized merely because QUIC permits reverse streams.
-        if self.inner.authorization.admit(remote).is_err() {
-            reject_stream(send, recv, b"not authorized");
+        if self.inner.lifecycle.is_quiescing() {
+            reject_stream(&mut send, &mut recv, b"transport stopping");
             return;
         }
+        // Receiver-side directionality: an outbound-only known device is not
+        // implicitly authorized merely because QUIC permits reverse streams.
+        let accepted_generation = match receiver_generation_for_stream(
+            &self.inner.authorization,
+            remote,
+            connection_generation,
+        ) {
+            Ok(generation) => generation,
+            Err(_) => {
+                reject_stream(&mut send, &mut recv, b"not authorized");
+                return;
+            }
+        };
         let deadline = Instant::now() + self.inner.limits.first_frame_deadline;
-        let frame = match read_service_frame(recv, deadline).await {
+        if let Some(handler) = self.inner.service_handler.get() {
+            if self.inner.lifecycle.is_quiescing() {
+                reject_stream(&mut send, &mut recv, b"transport stopping");
+                return;
+            }
+            let stream = InboundAuthenticatedStream {
+                send,
+                recv,
+                remote_device_id: remote,
+                accepted_generation,
+            };
+            let _ = handler.handle_service_stream(stream, deadline).await;
+            return;
+        }
+
+        // Isolated M5-M6 composition intentionally retains the typed fallback.
+        // Only this no-handler branch owns its compatibility pre-read.
+        let frame = match read_service_frame(&mut recv, deadline).await {
             Ok(frame) => frame,
             Err(_) => {
-                reject_stream(send, recv, b"invalid service frame");
+                reject_stream(&mut send, &mut recv, b"invalid service frame");
                 return;
             }
         };
         if !is_remote_service_kind(frame.kind) {
-            reject_stream(send, recv, b"invalid service kind");
+            reject_stream(&mut send, &mut recv, b"invalid service kind");
             return;
         }
         let response = v1::ServiceError {
@@ -2139,7 +2332,7 @@ impl ConnectionBroker {
         ) {
             Ok(bytes) => bytes,
             Err(_) => {
-                reject_stream(send, recv, b"service response unavailable");
+                reject_stream(&mut send, &mut recv, b"service response unavailable");
                 return;
             }
         };
@@ -2149,7 +2342,7 @@ impl ConnectionBroker {
         {
             let _ = send.finish();
         } else {
-            reject_stream(send, recv, b"service response failed");
+            reject_stream(&mut send, &mut recv, b"service response failed");
         }
     }
 
@@ -2267,6 +2460,7 @@ impl Candidate {
         remote: DeviceId,
         connection: Connection,
         side: CandidateSide,
+        inbound_authorization: Option<AuthorizationSnapshot>,
         verified_relay: Option<RelayHint>,
         connection_permit: OwnedSemaphorePermit,
         metrics: Arc<BrokerMetrics>,
@@ -2279,6 +2473,7 @@ impl Candidate {
             remote,
             connection,
             side,
+            inbound_authorization,
             verified_relay,
             cancel,
             actor_started: AtomicBool::new(false),
@@ -2516,6 +2711,21 @@ fn recheck_inbound_admission(
         ));
     }
     Ok(current)
+}
+
+fn receiver_generation_for_stream(
+    authorization: &AuthorizationRegistry,
+    remote: DeviceId,
+    connection_generation: Option<AuthGeneration>,
+) -> Result<AuthGeneration, DaemonError> {
+    let current = authorization.admit(remote)?;
+    if connection_generation.is_some_and(|accepted| accepted != current.snapshot.generation) {
+        return Err(DaemonError::new(
+            DomainErrorKind::Unauthorized,
+            "device is not authorized to control this host",
+        ));
+    }
+    Ok(current.snapshot.generation)
 }
 
 async fn wait_for_authorization_change(
@@ -3085,9 +3295,11 @@ fn bounded_u32(value: usize) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use std::future::{Future, poll_fn};
     use std::sync::Arc;
 
     use iroh::{RelayUrl, TransportAddr};
+    use tokio::sync::oneshot;
     use zterm_core::{
         AuthorizationSnapshot, ConnectionAttemptId, DeviceDisplayName, TransportLimits,
     };
@@ -3096,6 +3308,18 @@ mod tests {
     use crate::authorization::AuthorizationRegistry;
     use crate::network::NetworkReporter;
     use crate::store::DeviceAuthorization;
+
+    struct NoopRemoteServiceHandler;
+
+    impl RemoteServiceHandler for NoopRemoteServiceHandler {
+        fn handle_service_stream(
+            &self,
+            _stream: InboundAuthenticatedStream,
+            _first_frame_deadline: Instant,
+        ) -> RemoteServiceHandlerFuture {
+            Box::pin(async { Ok(()) })
+        }
+    }
 
     fn device(byte: u8) -> DeviceId {
         DeviceId::from_array([byte; 32])
@@ -3280,6 +3504,100 @@ mod tests {
         assert_two_permits_then_full(&peer.open_queue);
         assert_two_permits_then_full(&connection.streams);
         assert_two_permits_then_full(&connection.handlers);
+    }
+
+    #[test]
+    fn remote_service_handler_installs_once_without_transport_ownership() {
+        let slot = RemoteServiceHandlerSlot::default();
+        assert!(!slot.is_installed());
+        slot.install(Arc::new(NoopRemoteServiceHandler))
+            .expect("first handler installation");
+        assert!(slot.is_installed());
+        assert!(slot.get().is_some());
+        let error = slot
+            .install(Arc::new(NoopRemoteServiceHandler))
+            .expect_err("handler ownership cannot be replaced after installation");
+        assert_eq!(error.kind(), DomainErrorKind::IdentityStateMismatch);
+    }
+
+    #[tokio::test]
+    async fn service_handler_admission_quiesce_and_reclamation_use_raii_permits() {
+        let lifecycle = BrokerLifecycle::default();
+        let connection = Arc::new(Semaphore::new(1));
+        let global = Arc::new(Semaphore::new(1));
+        let permits = try_admit_service_handler(&lifecycle, &connection, &global)
+            .expect("first service handler is admitted");
+        assert_eq!(connection.available_permits(), 0);
+        assert_eq!(global.available_permits(), 0);
+        assert_eq!(
+            try_admit_service_handler(&lifecycle, &connection, &global)
+                .expect_err("connection-local handler capacity is bounded")
+                .kind(),
+            DomainErrorKind::ResourceExhausted
+        );
+
+        let wait_global = Arc::clone(&global);
+        let (first_poll, first_poll_observation) = oneshot::channel();
+        let waiting = tokio::spawn(async move {
+            let wait = tokio::task::unconstrained(wait_for_service_handlers_until(
+                wait_global,
+                1,
+                Instant::now() + Duration::from_secs(1),
+            ));
+            tokio::pin!(wait);
+            let mut observer = Some(first_poll);
+            poll_fn(|context| {
+                let result = wait.as_mut().poll(context);
+                if let Some(observer) = observer.take() {
+                    let _ = observer.send(result.is_pending());
+                }
+                result
+            })
+            .await
+        });
+        assert!(
+            first_poll_observation
+                .await
+                .expect("handler reclamation first-poll result"),
+            "reclamation waits while the admitted handler owns its permit"
+        );
+        drop(permits);
+        waiting
+            .await
+            .expect("handler reclamation task")
+            .expect("released handler permit is reclaimed");
+        assert_eq!(connection.available_permits(), 1);
+        assert_eq!(global.available_permits(), 1);
+
+        lifecycle.begin_quiesce();
+        let error = try_admit_service_handler(&lifecycle, &connection, &global)
+            .expect_err("new service admission fails closed after quiesce");
+        assert_eq!(error.kind(), DomainErrorKind::TransportUnavailable);
+        assert_eq!(connection.available_permits(), 1);
+        assert_eq!(global.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn service_handler_panic_releases_only_its_stream_permits() {
+        let lifecycle = BrokerLifecycle::default();
+        let connection = Arc::new(Semaphore::new(1));
+        let global = Arc::new(Semaphore::new(1));
+        let permits = try_admit_service_handler(&lifecycle, &connection, &global)
+            .expect("panic fixture handler admission");
+        let mut handlers = JoinSet::new();
+        handlers.spawn(async move {
+            let _permits = permits;
+            panic!("injected stream-local handler panic");
+        });
+        let joined = handlers.join_next().await.expect("one handler task joined");
+        assert!(joined.is_err(), "the injected handler task panicked");
+        assert!(!lifecycle.is_quiescing());
+        assert_eq!(connection.available_permits(), 1);
+        assert_eq!(global.available_permits(), 1);
+        drop(
+            try_admit_service_handler(&lifecycle, &connection, &global)
+                .expect("another independent handler remains admissible"),
+        );
     }
 
     fn assert_two_permits_then_full(semaphore: &Arc<Semaphore>) {
@@ -3535,6 +3853,15 @@ mod tests {
 
         let admitted =
             admit_inbound_before_payload(&registry, authorized).expect("authorized before payload");
+        assert_eq!(
+            receiver_generation_for_stream(
+                &registry,
+                authorized,
+                Some(admitted.snapshot.generation),
+            )
+            .expect("stream uses the receiver-owned accepted generation"),
+            admitted.snapshot.generation
+        );
         let revoked_error =
             admit_inbound_before_payload(&registry, revoked).expect_err("revoked before payload");
         let unknown_error =
@@ -3565,6 +3892,18 @@ mod tests {
         let stale = recheck_inbound_admission(&registry, authorized, admitted.snapshot)
             .expect_err("generation changed before candidate publication");
         assert_eq!(stale.kind(), DomainErrorKind::Unauthorized);
+        let stale_stream = receiver_generation_for_stream(
+            &registry,
+            authorized,
+            Some(admitted.snapshot.generation),
+        )
+        .expect_err("an old inbound connection cannot adopt a new generation");
+        assert_eq!(stale_stream.kind(), DomainErrorKind::Unauthorized);
+        assert_eq!(
+            receiver_generation_for_stream(&registry, authorized, None)
+                .expect("an outbound candidate checks current reverse direction"),
+            AuthGeneration::new(2).expect("generation two")
+        );
     }
 
     #[test]

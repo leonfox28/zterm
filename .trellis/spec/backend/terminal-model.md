@@ -55,6 +55,24 @@ or icon-name event retains at most `MAX_TITLE_BYTES = 256` source bytes.
   visible cells and styles, cursor and active style, and supported input modes.
 - A reconnect client applies `recent_history_ansi` before `screen_ansi`.
   Snapshot replay into a fresh model must reproduce the latest semantic state.
+- The Unix raw-terminal controller validates both physical TTYs before attach,
+  saves exact termios, and owns one outer alternate screen. It strips the one
+  expected model screen selector, rejects every nested or inconsistent main /
+  alternate selector, writes and flushes the complete snapshot before its
+  exact acknowledgement, and requests a full sync on any revision gap.
+- Input is read through one fixed-capacity channel. While preparing,
+  synchronizing, or reconnecting, ordinary bytes are drained and discarded;
+  only the local detach prefix remains actionable. Before publishing each
+  transition to `Active`, the controller closes the old receiver, wakes and
+  synchronously joins its reader, flushes queued terminal input while no reader
+  exists, advances the input epoch and clears prefix state, then starts the
+  replacement reader. No byte observed before that fence may be replayed into
+  the Session.
+- Normal completion, typed failure, task cancellation, unwind, and captured
+  SIGINT/SIGTERM/SIGHUP all attempt the same idempotent display and exact
+  termios restoration before a content-free normal-mode diagnostic. Termios
+  calls retry `EINTR`; a failed explicit restoration remains retryable by
+  `Drop` and is not hidden by the terminal operation's earlier error.
 - Snapshot frame bounding preserves the current `screen_ansi`. If a wire
   envelope would exceed 8 MiB, the one snapshot limiter drops only oldest
   complete `CRLF`-terminated history lines, prepends an ANSI reset at the new
@@ -151,6 +169,11 @@ or icon-name event retains at most `MAX_TITLE_BYTES = 256` source bytes.
   matrix, saturated RSS/CPU evidence, and accepted three/eight-session bounds.
 - Ordinary workspace format, Clippy with warnings denied, tests, docs, and
   dependency policy remain required on every change.
+- Task-private PTY tests deterministically stop the stdin reader between
+  readable `poll` and blocking `read`, require repeated Active fences to join
+  before flushing, and prove only post-fence bytes are delivered. Isolated
+  child-process tests cover success, error, cancellation, panic, SIGINT,
+  SIGTERM, and SIGHUP restoration ordering without terminal-content logging.
 
 ## 7. Wrong vs Correct
 

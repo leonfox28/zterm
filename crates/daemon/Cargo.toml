@@ -25,7 +25,7 @@ zterm-proto.workspace = true
 anyhow.workspace = true
 futures-util.workspace = true
 tempfile.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 nix = { workspace = true, features = ["signal", "term"] }

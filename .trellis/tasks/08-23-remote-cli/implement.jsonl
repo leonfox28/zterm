@@ -1,0 +1,27 @@
+{"file":".trellis/spec/backend/index.md","reason":"Load the active backend contract index before changing the cross-layer daemon and CLI runtime."}
+{"file":".trellis/spec/guides/evidence-driven-simplicity.md","reason":"Give every retry, reconnect state, bound and recovery path one real consumer and deterministic evidence."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Carry targets, device generations, operation identity, revisions and errors through CLI, IPC, broker and SessionService without duplicate parsing."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Reuse the existing SessionService, broker, authorization gate, frame codec, launcher and TerminalModel rather than creating parallel owners."}
+{"file":".trellis/spec/guides/cross-platform-thinking-guide.md","reason":"Keep Unix runtime behavior, macOS network-test safety and hosted Windows shared compilation explicit throughout implementation."}
+{"file":".trellis/spec/backend/directory-structure.md","reason":"Place the shared wire server, broker adapter, bridge and CLI boundaries in the existing crate ownership layout."}
+{"file":".trellis/spec/backend/core-wire-domain.md","reason":"Add only compatible IDs, fields, message kinds and conversions with stable bounds, redaction and error projection."}
+{"file":".trellis/spec/backend/local-daemon-ipc.md","reason":"Route every public command through the same-UID daemon while preserving strict unary and bounded duplex framing semantics."}
+{"file":".trellis/spec/backend/session-service.md","reason":"Keep Session, PTY, attachment, controller, replay and resource truth in the one transport-independent SessionService."}
+{"file":".trellis/spec/backend/transport-auth.md","reason":"Use authenticated normal-ALPN service streams, ConnectionDemand and generation-aware commit permits without widening Endpoint ownership."}
+{"file":".trellis/spec/backend/effective-user-state.md","reason":"Resolve device direction and implement identity reset through exact UserPaths, StoreActor and lifecycle ownership."}
+{"file":".trellis/spec/backend/pty-lifecycle.md","reason":"Ensure stream loss, detach, revoke and CLI exit never gain authority to close or signal a persistent PTY."}
+{"file":".trellis/spec/backend/terminal-driver.md","reason":"Preserve bounded drain, resize and revision notification while remote attachments reconnect independently."}
+{"file":".trellis/spec/backend/terminal-model.md","reason":"Render authoritative snapshots and continuous deltas with bounded visible-grid checkpoints and no raw escape replay."}
+{"file":".trellis/spec/backend/error-handling.md","reason":"Project target, transport, authorization, Session, lease, sync and outcome-unknown failures into stable typed CLI diagnostics."}
+{"file":".trellis/spec/backend/logging-guidelines.md","reason":"Keep tickets, terminal bytes, cwd, direct addresses and route data out of logs, Debug and error surfaces."}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Apply focused deterministic tests, full quality gates and proportionate Linux real-Iroh evidence."}
+{"file":".trellis/tasks/08-23-remote-cli/research/current-boundary.md","reason":"Start from the inspected M4 and M5-M6 APIs, identified adapter seams and explicit forbidden shortcuts."}
+{"file":".trellis/tasks/archive/2026-08/08-22-persistent-session-local-attach/research/current-boundary.md","reason":"Preserve the exact M4 SessionService, local IPC, replay, attachment and PTY ownership handoff."}
+{"file":".trellis/tasks/archive/2026-08/08-22-transport-auth/research/current-boundary.md","reason":"Preserve the exact M5-M6 broker, service-stream, authorization and lifecycle handoff into M7."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/connection-multiplexing.md","reason":"Maintain one normal connection per device pair with independent bounded streams for multiple Sessions."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/local-self-attach.md","reason":"Make local and remote views attach the same Session with no implicit local controller priority."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/persistent-agent-session.md","reason":"Keep persistence generic to shell Sessions and independent of connection, CLI and named agent programs."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/terminal-reconnect-state.md","reason":"Implement snapshot-first reconnect, revision continuity and input suppression during synchronization."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/device-revocation.md","reason":"Enforce durable revoke and generation fairness while preserving host Session and PTY state."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/authorization-scope.md","reason":"Keep pairing as honest host-user trust and avoid inventing unsupported per-session isolation."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/desktop-product-shape.md","reason":"Honor the confirmed one-Session-per-CLI command surface and leave embedded tabs and mobile UI deferred."}

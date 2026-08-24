@@ -4489,11 +4489,14 @@ name = "zterm-cli"
 version = "0.1.1"
 dependencies = [
  "clap",
+ "futures-util",
  "nix 0.28.0",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "zeroize",
  "zterm-core",
  "zterm-daemon",
  "zterm-platform",

@@ -1,22 +1,21 @@
 //! Task-private two-owner Iroh fixture for the Linux transport gate.
 //!
-//! The fixture deliberately builds only loopback IP transport plus one
-//! self-hosted Relay-map seam. It never installs production DNS/Pkarr lookup,
-//! never touches the effective user's state, and creates exactly one Endpoint
-//! for each prepared daemon owner.
-
-#![allow(dead_code)]
+//! Persistent task-private config remains the production `OfficialN0`
+//! selection. The runtime fixture is deliberately narrower: relay-disabled
+//! loopback/direct transport. It never installs production DNS/Pkarr lookup,
+//! never contacts a Relay, never touches the effective user's state, and
+//! creates exactly one Endpoint for each prepared daemon owner.
 
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use iroh::endpoint::{Incoming, VarInt, presets};
-use iroh::{Endpoint, EndpointAddr, RelayConfig, RelayMap, RelayMode, RelayUrl, SecretKey};
+use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
 use tokio::sync::Notify;
 use tokio::task::{JoinHandle, JoinSet};
 use zeroize::Zeroizing;
-use zterm_core::{Capabilities, DeviceAlias, DeviceId, RelayHint, TransportLimits};
+use zterm_core::{Capabilities, DeviceAlias, DeviceId, TransportLimits};
 use zterm_daemon::authorization::AuthorizationRegistry;
 use zterm_daemon::config::{
     ValidatedInfrastructure, load_config, validate_setup_input, write_config,
@@ -35,6 +34,7 @@ use state_fixture::TestState;
 const FIXTURE_BUILD: &str = "two-daemon-fixture";
 const FIXTURE_PLATFORM: &str = "linux-loopback";
 const FIXTURE_TIMESTAMP: i64 = 1;
+const FIXTURE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Persistent task-private state prepared before either network owner binds.
 pub struct PreparedDaemonOwner {
@@ -45,14 +45,14 @@ pub struct PreparedDaemonOwner {
 
 impl PreparedDaemonOwner {
     /// Commits one isolated config and identity without creating an Endpoint.
-    pub fn new(name: &str, relay_url: RelayUrl) -> Self {
+    pub fn new(name: &str) -> Self {
         let state = TestState::new();
         state
             .paths
             .prepare_state_directories()
             .expect("task-private state directories");
-        let config = validate_setup_input(name, ValidatedInfrastructure::SelfHosted(relay_url))
-            .expect("task-private self-hosted config");
+        let config = validate_setup_input(name, ValidatedInfrastructure::OfficialN0)
+            .expect("task-private OfficialN0 config");
         write_config(&state.paths, &config).expect("task-private config commit");
         let identity = DeviceIdentity::create(&state.paths).expect("task-private identity commit");
         let device_id = identity.device_id();
@@ -76,16 +76,14 @@ impl PreparedDaemonOwner {
         known: &[(DeviceId, &str, &str)],
         limits: TransportLimits,
     ) -> DaemonNetworkOwner {
-        if cfg!(target_os = "macos") {
-            panic!("real Iroh loopback is Linux CI only");
-        }
-        if !cfg!(target_os = "linux") {
-            panic!("real Iroh loopback is Linux CI only");
-        }
+        assert_linux_before_bind();
 
         let persisted_identity =
             DeviceIdentity::load(&self.state.paths).expect("task-private identity reload");
-        assert_eq!(persisted_identity.device_id(), self.device_id);
+        assert!(
+            persisted_identity.device_id() == self.device_id,
+            "persisted fixture identity must match its prepared owner"
+        );
         drop(persisted_identity);
 
         // DeviceIdentity intentionally does not expose its secret outside the
@@ -100,35 +98,37 @@ impl PreparedDaemonOwner {
             .try_into()
             .expect("identity.key is exactly 32 bytes");
         let secret = SecretKey::from_bytes(secret_bytes);
-        assert_eq!(
-            DeviceId::from_array(*secret.public().as_bytes()),
-            self.device_id
+        assert!(
+            DeviceId::from_array(*secret.public().as_bytes()) == self.device_id,
+            "task-private secret must derive the prepared public identity"
         );
 
         let committed = load_config(&self.state.paths).expect("task-private committed config");
-        let profile = InfrastructureProfile::from_validated(&committed.infrastructure);
-        let profile_summary = profile.summary();
-        assert_eq!(profile_summary.relays.len(), 1);
-        assert!(!profile_summary.relays[0].quic_address_discovery);
-        let configured_relay = profile_summary.relays[0].url.clone();
-        let isolated_relay_mode = RelayMode::Custom(RelayMap::from_iter([RelayConfig::new(
-            configured_relay.clone(),
-            None,
-        )]));
+        assert!(matches!(
+            committed.infrastructure,
+            ValidatedInfrastructure::OfficialN0
+        ));
 
         // Do not use InfrastructureProfile::endpoint_builder here: this gate
-        // is intentionally independent of public DNS/Pkarr and port mapping.
-        let endpoint = Endpoint::builder(presets::Minimal)
+        // is intentionally independent of public DNS/Pkarr, Relay traffic,
+        // and port mapping. OfficialN0 is committed state, not runtime relay
+        // evidence in this hermetic gate.
+        let bind = Endpoint::builder(presets::Minimal)
             .secret_key(secret)
-            .relay_mode(isolated_relay_mode)
+            .relay_mode(RelayMode::Disabled)
             .alpns(vec![ZTERM_ALPN.to_vec(), ZTERM_PAIR_ALPN.to_vec()])
             .clear_ip_transports()
             .bind_addr((Ipv4Addr::LOCALHOST, 0))
-            .expect("task-private loopback address")
-            .bind()
+            .unwrap_or_else(|_| panic!("task-private loopback bind configuration failed"))
+            .bind();
+        let endpoint = tokio::time::timeout(FIXTURE_TIMEOUT, bind)
             .await
-            .expect("task-private Endpoint bind");
-        assert_eq!(endpoint.id().as_bytes(), self.device_id.as_bytes());
+            .unwrap_or_else(|_| panic!("task-private Endpoint bind deadline elapsed"))
+            .unwrap_or_else(|_| panic!("task-private Endpoint bind failed"));
+        assert!(
+            endpoint.id().as_bytes() == self.device_id.as_bytes(),
+            "task-private Endpoint identity must match its prepared owner"
+        );
 
         let mut store = StateStore::open(&self.state.paths).expect("task-private store");
         store
@@ -197,12 +197,10 @@ impl PreparedDaemonOwner {
             broker,
             authorization,
             store_handle,
-            store_actor,
-            configured_relay,
-            profile_summary,
+            store_actor: Some(store_actor),
             pair_accepts,
             pair_changed,
-            accept_task,
+            accept_task: Some(accept_task),
         }
     }
 }
@@ -215,19 +213,13 @@ pub struct DaemonNetworkOwner {
     broker: ConnectionBroker,
     authorization: AuthorizationRegistry,
     store_handle: StoreHandle,
-    store_actor: StoreActor,
-    configured_relay: RelayUrl,
-    profile_summary: InfrastructureProfileSummary,
+    store_actor: Option<StoreActor>,
     pair_accepts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pair_changed: std::sync::Arc<Notify>,
-    accept_task: JoinHandle<()>,
+    accept_task: Option<JoinHandle<()>>,
 }
 
 impl DaemonNetworkOwner {
-    pub const fn device_id(&self) -> DeviceId {
-        self.device_id
-    }
-
     pub fn broker(&self) -> &ConnectionBroker {
         &self.broker
     }
@@ -236,21 +228,18 @@ impl DaemonNetworkOwner {
         self.endpoint.bound_sockets()
     }
 
-    pub fn configured_relay(&self) -> &RelayUrl {
-        &self.configured_relay
-    }
-
-    pub fn relay_hint(&self) -> RelayHint {
-        RelayHint::new(self.configured_relay.to_string()).expect("configured Relay is valid")
-    }
-
-    pub fn profile_summary(&self) -> InfrastructureProfileSummary {
-        self.profile_summary.clone()
-    }
-
     pub fn committed_profile_summary(&self) -> InfrastructureProfileSummary {
         let committed = load_config(&self.state.paths).expect("task-private committed config");
         InfrastructureProfile::from_validated(&committed.infrastructure).summary()
+    }
+
+    pub fn committed_is_official_n0(&self) -> bool {
+        matches!(
+            load_config(&self.state.paths)
+                .expect("task-private committed config")
+                .infrastructure,
+            ValidatedInfrastructure::OfficialN0
+        )
     }
 
     pub fn authorization_snapshot(&self, remote: DeviceId) -> zterm_core::AuthorizationSnapshot {
@@ -287,9 +276,7 @@ impl DaemonNetworkOwner {
         remote: &Self,
         deadline: Instant,
     ) -> Result<(), String> {
-        let address = remote
-            .direct_address()
-            .with_relay_url(remote.configured_relay.clone());
+        let address = remote.direct_address();
         let connection = tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),
             self.endpoint.connect(address, ZTERM_PAIR_ALPN),
@@ -327,24 +314,55 @@ impl DaemonNetworkOwner {
 
     async fn wait_for_pair_accept(&self, expected: usize, deadline: Instant) -> Result<(), String> {
         loop {
+            let notified = self.pair_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.pair_accepts.load(std::sync::atomic::Ordering::Acquire) >= expected {
                 return Ok(());
             }
-            tokio::time::timeout_at(
-                tokio::time::Instant::from_std(deadline),
-                self.pair_changed.notified(),
-            )
-            .await
-            .map_err(|_| "pair accept deadline elapsed".to_owned())?;
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), notified)
+                .await
+                .map_err(|_| "pair accept deadline elapsed".to_owned())?;
         }
     }
 
     pub async fn shutdown(mut self) {
-        self.broker.quiesce().await;
-        self.endpoint.close().await;
-        self.accept_task.abort();
-        let _ = (&mut self.accept_task).await;
-        self.store_actor.shutdown();
+        let deadline = Instant::now() + FIXTURE_TIMEOUT;
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            self.broker.quiesce(),
+        )
+        .await
+        .expect("broker cleanup deadline");
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            self.endpoint.close(),
+        )
+        .await
+        .expect("Endpoint cleanup deadline");
+        if let Some(mut task) = self.accept_task.take() {
+            task.abort();
+            let _ = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut task)
+                .await
+                .expect("accept-router cleanup deadline");
+        }
+        if let Some(actor) = self.store_actor.take() {
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                tokio::task::spawn_blocking(move || actor.shutdown()),
+            )
+            .await
+            .expect("StoreActor cleanup deadline")
+            .expect("StoreActor cleanup worker");
+        }
+    }
+}
+
+impl Drop for DaemonNetworkOwner {
+    fn drop(&mut self) {
+        if let Some(task) = self.accept_task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -356,14 +374,22 @@ fn spawn_accept_router(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut handlers = JoinSet::new();
-        while let Some(incoming) = endpoint.accept().await {
-            let broker = broker.clone();
-            let pair_accepts = std::sync::Arc::clone(&pair_accepts);
-            let pair_changed = std::sync::Arc::clone(&pair_changed);
-            handlers.spawn(async move {
-                route_incoming(incoming, broker, pair_accepts, pair_changed).await;
-            });
-            while handlers.try_join_next().is_some() {}
+        loop {
+            tokio::select! {
+                biased;
+                _joined = handlers.join_next(), if !handlers.is_empty() => {}
+                incoming = endpoint.accept() => {
+                    let Some(incoming) = incoming else {
+                        break;
+                    };
+                    let broker = broker.clone();
+                    let pair_accepts = std::sync::Arc::clone(&pair_accepts);
+                    let pair_changed = std::sync::Arc::clone(&pair_changed);
+                    handlers.spawn(async move {
+                        route_incoming(incoming, broker, pair_accepts, pair_changed).await;
+                    });
+                }
+            }
         }
         handlers.abort_all();
         while handlers.join_next().await.is_some() {}
@@ -393,4 +419,9 @@ async fn route_incoming(
         pair_changed.notify_waiters();
         connection.close(VarInt::from_u32(0x105), b"pair probe complete");
     }
+}
+
+fn assert_linux_before_bind() {
+    #[cfg(not(target_os = "linux"))]
+    panic!("real Iroh loopback helpers must fail before bind outside Linux");
 }

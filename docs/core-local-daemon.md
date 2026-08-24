@@ -1,13 +1,13 @@
 # Core and local daemon milestone
 
 This document describes Phase One M2–M3: shared domain/wire contracts and a
-normal user's per-account local daemon. M4 now adds daemon-lifetime terminal
-sessions and the internal real-socket attachment adapter documented in
-[Persistent session engine and local attachment](persistent-sessions.md). The
-public command table below remains unchanged until the later raw-terminal CLI
-milestone, and remote connection is still not implemented.
+normal user's per-account local daemon. Later milestones now build the public
+local/remote CLI on this same owner. See
+[Persistent session engine and local attachment](persistent-sessions.md) for
+Session lifetime and [Remote sessions and the public CLI](remote-cli.md) for
+the complete current command surface.
 
-## Supported commands
+## Local lifecycle and inspection commands
 
 | Command | Starts a daemon | Purpose |
 | --- | --- | --- |
@@ -20,8 +20,10 @@ milestone, and remote connection is still not implemented.
 | `zterm daemon restart [--force]` | yes | Stop, wait, then explicitly start one daemon |
 | `zterm logs [--lines <n>]` | no | Read at most 1,000 recent lines and 1 MiB |
 
-Running `zterm` with no command prints milestone help. The hidden daemon entry
-accepts no state-path argument and is omitted from help.
+After setup, running `zterm` with no command attaches local `main`; before setup
+it prints fixed setup guidance without creating an identity. `zterm --help`
+always prints help. The hidden daemon entry accepts no state-path argument and
+is omitted from help.
 
 First noninteractive setup requires both `--name` and `--profile`; self-hosted
 also requires `--relay-url`. An interactive terminal prompts for missing
@@ -71,8 +73,8 @@ The launcher redirects stdin to null, appends stdout/stderr to the managed log,
 uses the account home as cwd, and the child calls safe `setsid()` before Tokio
 runtime initialization. There is no systemd, launchd, cron, login item,
 supervisor, or automatic update. After a crash or reboot, no daemon starts
-until an explicit setup/restart or future connection command calls the same
-on-demand launcher.
+until an explicit setup/restart or a configured pair/device/connect/Session
+command calls the same on-demand launcher.
 
 Local IPC uses the shared bounded protobuf framing. The daemon authorizes the
 peer UID before decoding bytes:
@@ -106,8 +108,10 @@ socket token it
 published and restores status/stop retry. A replaced same-UID socket path is
 never unlinked by that recovery loop.
 
-Readiness and status are local-only. They do not create or bind an Iroh
-endpoint and do not access DNS, Pkarr, Relay, or the Internet.
+Readiness and status are local-only observations. They neither wait for nor
+initiate Endpoint bind, DNS/Pkarr, Relay, or Internet work. A running production
+daemon separately owns its Iroh Endpoint and publishes truthful degraded
+network state without making local IPC unavailable.
 
 `doctor` uses those same local owners without creating files or starting the
 daemon. It validates the account home and login shell, managed path ownership
@@ -140,21 +144,25 @@ profile = "self-hosted"
 relay_url = "https://relay.example.com"
 ```
 
-The profiles cannot be mixed. Neither profile is contacted by the M3 local
-daemon; M5 consumes this validated choice when network transport is added.
+The profiles cannot be mixed. The current production network owner consumes
+this validated choice; `OfficialN0` remains the default and recommended
+profile. The optional self-hosted profile is not an additional M7-M8 acceptance
+workflow.
 
 ## Deliberate exclusions
 
-- No public `connect local`, raw-terminal renderer, detach key prefix, or user
-  session command tree yet. The M4 service and socket adapter are internal/test-facing.
-- No Iroh endpoint bind, NAT traversal, pairing, remote authorization, or revoke RPC.
-- No GUI, Android, Windows daemon, or iOS client in this milestone.
-- No boot/login autostart and no persistence of live work across daemon restart.
-- No Agent-specific state recognition or notification behavior before 2.0.
+- No M9 installer, updater, uninstaller, or release artifact yet.
+- No M10 two-physical-network, NAT/path-migration, or new public Relay gate.
+- No GUI, Android runtime, Windows daemon/ConPTY, or iOS client in this
+  milestone.
+- No boot/login autostart and no persistence of live work across daemon crash,
+  restart, upgrade, or host reboot.
+- No Agent-specific state recognition, observer mode, multi-writer controller,
+  or disk transcript.
 
-M4 routes local attachment through the same `SessionService` that a future
-remote adapter will use. It does not add self-pairing, self-Iroh dial, or a
-second local session registry.
+Local attachment uses the same `SessionService` as the authenticated remote
+adapter. The `local` target does not self-pair, self-dial Iroh, perform address
+discovery, or create a second Session registry.
 
 ## Focused verification
 

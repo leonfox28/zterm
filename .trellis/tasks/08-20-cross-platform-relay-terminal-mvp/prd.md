@@ -209,10 +209,10 @@ zterm 是一个面向长时间远程终端任务的跨网络连接工具。用�
 
 - [ ] 无账号、注册或业务 API 即可通过一次性文本票据完成两台设备配对；控制端重启后直接使用长期身份连接。
 - [ ] A 生成票据、B 导入后，B 可以控制 A，A 不因此获得控制 B 的权限；只有反向再完成一次配对才建立反向授权，两个方向可以分别撤销。
-- [ ] 配对票据默认通过交互式 TTY/stdin 导入，不作为命令行参数暴露在 shell history 或进程参数中；完整票据和 pair secret 不进入 zterm 日志。
+- [x] 配对票据默认通过交互式 TTY/stdin 导入，不作为命令行参数暴露在 shell history 或进程参数中；完整票据和 pair secret 不进入 zterm 日志。
 - [ ] 成功消费后的票据不能重放；过期、篡改和并发重复消费均失败且不产生半授权。后续二维码可以直接承载同一版本化字节格式。
 - [ ] 已配对设备无需逐 session 授权即可管理全部当前及未来 session；未经配对的 EndpointId 即使能使用 relay，也不能通过 zterm ALPN/握手访问任何 RPC 或终端数据。
-- [ ] 撤销在线 controller 后，其全部 connection、stream、attachment 与 lease 立即失效，并发重连和未提交输入不能绕过撤销；PTY 与任务继续，另一已授权设备可以 reattach，daemon 重启后授权不会复活。
+- [x] 撤销在线 controller 后，其全部 connection、stream、attachment 与 lease 立即失效，并发重连和未提交输入不能绕过撤销；PTY 与任务继续，另一已授权设备可以 reattach，daemon 重启后授权不会复活。
 
 ### C. 网络、隐私与 relay
 
@@ -226,21 +226,21 @@ zterm 是一个面向长时间远程终端任务的跨网络连接工具。用�
 
 ### D. Session、终端恢复与连接复用
 
-- [ ] 首次裸连接创建并进入 `main`，以后默认回到同名 session；可以再创建至少两个独立 session，并分别 list、rename、attach、detach、takeover 和 close。
-- [ ] session 使用当前 OS 账户的交互式 login shell；默认 cwd 为 home，合法 `--cwd` 生效，无效目录不留下 session；创建接口不接受任意启动命令。
+- [x] 首次裸连接创建并进入 `main`，以后默认回到同名 session；可以再创建至少两个独立 session，并分别 list、rename、attach、detach、takeover 和 close。
+- [x] session 使用当前 OS 账户的交互式 login shell；默认 cwd 为 home，合法 `--cwd` 生效，无效目录不留下 session；创建接口不接受任意启动命令。
 - [ ] 在 session 中运行持续任务后强制断开网络或退出 CLI，任务不收到由 transport 断开导致的挂断信号；恢复后 reattach 到同一 session ID，取得正确当前 screen 与有界近期历史并继续输入。
-- [ ] 无人连接、无输入或无输出的 session 不会自动关闭；前台子进程退出并返回 Shell 不回收 session，只有根 Shell 退出、显式 close 或经确认停止 daemon 才结束。
+- [x] 无人连接、无输入或无输出的 session 不会自动关闭；前台子进程退出并返回 Shell 不回收 session，只有根 Shell 退出、显式 close 或经确认停止 daemon 才结束。
 - [ ] 同一控制设备同时打开多个 session 时只建立一条到宿主的 Iroh connection，各 attachment 使用独立 stream；关闭或拖慢一个 attachment 不影响其他 session 或控制 RPC。
 - [ ] 强制断开共享 connection 后，全部本地 attachment 显示重连状态，宿主 session 继续；恢复一条 connection 后分别 reattach 并取得各自正确 snapshot。
-- [ ] snapshot 与 revision 增量的交接无丢失、无重复；长时间高输出、慢客户端和历史淘汰不会阻塞 PTY reader、破坏当前 screen 或造成无界内存增长。
-- [ ] 对 create、rename、close 等状态变更注入“服务端已提交但响应丢失”的故障后，客户端重试得到同一操作结果，不产生重复 session 或错误的二次副作用。
-- [ ] 已有 controller 时普通第二次 attach 不注入输入、不 resize、不打断原 controller；显式 takeover 后原 controller 明确 detach，新 controller 接续同一 PTY 与 session ID。
+- [x] snapshot 与 revision 增量的交接无丢失、无重复；长时间高输出、慢客户端和历史淘汰不会阻塞 PTY reader、破坏当前 screen 或造成无界内存增长。
+- [x] 对 create、rename、close 等状态变更注入“服务端已提交但响应丢失”的故障后，客户端重试得到同一操作结果，不产生重复 session 或错误的二次副作用。
+- [x] 已有 controller 时普通第二次 attach 不注入输入、不 resize、不打断原 controller；显式 takeover 后原 controller 明确 detach，新 controller 接续同一 PTY 与 session ID。
 - [ ] 第一阶段由另一台已配对的桌面 CLI 在 macOS/Linux 宿主的 `main` 或命名 session 中启动任务并 detach，用户可以在该宿主本机通过 same-UID local IPC attach 相同 SessionId，取得相同进程、cwd、当前 screen 与近期历史并继续输入；本机 detach 后远端 CLI reattach 仍是同一会话。第二阶段 Android 必须复用并实机验收同一契约，不另建手机专用 session 路径。
-- [ ] 本机 self attach 不要求配对，不建立到自身 EndpointId 的 Iroh connection；在外网、DNS/Pkarr 和 relay 全部不可用时仍可工作。远端控制端（第二阶段可为手机）仍持有 controller 时本机普通 attach 返回 occupied，显式 takeover 才原子转移 lease。
-- [ ] 本机创建、rename、close 的 session 与远端设备看到的是同一对象；两个本地 CLI 同样遵守单 controller 规则，其他 OS 用户无法通过 local IPC 查看或控制该用户的 session。
-- [ ] setup 后运行裸 `zterm` 直接 attach 本机 `main`；未 setup 时不静默创建身份，只提示运行 `zterm setup`；`zterm --help` 稳定显示命令帮助，显式 `zterm connect local` 与裸命令行为等价。
+- [x] 本机 self attach 不要求配对，不建立到自身 EndpointId 的 Iroh connection；在外网、DNS/Pkarr 和 relay 全部不可用时仍可工作。远端控制端（第二阶段可为手机）仍持有 controller 时本机普通 attach 返回 occupied，显式 takeover 才原子转移 lease。
+- [x] 本机创建、rename、close 的 session 与远端设备看到的是同一对象；两个本地 CLI 同样遵守单 controller 规则，其他 OS 用户无法通过 local IPC 查看或控制该用户的 session。
+- [x] setup 后运行裸 `zterm` 直接 attach 本机 `main`；未 setup 时不静默创建身份，只提示运行 `zterm setup`；`zterm --help` 稳定显示命令帮助，显式 `zterm connect local` 与裸命令行为等价。
 - [ ] 在没有程序名特判的同一通用路径中，tmux 与 Herdr 均通过键盘、Unicode、颜色、光标、alternate screen、bracketed paste、连续 resize、断线存活和 snapshot 恢复验收。
-- [ ] `Ctrl+] .` 只 detach；`Ctrl+] Ctrl+]` 向远端发送原始前缀；改键和禁用前缀后行为正确。
+- [x] `Ctrl+] .` 只 detach；`Ctrl+] Ctrl+]` 向远端发送原始前缀；改键和禁用前缀后行为正确。
 
 ### E. 兼容性与文档
 

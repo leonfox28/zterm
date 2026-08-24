@@ -1,9 +1,7 @@
-//! Typed local-daemon lifecycle and session-service dispatch.
+//! Typed local-daemon lifecycle, pairing, and device-service dispatch.
 
 #[cfg(unix)]
 use std::future::Future;
-#[cfg(unix)]
-use std::path::PathBuf;
 #[cfg(unix)]
 use std::pin::Pin;
 #[cfg(unix)]
@@ -16,8 +14,8 @@ use zeroize::{Zeroize, Zeroizing};
 use zterm_core::DeviceId;
 #[cfg(unix)]
 use zterm_core::{
-    AttachmentId, AuthorizationSnapshot, AuthorizationStatus, Capabilities, DeviceAlias,
-    DeviceSummary, DomainErrorKind, OperationId, SessionId, SessionName,
+    AuthorizationSnapshot, AuthorizationStatus, Capabilities, DeviceAlias, DeviceSummary,
+    DomainErrorKind,
 };
 #[cfg(unix)]
 use zterm_proto::{DecodedFrame, WireKind, encode_message, v1};
@@ -40,6 +38,8 @@ use crate::network::NetworkObservation;
 use crate::network::NetworkObserver;
 #[cfg(unix)]
 use crate::pairing_service::{LocalPairAcceptInput, LocalPairCreateInput, PairingService};
+#[cfg(unix)]
+use crate::remote_session::RemoteSessionService;
 #[cfg(unix)]
 use crate::session::{SessionService, SessionSummary};
 #[cfg(unix)]
@@ -208,6 +208,7 @@ pub struct DeviceManagement {
     directory: DeviceDirectory,
     authorization: AuthorizationRegistry,
     remote_access: Arc<dyn RemoteDeviceAccess>,
+    #[cfg(test)]
     revoke_guard_after_first_poll_for_test: Option<tokio::sync::mpsc::UnboundedSender<DeviceId>>,
 }
 
@@ -228,12 +229,14 @@ impl DeviceManagement {
             directory,
             authorization,
             remote_access,
+            #[cfg(test)]
             revoke_guard_after_first_poll_for_test: None,
         }
     }
 
     /// Installs a deterministic notification after the revoke writer's first
     /// actual lock poll proves that it has queued or acquired the fair gate.
+    #[cfg(test)]
     #[doc(hidden)]
     #[must_use]
     pub fn with_revoke_guard_after_first_poll_for_test(
@@ -260,6 +263,8 @@ pub struct DaemonService {
     devices: Option<DeviceManagement>,
     #[cfg(unix)]
     pairing: Option<PairingService>,
+    #[cfg(unix)]
+    remote_sessions: Option<RemoteSessionService>,
 }
 
 impl DaemonService {
@@ -290,6 +295,7 @@ impl DaemonService {
             sessions,
             devices: None,
             pairing: None,
+            remote_sessions: None,
         }
     }
 
@@ -309,6 +315,7 @@ impl DaemonService {
             sessions,
             devices: None,
             pairing: None,
+            remote_sessions: None,
         }
     }
 
@@ -324,6 +331,7 @@ impl DaemonService {
             network,
             devices: None,
             pairing: None,
+            remote_sessions: None,
         }
     }
 
@@ -344,6 +352,7 @@ impl DaemonService {
             network,
             devices: None,
             pairing: None,
+            remote_sessions: None,
         }
     }
 
@@ -364,6 +373,14 @@ impl DaemonService {
         self
     }
 
+    /// Adds exact target resolution and outbound Session unary forwarding.
+    #[cfg(unix)]
+    #[must_use]
+    pub(crate) fn with_remote_sessions(mut self, remote_sessions: RemoteSessionService) -> Self {
+        self.remote_sessions = Some(remote_sessions);
+        self
+    }
+
     #[cfg(unix)]
     pub(crate) fn pairing(&self) -> Option<&PairingService> {
         self.pairing.as_ref()
@@ -372,6 +389,11 @@ impl DaemonService {
     #[cfg(unix)]
     pub(crate) const fn sessions(&self) -> &SessionService {
         &self.sessions
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn remote_sessions(&self) -> Option<&RemoteSessionService> {
+        self.remote_sessions.as_ref()
     }
 
     /// Creates the non-Unix placeholder for isolated cross-platform callers.
@@ -403,6 +425,9 @@ impl DaemonService {
         ) {
             return self.dispatch_device_until(frame, deadline).await;
         }
+        if frame.kind == WireKind::LocalSessionUnaryRequest {
+            return self.dispatch_remote_session_until(frame, deadline).await;
+        }
         let request_id = frame.request_id;
         let service = self.clone();
         let result = tokio::task::spawn_blocking(move || service.dispatch_inner(frame, deadline))
@@ -414,6 +439,53 @@ impl DaemonService {
                 )
             })
             .and_then(|result| result);
+        match result {
+            Ok(reply) => reply,
+            Err(error) => ServiceReply::error(request_id, &error),
+        }
+    }
+
+    #[cfg(unix)]
+    async fn dispatch_remote_session_until(
+        &self,
+        mut frame: DecodedFrame,
+        deadline: Instant,
+    ) -> ServiceReply {
+        let request_id = frame.request_id;
+        let request = decode_request::<v1::LocalSessionUnaryRequest>(&frame);
+        frame.payload.zeroize();
+        let result = async {
+            let mut request = request?;
+            let target: DeviceId = request
+                .target_device_id
+                .take()
+                .ok_or_else(|| {
+                    DaemonError::new(
+                        DomainErrorKind::MalformedFrame,
+                        "local remote-Session envelope omitted target_device_id",
+                    )
+                })?
+                .try_into()
+                .map_err(protocol_error)?;
+            let bytes = Zeroizing::new(std::mem::take(&mut request.frame));
+            let remote_sessions = self.remote_sessions.as_ref().ok_or_else(|| {
+                DaemonError::new(
+                    DomainErrorKind::TransportUnavailable,
+                    "remote Session transport is not composed into this daemon",
+                )
+            })?;
+            let response = remote_sessions
+                .forward_preencoded(target, request_id, &bytes, deadline)
+                .await?;
+            if response.request_id != request_id {
+                return Err(DaemonError::new(
+                    DomainErrorKind::MalformedFrame,
+                    "local forwarding envelope request_id differs from the inner Session request",
+                ));
+            }
+            ServiceReply::decoded(response)
+        }
+        .await;
         match result {
             Ok(reply) => reply,
             Err(error) => ServiceReply::error(request_id, &error),
@@ -647,6 +719,7 @@ impl DaemonService {
         // The write permit is held across the complete ordered revoke. A
         // queued sensitive commit cannot overtake it, while an already-held
         // read permit completes before the durable transaction begins.
+        #[cfg(test)]
         let mut guard = match &devices.revoke_guard_after_first_poll_for_test {
             Some(observer) => {
                 devices
@@ -656,6 +729,8 @@ impl DaemonService {
             }
             None => devices.authorization.revoke_guard(device_id).await?,
         };
+        #[cfg(not(test))]
+        let mut guard = devices.authorization.revoke_guard(device_id).await?;
         let store = devices.store.clone();
         let revoked_at_unix = now_unix_i64();
         let generation = store
@@ -842,98 +917,29 @@ impl DaemonService {
                     false,
                 )
             }
-            WireKind::SessionListRequest => {
-                let request: v1::SessionListRequest = decode_request(&frame)?;
-                require_local_target(request.target)?;
-                let sessions = self
-                    .sessions
-                    .list()?
-                    .into_iter()
-                    .map(session_summary_proto)
-                    .collect();
+            WireKind::LocalTargetResolveRequest => {
+                let request: v1::LocalTargetResolveRequest = decode_request(&frame)?;
+                let target = if request.selector == zterm_core::RESERVED_DEVICE_ALIAS {
+                    crate::device_directory::ResolvedSessionTarget::local()
+                } else {
+                    self.remote_sessions
+                        .as_ref()
+                        .ok_or_else(|| {
+                            DaemonError::new(
+                                DomainErrorKind::TransportUnavailable,
+                                "remote target resolution is unavailable in this daemon",
+                            )
+                        })?
+                        .resolve(&request.selector, deadline)?
+                };
                 ServiceReply::message(
-                    WireKind::SessionListResponse,
+                    WireKind::LocalTargetResolveResponse,
                     request_id,
-                    &v1::SessionListResponse { sessions },
-                    false,
-                )
-            }
-            WireKind::SessionOperationLeaseRequest => {
-                let request: v1::SessionOperationLeaseRequest = decode_request(&frame)?;
-                require_local_target(request.target)?;
-                let lease = self
-                    .sessions
-                    .issue_operation_lease(local_principal(self.setup.device_id, request_id))?;
-                ServiceReply::message(
-                    WireKind::SessionOperationLeaseResponse,
-                    request_id,
-                    &v1::SessionOperationLeaseResponse {
-                        lease: Some(lease.into()),
+                    &v1::LocalTargetResolveResponse {
+                        target: Some(resolved_target_wire(target)),
                     },
                     false,
                 )
-            }
-            WireKind::SessionCreateRequest => {
-                let request: v1::SessionCreateRequest = decode_request(&frame)?;
-                require_local_target(request.target)?;
-                let operation_id = required_operation_id(request.operation_id)?;
-                let name = session_name(&request.name)?;
-                let working_directory = (!request.working_directory.is_empty())
-                    .then(|| PathBuf::from(request.working_directory));
-                let viewport = request
-                    .viewport
-                    .map(TryInto::try_into)
-                    .transpose()
-                    .map_err(protocol_error)?;
-                let summary = self.sessions.create_until(
-                    local_principal(self.setup.device_id, request_id),
-                    operation_id,
-                    name,
-                    working_directory,
-                    viewport,
-                    deadline,
-                )?;
-                mutate_reply(request_id, summary)
-            }
-            WireKind::SessionRenameRequest => {
-                let request: v1::SessionRenameRequest = decode_request(&frame)?;
-                require_local_target(request.target)?;
-                let summary = self.sessions.rename_until(
-                    local_principal(self.setup.device_id, request_id),
-                    required_operation_id(request.operation_id)?,
-                    required_session_id(request.session_id)?,
-                    session_name(&request.name)?,
-                    deadline,
-                )?;
-                mutate_reply(request_id, summary)
-            }
-            WireKind::SessionCloseRequest => {
-                let request: v1::SessionCloseRequest = decode_request(&frame)?;
-                require_local_target(request.target)?;
-                let summary = self.sessions.close_until(
-                    local_principal(self.setup.device_id, request_id),
-                    required_operation_id(request.operation_id)?,
-                    required_session_id(request.session_id)?,
-                    deadline,
-                )?;
-                mutate_reply(request_id, summary)
-            }
-            WireKind::SessionTakeoverRequest => {
-                let request: v1::SessionTakeoverRequest = decode_request(&frame)?;
-                require_local_target(request.target)?;
-                let attachment_id = request
-                    .attachment_id
-                    .ok_or_else(|| malformed("takeover omitted attachment_id"))?
-                    .try_into()
-                    .map_err(protocol_error)?;
-                let summary = self.sessions.takeover_by_id_until(
-                    local_principal(self.setup.device_id, request_id),
-                    required_operation_id(request.operation_id)?,
-                    required_session_id(request.session_id)?,
-                    attachment_id,
-                    deadline,
-                )?;
-                mutate_reply(request_id, summary)
             }
             _ => Err(DaemonError::new(
                 DomainErrorKind::ServiceNotImplemented,
@@ -1092,7 +1098,7 @@ pub(crate) struct ServiceReply {
 
 #[cfg(unix)]
 impl ServiceReply {
-    fn message<Message>(
+    pub(crate) fn message<Message>(
         kind: WireKind,
         request_id: u64,
         message: &Message,
@@ -1122,6 +1128,35 @@ impl ServiceReply {
             bytes,
             stop_after_flush: false,
         }
+    }
+
+    pub(crate) fn decoded(frame: DecodedFrame) -> Result<Self, DaemonError> {
+        let bytes = Zeroizing::new(
+            zterm_proto::encode_payload(
+                frame.kind,
+                frame.request_id,
+                frame.deadline_ms,
+                frame.payload,
+            )
+            .map_err(protocol_error)?,
+        );
+        Ok(Self {
+            bytes,
+            stop_after_flush: false,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn resolved_target_wire(
+    target: crate::device_directory::ResolvedSessionTarget,
+) -> v1::TargetSelector {
+    let target = match target.device_id() {
+        Some(device_id) => v1::target_selector::Target::Device(device_id.into()),
+        None => v1::target_selector::Target::Local(true),
+    };
+    v1::TargetSelector {
+        target: Some(target),
     }
 }
 
@@ -1163,84 +1198,11 @@ fn protocol_proto() -> v1::ProtocolVersion {
 }
 
 #[cfg(unix)]
-fn mutate_reply(request_id: u64, summary: SessionSummary) -> Result<ServiceReply, DaemonError> {
-    ServiceReply::message(
-        WireKind::SessionMutateResponse,
-        request_id,
-        &v1::SessionMutateResponse {
-            session: Some(session_summary_proto(summary)),
-        },
-        false,
-    )
-}
-
-#[cfg(unix)]
-fn session_summary_proto(summary: SessionSummary) -> v1::SessionSummary {
-    v1::SessionSummary {
-        session_id: Some(summary.session_id.into()),
-        name: summary.name.to_string(),
-        revision: summary.revision.get(),
-        has_controller: summary.has_controller,
-        working_directory: summary.working_directory.to_string_lossy().into_owned(),
-        viewport: Some(summary.viewport.into()),
-    }
-}
-
-#[cfg(unix)]
 fn session_names(sessions: &[SessionSummary]) -> Vec<String> {
     sessions
         .iter()
         .map(|session| session.name.to_string())
         .collect()
-}
-
-#[cfg(unix)]
-fn require_local_target(target: Option<v1::TargetSelector>) -> Result<(), DaemonError> {
-    match target.and_then(|target| target.target) {
-        Some(v1::target_selector::Target::Local(true)) => Ok(()),
-        _ => Err(malformed(
-            "local session request requires target.local=true",
-        )),
-    }
-}
-
-#[cfg(unix)]
-fn required_operation_id(
-    operation_id: Option<v1::OperationId>,
-) -> Result<OperationId, DaemonError> {
-    operation_id
-        .ok_or_else(|| malformed("session mutation omitted operation_id"))?
-        .try_into()
-        .map_err(protocol_error)
-}
-
-#[cfg(unix)]
-fn required_session_id(session_id: Option<v1::SessionId>) -> Result<SessionId, DaemonError> {
-    session_id
-        .ok_or_else(|| malformed("session mutation omitted session_id"))?
-        .try_into()
-        .map_err(protocol_error)
-}
-
-#[cfg(unix)]
-fn session_name(value: &str) -> Result<SessionName, DaemonError> {
-    SessionName::new(value.to_owned())
-        .map_err(|error| DaemonError::new(DomainErrorKind::InvalidSessionName, error.to_string()))
-}
-
-#[cfg(unix)]
-fn local_principal(device_id: DeviceId, request_id: u64) -> zterm_core::AttachmentPrincipal {
-    let mut bytes = [0_u8; 16];
-    bytes[..8].copy_from_slice(&request_id.to_le_bytes());
-    zterm_core::AttachmentPrincipal::LocalSameUid {
-        own_device_id: device_id,
-        local_view_id: AttachmentId::from_array(bytes),
-    }
-}
-
-#[cfg(unix)]
-fn malformed(detail: impl Into<String>) -> DaemonError {
-    DaemonError::new(DomainErrorKind::MalformedFrame, detail)
 }
 
 #[cfg(unix)]

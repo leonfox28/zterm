@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use zterm_core::{
-    AuthorizationSnapshot, DeviceAlias, DeviceDisplayName, DeviceId, DomainErrorKind,
+    AuthorizationSnapshot, AuthorizationStatus, DeviceAlias, DeviceDisplayName, DeviceId,
+    DomainErrorKind,
 };
 
 use crate::error::DaemonError;
@@ -53,6 +54,44 @@ struct ReservationEntry {
     count: usize,
 }
 
+/// Opaque exact Session target returned by the daemon-side resolver.
+///
+/// The value contains no alias. Holding it across lease allocation and retry
+/// therefore cannot be retargeted by a concurrent alias rename.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ResolvedSessionTarget(ResolvedSessionTargetKind);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+enum ResolvedSessionTargetKind {
+    Local,
+    Device(DeviceId),
+}
+
+impl ResolvedSessionTarget {
+    /// Returns whether this exact target is the current local daemon.
+    #[must_use]
+    pub const fn is_local(self) -> bool {
+        matches!(self.0, ResolvedSessionTargetKind::Local)
+    }
+
+    /// Returns the frozen full device identity for a remote target.
+    #[must_use]
+    pub const fn device_id(self) -> Option<DeviceId> {
+        match self.0 {
+            ResolvedSessionTargetKind::Local => None,
+            ResolvedSessionTargetKind::Device(device_id) => Some(device_id),
+        }
+    }
+
+    pub(crate) const fn local() -> Self {
+        Self(ResolvedSessionTargetKind::Local)
+    }
+
+    pub(crate) const fn device(device_id: DeviceId) -> Self {
+        Self(ResolvedSessionTargetKind::Device(device_id))
+    }
+}
+
 /// The single owner of the directional device merge and alias reservations.
 #[derive(Clone)]
 pub struct DeviceDirectory {
@@ -68,6 +107,83 @@ impl DeviceDirectory {
             store,
             reservations: Arc::new(Mutex::new(ReservationState::default())),
         }
+    }
+
+    /// Resolves one user selector to a frozen exact Session target.
+    ///
+    /// Alias comparison is exact and case-sensitive. A canonical identifier is
+    /// exactly 64 lowercase hexadecimal bytes; ID-looking uppercase, short, or
+    /// prefix text is rejected instead of becoming a fuzzy lookup.
+    pub fn resolve_session_target(
+        &self,
+        selector: &str,
+        deadline: Instant,
+    ) -> Result<ResolvedSessionTarget, DaemonError> {
+        if selector == zterm_core::RESERVED_DEVICE_ALIAS {
+            return Ok(ResolvedSessionTarget::local());
+        }
+
+        let bytes = selector.as_bytes();
+        let looks_hex = !bytes.is_empty() && bytes.iter().all(u8::is_ascii_hexdigit);
+        if bytes.len() == DeviceId::CANONICAL_TEXT_LENGTH && looks_hex {
+            if bytes.iter().any(u8::is_ascii_uppercase) {
+                return Err(invalid_target_selector(
+                    "device IDs must use the canonical lowercase hexadecimal form",
+                ));
+            }
+            let device_id = selector.parse::<DeviceId>().map_err(|error| {
+                invalid_target_selector(format!("invalid canonical device ID: {error}"))
+            })?;
+            if let Some(alias_owner) = self.store.alias_owner(selector.to_owned(), deadline)?
+                && alias_owner != device_id
+            {
+                return Err(invalid_target_selector(
+                    "selector is ambiguous between an exact alias and a canonical device ID",
+                ));
+            }
+            return self.require_outbound_device(device_id, deadline);
+        }
+
+        let alias = DeviceAlias::new(selector.to_owned()).map_err(|error| {
+            invalid_target_selector(format!("invalid exact device alias: {error}"))
+        })?;
+        if let Some(device_id) = self
+            .store
+            .alias_owner(alias.as_str().to_owned(), deadline)?
+        {
+            return Ok(ResolvedSessionTarget::device(device_id));
+        }
+        if looks_hex {
+            return Err(invalid_target_selector(
+                "short and prefix device IDs are not accepted",
+            ));
+        }
+        Err(DaemonError::new(
+            DomainErrorKind::DeviceNotFound,
+            "no outbound known device has the exact requested alias",
+        ))
+    }
+
+    /// Rechecks that one frozen full identity remains an outbound target.
+    pub fn require_outbound_device(
+        &self,
+        device_id: DeviceId,
+        deadline: Instant,
+    ) -> Result<ResolvedSessionTarget, DaemonError> {
+        if self.store.known_device(device_id, deadline)?.is_some() {
+            return Ok(ResolvedSessionTarget::device(device_id));
+        }
+        let authorization = self.store.authorization_snapshot(device_id, deadline)?;
+        if authorization.status != AuthorizationStatus::None {
+            return Err(DaemonError::new(
+                DomainErrorKind::OutboundDirectionDenied,
+                "device exists only in the inbound authorization direction",
+            ));
+        }
+        Err(DaemonError::new(
+            DomainErrorKind::DeviceNotFound,
+            "target is not an outbound known device",
+        ))
     }
 
     /// Lists the merged outbound/inbound projection for every device.
@@ -226,6 +342,10 @@ impl DeviceDirectory {
         self.store
             .alias_available(alias.as_str().to_owned(), deadline)
     }
+}
+
+fn invalid_target_selector(detail: impl Into<String>) -> DaemonError {
+    DaemonError::new(DomainErrorKind::InvalidTargetSelector, detail)
 }
 
 /// RAII guard holding one in-memory alias reservation.

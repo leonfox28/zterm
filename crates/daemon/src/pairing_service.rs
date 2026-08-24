@@ -1420,9 +1420,6 @@ where
 }
 
 #[cfg(all(test, unix))]
-mod multiprocess_test;
-
-#[cfg(all(test, unix))]
 mod tests {
     use std::fs;
     use std::path::PathBuf;
