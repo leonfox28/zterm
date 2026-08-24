@@ -144,7 +144,8 @@ zterm reset --identity [--yes] [--force]
 3. wire v1 只做兼容字段/kind新增并保留 unknown capability bits；不改变 normal/pair ALPN、
    EndpointId、授权方向、SQLite schema 或 Session identity。
 4. macOS 开发机不得执行会 bind Endpoint/UDP、DNS 或联网的测试；只运行纯状态、本地 Unix socket、
-   PTY、CLI、compile/Clippy/`--no-run`。Linux CI 执行 real-Iroh loopback remote Session/多进程门禁。
+   PTY、CLI、compile/Clippy/`--no-run`。Linux CI 执行保留的 real-Iroh loopback transport 门禁；使用
+   正式安装产物的 public CLI/remote Session 多进程验收由 M10 负责。
 
 ## 验收标准
 
@@ -175,6 +176,18 @@ zterm reset --identity [--yes] [--force]
       Windows shared build/Clippy保持清洁且运行命令返回明确 unsupported。
 - [ ] workspace fmt/check/Clippy `-D warnings`/tests/docs/deny、source/version/secret policy、Trellis
       validation与diff check全部通过；开发者Mac未执行任何Endpoint/UDP/DNS/network测试。
+
+### 2026-08-24 交付与最终验收边界
+
+本 child 的实现交付以唯一 production owner、pure/Unix/PTY 行为门禁、完整 hosted shared matrix，以及
+Linux 实际执行的保留 `two_daemon_transport` real-Iroh loopback test 为准，现已完成。该 transport test
+只证明 pair/normal ALPN、Endpoint/primary 复用、方向授权和 direct route 不落盘；它不证明 public CLI
+或 remote Session 的 OS 多进程行为。
+
+上面的未勾选条目保留为第一阶段的最终产品验收需求，不通过新增第二套 task-private daemon harness
+在本 child 内补做。它们已明确移交给 `08-24-e2e-hardening`：M10 必须使用 M9 的正式签名 Release 与
+官方 installer，在 installed-binary hosted/真实网络矩阵中补齐证据。该移交允许本实现 child 收口，
+但父任务 M7-M8 在 M10 通过前仍不标记为发布验收完成。
 
 ## 明确不在本任务范围
 

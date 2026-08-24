@@ -25,7 +25,9 @@
     "08-22-core-local-daemon",
     "08-22-persistent-session-local-attach",
     "08-22-transport-auth",
-    "08-23-remote-cli"
+    "08-23-remote-cli",
+    "08-24-distribution-release",
+    "08-24-e2e-hardening"
   ],
   "parent": null,
   "relatedFiles": [

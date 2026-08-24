@@ -1,0 +1,9 @@
+{"file":".trellis/spec/backend/effective-user-state.md","reason":"Verify installer/update/uninstall preserve exact path, permission, identity, atomicity, and state ownership contracts."}
+{"file":".trellis/spec/backend/local-daemon-ipc.md","reason":"Verify update/uninstall side effects use existing runtime/lifecycle owners and public CLI boundaries."}
+{"file":".trellis/spec/backend/error-handling.md","reason":"Audit stable typed failures and absence of peer/network/secret-controlled details."}
+{"file":".trellis/spec/backend/logging-guidelines.md","reason":"Audit release key, manifest, network response, user-state, and terminal redaction."}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Run authoritative source, workspace, dependency, docs, platform, and secret gates."}
+{"file":".trellis/spec/guides/cross-platform-thinking-guide.md","reason":"Check all four native artifacts, Unix shell behavior, Windows shared boundaries, LF, and hosted evidence."}
+{"file":".trellis/spec/guides/evidence-driven-simplicity.md","reason":"Reject duplicate verifiers, release databases, retry loops, rollback theater, and redundant tests."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/distribution-update-channel.md","reason":"Check implemented channel and version semantics match the approved user decision."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/install-version-identity-lifecycle.md","reason":"Check uninstall/reinstall identity and stale-authorization claims remain exact."}

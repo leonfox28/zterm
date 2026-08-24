@@ -1,0 +1,10 @@
+{"file":".trellis/spec/backend/effective-user-state.md","reason":"Owns per-user paths, permissions, atomic replacement, symlink rejection, identity persistence, and install metadata boundaries."}
+{"file":".trellis/spec/backend/local-daemon-ipc.md","reason":"Owns LocalRuntime, daemon impact/stop, no-autospawn commands, identity reset, and the update preflight seam."}
+{"file":".trellis/spec/backend/error-handling.md","reason":"Required for typed, stable, content-free release/download/activation errors."}
+{"file":".trellis/spec/backend/logging-guidelines.md","reason":"Prevents signing material, release responses, state paths, tickets, and terminal content from entering logs."}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Defines package, platform, docs, dependency, and source-policy release gates."}
+{"file":".trellis/spec/guides/cross-platform-thinking-guide.md","reason":"Owns complete platform cfg boundaries, checkout policy, native-runner evidence, paths, and shell semantics."}
+{"file":".trellis/spec/guides/evidence-driven-simplicity.md","reason":"Limits release machinery, retries, rollback drills, worker count, broad checks, and harness flake time."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/distribution-update-channel.md","reason":"Records the approved GitHub direct installer and manual update product decision."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/install-version-identity-lifecycle.md","reason":"Records exact version selection, identity destruction/reinstall, and no-central-revocation decisions."}
+{"file":".trellis/tasks/08-23-remote-cli/research/execution-retrospective.md","reason":"Binding continuation limits prevent duplicated harnesses, excessive workers/checks, and unapproved external providers."}

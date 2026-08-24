@@ -37,7 +37,7 @@ Gate 0 的硬停止条件：
 
 ## 3. 任务拆分与依赖
 
-最终规划批准后、第一次运行 `task.py start` 之前，将实施拆成以下 Trellis 子任务。每个子任务都有独立 PRD/实施/检查上下文，并在子任务元数据中写明下表的依赖；不在本轮规划审阅中创建或启动它们：
+实施按下列 Trellis 子任务顺序推进。M1–M8 的既有子任务已经建立；用户于 2026-08-24 同意继续完成第一阶段后，又建立了规划态的 `08-24-distribution-release` 与 `08-24-e2e-hardening`，但它们必须分别完成规划审阅并按顺序启动：
 
 | 子任务 | 包含里程碑 | 依赖 | 主要成果 |
 | --- | --- | --- | --- |
@@ -335,11 +335,13 @@ Session adapter 与 M8 public CLI 仍保持未完成，未在本次完成状态�
 
 ### M7. 远程 Session 协议与断线恢复
 
-状态：**代码与本机安全证据已完成，hosted Linux runtime 待完成**。共享
+状态：**代码与本机安全证据已完成；正式安装后的 remote Session 验收由 M10 负责**。共享
 `SessionWireServer`、daemon-owned remote unary/attachment bridge、generation commit gate、exact
 replay、reconnect/snapshot/input-drop、no-HOL 与 local/remote 双向 takeover 已由 pure、Unix 与真实 PTY
-门禁直接覆盖。Linux-only real-Iroh target 已在 macOS 仅编译/列出；尚无 Linux 实际执行与 run URL，
-且没有 public CLI OS 多进程证据，因此本里程碑不标记为最终完成。该 hermetic target 使用
+门禁直接覆盖。GitHub Actions run `32725142928` 已在 Linux x86_64 实际执行保留的
+`two_daemon_transport` real-Iroh loopback test；它只证明 pair/normal transport owner。为避免重新复制
+已删除的 daemon-like harness，public CLI/remote Session 的 OS 多进程证据改由 M10 使用 M9 正式安装
+产物完成。在该实机证据完成前，父任务仍不把 M7 标为发布验收完成。loopback 使用
 `RelayMode::Disabled`、IPv4 loopback 与 task-only direct route，不是 official-n0 Relay、公网、
 self-hosted Relay 或 M10 discovery/path 证据。
 
@@ -373,11 +375,12 @@ self-hosted Relay 或 M10 discovery/path 证据。
 
 ### M8. CLI 产品面
 
-状态：**公开命令与 Unix raw-terminal 实现/本机门禁已完成，hosted 平台与远端多进程验收待完成**。
+状态：**公开命令、Unix raw-terminal 与 hosted shared matrix 已完成；正式安装后的远端多进程验收由 M10 负责**。
 当前 clap help、side-effect/autospawn、no-echo ticket、方向化 device、bare/local-main、confirmation、
-identity reset、raw-mode/renderer、SIGWINCH、signal/unwind 恢复与 prefix 均有直接测试。Windows runtime
-仍不支持，hosted Windows shared compile 结果尚待记录；Linux public CLI 多进程与真实 run URL 同样
-待 Step 9 hosted gate，不能用 macOS compile-only 替代。
+identity reset、raw-mode/renderer、SIGWINCH、signal/unwind 恢复与 prefix 均有直接测试。GitHub Actions
+run `32725142928` 已通过 macOS arm64/Intel、Linux x86_64/arm64、Windows shared/unsupported、dependency
+与 Relay bundle 全矩阵。Windows runtime 仍不支持；public CLI remote Session 的 OS 多进程结果必须由
+M10 使用签名 Release 实际执行，不能用 macOS compile-only 或另一个 task-private harness 替代。
 
 工作内容：
 
@@ -409,6 +412,10 @@ identity reset、raw-mode/renderer、SIGWINCH、signal/unwind 恢复与 prefix �
     cargo test -p zterm-cli --test end_to_end
 
 ### M9. Direct installer、release 供应链与手动升级
+
+状态：**规划已获用户批准，待启动实现**。子任务 `08-24-distribution-release` 已记录签名 manifest、protected
+GitHub `release` Environment、immutable Release、四目标 artifact、installer、显式 update/rollback 与
+uninstall 的设计和门禁；尚未启动实现或创建签名 secret。
 
 工作内容：
 
@@ -446,6 +453,10 @@ identity reset、raw-mode/renderer、SIGWINCH、signal/unwind 恢复与 prefix �
     ./tests/install/unsupported-platform.sh
 
 ### M10. 端到端、安全与发布验收
+
+状态：**规划已获用户批准，依赖 M9 正式候选后启动**。子任务 `08-24-e2e-hardening` 使用正式签名 Release
+完成 installed-binary hosted/network/security matrix 与用户最后一次统一验收；不新增 public state/socket
+override，也不复制 daemon-like remote Session harness。
 
 工作内容：
 

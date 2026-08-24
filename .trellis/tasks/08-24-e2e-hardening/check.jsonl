@@ -1,0 +1,12 @@
+{"file":".trellis/spec/backend/transport-auth.md","reason":"Verify exact path/profile/auth/broker/revoke claims and reject loopback/public/official evidence conflation."}
+{"file":".trellis/spec/backend/session-service.md","reason":"Verify installed remote/local Session identity, PTY, lease, replay, reconnect, and cleanup behavior."}
+{"file":".trellis/spec/backend/local-daemon-ipc.md","reason":"Verify the public CLI uses same-UID daemon IPC with no test-only state/socket escape hatch."}
+{"file":".trellis/spec/backend/pty-lifecycle.md","reason":"Verify long-lived process and explicit close/stop behavior on real platforms."}
+{"file":".trellis/spec/backend/terminal-model.md","reason":"Verify terminal corpus, snapshot/revision, malicious sequences, and generic tmux/Herdr behavior."}
+{"file":".trellis/spec/backend/relay-deployment.md","reason":"Verify current official/default and optional self-hosted Relay scope without resurrecting deleted gates."}
+{"file":".trellis/spec/backend/logging-guidelines.md","reason":"Audit packet/log/error evidence for terminal, cwd, ticket, key, and route leakage."}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Run full workspace/platform/dependency/docs/source/secret/release acceptance."}
+{"file":".trellis/spec/guides/cross-platform-thinking-guide.md","reason":"Require native platform execution and precise compile-only versus runtime claims."}
+{"file":".trellis/spec/guides/evidence-driven-simplicity.md","reason":"Check every new harness/gate has one current claim and enforce stop/time/delegation budgets."}
+{"file":".trellis/tasks/08-23-remote-cli/research/execution-retrospective.md","reason":"Ensure deleted redundant infrastructure and provider/billing mistakes are not reintroduced."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/cloud-trust-boundary.md","reason":"Audit E2EE and cloud/Relay metadata claims against the approved trust model."}

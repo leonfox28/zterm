@@ -1,0 +1,12 @@
+{"file":".trellis/spec/backend/transport-auth.md","reason":"Owns production Iroh profile, route/path evidence, authorization generation, broker, pairing, revoke, and network test claims."}
+{"file":".trellis/spec/backend/session-service.md","reason":"Owns Session/PTTY/controller/replay/recovery and local/remote continuation behavior."}
+{"file":".trellis/spec/backend/local-daemon-ipc.md","reason":"Owns public CLI-to-daemon flow, remote bridge, raw terminal, lifecycle, and no state/socket override boundary."}
+{"file":".trellis/spec/backend/pty-lifecycle.md","reason":"Required for long-task survival, child cleanup, SSH detach, tmux/Herdr, and daemon-stop claims."}
+{"file":".trellis/spec/backend/terminal-model.md","reason":"Owns snapshot/delta, current screen, history, escape sequence, and parser evidence."}
+{"file":".trellis/spec/backend/relay-deployment.md","reason":"Separates official-n0, optional self-hosted Relay, deployment, and evidence boundaries."}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Defines full release/platform/security/documentation gates."}
+{"file":".trellis/spec/guides/evidence-driven-simplicity.md","reason":"Prevents duplicated daemon harnesses, overclaim, excessive stress, and unbounded verification."}
+{"file":".trellis/tasks/08-23-remote-cli/research/current-boundary.md","reason":"Maps the unique SessionService, broker, remote adapter, reconnect bridge, and CLI ownership seams."}
+{"file":".trellis/tasks/08-23-remote-cli/research/execution-retrospective.md","reason":"Binding limits for hosted evidence, worker count, checks, flakes, and provider/billing safety."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/terminal-reconnect-state.md","reason":"Provides the approved reconnect/snapshot/input-drop state semantics."}
+{"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/cloud-trust-boundary.md","reason":"Owns E2EE, metadata, Relay, address discovery, and cloud non-ownership claims."}

@@ -10,6 +10,10 @@ zterm 是一个面向长时间远程终端任务的跨网络连接工具。用�
 
 本文先以第零阶段建立本地开发环境并把固定版本的上游 Iroh relay 部署到用户提供的公网服务器，再进入第一阶段 macOS 与主流 glibc Linux 的 CLI 技术 MVP，两者均支持 x86_64/arm64。文中“1.0”表示通用远程终端的首个稳定产品边界；Android、Windows、桌面 GUI 和 iOS 按路线图后续交付，但第一阶段的数据模型与协议不得阻塞它们。
 
+### 2026-08-24 最终验收顺序
+
+用户决定不安装或分段验收源码构建、branch head、Cargo 开发安装或会过期的 CI artifact。执行顺序固定为：先以当前 hosted matrix 和已实际执行的 Linux `two_daemon_transport` 收口 M7–M8 的实现任务，不再为 compile-only 或最终实机主张复制 task-private daemon harness；再完成 M9 的正式 GitHub Release、签名 manifest、四平台 artifact、用户级 installer、显式 update/rollback 与 uninstall；最后由 M10 使用这些正式发行产物补齐 public CLI/remote Session、真实网络和用户统一验收。只有前述证据与发布门全部通过后，才向用户提供官方 installer 作为第一阶段最终验收入口。
+
 ## 2. 项目背景与边界
 
 - 当前 `/Users/huyuanzhe/projects/zterm` 是全新的产品仓库，不迁移或兼容已更名为 `zterm_old` 的旧 Electron/SSH 项目。

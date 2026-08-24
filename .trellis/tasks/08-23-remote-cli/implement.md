@@ -261,30 +261,34 @@ broker RAII/panic/malformed/oversized/stalled、stream/resource/revoke gates与d
 check/Clippy、fmt、source-policy、secret-scan、task validate、diff check全绿。未执行Endpoint、UDP、
 DNS、Relay、Internet或任何真实网络路径。
 
-## Step 9：Linux real-Iroh 多进程与CLI门禁
+## Step 9：Linux real-Iroh transport 门禁与 M10 移交
 
-- [ ] 建立Linux-only、task-private的两个production daemon/broker/SessionService harness；每owner使用
-      隔离UserPaths/identity/store/auth并通过同一normal ALPN connection。测试不得新增生产state/
-      identity/socket override argv。
-- [ ] 通过生产pairing/授权或等价既有test-only bootstrap建立可信关系，运行remote list/create/
-      attach/input/resize/ack/detach/rename/close/takeover及宿主local接续；pair stream不进入normal broker。
-- [ ] 同时连接两个Session并验证一个primary、独立streams；强制normal connection/stream丢失与
-      revision gap，验证相同SessionId/进程/cwd/screen恢复、sync期间输入不重放。
-- [ ] 覆盖提交后响应丢失、revoke竞态与方向拒绝；清理仅作用于task-private进程、socket和state。
-- [ ] real target在macOS标记ignore且fixture在任何bind前fail closed；本机只运行`--no-run`/`--list`。
-      Linux hosted runner执行exact target并保存test名称/commit/run URL作为验收证据。
+- [x] 保留唯一较小的Linux-only `two_daemon_transport` fixture；两个owner隔离identity/store/auth，
+      复用一个Endpoint承载pair与normal ALPN，且不新增生产state/identity/socket override argv。
+- [x] real target在macOS标记ignore且fixture在任何bind前fail closed；开发者Mac只运行`--no-run`/
+      `--list`，Linux hosted runner实际执行该target。
+- [x] 记录精确commit、test名称与run URL，并限制证据范围为transport owner/授权/route persistence。
+- [x] public CLI/remote Session 的正式OS多进程验收移交M10，由M9签名Release的installed binaries执行；
+      不再建立第二套仅编译或task-private的daemon-like Session harness。
 
-Gate：Linux exact real-Iroh tests实际通过；该loopback证据不冒充official-n0公网、self-hosted relay或
-M10双NAT/双物理网络发现证据。
+Gate：Linux保留的real-Iroh loopback transport test实际通过；该loopback证据不冒充remote Session、
+official-n0公网、self-hosted relay或M10双NAT/双物理网络发现证据。
 
-Step 9 cleanup evidence（2026-08-24，runtime仍pending）：删除了没有hosted Linux job或真实run URL的
+Step 9 cleanup evidence（2026-08-24）：删除了没有hosted Linux job或真实run URL的
 remote Session daemon-like lib-test harness及其专用response-loss注入。保留唯一较小的
 `two_daemon_transport` fixture，持久配置为`OfficialN0`、运行时为relay-disabled IPv4 loopback和
 task-only direct route；它只覆盖pair/normal ALPN、Endpoint/primary复用、方向授权与direct-route不落盘，
 不冒充remote Session、official-n0 Relay、公网或public CLI多进程证据。remote Session的重试、
 response-loss、reconnect、no-HOL、revoke与cleanup继续由pure/Unix IPC测试覆盖。未来若补真实remote
 Session或pairing acceptance，必须与hosted Linux job及run URL一起建立，并复用这一fixture，不能再
-维护第二套仅编译的daemon-like owner。以上Step 9 checkbox保持未勾选。
+维护第二套仅编译的daemon-like owner。
+
+Hosted evidence（2026-08-24）：commit `d3cfc5697c4b6a5dcd10f3bf70689e29b3c797f8` 的
+[GitHub Actions run 32725142928](https://github.com/leonfox28/zterm/actions/runs/32725142928)
+全部成功。Linux x86_64 job 实际运行
+`two_daemon_owners_reuse_endpoint_for_pair_and_normal_confirmation` 并通过；Linux arm64、macOS arm64/
+Intel、Windows shared/unsupported、dependency policy 与 official Relay bundle jobs 同时通过。该
+run 没有执行已删除的remote Session harness，因此不能被引用为public CLI/remote Session证据。
 
 ## Step 10：文档、spec与最终门禁
 
@@ -292,7 +296,7 @@ Session或pairing acceptance，必须与hosted Linux job及run URL一起建立�
       takeover、directional trust、ticket input、identity reset和daemon-lifetime Session边界。
 - [x] 文档保持official n0为production默认，不新增public/self-hosted Relay acceptance workflow；
       M10 discovery/NAT/path与M9发行事项继续未完成。
-- [ ] 更新parent M7-M8 checklist只勾选有直接实现与测试证据的条目，记录Linux run与Windows hosted
+- [x] 更新parent M7-M8 checklist只勾选有直接实现与测试证据的条目，记录Linux run与Windows hosted
       shared compile证据；不把macOS compile-only写成network runtime通过。
 - [x] 运行独立`trellis-check`，修复spec drift、cross-layer重复、cfg dead-code、secret surface与
       flaky/非确定性测试后重跑完整门禁。
@@ -307,9 +311,9 @@ milestones”；已改为会结束当前active Sessions/PTYS，并由`command_si
 loopback和task-only direct route，不能充当official-n0 Relay、公网、自建Relay、DNS/Pkarr、M10或
 public CLI多进程证据。
 
-父任务仅勾选现有pure/Unix/PTY及source gate直接证明的M7-M8条目，并修正Ctrl+] prefix契约；Linux
-actual runtime、exact run URL、public CLI OS多进程、hosted Windows shared compile、M9发行与M10
-network lab仍未勾选，所以上述第三项保持pending。
+父任务仅勾选现有pure/Unix/PTY及source gate直接证明的M7-M8条目，并修正Ctrl+] prefix契约；已记录
+Linux retained transport runtime、exact run URL与hosted Windows shared compile。public CLI/remote
+Session OS多进程、M9发行与M10 network lab仍未勾选并明确移交，不把transport test扩大解释。
 
 独立final checker（2026-08-24）修复两项跨层问题：peer-authored `ServiceError.message` 不再进入本地
 `DaemonError`或attachment frame，只保留correlated request ID/kind、zeroize原文本并重编码稳定
@@ -359,10 +363,13 @@ unsupported tests，本机缺MSVC SDK的cross-check不能替代或阻塞该证�
 
 ## 完成条件
 
-- [ ] PRD全部M7-M8验收项都有直接、可复现证据，没有借用M9/M10或未执行的公网测试。
+- [x] M7-M8实现范围都有直接、可复现证据；正式安装后的public CLI/remote Session验收明确移交M10，
+      没有借用M9/M10或未执行的公网测试冒充当前证据。
 - [x] 唯一SessionService/ConnectionBroker/AuthorizationRegistry与secret ownership未被复制或绕过。
-- [ ] 独立checker、完整本机安全gate和hosted matrix全绿；Linux real-Iroh exact gate实际执行通过。
-- [ ] parent M7-M8同步后完成/归档child task，并记录commit、CI run与剩余M9-M10边界。
+- [x] 独立checker、完整本机安全gate和hosted matrix全绿；Linux retained real-Iroh transport gate实际
+      执行通过，证据范围已准确记录。
+- [x] parent M7-M8已同步实现状态与发布验收边界；child已记录commit、CI run与剩余M9-M10 owner，
+      可以在本次规划/evidence commit后归档。
 
 ## 执行复盘与继续条件
 
