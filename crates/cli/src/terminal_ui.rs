@@ -2515,6 +2515,7 @@ mod unix {
                             }
                         }
                         Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                        Err(error) if linux_pty_master_closed(&error) => break,
                         Err(error) => panic!("read signal child PTY: {error}"),
                     }
                 }
@@ -2567,6 +2568,10 @@ mod unix {
 
         fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
             find_bytes(haystack, needle).is_some()
+        }
+
+        fn linux_pty_master_closed(error: &io::Error) -> bool {
+            cfg!(target_os = "linux") && error.raw_os_error() == Some(nix::errno::Errno::EIO as i32)
         }
 
         fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -2652,6 +2657,7 @@ mod unix {
                         Ok(0) => break,
                         Ok(read) => bytes.extend_from_slice(&buffer[..read]),
                         Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                        Err(error) if linux_pty_master_closed(&error) => break,
                         Err(error) => panic!("read panic child PTY: {error}"),
                     }
                 }
