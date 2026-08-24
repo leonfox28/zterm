@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 workflow="$repo_root/.github/workflows/release.yml"
 bootstrap="$repo_root/install/install.sh"
 template="$repo_root/install/versioned.sh.in"
@@ -53,12 +53,12 @@ secret_references=$(grep -Ec \
     'secrets[.]ZTERM_RELEASE_SIGNING_KEY' "$workflow" || true)
 [ "$secret_references" -eq 1 ] \
     || fail "the signing secret must be referenced by exactly one step"
-frozen_checkouts=$(grep -Fc 'ref: ${{ needs.validate.outputs.commit }}' "$workflow" || true)
+frozen_checkouts=$(grep -Fc "ref: \${{ needs.validate.outputs.commit }}" "$workflow" || true)
 [ "$frozen_checkouts" -eq 6 ] \
     || fail "every downstream release job must check out the validated commit"
 grep -Fq 'target/release/zterm-release-tool sign release-output' "$workflow" \
     || fail "the signing step must execute the tool built before secret exposure"
-grep -Fq 'git rev-list -n 1 "$RELEASE_TAG"' "$workflow" \
+grep -Fq "git rev-list -n 1 \"\$RELEASE_TAG\"" "$workflow" \
     || fail "draft creation must recheck the existing tag against the validated commit"
 if grep -Fq 'std::env::var("GITHUB_SHA")' "$build_script"; then
     fail "ambient ordinary-CI SHA must not mark a managed distribution build"
@@ -81,7 +81,7 @@ for bounded_installer in "$bootstrap" "$template"; do
     grep -Fq -- '--max-filesize' "$bounded_installer" \
         || fail "curl installer download must enforce its byte bound"
 done
-grep -Fq '[ ! -L "$candidate" ] && [ -f "$candidate" ]' "$template" \
+grep -Fq "[ ! -L \"\$candidate\" ] && [ -f \"\$candidate\" ]" "$template" \
     || fail "versioned installer must reject a symlink/non-file candidate before chmod"
 
 public_key=$(tr -d '[:space:]' < "$repo_root/release/public-key.hex")

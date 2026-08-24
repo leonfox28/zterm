@@ -71,6 +71,7 @@ impl ReleaseSelection {
 /// Prepared candidate whose bytes and identity are authenticated before daemon contact.
 pub struct PreparedRelease {
     _temporary: TempDir,
+    #[cfg(unix)]
     candidate: PathBuf,
     manifest: ReleaseManifest,
     artifact: ReleaseArtifact,
@@ -101,12 +102,14 @@ impl PreparedRelease {
     }
 
     /// Candidate file retained by this owner until activation completes.
+    #[cfg(unix)]
     #[must_use]
     pub(crate) fn candidate(&self) -> &Path {
         &self.candidate
     }
 
     /// Authenticated manifest retained for post-activation metadata.
+    #[cfg(unix)]
     #[must_use]
     pub(crate) const fn manifest(&self) -> &ReleaseManifest {
         &self.manifest
@@ -298,6 +301,7 @@ pub(crate) fn validate_managed_executable(path: &Path, uid: u32) -> Result<(), D
 }
 
 /// Re-runs the side-effect-free identity check against the activated path.
+#[cfg(unix)]
 pub(crate) fn verify_activated_candidate(
     candidate: &Path,
     manifest: &ReleaseManifest,
@@ -431,6 +435,7 @@ fn prepare_with(
 
     Ok(PreparedRelease {
         _temporary: temporary,
+        #[cfg(unix)]
         candidate,
         manifest,
         artifact,

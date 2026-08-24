@@ -1087,6 +1087,7 @@ pub struct UninstallResult {
     pub previous_device_id: Option<DeviceId>,
 }
 
+#[cfg(unix)]
 fn require_update_daemon_compatible(
     version: &str,
     wire_major: u32,
@@ -1105,6 +1106,7 @@ fn require_update_daemon_compatible(
     Ok(())
 }
 
+#[cfg(unix)]
 fn require_update_session_force(impact: &SessionImpact, force: bool) -> Result<(), DaemonError> {
     if (impact.interruption_required || impact.active_session_count > 0) && !force {
         return Err(DaemonError::new(
@@ -2450,20 +2452,23 @@ mod tests {
 
     #[test]
     fn distribution_lifecycle_requires_force_for_active_sessions() {
-        let update_impact = SessionImpact {
-            active_session_count: 1,
-            active_session_names: vec!["main".to_owned()],
-            stopping: false,
-            interruption_required: true,
-        };
-        assert_eq!(
-            require_update_session_force(&update_impact, false)
-                .expect_err("update must refuse active Sessions without force")
-                .kind(),
-            DomainErrorKind::UpdateRejected
-        );
-        require_update_session_force(&update_impact, true)
-            .expect("forced update may cross the already-rendered impact boundary");
+        #[cfg(unix)]
+        {
+            let update_impact = SessionImpact {
+                active_session_count: 1,
+                active_session_names: vec!["main".to_owned()],
+                stopping: false,
+                interruption_required: true,
+            };
+            assert_eq!(
+                require_update_session_force(&update_impact, false)
+                    .expect_err("update must refuse active Sessions without force")
+                    .kind(),
+                DomainErrorKind::UpdateRejected
+            );
+            require_update_session_force(&update_impact, true)
+                .expect("forced update may cross the already-rendered impact boundary");
+        }
 
         let uninstall_impact = IdentityResetPreflight {
             state_present: true,
@@ -2483,6 +2488,7 @@ mod tests {
             .expect("forced uninstall may cross the already-rendered impact boundary");
     }
 
+    #[cfg(unix)]
     #[test]
     fn update_rejects_every_incompatible_running_daemon_identity_field() {
         let build = zterm_core::BuildIdentity::current();
