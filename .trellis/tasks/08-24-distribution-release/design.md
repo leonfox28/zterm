@@ -33,6 +33,8 @@ The long-lived Ed25519 seed exists only as the `ZTERM_RELEASE_SIGNING_KEY` secre
 - is reached only by a manual release workflow for an existing exact tag;
 - cannot read the secret until the configured reviewer approves the environment;
 - receives no pull-request-controlled code or inputs after approval;
+- builds the reviewed signing tool before the secret-bearing step, so Cargo,
+  build scripts, and proc macros never inherit the seed;
 - uses commit-pinned third-party actions;
 - zeroizes the decoded seed owner and never prints derived secret material.
 
@@ -91,7 +93,7 @@ Release metadata and signature verification live in one shared Rust module below
 - SHA-256 streaming verification and bounded download results;
 - redacted typed errors with no URL query, response body, secret, state path, or terminal content.
 
-Production HTTPS fetching uses one native Rust client with rustls/WebPKI trust roots and explicit connect/total/size bounds; it does not shell out to `curl`. Tests inject a bounded fetcher and local HTTPS fixtures. Release URLs are fixed product constants and cannot be overridden by ordinary config, environment variables, or public CLI flags.
+Production HTTPS fetching uses one native Rust client with rustls and the platform trust roots plus explicit connect/total/size bounds; it does not shell out to `curl`. Tests inject a bounded fetcher and local HTTPS fixtures. Release URLs are fixed product constants and cannot be overridden by ordinary config, environment variables, or public CLI flags.
 
 Signing is not included in the product binary. A task-private release tool outside the five product crates creates/verifies manifests, signatures, generated installer assets, checksums, and SBOM inputs in CI.
 
@@ -99,13 +101,19 @@ Signing is not included in the product binary. A task-private release tool outsi
 
 Release builds embed product version, exact target, source commit, wire major, schema version, release key identifier, and release classification. A hidden side-effect-free self-check returns a machine-readable fixed schema for the installer/workflow; ordinary public help does not expose internal state or test overrides.
 
+Only an explicit `ZTERM_SOURCE_COMMIT` plus the configured reviewed public key
+marks an official managed-distribution build. Ambient `GITHUB_SHA` never does.
+Installer activation, update, and uninstall reject development, ordinary-CI,
+and `UNCONFIGURED` builds before network access or destructive state
+observation, while retaining support for any safe user-selected install path.
+
 The installer creates no state metadata. On first `setup`, the existing validated `~/.zterm` transaction records `install.json` from the running binary and executable path. Update/uninstall also work before setup by validating the current executable directly. Managed metadata is mode `0600`, rejects symlinks, and never becomes identity authority.
 
 ## 7. Explicit update
 
 `zterm update` is a LocalRuntime operation and the only update entry point:
 
-1. Resolve latest stable or an exact published tag; an exact older version is rejected as a managed downgrade unless a future separately designed compatibility path exists.
+1. Prove the running executable is an official managed-distribution build, then resolve latest stable or an exact published tag; an exact older version is rejected as a managed downgrade unless a future separately designed compatibility path exists.
 2. Download bounded manifest/signature/archive and verify signature, target, version monotonicity, size, checksum, and candidate self-check before contacting/stopping a daemon.
 3. Query exact installed binary/daemon build and active Session impact. A nonempty impact refuses without explicit `--force`; the CLI never invents an implicit confirmation bypass.
 4. Stop the daemon using the existing bounded owner release path, ending PTYs only after verification and approval.
@@ -133,6 +141,9 @@ Failure is retryable from the surviving binary or documented versioned installer
 - Linux artifacts build natively inside digest-pinned glibc 2.28 build containers on GitHub x86_64 and arm64 runners. The release gate inspects ELF symbol versions and rejects a higher glibc floor.
 - archives use a fixed file inventory, ownership, permissions, ordering, and source timestamp. A repeated-build comparison is evidence only after platform-specific nondeterminism is measured; the workflow must not claim bit-for-bit reproducibility without a matching digest.
 - Windows shared compilation remains CI evidence only and produces no M9 artifact.
+- The validate job freezes the tag's peeled commit; every later checkout uses
+  that commit, and draft creation rechecks that the existing tag still peels to
+  it before creating external state.
 
 ## 10. Failure and rollback boundaries
 

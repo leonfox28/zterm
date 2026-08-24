@@ -7,4 +7,4 @@
 {"file":".trellis/spec/guides/evidence-driven-simplicity.md","reason":"Limits release machinery, retries, rollback drills, worker count, broad checks, and harness flake time."}
 {"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/distribution-update-channel.md","reason":"Records the approved GitHub direct installer and manual update product decision."}
 {"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/install-version-identity-lifecycle.md","reason":"Records exact version selection, identity destruction/reinstall, and no-central-revocation decisions."}
-{"file":".trellis/tasks/08-23-remote-cli/research/execution-retrospective.md","reason":"Binding continuation limits prevent duplicated harnesses, excessive workers/checks, and unapproved external providers."}
+{"file":".trellis/tasks/archive/2026-08/08-23-remote-cli/research/execution-retrospective.md","reason":"Binding continuation limits prevent duplicated harnesses, excessive workers/checks, and unapproved external providers."}

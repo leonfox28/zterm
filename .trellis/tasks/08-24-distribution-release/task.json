@@ -3,7 +3,7 @@
   "name": "distribution-release",
   "title": "Implement signed installer and release lifecycle",
   "description": "完成第一阶段 M9：四平台原生 GitHub Release、签名 manifest、用户级 installer、显式 update/rollback 与 uninstall。",
-  "status": "planning",
+  "status": "in_progress",
   "dev_type": null,
   "scope": null,
   "package": null,
