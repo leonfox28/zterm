@@ -38,6 +38,8 @@ zterm daemon stop [--force]
 zterm daemon restart [--force]
 zterm logs [--lines <n>]
 zterm reset --identity [--yes] [--force]
+zterm update [--version <vSEMVER>] [--force]
+zterm uninstall [--yes] [--force]
 ```
 
 `setup` and `daemon restart` explicitly start the daemon. Pair, device,
@@ -52,18 +54,19 @@ command, target, pairing, reconnect, takeover, raw-terminal, ambiguity, and
 identity-reset contracts. [Persistent session engine](docs/persistent-sessions.md)
 documents the daemon-lifetime PTY and resource boundaries, while
 [Core and local daemon](docs/core-local-daemon.md) documents local state and
-lifecycle ownership.
+lifecycle ownership. [Install, update, and uninstall](docs/install.md) covers
+the signed native Release path and its trust/recovery boundaries.
 
 ## Version policy
 
 zterm uses one lockstep SemVer for the product rather than independent
 component versions. The root `[workspace.package].version` is the source for
-all product crates and is currently `0.1.1`; future CLI, daemon, desktop/mobile
+all product crates and is currently `0.1.2`; future CLI, daemon, desktop/mobile
 apps, protocol artifacts, and the zterm Relay wrapper advance together.
 
 A GitHub Release tag must equal `v` plus Cargo's resolved workspace version.
 The same tag is used unchanged for the versioned GHCR image, so release
-`v0.1.1` publishes `zterm-relay:v0.1.1` and the stable `latest` alias. GitHub
+`v0.1.2` publishes `zterm-relay:v0.1.2` and the stable `latest` alias. GitHub
 prereleases and manual builds publish only to `zterm-relay-dev`; manual tags are
 used unchanged except that `latest` is reserved. Internal validation tools such
 as the isolated Relay handshake probe are not product deliverables and keep
@@ -78,18 +81,25 @@ their own non-product version.
   separate `zterm-relay` production and `zterm-relay-dev` development GHCR
   packages.
 - `tests/relay/` — architecture, checksum, minimal configuration, and health checks.
+- `install/` and `tools/release/` — the reviewed bootstrap/template and private
+  signed native-asset assembler.
+- `.github/workflows/release.yml` — manual, protected, draft-only native
+  Release workflow for the four supported Unix targets.
 - `docs/development.md` — exact local toolchain baseline and repeatable commands.
 - `docs/relay.md` — relay trust boundary, publication, and deployment.
 - `docs/phase-zero-verification.md` — evidence from the completed local gate.
 - `docs/core-local-daemon.md` — current M2–M3 behavior, state, CLI, and exclusions.
 - `docs/persistent-sessions.md` — M4 daemon-lifetime session and local attachment contracts.
 - `docs/remote-cli.md` — M7–M8 public commands, directional trust, remote attachment, and evidence boundaries.
+- `docs/install.md` — signed installer, explicit update/uninstall, recovery,
+  and release-operator checkpoints.
 
 ## Local checks
 
 ```bash
 sh tests/source-policy.sh
 sh tests/workspace-version.sh
+sh tests/release/static.sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features

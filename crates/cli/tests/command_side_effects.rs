@@ -23,13 +23,24 @@ async fn help_version_status_doctor_logs_and_stop_never_spawn() {
     assert!(help.contains("setup"));
     assert!(help.contains("daemon"));
     assert!(!help.contains("internal-daemon"));
+    assert!(!help.contains("internal-release"));
     let public_commands = definition
         .get_subcommands()
         .map(clap::Command::get_name)
         .collect::<Vec<_>>();
     for available in [
-        "setup", "status", "doctor", "pair", "device", "connect", "session", "daemon", "logs",
+        "setup",
+        "status",
+        "doctor",
+        "pair",
+        "device",
+        "connect",
+        "session",
+        "daemon",
+        "logs",
         "reset",
+        "update",
+        "uninstall",
     ] {
         assert!(
             public_commands.contains(&available),

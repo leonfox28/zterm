@@ -84,6 +84,12 @@ impl DaemonLauncher {
         }
     }
 
+    /// Exact executable owned by this invocation's lifecycle operations.
+    #[must_use]
+    pub(crate) fn executable(&self) -> &std::path::Path {
+        &self.executable
+    }
+
     /// Ensures one daemon using this launch target.
     #[cfg(unix)]
     pub async fn ensure(&self, paths: &UserPaths) -> Result<DaemonReadiness, DaemonError> {

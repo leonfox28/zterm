@@ -1,0 +1,430 @@
+name: signed native release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing exact v-prefixed Cargo version tag
+        required: true
+        type: string
+      immutable_release_checkpoint:
+        description: Repo admin confirmed immutable Releases are enabled (enter enabled-and-reviewed)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: signed-native-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ inputs.tag }}
+
+jobs:
+  validate:
+    name: Validate exact immutable release source
+    runs-on: ubuntu-24.04
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+      source_epoch: ${{ steps.source.outputs.source_epoch }}
+      released_at: ${{ steps.source.outputs.released_at }}
+      prerelease: ${{ steps.source.outputs.prerelease }}
+    steps:
+      - name: Check out the exact existing tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install exact Rust toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal
+
+      - name: Validate tag, version, commit, and release vacancy
+        id: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMMUTABLE_RELEASE_CHECKPOINT: ${{ inputs.immutable_release_checkpoint }}
+        run: |
+          set -euo pipefail
+          test "$IMMUTABLE_RELEASE_CHECKPOINT" = enabled-and-reviewed
+          version=$(cargo +1.98.0 metadata --locked --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "zterm-cli") | .version')
+          test "$RELEASE_TAG" = "v$version"
+          test "$(git tag --points-at HEAD --list "$RELEASE_TAG")" = "$RELEASE_TAG"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "the tag already has a Release; assets are never replaced" >&2
+            exit 1
+          fi
+          commit=$(git rev-parse HEAD)
+          source_epoch=$(git show -s --format=%ct HEAD)
+          released_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+          case "$version" in
+            *-*) prerelease=true ;;
+            *) prerelease=false ;;
+          esac
+          {
+            echo "commit=$commit"
+            echo "source_epoch=$source_epoch"
+            echo "released_at=$released_at"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+
+  macos-artifacts:
+    name: Build ${{ matrix.target }}
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            architecture: arm64
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            architecture: x86_64
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+      SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.source_epoch }}
+      ZTERM_SOURCE_COMMIT: ${{ needs.validate.outputs.commit }}
+    steps:
+      - name: Check out the exact existing tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+
+      - name: Install exact Rust toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal
+
+      - name: Build and inspect the native candidate
+        shell: bash
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+          RELEASE_ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$ZTERM_SOURCE_COMMIT"
+          test "$(rustc +1.98.0 -vV | sed -n 's/^host: //p')" = "$RELEASE_TARGET"
+          cargo +1.98.0 build --locked --release \
+            --package zterm-cli --package zterm-release-tool
+          file target/release/zterm | grep -F "$RELEASE_ARCHITECTURE"
+          test "$(otool -l target/release/zterm | awk '$1 == "minos" {print $2}' | sort -u)" = "13.0"
+          mkdir release-input
+          target/release/zterm --internal-release-self-check \
+            > "release-input/zterm-$RELEASE_TARGET.identity.json"
+          target/release/zterm-release-tool archive target/release/zterm \
+            "release-input/zterm-$RELEASE_TARGET.tar.gz"
+
+      - name: Upload the native candidate and identity
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-${{ matrix.target }}
+          path: release-input/
+          if-no-files-found: error
+          retention-days: 7
+
+  linux-artifacts:
+    name: Build ${{ matrix.target }} at glibc 2.28
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: debian:10-slim@sha256:bb3dc79fddbca7e8903248ab916bb775c96ec61014b3d02b4f06043b604726dc
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    env:
+      SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.source_epoch }}
+      ZTERM_SOURCE_COMMIT: ${{ needs.validate.outputs.commit }}
+    steps:
+      - name: Select the frozen Debian 10 package snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -i \
+            -e 's|^# deb http://snapshot|deb [check-valid-until=no] http://snapshot|' \
+            -e 's|^deb http://deb|# deb http://deb|' \
+            /etc/apt/sources.list
+          apt-get -o Acquire::Check-Valid-Until=false update
+          DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+            binutils build-essential ca-certificates curl git pkg-config
+
+      - name: Check out the exact existing tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+
+      - name: Install exact Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+            https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.98.0
+          echo "/root/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build and inspect the native candidate
+        shell: bash
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$ZTERM_SOURCE_COMMIT"
+          test "$(rustc -vV | sed -n 's/^host: //p')" = "$RELEASE_TARGET"
+          test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.28"
+          cargo build --locked --release \
+            --package zterm-cli --package zterm-release-tool
+          maximum_glibc=$(readelf --version-info target/release/zterm \
+            | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)
+          test -n "$maximum_glibc"
+          test "$(printf '%s\n%s\n' "$maximum_glibc" GLIBC_2.28 | sort -V | tail -1)" = GLIBC_2.28
+          mkdir release-input
+          target/release/zterm --internal-release-self-check \
+            > "release-input/zterm-$RELEASE_TARGET.identity.json"
+          target/release/zterm-release-tool archive target/release/zterm \
+            "release-input/zterm-$RELEASE_TARGET.tar.gz"
+
+      - name: Upload the native candidate and identity
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-${{ matrix.target }}
+          path: release-input/
+          if-no-files-found: error
+          retention-days: 7
+
+  assemble:
+    name: Assemble and verify unsigned assets
+    needs:
+      - validate
+      - macos-artifacts
+      - linux-artifacts
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the exact existing tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+
+      - name: Install exact Rust toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal
+
+      - name: Download all four native candidates
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: native-*
+          path: release-input
+          merge-multiple: true
+
+      - name: Assemble and verify the exact unsigned inventory
+        env:
+          SOURCE_COMMIT: ${{ needs.validate.outputs.commit }}
+          RELEASED_AT: ${{ needs.validate.outputs.released_at }}
+        run: |
+          cargo +1.98.0 run --locked --release --package zterm-release-tool -- \
+            prepare release-input release-output "$RELEASE_TAG" "$SOURCE_COMMIT" "$RELEASED_AT"
+          cargo +1.98.0 run --locked --release --package zterm-release-tool -- \
+            verify-unsigned release-output
+          sh tests/release/static.sh
+
+      - name: Upload the unsigned exact inventory
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: unsigned-release-${{ inputs.tag }}
+          path: release-output/
+          if-no-files-found: error
+          retention-days: 7
+
+  sign:
+    name: Approve and sign exact manifest bytes
+    needs:
+      - validate
+      - assemble
+    runs-on: ubuntu-24.04
+    environment: release
+    steps:
+      - name: Check out the exact existing tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+
+      - name: Install exact Rust toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal
+
+      - name: Download the unsigned inventory
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: unsigned-release-${{ inputs.tag }}
+          path: release-output
+
+      - name: Build the reviewed signing tool without the signing secret
+        run: >-
+          cargo +1.98.0 build --locked --release --package zterm-release-tool
+
+      - name: Sign and self-verify with the protected release key
+        env:
+          ZTERM_RELEASE_SIGNING_KEY: ${{ secrets.ZTERM_RELEASE_SIGNING_KEY }}
+        run: target/release/zterm-release-tool sign release-output
+
+      - name: Render the authenticated fixture-only installer
+        run: |
+          mkdir fixture
+          target/release/zterm-release-tool \
+            render-test-installer release-output fixture/zterm-install-test.sh
+
+      - name: Upload the signed exact inventory
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: signed-release-${{ inputs.tag }}
+          path: release-output/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload the fixture-only installer separately
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: installer-fixture-${{ inputs.tag }}
+          path: fixture/zterm-install-test.sh
+          if-no-files-found: error
+          retention-days: 7
+
+  installer:
+    name: Install ${{ matrix.target }} from local HTTPS
+    needs:
+      - validate
+      - sign
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+    steps:
+      - name: Check out the exact existing tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+
+      - name: Download the signed inventory
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: signed-release-${{ inputs.tag }}
+          path: release-output
+
+      - name: Download the fixture-only installer
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: installer-fixture-${{ inputs.tag }}
+          path: fixture
+
+      - name: Check installer syntax and policy
+        run: |
+          command -v shellcheck
+          shellcheck -s sh install/install.sh tests/release/installer-fixture.sh \
+            fixture/zterm-install-test.sh
+          sh -n install/install.sh tests/release/installer-fixture.sh \
+            fixture/zterm-install-test.sh
+          python3 -m py_compile tests/release/https_fixture.py
+
+      - name: Exercise authenticated install and smallest preflight negatives
+        run: >-
+          sh tests/release/installer-fixture.sh
+          "$PWD/release-output" "$PWD/fixture/zterm-install-test.sh"
+
+  draft:
+    name: Approve and create verified draft for immutable publication
+    needs:
+      - validate
+      - installer
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out the exact existing tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+
+      - name: Install exact Rust toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal
+
+      - name: Download and verify the signed inventory
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: signed-release-${{ inputs.tag }}
+          path: release-output
+
+      - name: Re-verify before creating external state
+        run: >-
+          cargo +1.98.0 run --locked --release --package zterm-release-tool --
+          verify release-output
+
+      - name: Create one draft after the reviewed immutable-release checkpoint
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_COMMIT: ${{ needs.validate.outputs.commit }}
+          PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          git fetch --force --no-tags origin \
+            "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          test "$(git rev-list -n 1 "$RELEASE_TAG")" = "$SOURCE_COMMIT"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "the tag already has a Release; assets are never replaced" >&2
+            exit 1
+          fi
+          flags=(--draft --verify-tag --target "$SOURCE_COMMIT" \
+            --title "zterm $RELEASE_TAG" --generate-notes)
+          if [ "$PRERELEASE" = true ]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" "${flags[@]}"
+          gh release upload "$RELEASE_TAG" \
+            release-output/SHA256SUMS \
+            release-output/zterm-release.json \
+            release-output/zterm-release.json.sig \
+            release-output/zterm-install.sh \
+            release-output/zterm-sbom.spdx.json \
+            release-output/zterm-aarch64-apple-darwin.tar.gz \
+            release-output/zterm-x86_64-apple-darwin.tar.gz \
+            release-output/zterm-aarch64-unknown-linux-gnu.tar.gz \
+            release-output/zterm-x86_64-unknown-linux-gnu.tar.gz
+
+      - name: Download and verify the draft asset round-trip
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir roundtrip
+          gh release download "$RELEASE_TAG" --dir roundtrip --pattern '*'
+          cargo +1.98.0 run --locked --release --package zterm-release-tool -- \
+            verify roundtrip
+          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
+
+      - name: Attest the exact verified draft inventory
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: roundtrip/*

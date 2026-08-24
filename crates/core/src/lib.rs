@@ -4,6 +4,7 @@ pub mod authorization;
 pub mod device;
 pub mod domain;
 pub mod pairing;
+pub mod release;
 pub mod terminal;
 pub mod transport;
 
@@ -41,6 +42,9 @@ pub const PHASE_NAME: &str = "phase-one-core-local-daemon";
 /// Current persistent-state schema version.
 pub const STATE_SCHEMA_VERSION: u32 = 1;
 
+/// Product wire major shared by local IPC and authenticated network streams.
+pub const WIRE_MAJOR: u32 = 1;
+
 /// Immutable identity exposed by build and status projections.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BuildIdentity {
@@ -48,6 +52,18 @@ pub struct BuildIdentity {
     pub version: &'static str,
     /// Current implementation phase.
     pub phase: &'static str,
+    /// Exact Rust target triple embedded by the crate build script.
+    pub target: &'static str,
+    /// Source commit supplied by a release build, or `development` otherwise.
+    pub source_commit: &'static str,
+    /// Product wire major supported by this binary.
+    pub wire_major: u32,
+    /// Persistent-state schema supported by this binary.
+    pub state_schema: u32,
+    /// Reviewed release verification-key identifier.
+    pub release_key_id: &'static str,
+    /// Stable or prerelease classification derived from Cargo SemVer.
+    pub release_classification: &'static str,
 }
 
 impl BuildIdentity {
@@ -57,6 +73,12 @@ impl BuildIdentity {
         Self {
             version: env!("CARGO_PKG_VERSION"),
             phase: PHASE_NAME,
+            target: env!("ZTERM_BUILD_TARGET"),
+            source_commit: env!("ZTERM_SOURCE_COMMIT"),
+            wire_major: WIRE_MAJOR,
+            state_schema: STATE_SCHEMA_VERSION,
+            release_key_id: release::RELEASE_KEY_ID,
+            release_classification: env!("ZTERM_RELEASE_CLASSIFICATION"),
         }
     }
 }
@@ -70,5 +92,9 @@ mod tests {
         let identity = BuildIdentity::current();
         assert_eq!(identity.phase, PHASE_NAME);
         assert_eq!(identity.version, env!("CARGO_PKG_VERSION"));
+        assert!(!identity.target.is_empty());
+        assert_eq!(identity.wire_major, WIRE_MAJOR);
+        assert_eq!(identity.state_schema, STATE_SCHEMA_VERSION);
+        assert_eq!(identity.release_key_id, release::RELEASE_KEY_ID);
     }
 }

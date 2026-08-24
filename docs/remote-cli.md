@@ -257,8 +257,8 @@ the exact identity and daemon state, and removes only the validated managed
 state root. No `RevokeSelf` is sent and setup is not run automatically.
 
 After reset, run `zterm setup` to create a different identity and pair again.
-The M9 installer, updater, uninstaller, and release artifacts remain separate
-unfinished work.
+The signed installer, explicit updater, and uninstaller reuse this local
+lifecycle boundary; see [Install, update, and uninstall](install.md).
 
 ## Transport acceptance boundary
 

@@ -29,7 +29,7 @@ upgrade is an explicit repository change and must rerun every quality gate.
 ## Product version
 
 The root `[workspace.package].version` is the single lockstep product version,
-currently `0.1.1`. All five zterm product crates inherit it with
+currently `0.1.2`. All five zterm product crates inherit it with
 `version.workspace = true`; do not assign a component-specific version to a
 crate. A release changes this one value, refreshes `Cargo.lock`, and advances
 the CLI, daemon, protocol, platform libraries, apps, and Relay wrapper as one
@@ -121,6 +121,7 @@ separate acceptance gate; see [Remote sessions and the public CLI](remote-cli.md
 ```bash
 sh tests/source-policy.sh
 sh tests/workspace-version.sh
+sh tests/release/static.sh
 cargo +1.98.0 fmt --all -- --check
 cargo +1.98.0 clippy --workspace --all-targets --all-features -- -D warnings
 cargo +1.98.0 test --workspace --all-features

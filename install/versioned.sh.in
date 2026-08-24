@@ -1,0 +1,218 @@
+#!/bin/sh
+set -eu
+
+release_tag='@TAG@'
+release_base='@BASE_URL@'
+manifest_sha256='@MANIFEST_SHA256@'
+test_mode='@TEST_MODE@'
+install_dir=""
+
+fail() {
+    echo "zterm installer failed: $*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<EOF
+Usage: zterm-install.sh [--install-dir <directory>]
+
+Installs immutable zterm Release $release_tag without running setup or starting
+a daemon. The destination defaults to \$HOME/.local/bin.
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --install-dir)
+            [ "$#" -ge 2 ] || fail "--install-dir requires a directory"
+            install_dir=$2
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+version_at_least() {
+    observed_major=${1%%.*}
+    observed_rest=${1#*.}
+    observed_minor=${observed_rest%%.*}
+    required_major=${2%%.*}
+    required_rest=${2#*.}
+    required_minor=${required_rest%%.*}
+    [ "$observed_major" -gt "$required_major" ] 2>/dev/null \
+        || { [ "$observed_major" -eq "$required_major" ] 2>/dev/null \
+            && [ "$observed_minor" -ge "$required_minor" ] 2>/dev/null; }
+}
+
+os=$(uname -s 2>/dev/null) || fail "unable to detect operating system"
+arch=$(uname -m 2>/dev/null) || fail "unable to detect architecture"
+case "$arch" in
+    arm64|aarch64) rust_arch=aarch64 ;;
+    x86_64|amd64) rust_arch=x86_64 ;;
+    *) fail "unsupported CPU architecture: $arch" ;;
+esac
+
+case "$os" in
+    Darwin)
+        target="$rust_arch-apple-darwin"
+        macos_version=$(sw_vers -productVersion 2>/dev/null) \
+            || fail "unable to detect macOS version"
+        version_at_least "$macos_version" 13.0 \
+            || fail "macOS 13.0 or newer is required"
+        ;;
+    Linux)
+        [ ! -e /etc/NIXOS ] || fail "NixOS native installation is unsupported; use a future Nix package"
+        [ ! -e /etc/alpine-release ] || fail "Alpine/musl is unsupported; glibc 2.28 or newer is required"
+        ldd_version=$(ldd --version 2>&1 || true)
+        case "$ldd_version" in
+            *musl*|*Musl*) fail "musl is unsupported; glibc 2.28 or newer is required" ;;
+        esac
+        glibc_line=$(getconf GNU_LIBC_VERSION 2>/dev/null) \
+            || fail "unable to confirm glibc 2.28 or newer"
+        glibc_version=${glibc_line#glibc }
+        version_at_least "$glibc_version" 2.28 \
+            || fail "glibc 2.28 or newer is required"
+        target="$rust_arch-unknown-linux-gnu"
+        ;;
+    *) fail "unsupported operating system: $os" ;;
+esac
+
+case "$target" in
+@ARTIFACT_CASES@
+    *) fail "unsupported release target: $target" ;;
+esac
+
+if [ -z "$install_dir" ]; then
+    [ -n "${HOME:-}" ] || fail "HOME is required for the default install directory"
+    install_dir="$HOME/.local/bin"
+fi
+case "$install_dir" in
+    /*) ;;
+    *) fail "install directory must be absolute" ;;
+esac
+[ ! -L "$install_dir" ] || fail "install directory must not be a symlink"
+mkdir -p "$install_dir" || fail "unable to create install directory"
+[ -d "$install_dir" ] && [ -w "$install_dir" ] \
+    || fail "install directory must be a writable directory owned by this user"
+destination="$install_dir/zterm"
+if [ -e "$destination" ] || [ -L "$destination" ]; then
+    fail "destination already exists; use the installed binary's explicit 'zterm update' command"
+fi
+
+for tool in tar wc tr chmod mktemp awk id stat; do
+    command -v "$tool" >/dev/null 2>&1 || fail "$tool is required"
+done
+
+current_uid=$(id -u 2>/dev/null) || fail "unable to determine the current user"
+case "$os" in
+    Darwin)
+        directory_uid=$(stat -f '%u' "$install_dir" 2>/dev/null) \
+            || fail "unable to inspect install directory ownership"
+        directory_mode=$(stat -f '%Lp' "$install_dir" 2>/dev/null) \
+            || fail "unable to inspect install directory permissions"
+        ;;
+    Linux)
+        directory_uid=$(stat -c '%u' "$install_dir" 2>/dev/null) \
+            || fail "unable to inspect install directory ownership"
+        directory_mode=$(stat -c '%a' "$install_dir" 2>/dev/null) \
+            || fail "unable to inspect install directory permissions"
+        ;;
+esac
+[ "$directory_uid" = "$current_uid" ] || fail "install directory must be owned by this user"
+case "$directory_mode" in
+    *[2367][0-7]|*[0-7][2367]) fail "install directory must not be writable by group or other users" ;;
+esac
+if command -v sha256sum >/dev/null 2>&1; then
+    sha256_file() { sha256sum "$1" | awk '{print $1}'; }
+elif command -v shasum >/dev/null 2>&1; then
+    sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
+else
+    fail "sha256sum or shasum is required"
+fi
+
+if command -v curl >/dev/null 2>&1; then
+    download() {
+        file_blocks=$((($3 + 511) / 512))
+        (
+            ulimit -f "$file_blocks"
+            curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+                --connect-timeout 10 --max-time 60 --max-filesize "$3" \
+                --output "$2" "$1"
+        )
+    }
+elif command -v wget >/dev/null 2>&1; then
+    download() {
+        file_blocks=$((($3 + 511) / 512))
+        (
+            ulimit -f "$file_blocks"
+            wget --https-only --timeout=60 --tries=1 --quiet \
+                --output-document="$2" "$1"
+        )
+    }
+else
+    fail "curl or wget is required"
+fi
+
+if [ "$test_mode" = 1 ] && [ -n "${ZTERM_INSTALL_TEST_BASE_URL:-}" ]; then
+    case "$ZTERM_INSTALL_TEST_BASE_URL" in
+        https://*) release_base=$ZTERM_INSTALL_TEST_BASE_URL ;;
+        *) fail "test fixture URL must use HTTPS" ;;
+    esac
+fi
+
+temporary=$(mktemp -d "${TMPDIR:-/tmp}/zterm-install.XXXXXX") \
+    || fail "unable to create a private temporary directory"
+chmod 700 "$temporary" || fail "unable to secure the temporary directory"
+cleanup() {
+    rm -f "$temporary/$archive_name" "$temporary/zterm-release.json" \
+        "$temporary/zterm-release.json.sig" "$temporary/zterm"
+    rmdir "$temporary" 2>/dev/null || true
+}
+trap cleanup 0
+trap 'exit 1' HUP INT TERM
+
+manifest="$temporary/zterm-release.json"
+signature="$temporary/zterm-release.json.sig"
+archive="$temporary/$archive_name"
+download "$release_base/zterm-release.json" "$manifest" 65536 \
+    || fail "unable to download signed release manifest"
+manifest_length=$(wc -c < "$manifest" | tr -d '[:space:]')
+[ "$manifest_length" -gt 0 ] 2>/dev/null && [ "$manifest_length" -le 65536 ] 2>/dev/null \
+    || fail "release manifest size is invalid"
+[ "$(sha256_file "$manifest")" = "$manifest_sha256" ] \
+    || fail "release manifest digest does not match this immutable installer"
+
+download "$release_base/zterm-release.json.sig" "$signature" 64 \
+    || fail "unable to download release signature"
+[ "$(wc -c < "$signature" | tr -d '[:space:]')" -eq 64 ] 2>/dev/null \
+    || fail "release signature size is invalid"
+
+download "$release_base/$archive_name" "$archive" "$archive_length" \
+    || fail "unable to download release archive"
+[ "$(wc -c < "$archive" | tr -d '[:space:]')" -eq "$archive_length" ] 2>/dev/null \
+    || fail "release archive length does not match signed metadata"
+[ "$(sha256_file "$archive")" = "$archive_sha256" ] \
+    || fail "release archive digest does not match signed metadata"
+[ "$(tar -tzf "$archive")" = "zterm" ] \
+    || fail "release archive inventory is invalid"
+tar -xzf "$archive" -C "$temporary" || fail "unable to extract release candidate"
+candidate="$temporary/zterm"
+[ ! -L "$candidate" ] && [ -f "$candidate" ] \
+    || fail "release candidate is not a direct regular file"
+chmod 700 "$candidate" || fail "unable to secure release candidate"
+"$candidate" --internal-release-self-check >/dev/null \
+    || fail "release candidate self-check failed"
+"$candidate" --internal-release-verify "$manifest" "$signature" \
+    || fail "release manifest signature or candidate identity is invalid"
+"$candidate" --internal-release-install "$destination" \
+    || fail "atomic no-clobber installation failed"
+
+echo "Installed zterm $release_tag at $destination"
+case ":${PATH:-}:" in
+    *:"$install_dir":*) ;;
+    *) echo "Add $install_dir to PATH, then run 'zterm setup'." ;;
+esac

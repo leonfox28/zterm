@@ -16,6 +16,36 @@ fn main() -> ExitCode {
             }
         };
     }
+    if cli.internal_release_self_check() {
+        return match zterm_daemon::distribution::self_check_json() {
+            Ok(output) => {
+                print!("{output}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if let Some((manifest, signature)) = cli.internal_release_verify() {
+        return match zterm_daemon::distribution::verify_candidate_files(manifest, signature) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if let Some(destination) = cli.internal_release_install() {
+        return match zterm_daemon::distribution::install_current_executable(destination) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     let runtime = match zterm_daemon::operations::LocalRuntime::current() {
         Ok(runtime) => runtime,

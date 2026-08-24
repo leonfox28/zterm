@@ -12,6 +12,7 @@ pub mod bootstrap;
 pub mod config;
 pub mod connection_broker;
 pub mod device_directory;
+pub mod distribution;
 pub mod error;
 pub mod identity;
 pub mod lifecycle;

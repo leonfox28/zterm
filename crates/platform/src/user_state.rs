@@ -12,6 +12,8 @@ use crate::account::EffectiveAccount;
 const DIRECTORY_MODE: u32 = 0o700;
 #[cfg(unix)]
 const FILE_MODE: u32 = 0o600;
+#[cfg(unix)]
+const EXECUTABLE_MODE: u32 = 0o700;
 const MAX_SOCKET_PATH_BYTES: usize = 100;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -405,6 +407,176 @@ pub fn inspect_existing_lock(path: &Path, uid: u32) -> Result<ExistingLockState,
     }
 }
 
+/// One activated executable with its exact same-directory rollback owner.
+pub struct ExecutableActivation {
+    target: PathBuf,
+    backup: PathBuf,
+}
+
+impl fmt::Debug for ExecutableActivation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExecutableActivation")
+            .field("paths", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ExecutableActivation {
+    /// Removes only the exact retained rollback file after post-activation checks pass.
+    pub fn commit(self) -> Result<(), PathError> {
+        let parent = self
+            .target
+            .parent()
+            .ok_or_else(|| PathError::NotAbsolute(self.target.clone()))?;
+        fs::remove_file(&self.backup).map_err(|error| io_error(&self.backup, error))?;
+        sync_directory(parent)
+    }
+
+    /// Restores the retained executable and removes the failed activated candidate.
+    pub fn rollback(self) -> Result<(), PathError> {
+        let parent = self
+            .target
+            .parent()
+            .ok_or_else(|| PathError::NotAbsolute(self.target.clone()))?;
+        fs::rename(&self.backup, &self.target).map_err(|error| io_error(&self.target, error))?;
+        sync_directory(parent)
+    }
+}
+
+/// Validates a user-owned direct executable without following a symlink.
+pub fn validate_owned_executable(path: &Path, uid: u32) -> Result<(), PathError> {
+    ensure_absolute(path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| PathError::NotAbsolute(path.to_path_buf()))?;
+    validate_executable_parent(parent, uid)?;
+    let metadata = fs::symlink_metadata(path).map_err(|error| io_error(path, error))?;
+    if metadata.file_type().is_symlink() {
+        return Err(PathError::Symlink(path.to_path_buf()));
+    }
+    if !metadata.is_file() {
+        return Err(PathError::WrongType(path.to_path_buf()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != uid {
+            return Err(PathError::WrongOwner {
+                path: path.to_path_buf(),
+                expected: uid,
+                actual: metadata.uid(),
+            });
+        }
+        let actual = metadata.mode() & 0o777;
+        if actual & 0o100 == 0 || actual & 0o022 != 0 {
+            return Err(PathError::WrongMode {
+                path: path.to_path_buf(),
+                expected: EXECUTABLE_MODE,
+                actual,
+            });
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = uid;
+        Err(PathError::UnsupportedPlatform)
+    }
+}
+
+/// Stages and atomically activates one executable while retaining the old binary.
+pub fn activate_executable(
+    target: &Path,
+    uid: u32,
+    writer: impl FnOnce(&mut File) -> io::Result<()>,
+) -> Result<ExecutableActivation, PathError> {
+    validate_owned_executable(target, uid)?;
+    let parent = target
+        .parent()
+        .ok_or_else(|| PathError::NotAbsolute(target.to_path_buf()))?;
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let staged = parent.join(format!(".zterm.update-{}-{sequence}", std::process::id()));
+    let backup = parent.join(format!(".zterm.rollback-{}-{sequence}", std::process::id()));
+    let mut file = create_new_executable(&staged)?;
+    let result = writer(&mut file)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| io_error(&staged, error));
+    if let Err(error) = result {
+        drop(file);
+        let _ = fs::remove_file(&staged);
+        return Err(error);
+    }
+    drop(file);
+
+    fs::hard_link(target, &backup).map_err(|error| {
+        let _ = fs::remove_file(&staged);
+        io_error(target, error)
+    })?;
+    if let Err(error) = fs::rename(&staged, target) {
+        let _ = fs::remove_file(&backup);
+        let _ = fs::remove_file(&staged);
+        return Err(io_error(target, error));
+    }
+    let activation = ExecutableActivation {
+        target: target.to_path_buf(),
+        backup,
+    };
+    if let Err(error) = sync_directory(parent) {
+        return match activation.rollback() {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(rollback),
+        };
+    }
+    Ok(activation)
+}
+
+/// Installs one validated executable with an atomic no-clobber link publication.
+pub fn install_executable(source: &Path, target: &Path, uid: u32) -> Result<(), PathError> {
+    validate_owned_executable(source, uid)?;
+    ensure_absolute(target)?;
+    let parent = target
+        .parent()
+        .ok_or_else(|| PathError::NotAbsolute(target.to_path_buf()))?;
+    validate_executable_parent(parent, uid)?;
+    if fs::symlink_metadata(target).is_ok() {
+        return Err(PathError::Io {
+            path: target.to_path_buf(),
+            detail: "installation destination already exists".to_owned(),
+        });
+    }
+
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let staged = parent.join(format!(".zterm.install-{}-{sequence}", std::process::id()));
+    let mut input = File::open(source).map_err(|error| io_error(source, error))?;
+    let mut output = create_new_executable(&staged)?;
+    let result = io::copy(&mut input, &mut output)
+        .and_then(|_| output.sync_all())
+        .map_err(|error| io_error(&staged, error));
+    if let Err(error) = result {
+        drop(output);
+        let _ = fs::remove_file(&staged);
+        return Err(error);
+    }
+    drop(output);
+    if let Err(error) = fs::hard_link(&staged, target) {
+        let _ = fs::remove_file(&staged);
+        return Err(io_error(target, error));
+    }
+    fs::remove_file(&staged).map_err(|error| io_error(&staged, error))?;
+    sync_directory(parent)
+}
+
+/// Removes one validated user-owned executable and syncs its directory.
+pub fn remove_owned_executable(path: &Path, uid: u32) -> Result<(), PathError> {
+    validate_owned_executable(path, uid)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| PathError::NotAbsolute(path.to_path_buf()))?;
+    fs::remove_file(path).map_err(|error| io_error(path, error))?;
+    sync_directory(parent)
+}
+
 /// Removes the exact managed state root while the caller holds its lifecycle lock.
 ///
 /// The complete tree is validated before the first unlink. Unknown entries,
@@ -650,6 +822,55 @@ fn create_new_file(path: &Path) -> Result<File, PathError> {
     options.write(true).create_new(true);
     configure_secure_open(&mut options);
     options.open(path).map_err(|error| io_error(path, error))
+}
+
+fn create_new_executable(path: &Path) -> Result<File, PathError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(EXECUTABLE_MODE)
+            .custom_flags(nix::libc::O_NOFOLLOW);
+    }
+    options.open(path).map_err(|error| io_error(path, error))
+}
+
+fn validate_executable_parent(path: &Path, uid: u32) -> Result<(), PathError> {
+    ensure_absolute(path)?;
+    let metadata = fs::symlink_metadata(path).map_err(|error| io_error(path, error))?;
+    if metadata.file_type().is_symlink() {
+        return Err(PathError::Symlink(path.to_path_buf()));
+    }
+    if !metadata.is_dir() {
+        return Err(PathError::WrongType(path.to_path_buf()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != uid {
+            return Err(PathError::WrongOwner {
+                path: path.to_path_buf(),
+                expected: uid,
+                actual: metadata.uid(),
+            });
+        }
+        let actual = metadata.mode() & 0o777;
+        if actual & 0o022 != 0 {
+            return Err(PathError::WrongMode {
+                path: path.to_path_buf(),
+                expected: 0o755,
+                actual,
+            });
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = uid;
+        Err(PathError::UnsupportedPlatform)
+    }
 }
 
 fn configure_secure_open(options: &mut OpenOptions) {
@@ -923,6 +1144,103 @@ mod tests {
             validate_regular_file(paths.config(), paths.uid()),
             Err(PathError::WrongMode { .. })
         ));
+    }
+
+    #[test]
+    fn executable_activation_restores_old_binary_after_postcheck_failure_or_commits() {
+        use nix::unistd::Uid;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().expect("temporary executable root");
+        let directory = temporary.path().join("bin");
+        fs::create_dir(&directory).expect("binary directory");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755))
+            .expect("binary directory mode");
+        let target = directory.join("zterm");
+        fs::write(&target, b"old").expect("old executable");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700))
+            .expect("old executable mode");
+        let uid = Uid::effective().as_raw();
+
+        let activation = activate_executable(&target, uid, |file| file.write_all(b"new"))
+            .expect("activate candidate");
+        assert_eq!(fs::read(&target).expect("active candidate"), b"new");
+        // The update owner calls rollback when its post-activation self-check fails.
+        activation.rollback().expect("rollback candidate");
+        assert_eq!(fs::read(&target).expect("restored binary"), b"old");
+
+        let activation = activate_executable(&target, uid, |file| file.write_all(b"final"))
+            .expect("activate final candidate");
+        activation.commit().expect("commit candidate");
+        assert_eq!(fs::read(&target).expect("committed binary"), b"final");
+        assert!(
+            fs::read_dir(&directory)
+                .expect("binary inventory")
+                .all(|entry| entry.expect("directory entry").path() == target)
+        );
+    }
+
+    #[test]
+    fn executable_activation_rejects_symlink_and_group_writable_targets() {
+        use nix::unistd::Uid;
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temporary = tempfile::tempdir().expect("temporary executable root");
+        let directory = temporary.path().join("bin");
+        fs::create_dir(&directory).expect("binary directory");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755))
+            .expect("binary directory mode");
+        let target = directory.join("real");
+        fs::write(&target, b"old").expect("old executable");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o720))
+            .expect("unsafe executable mode");
+        let uid = Uid::effective().as_raw();
+        assert!(matches!(
+            validate_owned_executable(&target, uid),
+            Err(PathError::WrongMode { .. })
+        ));
+
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700))
+            .expect("safe executable mode");
+        let link = directory.join("zterm");
+        symlink(&target, &link).expect("executable symlink");
+        assert!(matches!(
+            validate_owned_executable(&link, uid),
+            Err(PathError::Symlink(path)) if path == link
+        ));
+    }
+
+    #[test]
+    fn executable_install_is_atomic_no_clobber() {
+        use nix::unistd::Uid;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().expect("temporary executable root");
+        let home = temporary.path().join("home");
+        let source_directory = temporary.path().join("source");
+        let destination_directory = home.join("bin");
+        fs::create_dir(&home).expect("test home");
+        fs::create_dir(&source_directory).expect("source directory");
+        fs::create_dir(&destination_directory).expect("destination directory");
+        fs::set_permissions(&source_directory, fs::Permissions::from_mode(0o700))
+            .expect("source directory mode");
+        fs::set_permissions(&destination_directory, fs::Permissions::from_mode(0o755))
+            .expect("destination directory mode");
+        let source = source_directory.join("zterm");
+        fs::write(&source, b"candidate").expect("candidate bytes");
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).expect("candidate mode");
+        let target = destination_directory.join("zterm");
+        let uid = Uid::effective().as_raw();
+
+        install_executable(&source, &target, uid).expect("first install");
+        assert_eq!(fs::read(&target).expect("installed bytes"), b"candidate");
+        assert!(
+            !home.join(".zterm").exists(),
+            "binary install must not create product state"
+        );
+        assert!(install_executable(&source, &target, uid).is_err());
+        assert_eq!(fs::read(&target).expect("unclobbered bytes"), b"candidate");
+        assert!(!home.join(".zterm").exists());
     }
 
     #[cfg(unix)]

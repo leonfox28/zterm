@@ -28,6 +28,7 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Local Daemon and IPC Contract](./local-daemon-ipc.md) | Same-UID Unix IPC, single-instance lifecycle, detached spawn, and CLI side effects | Active |
 | [Persistent Session Service Contract](./session-service.md) | Daemon-lifetime sessions, attachments, controller leases, and resource admission | Active |
 | [Iroh Transport, Pairing, and Device Authorization Contract](./transport-auth.md) | Endpoint ownership, route fallback, pairing, directional authorization, revoke, security, and platform evidence boundaries | Active |
+| [Signed Distribution and Executable Lifecycle Contract](./distribution-lifecycle.md) | Native Release trust, installer, explicit update/rollback, uninstall, and protected draft workflow | Active |
 
 ---
 

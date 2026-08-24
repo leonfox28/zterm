@@ -24,7 +24,7 @@ pub use terminal_ui::run_terminal;
 const SETUP_GUIDANCE: &str = "zterm is not configured. Run `zterm setup` first.\n";
 
 /// zterm's public command tree plus one hidden daemon entry flag.
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(
     name = "zterm",
     version,
@@ -33,11 +33,61 @@ const SETUP_GUIDANCE: &str = "zterm is not configured. Run `zterm setup` first.\
 )]
 pub struct Cli {
     /// Internal detached daemon entry; never accepted as a state-path override.
-    #[arg(long, hide = true)]
+    #[arg(
+        long,
+        hide = true,
+        conflicts_with_all = ["internal_release_self_check", "internal_release_verify", "internal_release_install"]
+    )]
     internal_daemon: bool,
+    /// Internal side-effect-free build identity used by the installer.
+    #[arg(
+        long,
+        hide = true,
+        conflicts_with_all = ["internal_daemon", "internal_release_verify", "internal_release_install"]
+    )]
+    internal_release_self_check: bool,
+    /// Internal exact manifest/signature verification used by the installer.
+    #[arg(
+        long,
+        hide = true,
+        num_args = 2,
+        value_names = ["MANIFEST", "SIGNATURE"],
+        conflicts_with_all = ["internal_daemon", "internal_release_self_check", "internal_release_install"]
+    )]
+    internal_release_verify: Option<Vec<PathBuf>>,
+    /// Internal no-clobber installation of this already verified candidate.
+    #[arg(
+        long,
+        hide = true,
+        value_name = "DESTINATION",
+        conflicts_with_all = ["internal_daemon", "internal_release_self_check", "internal_release_verify"]
+    )]
+    internal_release_install: Option<PathBuf>,
     /// Public operation to perform.
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+impl fmt::Debug for Cli {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Cli")
+            .field("internal_daemon", &self.internal_daemon)
+            .field(
+                "internal_release_self_check",
+                &self.internal_release_self_check,
+            )
+            .field(
+                "internal_release_verify_present",
+                &self.internal_release_verify.is_some(),
+            )
+            .field(
+                "internal_release_install_present",
+                &self.internal_release_install.is_some(),
+            )
+            .field("command", &self.command)
+            .finish()
+    }
 }
 
 impl Cli {
@@ -45,6 +95,36 @@ impl Cli {
     #[must_use]
     pub const fn internal_daemon(&self) -> bool {
         self.internal_daemon
+    }
+
+    /// Whether this parse selected the side-effect-free release identity entry.
+    #[must_use]
+    pub const fn internal_release_self_check(&self) -> bool {
+        self.internal_release_self_check
+    }
+
+    /// Exact manifest/signature paths selected by the hidden verifier entry.
+    #[must_use]
+    pub fn internal_release_verify(&self) -> Option<(&std::path::Path, &std::path::Path)> {
+        match self.internal_release_verify.as_deref() {
+            Some([manifest, signature]) => Some((manifest.as_path(), signature.as_path())),
+            _ => None,
+        }
+    }
+
+    /// Exact destination selected by the hidden candidate installer entry.
+    #[must_use]
+    pub fn internal_release_install(&self) -> Option<&std::path::Path> {
+        self.internal_release_install.as_deref()
+    }
+
+    /// Whether any hidden pre-runtime entry was selected.
+    #[must_use]
+    pub fn has_internal_entry(&self) -> bool {
+        self.internal_daemon
+            || self.internal_release_self_check
+            || self.internal_release_verify.is_some()
+            || self.internal_release_install.is_some()
     }
 }
 
@@ -87,6 +167,10 @@ enum Command {
     Logs(LogsArgs),
     /// Destroy this host's managed identity and pairing state.
     Reset(ResetArgs),
+    /// Explicitly download, verify, and install a newer official Release.
+    Update(UpdateArgs),
+    /// Remove the complete managed state and this installed executable.
+    Uninstall(UninstallArgs),
 }
 
 #[derive(clap::Args)]
@@ -325,6 +409,26 @@ struct ResetArgs {
     force: bool,
 }
 
+#[derive(Debug, clap::Args)]
+struct UpdateArgs {
+    /// Install one exact published stable or prerelease tag instead of latest stable.
+    #[arg(long, value_name = "TAG")]
+    version: Option<String>,
+    /// Allow verified activation to stop active Sessions and their PTYs.
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct UninstallArgs {
+    /// Confirm without an interactive prompt.
+    #[arg(long)]
+    yes: bool,
+    /// Allow uninstall to end active Sessions and their PTYs.
+    #[arg(long)]
+    force: bool,
+}
+
 /// Whether missing first-setup values may be prompted from the terminal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InteractionMode {
@@ -537,9 +641,9 @@ pub async fn execute(
     runtime: &LocalRuntime,
     interaction: InteractionMode,
 ) -> Result<CommandOutcome, CliError> {
-    if cli.internal_daemon {
+    if cli.has_internal_entry() {
         return Err(CliError::Usage(
-            "--internal-daemon is reserved for the detached child entry".to_owned(),
+            "internal entries are reserved for detached daemon and release verification".to_owned(),
         ));
     }
     match cli.command {
@@ -569,6 +673,8 @@ pub async fn execute(
         },
         Some(Command::Logs(arguments)) => logs(runtime, arguments.lines).map(CommandOutcome::Text),
         Some(Command::Reset(arguments)) => reset(runtime, arguments, interaction).await,
+        Some(Command::Update(arguments)) => update(runtime, arguments).await,
+        Some(Command::Uninstall(arguments)) => uninstall(runtime, arguments, interaction).await,
         None => bare(runtime).await,
     }
 }
@@ -809,6 +915,62 @@ async fn reset(
         "Managed identity state is already absent. Run `zterm setup` to configure zterm.\n"
             .to_owned()
     }))
+}
+
+async fn update(runtime: &LocalRuntime, arguments: UpdateArgs) -> Result<CommandOutcome, CliError> {
+    let result = runtime
+        .update(arguments.version.as_deref(), arguments.force)
+        .await?;
+    let impact = if result.ended_session_names.is_empty() {
+        "No active Sessions were ended.".to_owned()
+    } else {
+        format!(
+            "Ended {} active Session(s): {}.",
+            result.ended_session_names.len(),
+            result.ended_session_names.join(", ")
+        )
+    };
+    Ok(CommandOutcome::Text(format!(
+        "Updated zterm from {} to {}. {impact} The daemon remains stopped.\n",
+        result.previous_version, result.installed_version
+    )))
+}
+
+async fn uninstall(
+    runtime: &LocalRuntime,
+    arguments: UninstallArgs,
+    interaction: InteractionMode,
+) -> Result<CommandOutcome, CliError> {
+    let preflight = runtime.uninstall_preflight().await?;
+    if preflight.identity.active_session_count() > 0 && !arguments.force {
+        return Err(CliError::Usage(format!(
+            "uninstall would end {} active Session(s); retry with --force",
+            preflight.identity.active_session_count()
+        )));
+    }
+    let identity = preflight
+        .identity
+        .endpoint_id
+        .as_deref()
+        .unwrap_or("no committed identity");
+    confirm(
+        &format!(
+            "Uninstall zterm {} for {}, destroy identity {}, remove all local pairing/authorization state, and end {} active Session(s)? No RevokeSelf will be sent and every device must be paired again after reinstall.",
+            preflight.version,
+            preflight.target,
+            identity,
+            preflight.identity.active_session_count()
+        ),
+        arguments.yes,
+        interaction,
+    )?;
+    let result = runtime
+        .uninstall(preflight.identity.device_id, arguments.force)
+        .await?;
+    Ok(CommandOutcome::Text(format!(
+        "Uninstalled zterm. Managed state removed: {}. Executable removed: {}.\n",
+        result.state_removed, result.executable_removed
+    )))
 }
 
 fn parse_pair_ttl(value: &str) -> Result<u32, String> {

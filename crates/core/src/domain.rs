@@ -729,6 +729,16 @@ pub enum DomainErrorKind {
     InvalidSessionName,
     /// A requested session working directory is invalid or inaccessible.
     InvalidWorkingDirectory,
+    /// Signed release metadata failed its schema or identity contract.
+    ReleaseManifestInvalid,
+    /// A detached release signature failed authentication.
+    ReleaseSignatureInvalid,
+    /// A downloaded release artifact failed its authenticated metadata.
+    ReleaseArtifactInvalid,
+    /// The fixed official release endpoint could not provide bounded bytes.
+    ReleaseUnavailable,
+    /// An explicit update was refused before daemon stop or activation.
+    UpdateRejected,
     /// A normal create or rename attempted to use the reserved `main` name.
     ReservedSessionName,
     /// A live session already uses the requested name.
@@ -805,6 +815,11 @@ impl DomainErrorKind {
             Self::OperationOutcomeUnknown => "operation_outcome_unknown",
             Self::InvalidSessionName => "invalid_session_name",
             Self::InvalidWorkingDirectory => "invalid_working_directory",
+            Self::ReleaseManifestInvalid => "release_manifest_invalid",
+            Self::ReleaseSignatureInvalid => "release_signature_invalid",
+            Self::ReleaseArtifactInvalid => "release_artifact_invalid",
+            Self::ReleaseUnavailable => "release_unavailable",
+            Self::UpdateRejected => "update_rejected",
             Self::ReservedSessionName => "reserved_session_name",
             Self::SessionAlreadyExists => "session_already_exists",
             Self::SessionNotFound => "session_not_found",
@@ -860,6 +875,11 @@ impl DomainErrorKind {
             "operation_outcome_unknown" => Self::OperationOutcomeUnknown,
             "invalid_session_name" => Self::InvalidSessionName,
             "invalid_working_directory" => Self::InvalidWorkingDirectory,
+            "release_manifest_invalid" => Self::ReleaseManifestInvalid,
+            "release_signature_invalid" => Self::ReleaseSignatureInvalid,
+            "release_artifact_invalid" => Self::ReleaseArtifactInvalid,
+            "release_unavailable" => Self::ReleaseUnavailable,
+            "update_rejected" => Self::UpdateRejected,
             "reserved_session_name" => Self::ReservedSessionName,
             "session_already_exists" => Self::SessionAlreadyExists,
             "session_not_found" => Self::SessionNotFound,

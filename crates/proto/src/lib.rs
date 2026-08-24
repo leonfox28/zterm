@@ -289,7 +289,7 @@ impl fmt::Debug for v1::TerminalInput {
 }
 
 /// Product wire major shared by local IPC, `zterm/1`, and `zterm-pair/1`.
-pub const WIRE_MAJOR: u32 = 1;
+pub const WIRE_MAJOR: u32 = zterm_core::WIRE_MAJOR;
 /// Current persistent-state schema exposed in readiness/status.
 pub const STATE_SCHEMA_VERSION: u32 = zterm_core::STATE_SCHEMA_VERSION;
 /// Maximum encoded `WireFrame` body size.

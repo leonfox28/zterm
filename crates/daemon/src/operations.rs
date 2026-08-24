@@ -1054,6 +1054,86 @@ pub struct IdentityResetResult {
     pub previous_device_id: Option<DeviceId>,
 }
 
+/// Result of one explicit authenticated binary update.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpdateResult {
+    /// Version replaced by this invocation.
+    pub previous_version: String,
+    /// Authenticated version now installed.
+    pub installed_version: String,
+    /// Sessions ended only after candidate verification and explicit force.
+    pub ended_session_names: Vec<String>,
+}
+
+/// Side-effect-free uninstall impact bound to the current executable and identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UninstallPreflight {
+    /// Existing identity/state impact.
+    pub identity: IdentityResetPreflight,
+    /// Current binary version that will be removed.
+    pub version: String,
+    /// Current exact build target.
+    pub target: String,
+}
+
+/// Result of a completed or retry-safe uninstall.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UninstallResult {
+    /// Whether managed identity state was removed by this invocation.
+    pub state_removed: bool,
+    /// Whether the validated running executable was unlinked.
+    pub executable_removed: bool,
+    /// Public identity destroyed by this invocation, when any.
+    pub previous_device_id: Option<DeviceId>,
+}
+
+fn require_update_daemon_compatible(
+    version: &str,
+    wire_major: u32,
+    state_schema: u32,
+) -> Result<(), DaemonError> {
+    let build = zterm_core::BuildIdentity::current();
+    if version != build.version
+        || wire_major != build.wire_major
+        || state_schema != build.state_schema
+    {
+        return Err(DaemonError::new(
+            DomainErrorKind::UpdateRejected,
+            "running daemon build is incompatible with this CLI; stop it with the matching binary before updating",
+        ));
+    }
+    Ok(())
+}
+
+fn require_update_session_force(impact: &SessionImpact, force: bool) -> Result<(), DaemonError> {
+    if (impact.interruption_required || impact.active_session_count > 0) && !force {
+        return Err(DaemonError::new(
+            DomainErrorKind::UpdateRejected,
+            format!(
+                "{} active session(s) would be interrupted; retry with --force",
+                impact.active_session_count
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn require_identity_reset_session_force(
+    preflight: &IdentityResetPreflight,
+    force: bool,
+) -> Result<(), DaemonError> {
+    if preflight.active_session_count() > 0 && !force {
+        return Err(DaemonError::new(
+            DomainErrorKind::Cancelled,
+            format!(
+                "{} active session(s) would be interrupted; retry with --force",
+                preflight.active_session_count()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Daemon-owned paths and launcher used by one CLI invocation.
 #[derive(Clone)]
 pub struct LocalRuntime {
@@ -1089,6 +1169,157 @@ impl LocalRuntime {
     /// Validates or creates setup and explicitly ensures one daemon.
     pub async fn setup(&self, requested: &ValidatedConfig) -> Result<BootstrapResult, DaemonError> {
         setup_and_ensure(&self.paths, requested, &self.launcher).await
+    }
+
+    /// Authenticates, preflights, and atomically installs one explicit update.
+    pub async fn update(
+        &self,
+        exact_tag: Option<&str>,
+        force: bool,
+    ) -> Result<UpdateResult, DaemonError> {
+        #[cfg(unix)]
+        {
+            let executable = self.launcher.executable();
+            crate::distribution::validate_managed_executable(executable, self.paths.uid())?;
+            let selection = crate::distribution::ReleaseSelection::parse(exact_tag)?;
+            let prepared = crate::distribution::prepare_update(selection).await?;
+
+            let client = LocalClient::new(self.paths.socket());
+            let (daemon_running, impact) = match client.status().await {
+                Ok(status) => {
+                    require_update_daemon_compatible(
+                        &status.version,
+                        status.protocol.wire_major,
+                        status.protocol.state_schema,
+                    )?;
+                    (true, client.update_preflight().await?)
+                }
+                Err(error) if error.kind() == DomainErrorKind::DaemonStopped => (
+                    false,
+                    SessionImpact {
+                        active_session_count: 0,
+                        active_session_names: Vec::new(),
+                        stopping: false,
+                        interruption_required: false,
+                    },
+                ),
+                Err(error) => return Err(error),
+            };
+            require_update_session_force(&impact, force)?;
+            if daemon_running {
+                client.stop(force).await?;
+                wait_until_stopped(&self.paths).await?;
+            }
+
+            let state_present = managed_root_exists(&self.paths)?;
+            let lifecycle = if state_present {
+                let lock = acquire_lifecycle_lock(&self.paths, Instant::now()).await?;
+                if probe_readiness(&self.paths).await?.is_some() {
+                    return Err(DaemonError::new(
+                        DomainErrorKind::UpdateRejected,
+                        "daemon restarted while update was waiting for lifecycle ownership",
+                    ));
+                }
+                ensure_daemon_ownership_released(&self.paths)?;
+                Some(lock)
+            } else {
+                None
+            };
+
+            let mut source = fs::File::open(prepared.candidate()).map_err(|_| {
+                DaemonError::new(
+                    DomainErrorKind::ReleaseArtifactInvalid,
+                    "verified update candidate became unavailable before activation",
+                )
+            })?;
+            let activation = zterm_platform::user_state::activate_executable(
+                executable,
+                self.paths.uid(),
+                |output| std::io::copy(&mut source, output).map(|_| ()),
+            )
+            .map_err(|error| DaemonError::new(DomainErrorKind::PathUnsafe, error.to_string()))?;
+
+            let post_activation =
+                crate::distribution::verify_activated_candidate(executable, prepared.manifest())
+                    .and_then(|()| {
+                        if state_present {
+                            crate::distribution::write_install_metadata(
+                                &self.paths,
+                                executable,
+                                Some(prepared.manifest()),
+                            )?;
+                        }
+                        Ok(())
+                    });
+            if let Err(error) = post_activation {
+                activation.rollback().map_err(|rollback| {
+                    DaemonError::new(
+                        DomainErrorKind::PathUnsafe,
+                        format!(
+                            "update activation failed and rollback could not complete: {rollback}"
+                        ),
+                    )
+                })?;
+                return Err(error);
+            }
+            activation.commit().map_err(|error| {
+                DaemonError::new(DomainErrorKind::PathUnsafe, error.to_string())
+            })?;
+            drop(lifecycle);
+
+            Ok(UpdateResult {
+                previous_version: zterm_core::BuildIdentity::current().version.to_owned(),
+                installed_version: prepared.version().to_owned(),
+                ended_session_names: impact.active_session_names,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (exact_tag, force);
+            Err(unsupported_command_platform())
+        }
+    }
+
+    /// Observes uninstall impact without stopping, spawning, or deleting anything.
+    pub async fn uninstall_preflight(&self) -> Result<UninstallPreflight, DaemonError> {
+        crate::distribution::validate_managed_executable(
+            self.launcher.executable(),
+            self.paths.uid(),
+        )?;
+        let build = zterm_core::BuildIdentity::current();
+        Ok(UninstallPreflight {
+            identity: self.identity_reset_preflight().await?,
+            version: build.version.to_owned(),
+            target: build.target.to_owned(),
+        })
+    }
+
+    /// Removes validated managed state, then unlinks only the running executable.
+    pub async fn uninstall(
+        &self,
+        expected_device_id: Option<DeviceId>,
+        force: bool,
+    ) -> Result<UninstallResult, DaemonError> {
+        #[cfg(unix)]
+        {
+            let executable = self.launcher.executable();
+            crate::distribution::validate_managed_executable(executable, self.paths.uid())?;
+            let reset = self.reset_identity(expected_device_id, force).await?;
+            zterm_platform::user_state::remove_owned_executable(executable, self.paths.uid())
+                .map_err(|error| {
+                    DaemonError::new(DomainErrorKind::PathUnsafe, error.to_string())
+                })?;
+            Ok(UninstallResult {
+                state_removed: reset.removed,
+                executable_removed: true,
+                previous_device_id: reset.previous_device_id,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (expected_device_id, force);
+            Err(unsupported_command_platform())
+        }
     }
 
     /// Observes current setup/daemon state without spawning or creating files.
@@ -1427,15 +1658,7 @@ impl LocalRuntime {
                 "the configured identity changed after reset confirmation",
             ));
         }
-        if preflight.active_session_count() > 0 && !force {
-            return Err(DaemonError::new(
-                DomainErrorKind::Cancelled,
-                format!(
-                    "{} active session(s) would be interrupted; retry with --force",
-                    preflight.active_session_count()
-                ),
-            ));
-        }
+        require_identity_reset_session_force(&preflight, force)?;
 
         let stop_deadline = Instant::now() + stop_timeout;
         tokio::time::timeout_at(
@@ -2162,6 +2385,7 @@ pub async fn setup_and_ensure(
             return validate_running_setup(paths, requested).await;
         }
         let result = bootstrap_with_lock_held(paths, requested)?;
+        crate::distribution::write_install_metadata(paths, launcher.executable(), None)?;
         drop(lifecycle);
         launcher.ensure(paths).await?;
         Ok(result)
@@ -2223,6 +2447,61 @@ mod tests {
         AddressServiceState, NetworkDiagnostic, NetworkObservation, NetworkState,
     };
     use crate::service::ProtocolStatus;
+
+    #[test]
+    fn distribution_lifecycle_requires_force_for_active_sessions() {
+        let update_impact = SessionImpact {
+            active_session_count: 1,
+            active_session_names: vec!["main".to_owned()],
+            stopping: false,
+            interruption_required: true,
+        };
+        assert_eq!(
+            require_update_session_force(&update_impact, false)
+                .expect_err("update must refuse active Sessions without force")
+                .kind(),
+            DomainErrorKind::UpdateRejected
+        );
+        require_update_session_force(&update_impact, true)
+            .expect("forced update may cross the already-rendered impact boundary");
+
+        let uninstall_impact = IdentityResetPreflight {
+            state_present: true,
+            configured: true,
+            device_id: Some(DeviceId::from_array([0x71; DeviceId::LENGTH])),
+            endpoint_id: Some("public-endpoint".to_owned()),
+            daemon_running: true,
+            active_session_names: vec!["main".to_owned()],
+        };
+        assert_eq!(
+            require_identity_reset_session_force(&uninstall_impact, false)
+                .expect_err("uninstall must refuse active Sessions without force")
+                .kind(),
+            DomainErrorKind::Cancelled
+        );
+        require_identity_reset_session_force(&uninstall_impact, true)
+            .expect("forced uninstall may cross the already-rendered impact boundary");
+    }
+
+    #[test]
+    fn update_rejects_every_incompatible_running_daemon_identity_field() {
+        let build = zterm_core::BuildIdentity::current();
+        require_update_daemon_compatible(build.version, build.wire_major, build.state_schema)
+            .expect("matching daemon identity");
+
+        for (version, wire_major, state_schema) in [
+            ("0.0.0", build.wire_major, build.state_schema),
+            (build.version, build.wire_major + 1, build.state_schema),
+            (build.version, build.wire_major, build.state_schema + 1),
+        ] {
+            assert_eq!(
+                require_update_daemon_compatible(version, wire_major, state_schema)
+                    .expect_err("incompatible daemon must be refused before stop")
+                    .kind(),
+                DomainErrorKind::UpdateRejected
+            );
+        }
+    }
 
     #[test]
     fn terminal_end_debug_redacts_the_platform_signal_text() {
@@ -2466,6 +2745,56 @@ mod tests {
             .expect("retry after complete ownership release");
         assert!(result.removed);
         assert!(!paths.state_root().exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn development_binary_cannot_update_or_uninstall_owned_executable_or_state() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let home = temporary.path().join("home");
+        let bin = home.join("bin");
+        fs::create_dir_all(&bin).expect("owned install directory");
+        let uid = fs::metadata(&home).expect("home metadata").uid();
+        let paths = UserPaths::for_test(
+            uid,
+            home.clone(),
+            home.join(".zterm"),
+            temporary.path().join("runtime"),
+        );
+        let source = temporary.path().join("candidate");
+        fs::write(&source, b"candidate executable").expect("candidate bytes");
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).expect("candidate mode");
+        let executable = bin.join("zterm");
+        zterm_platform::user_state::install_executable(&source, &executable, uid)
+            .expect("owned development executable");
+        paths
+            .prepare_state_directories()
+            .expect("managed state fixture");
+
+        let runtime = LocalRuntime::for_test(
+            paths.clone(),
+            DaemonLauncher::for_test(executable.clone(), "--must-not-run".to_owned()),
+        );
+
+        let update = runtime
+            .update(None, false)
+            .await
+            .expect_err("development build must fail before release network access");
+        assert_eq!(update.kind(), DomainErrorKind::PathUnsafe);
+        let preflight = runtime
+            .uninstall_preflight()
+            .await
+            .expect_err("development build must not offer destructive preflight");
+        assert_eq!(preflight.kind(), DomainErrorKind::PathUnsafe);
+        let uninstall = runtime
+            .uninstall(None, false)
+            .await
+            .expect_err("development build must not remove binary or state");
+        assert_eq!(uninstall.kind(), DomainErrorKind::PathUnsafe);
+        assert!(executable.exists());
+        assert!(paths.state_root().exists());
     }
 
     #[cfg(unix)]
