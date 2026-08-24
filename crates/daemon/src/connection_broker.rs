@@ -2,10 +2,15 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::future::{Future, pending};
+#[cfg(unix)]
+use std::future::Future;
+use std::future::pending;
+#[cfg(unix)]
 use std::pin::Pin;
+#[cfg(unix)]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
@@ -249,6 +254,7 @@ pub struct ConnectionBroker {
 }
 
 /// Boxed future returned by the narrow inbound normal-service callback.
+#[cfg(unix)]
 pub(crate) type RemoteServiceHandlerFuture =
     Pin<Box<dyn Future<Output = Result<(), DaemonError>> + Send + 'static>>;
 
@@ -257,6 +263,7 @@ pub(crate) type RemoteServiceHandlerFuture =
 /// The callback cannot reach Endpoint, candidate, route, profile, or peer-slot
 /// state. It receives only the owned stream, verified peer identity, accepted
 /// receiver generation, and the first-frame deadline.
+#[cfg(unix)]
 pub(crate) trait RemoteServiceHandler: Send + Sync + 'static {
     fn handle_service_stream(
         &self,
@@ -267,6 +274,7 @@ pub(crate) trait RemoteServiceHandler: Send + Sync + 'static {
 
 /// Owned Iroh halves and receiver-owned authorization identity for one
 /// inbound normal service stream.
+#[cfg(unix)]
 pub(crate) struct InboundAuthenticatedStream {
     send: SendStream,
     recv: RecvStream,
@@ -274,6 +282,7 @@ pub(crate) struct InboundAuthenticatedStream {
     accepted_generation: AuthGeneration,
 }
 
+#[cfg(unix)]
 impl fmt::Debug for InboundAuthenticatedStream {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -284,6 +293,7 @@ impl fmt::Debug for InboundAuthenticatedStream {
     }
 }
 
+#[cfg(unix)]
 impl InboundAuthenticatedStream {
     #[must_use]
     pub(crate) const fn remote_device_id(&self) -> DeviceId {
@@ -301,10 +311,12 @@ impl InboundAuthenticatedStream {
 }
 
 #[derive(Default)]
+#[cfg(unix)]
 struct RemoteServiceHandlerSlot {
     handler: OnceLock<Arc<dyn RemoteServiceHandler>>,
 }
 
+#[cfg(unix)]
 impl RemoteServiceHandlerSlot {
     fn install(&self, handler: Arc<dyn RemoteServiceHandler>) -> Result<(), DaemonError> {
         self.handler.set(handler).map_err(|_| {
@@ -326,14 +338,14 @@ impl RemoteServiceHandlerSlot {
 
 impl fmt::Debug for ConnectionBroker {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ConnectionBroker")
-            .field("local_device_id", &self.inner.identity.device_id)
-            .field(
-                "service_handler_installed",
-                &self.inner.service_handler.is_installed(),
-            )
-            .finish_non_exhaustive()
+        let mut debug = formatter.debug_struct("ConnectionBroker");
+        debug.field("local_device_id", &self.inner.identity.device_id);
+        #[cfg(unix)]
+        debug.field(
+            "service_handler_installed",
+            &self.inner.service_handler.is_installed(),
+        );
+        debug.finish_non_exhaustive()
     }
 }
 
@@ -350,6 +362,7 @@ struct BrokerInner {
     observer: NetworkObserver,
     lifecycle: BrokerLifecycle,
     pairing: PairHandshakeAdmission,
+    #[cfg(unix)]
     service_handler: RemoteServiceHandlerSlot,
     test_routes: Mutex<BTreeMap<DeviceId, EndpointAddr>>,
 }
@@ -1033,6 +1046,7 @@ impl ConnectionBroker {
                 observer,
                 lifecycle: BrokerLifecycle::default(),
                 pairing,
+                #[cfg(unix)]
                 service_handler: RemoteServiceHandlerSlot::default(),
                 test_routes: Mutex::new(BTreeMap::new()),
             }),
@@ -1046,6 +1060,7 @@ impl ConnectionBroker {
     }
 
     /// Installs the single inbound normal-service owner before Endpoint spawn.
+    #[cfg(unix)]
     pub(crate) fn install_remote_service_handler(
         &self,
         handler: Arc<dyn RemoteServiceHandler>,
@@ -2292,6 +2307,7 @@ impl ConnectionBroker {
             }
         };
         let deadline = Instant::now() + self.inner.limits.first_frame_deadline;
+        #[cfg(unix)]
         if let Some(handler) = self.inner.service_handler.get() {
             if self.inner.lifecycle.is_quiescing() {
                 reject_stream(&mut send, &mut recv, b"transport stopping");
@@ -2306,6 +2322,8 @@ impl ConnectionBroker {
             let _ = handler.handle_service_stream(stream, deadline).await;
             return;
         }
+        #[cfg(not(unix))]
+        let _ = accepted_generation;
 
         // Isolated M5-M6 composition intentionally retains the typed fallback.
         // Only this no-handler branch owns its compatibility pre-read.
@@ -3309,8 +3327,10 @@ mod tests {
     use crate::network::NetworkReporter;
     use crate::store::DeviceAuthorization;
 
+    #[cfg(unix)]
     struct NoopRemoteServiceHandler;
 
+    #[cfg(unix)]
     impl RemoteServiceHandler for NoopRemoteServiceHandler {
         fn handle_service_stream(
             &self,
@@ -3507,6 +3527,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn remote_service_handler_installs_once_without_transport_ownership() {
         let slot = RemoteServiceHandlerSlot::default();
         assert!(!slot.is_installed());

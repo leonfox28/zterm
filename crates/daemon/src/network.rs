@@ -15,9 +15,9 @@ use tokio::task::{JoinHandle, JoinSet};
 use zterm_core::{DeviceId, DomainErrorKind, TransportLimits};
 
 use crate::authorization::AuthorizationRegistry;
-use crate::connection_broker::{
-    ConnectionBroker, ConnectionIdentity, PairConnection, RemoteServiceHandler,
-};
+#[cfg(unix)]
+use crate::connection_broker::RemoteServiceHandler;
+use crate::connection_broker::{ConnectionBroker, ConnectionIdentity, PairConnection};
 use crate::error::DaemonError;
 use crate::identity::DeviceIdentity;
 use crate::store::StoreHandle;
@@ -516,6 +516,7 @@ impl NetworkStartup {
 
     /// Installs the single later-composed inbound normal service owner before
     /// the supervisor can bind or admit a stream.
+    #[cfg(unix)]
     pub(crate) fn with_service_handler<H>(self, handler: H) -> Result<Self, DaemonError>
     where
         H: RemoteServiceHandler,
@@ -1240,19 +1241,28 @@ fn mutex_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::fs;
 
+    #[cfg(unix)]
     use zterm_platform::account::EffectiveAccount;
+    #[cfg(unix)]
     use zterm_platform::user_state::UserPaths;
 
     use super::*;
+    #[cfg(unix)]
     use crate::connection_broker::{InboundAuthenticatedStream, RemoteServiceHandlerFuture};
+    #[cfg(unix)]
     use crate::identity::DeviceIdentity;
+    #[cfg(unix)]
     use crate::store::{StateStore, StoreActor};
+    #[cfg(unix)]
     use crate::transport::InfrastructureProfile;
 
+    #[cfg(unix)]
     struct NoopRemoteServiceHandler;
 
+    #[cfg(unix)]
     impl RemoteServiceHandler for NoopRemoteServiceHandler {
         fn handle_service_stream(
             &self,
@@ -1339,6 +1349,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn network_startup_installs_the_normal_service_handler_exactly_once_without_binding() {
         let temporary = tempfile::tempdir().expect("temporary network composition root");
         let account = EffectiveAccount::current().expect("effective account");

@@ -565,35 +565,74 @@ impl fmt::Debug for TerminalViewCommandWriter {
 impl TerminalViewCommandWriter {
     /// Acknowledges an exactly flushed replacement snapshot or resume delta.
     pub async fn snapshot_applied(&self, revision: Revision) -> Result<(), DaemonError> {
-        self.submit(|response| TerminalDriverCommand::SnapshotApplied { revision, response })
-            .await
+        #[cfg(unix)]
+        {
+            self.submit(|response| TerminalDriverCommand::SnapshotApplied { revision, response })
+                .await
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = revision;
+            Err(unsupported_command_platform())
+        }
     }
 
     /// Sends ordinary controller input. Callers must gate this on `Active`.
     pub async fn write_input(&self, bytes: Vec<u8>) -> Result<(), DaemonError> {
-        self.submit(|response| TerminalDriverCommand::Input { bytes, response })
-            .await
+        #[cfg(unix)]
+        {
+            self.submit(|response| TerminalDriverCommand::Input { bytes, response })
+                .await
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = bytes;
+            Err(unsupported_command_platform())
+        }
     }
 
     /// Sends the latest validated viewport. Callers coalesce while non-active.
     pub async fn resize(&self, size: TerminalSize) -> Result<(), DaemonError> {
-        self.submit(|response| TerminalDriverCommand::Resize { size, response })
-            .await
+        #[cfg(unix)]
+        {
+            self.submit(|response| TerminalDriverCommand::Resize { size, response })
+                .await
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = size;
+            Err(unsupported_command_platform())
+        }
     }
 
     /// Requests a full replacement after a revision gap.
     pub async fn request_sync(&self, known_revision: Revision) -> Result<(), DaemonError> {
-        self.submit(|response| TerminalDriverCommand::RequestSync {
-            known_revision,
-            response,
-        })
-        .await
+        #[cfg(unix)]
+        {
+            self.submit(|response| TerminalDriverCommand::RequestSync {
+                known_revision,
+                response,
+            })
+            .await
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = known_revision;
+            Err(unsupported_command_platform())
+        }
     }
 
     /// Detaches this view while leaving the Session and PTY running.
     pub async fn detach(&self) -> Result<(), DaemonError> {
-        self.submit(|response| TerminalDriverCommand::Detach { response })
-            .await
+        #[cfg(unix)]
+        {
+            self.submit(|response| TerminalDriverCommand::Detach { response })
+                .await
+        }
+        #[cfg(not(unix))]
+        {
+            Err(unsupported_command_platform())
+        }
     }
 
     #[cfg(unix)]
@@ -610,18 +649,9 @@ impl TerminalViewCommandWriter {
             .map_err(|_| terminal_driver_closed())?;
         receiver.await.map_err(|_| terminal_driver_closed())?
     }
-
-    #[cfg(not(unix))]
-    async fn submit(
-        &self,
-        _command: impl FnOnce(
-            tokio::sync::oneshot::Sender<Result<(), DaemonError>>,
-        ) -> TerminalDriverCommand,
-    ) -> Result<(), DaemonError> {
-        Err(unsupported_command_platform())
-    }
 }
 
+#[cfg(unix)]
 enum TerminalDriverCommand {
     SnapshotApplied {
         revision: Revision,
@@ -977,10 +1007,12 @@ fn terminal_transport_state_from_wire(
     }
 }
 
+#[cfg(unix)]
 fn terminal_protocol_error(detail: &'static str) -> DaemonError {
     DaemonError::new(DomainErrorKind::MalformedFrame, detail)
 }
 
+#[cfg(unix)]
 fn terminal_driver_closed() -> DaemonError {
     DaemonError::new(
         DomainErrorKind::Cancelled,

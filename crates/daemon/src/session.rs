@@ -126,6 +126,7 @@ pub struct PreparedAttachment {
     /// Initial full host-authoritative state.
     pub snapshot: TerminalSnapshot,
     /// Initial merged resume update when an exact host checkpoint matched.
+    #[cfg(unix)]
     pub(crate) initial_delta: Option<TerminalDelta>,
 }
 
@@ -137,6 +138,7 @@ pub(crate) struct RemoteResumeRequest {
 }
 
 /// Fully validated remote-only attachment preparation arguments.
+#[cfg(unix)]
 pub(crate) struct RemoteAttachmentRequest {
     pub(crate) selector: Option<SessionSelector>,
     pub(crate) create_main: bool,
@@ -319,6 +321,7 @@ impl SessionAttachment {
 
     /// Moves an active authenticated remote controller checkpoint into the
     /// SessionActor's sole resume cell and releases its controller lease.
+    #[cfg(unix)]
     pub(crate) fn detach_for_remote_resume_until(
         &self,
         deadline: Instant,
@@ -605,6 +608,7 @@ impl SessionService {
 
     /// Prepares one authenticated remote attachment with an optional exact
     /// latest-state resume baseline. Local adapters never call this path.
+    #[cfg(unix)]
     pub(crate) fn prepare_remote_attach_until(
         &self,
         principal: AttachmentPrincipal,
@@ -2514,6 +2518,7 @@ enum SessionCommand {
         resume: Option<RemoteResumeRequest>,
         reply: SyncSender<Result<PreparedAttachment, DaemonError>>,
     },
+    #[cfg(unix)]
     DetachForRemoteResume {
         meta: CommandMeta,
         attachment_id: AttachmentId,
@@ -3133,6 +3138,7 @@ fn dispatch_command(
         } => respond(actor, meta, reply, || {
             prepare_attach(actor, runtime, principal, takeover, resume)
         }),
+        #[cfg(unix)]
         SessionCommand::DetachForRemoteResume {
             meta,
             attachment_id,
@@ -3363,6 +3369,7 @@ fn prepare_attach(
             final_update,
         }),
         snapshot,
+        #[cfg(unix)]
         initial_delta,
     })
 }
@@ -3388,6 +3395,7 @@ fn take_resume_terminal(
     })
 }
 
+#[cfg(unix)]
 fn detach_for_remote_resume(
     actor: &SessionActor,
     runtime: &mut SessionRuntime,

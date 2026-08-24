@@ -1000,9 +1000,9 @@ mod unix {
     fn cancellation_pipe() -> Result<(OwnedFd, OwnedFd), CliError> {
         #[cfg(target_os = "linux")]
         {
-            return rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(|error| {
+            rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(|error| {
                 terminal_io("create terminal stdin cancellation pipe", error.into())
-            });
+            })
         }
 
         #[cfg(not(target_os = "linux"))]
