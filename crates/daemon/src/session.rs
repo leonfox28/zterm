@@ -2423,6 +2423,7 @@ struct SessionRuntime {
 
 struct ActorAttachment {
     principal: AttachmentPrincipal,
+    #[cfg(unix)]
     resume_view_id: Option<ResumeViewId>,
     terminal: TerminalAttachment,
     sync: AttachmentSync,
@@ -3275,6 +3276,7 @@ fn prepare_attach(
     resume: Option<RemoteResumeRequest>,
 ) -> Result<PreparedAttachment, DaemonError> {
     reap_detached(actor, runtime);
+    #[cfg(unix)]
     let resume_view_id = resume.map(|request| request.view_id);
     let resumed_terminal = take_resume_terminal(actor, runtime, principal, resume);
     if runtime.controller.is_some() && !takeover {
@@ -3303,25 +3305,28 @@ fn prepare_attach(
     let driver = runtime.driver.as_ref().ok_or_else(session_not_found)?;
     let mut terminal = resumed_terminal.unwrap_or_else(|| driver.attach());
     let revisions = terminal.revision_watch();
-    let (snapshot, initial_delta, initial_revision) =
-        if resume.is_some() && terminal.checkpoint_revision().is_some() {
-            match terminal.sync_latest().map_err(map_driver_error)? {
-                TerminalDeltaResult::Delta(delta) => {
-                    let revision = delta.to_revision;
-                    let snapshot = terminal.latest_snapshot().map_err(map_driver_error)?;
-                    (snapshot, Some(delta), revision)
-                }
-                TerminalDeltaResult::Resync(snapshot) => {
-                    let revision = snapshot.revision;
-                    (snapshot, None, revision)
-                }
+    let initial_state = if resume.is_some() && terminal.checkpoint_revision().is_some() {
+        match terminal.sync_latest().map_err(map_driver_error)? {
+            TerminalDeltaResult::Delta(delta) => {
+                let revision = delta.to_revision;
+                let snapshot = terminal.latest_snapshot().map_err(map_driver_error)?;
+                (snapshot, Some(delta), revision)
             }
-        } else {
-            terminal.discard_checkpoint();
-            let snapshot = full_sync(&mut terminal)?;
-            let revision = snapshot.revision;
-            (snapshot, None, revision)
-        };
+            TerminalDeltaResult::Resync(snapshot) => {
+                let revision = snapshot.revision;
+                (snapshot, None, revision)
+            }
+        }
+    } else {
+        terminal.discard_checkpoint();
+        let snapshot = full_sync(&mut terminal)?;
+        let revision = snapshot.revision;
+        (snapshot, None, revision)
+    };
+    #[cfg(unix)]
+    let (snapshot, initial_delta, initial_revision) = initial_state;
+    #[cfg(not(unix))]
+    let (snapshot, _, initial_revision) = initial_state;
     let target = if runtime.controller.is_none() {
         runtime.next_generation = runtime
             .next_generation
@@ -3346,6 +3351,7 @@ fn prepare_attach(
         attachment_id,
         ActorAttachment {
             principal,
+            #[cfg(unix)]
             resume_view_id,
             terminal,
             sync: AttachmentSync::Awaiting {
