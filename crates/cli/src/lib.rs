@@ -445,6 +445,7 @@ impl fmt::Debug for EscapePrefix {
     }
 }
 
+#[cfg(unix)]
 enum TerminalRequestKind {
     Attach {
         target: String,
@@ -459,6 +460,12 @@ enum TerminalRequestKind {
     },
 }
 
+#[cfg(not(unix))]
+enum TerminalRequestKind {
+    Attach,
+    Create,
+}
+
 /// Deferred terminal operation. It owns no attachment, socket, frame, or route.
 pub struct TerminalRequest {
     kind: TerminalRequestKind,
@@ -468,8 +475,14 @@ pub struct TerminalRequest {
 impl fmt::Debug for TerminalRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let operation = match self.kind {
+            #[cfg(unix)]
             TerminalRequestKind::Attach { .. } => "attach",
+            #[cfg(not(unix))]
+            TerminalRequestKind::Attach => "attach",
+            #[cfg(unix)]
             TerminalRequestKind::Create { .. } => "create-and-attach",
+            #[cfg(not(unix))]
+            TerminalRequestKind::Create => "create-and-attach",
         };
         formatter
             .debug_struct("TerminalRequest")
@@ -655,17 +668,24 @@ async fn connect(
     _runtime: &LocalRuntime,
     arguments: ConnectArgs,
 ) -> Result<CommandOutcome, CliError> {
-    let create_main = arguments.session == "main";
-    let selector = (!create_main).then_some(arguments.session);
-    Ok(CommandOutcome::Terminal(TerminalRequest {
-        kind: TerminalRequestKind::Attach {
+    let escape = arguments.escape;
+    #[cfg(unix)]
+    let kind = {
+        let create_main = arguments.session == "main";
+        let selector = (!create_main).then_some(arguments.session);
+        TerminalRequestKind::Attach {
             target: arguments.target,
             selector,
             create_main,
             takeover: arguments.takeover,
-        },
-        escape: arguments.escape,
-    }))
+        }
+    };
+    #[cfg(not(unix))]
+    let kind = {
+        let _ = arguments;
+        TerminalRequestKind::Attach
+    };
+    Ok(CommandOutcome::Terminal(TerminalRequest { kind, escape }))
 }
 
 async fn session(
@@ -680,23 +700,37 @@ async fn session(
             .map_err(Into::into)
             .and_then(|sessions| render_sessions(sessions, arguments.json))
             .map(CommandOutcome::Text),
-        SessionCommand::New(arguments) => Ok(CommandOutcome::Terminal(TerminalRequest {
-            kind: TerminalRequestKind::Create {
+        SessionCommand::New(arguments) => {
+            let escape = arguments.escape;
+            #[cfg(unix)]
+            let kind = TerminalRequestKind::Create {
                 target: arguments.target,
                 name: arguments.name,
                 working_directory: arguments.cwd,
-            },
-            escape: arguments.escape,
-        })),
-        SessionCommand::Attach(arguments) => Ok(CommandOutcome::Terminal(TerminalRequest {
-            kind: TerminalRequestKind::Attach {
+            };
+            #[cfg(not(unix))]
+            let kind = {
+                let _ = arguments;
+                TerminalRequestKind::Create
+            };
+            Ok(CommandOutcome::Terminal(TerminalRequest { kind, escape }))
+        }
+        SessionCommand::Attach(arguments) => {
+            let escape = arguments.escape;
+            #[cfg(unix)]
+            let kind = TerminalRequestKind::Attach {
                 target: arguments.target,
                 selector: Some(arguments.session),
                 create_main: false,
                 takeover: arguments.takeover,
-            },
-            escape: arguments.escape,
-        })),
+            };
+            #[cfg(not(unix))]
+            let kind = {
+                let _ = arguments;
+                TerminalRequestKind::Attach
+            };
+            Ok(CommandOutcome::Terminal(TerminalRequest { kind, escape }))
+        }
         SessionCommand::Rename(arguments) => {
             let renamed = runtime
                 .session_rename(&arguments.target, &arguments.session, &arguments.new_name)
