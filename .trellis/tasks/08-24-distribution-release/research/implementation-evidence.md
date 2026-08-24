@@ -87,24 +87,47 @@ release workflow or CI. The hosted installer jobs own `shellcheck`. A full
 `cargo test --workspace` was intentionally not run on this macOS host because
 it includes real Iroh/Endpoint targets whose execution is hosted-Linux-owned.
 
-## External checkpoint / evidence still required
+## External checkpoint / remaining evidence
 
-Before any workflow run, tag, signing, draft, or formal installation:
+Completed on 2026-08-25 before any workflow run, tag, signing, draft, or formal
+installation:
 
-1. a repository administrator enables immutable Releases and records the
-   authenticated `gh api repos/leonfox28/zterm/immutable-releases` result;
-2. create the protected `release` Environment and required reviewer;
-3. generate the Ed25519 seed outside logs/artifacts, commit only its reviewed
-   public key, and add the seed as `ZTERM_RELEASE_SIGNING_KEY` in that
-   Environment;
-4. independent checker passes the implementation;
-5. create the exact reviewed `v0.1.2` tag, run the manual workflow with
-   `enabled-and-reviewed`, and retain the run ID, four digests, signed manifest
-   key ID, installer matrix, attestation, and verified draft round-trip.
+1. Immutable Releases now returns
+   `enabled=true,enforced_by_owner=false` from the authenticated repository API.
+2. The protected `release` Environment requires reviewer `leonfox28`; it has
+   no branch-policy override and permits the sole reviewer to approve a run
+   they triggered.
+3. `ZTERM_RELEASE_SIGNING_KEY` exists only as an Environment secret. The
+   checkpoint operator recorded that the seed was generated without xtrace,
+   argv, environment, repository file, terminal output, or persistent local
+   file; the shell owner was unset immediately after `gh secret set` consumed
+   stdin.
+4. The checkpoint operator recorded `release/public-key.hex` as the matching
+   Ring-derived public key for key ID `zterm-release-ed25519-v1`. The initial
+   bootstrap uses the bounded, zeroizing `zterm-release-tool derive-public-key`
+   command and an RFC 8032 fixed-vector test rather than a second OpenSSL/DER
+   derivation path.
+5. The independent implementation checker and hosted `ci.yml` run
+   `32752412818` passed before the public-key checkpoint.
 
-The workflow deliberately leaves the Release as a draft. This implementation
-created no Environment, secret, key, tag, Actions run, Release, attestation, or
-published external state.
+GitHub exposes only the secret's metadata, never its value. Independent
+repository review can therefore confirm the secret's existence, the exact
+public-key source shape, and the fail-closed signing comparison, but cannot
+rederive the stored secret without violating the boundary. The protected signed
+draft rehearsal remains the executable proof that the stored seed matches the
+reviewed public key.
+
+Still required:
+
+1. commit/push the reviewed public key and derivation command, then retain the
+   resulting green hosted CI run;
+2. create the exact reviewed `v0.1.2` tag and run the manual workflow with
+   `enabled-and-reviewed`, and retain the successful seed/public-key match
+   check, run ID, four digests, signed manifest key ID, installer matrix,
+   attestation, and verified draft round-trip.
+
+The workflow still deliberately leaves the Release as a draft. No tag, release
+workflow run, Release, attestation, or published client artifact exists yet.
 
 ## Independent checker fixes and final local gate (2026-08-25)
 

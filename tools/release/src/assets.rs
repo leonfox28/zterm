@@ -29,6 +29,8 @@ const CHECKSUMS_NAME: &str = "SHA256SUMS";
 const MAX_INSTALLER_BYTES: u64 = 256 * 1024;
 const MAX_SBOM_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
+const SIGNING_SEED_HEX_BYTES: usize = 64;
+const MAX_DERIVE_INPUT_BYTES: usize = SIGNING_SEED_HEX_BYTES + 1;
 const INSTALLER_TEMPLATE: &str = include_str!("../../../install/versioned.sh.in");
 
 /// Creates a single-file deterministic native archive.
@@ -282,7 +284,7 @@ pub fn sign(directory: &Path) -> Result<()> {
         std::env::var("ZTERM_RELEASE_SIGNING_KEY")
             .map_err(|_| anyhow::anyhow!("release signing key secret is unavailable"))?,
     );
-    let seed = Zeroizing::new(decode_seed(secret_text.trim())?);
+    let seed = Zeroizing::new(decode_seed(secret_text.as_str())?);
     let pair = Ed25519KeyPair::from_seed_unchecked(seed.as_ref())
         .map_err(|_| anyhow::anyhow!("release signing key is invalid"))?;
     let reviewed_public_key = official_release_public_key()
@@ -297,6 +299,49 @@ pub fn sign(directory: &Path) -> Result<()> {
     let checksums = render_checksums(directory)?;
     write_new(&directory.join(CHECKSUMS_NAME), checksums.as_bytes(), 0o644)?;
     verify(directory, true)
+}
+
+/// Derives the reviewed Ed25519 public key from a bounded seed supplied on stdin.
+pub fn derive_public_key() -> Result<()> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    derive_public_key_from_reader(stdin.lock(), stdout.lock())
+}
+
+fn derive_public_key_from_reader(input: impl Read, mut output: impl Write) -> Result<()> {
+    let mut bounded = input.take((MAX_DERIVE_INPUT_BYTES + 1) as u64);
+    let mut secret_text = Zeroizing::new(Vec::with_capacity(MAX_DERIVE_INPUT_BYTES + 1));
+    bounded
+        .read_to_end(&mut secret_text)
+        .context("unable to read release signing key from stdin")?;
+    ensure!(
+        secret_text.len() <= MAX_DERIVE_INPUT_BYTES,
+        "release signing key input exceeds its size bound"
+    );
+    let encoded_seed = secret_text
+        .as_slice()
+        .strip_suffix(b"\n")
+        .unwrap_or(secret_text.as_slice());
+    let encoded_seed =
+        std::str::from_utf8(encoded_seed).context("release signing key must be UTF-8")?;
+    let seed = Zeroizing::new(decode_seed(encoded_seed)?);
+    let pair = Ed25519KeyPair::from_seed_unchecked(seed.as_ref())
+        .map_err(|_| anyhow::anyhow!("release signing key is invalid"))?;
+
+    let mut encoded_public_key = [0_u8; 64];
+    for (index, byte) in pair.public_key().as_ref().iter().copied().enumerate() {
+        encoded_public_key[index * 2] = lower_hex_digit(byte >> 4);
+        encoded_public_key[index * 2 + 1] = lower_hex_digit(byte & 0x0f);
+    }
+    output
+        .write_all(&encoded_public_key)
+        .context("unable to write derived release public key")?;
+    output
+        .write_all(b"\n")
+        .context("unable to write derived release public key")?;
+    output
+        .flush()
+        .context("unable to flush derived release public key")
 }
 
 /// Verifies an exact unsigned or final signed Release directory without execution.
@@ -418,7 +463,7 @@ fn render_checksums(directory: &Path) -> Result<String> {
 
 fn decode_seed(value: &str) -> Result<[u8; 32]> {
     ensure!(
-        value.len() == 64
+        value.len() == SIGNING_SEED_HEX_BYTES
             && value
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
@@ -429,6 +474,14 @@ fn decode_seed(value: &str) -> Result<[u8; 32]> {
         seed[index] = hex_value(chunk[0]) * 16 + hex_value(chunk[1]);
     }
     Ok(seed)
+}
+
+fn lower_hex_digit(value: u8) -> u8 {
+    match value {
+        0..=9 => b'0' + value,
+        10..=15 => b'a' + value - 10,
+        _ => unreachable!("nibble is outside hexadecimal range"),
+    }
 }
 
 fn hex_value(value: u8) -> u8 {
@@ -638,6 +691,44 @@ fn ensure_executable(_metadata: &fs::Metadata) -> Result<()> {
 mod tests {
     use super::*;
     use zterm_core::release::ReleaseBuildIdentity;
+
+    #[test]
+    fn derive_public_key_follows_fixed_vector_and_redaction_contract() {
+        const RFC_8032_SEED: &[u8] =
+            b"9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
+        const RFC_8032_PUBLIC_KEY: &[u8] =
+            b"d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a\n";
+        let mut input = RFC_8032_SEED.to_vec();
+        input.push(b'\n');
+        let mut output = Vec::new();
+
+        derive_public_key_from_reader(input.as_slice(), &mut output).expect("public key");
+
+        assert_eq!(output, RFC_8032_PUBLIC_KEY);
+        assert_eq!(output.len(), SIGNING_SEED_HEX_BYTES + 1);
+        assert!(
+            output[..SIGNING_SEED_HEX_BYTES]
+                .iter()
+                .all(|byte| { byte.is_ascii_digit() || (b'a'..=b'f').contains(byte) })
+        );
+        assert_eq!(output[SIGNING_SEED_HEX_BYTES], b'\n');
+        assert!(
+            !output
+                .windows(RFC_8032_SEED.len())
+                .any(|window| window == RFC_8032_SEED)
+        );
+
+        let mut oversized = input;
+        oversized.push(b'x');
+        let mut rejected_output = Vec::new();
+        let error = derive_public_key_from_reader(oversized.as_slice(), &mut rejected_output)
+            .expect_err("oversized input must fail");
+        assert!(rejected_output.is_empty());
+        assert!(
+            !format!("{error:#}")
+                .contains(std::str::from_utf8(RFC_8032_SEED).expect("test seed is UTF-8"))
+        );
+    }
 
     #[test]
     fn deterministic_archive_has_the_formal_inventory() {

@@ -59,6 +59,14 @@ The installer-only entries are hidden and handled before `LocalRuntime::current`
 --internal-release-install <ABSOLUTE_DESTINATION>
 ```
 
+The non-product maintainer bootstrap command is:
+
+```text
+zterm-release-tool derive-public-key
+stdin:  64 lowercase hexadecimal seed bytes, with at most one trailing LF
+stdout: 64 lowercase hexadecimal Ed25519 public-key bytes plus LF
+```
+
 ### 3. Contracts
 
 - `zterm-release.json` authenticates schema/product/version/tag/classification,
@@ -74,10 +82,13 @@ The installer-only entries are hidden and handled before `LocalRuntime::current`
   `ZTERM_SOURCE_COMMIT`; deterministic archive creation requires
   `SOURCE_DATE_EPOCH`. Ordinary development/CI builds remain `development`;
   ambient `GITHUB_SHA` is not managed-distribution authority.
-- The non-product `zterm-release-tool` alone reads
-  `ZTERM_RELEASE_SIGNING_KEY`. It accepts one 32-byte lowercase-hex seed only
-  when its derived public key equals reviewed source. Never log/debug the seed,
-  copy it into an Action artifact, or expose it to build/test jobs.
+- The non-product `zterm-release-tool` alone handles release seed material.
+  `derive-public-key` accepts the bounded seed only on stdin, zeroizes both its
+  encoded and decoded owners, and writes only the Ring-derived public key.
+  Signing reads `ZTERM_RELEASE_SIGNING_KEY` and proceeds only when the same
+  Ring-derived public key equals reviewed source. Build the reviewed tool
+  before initial key generation; never put the seed in argv, a repository
+  file, logs/debug output, an Action artifact, or a build/test job.
 - Archive inventory is exactly one regular `zterm`, mode `0700`, uid/gid 0,
   with fixed tar/gzip timestamps. Formal assets are the four archives,
   manifest/signature, `SHA256SUMS`, generated installer, and SPDX JSON.
@@ -114,6 +125,7 @@ The installer-only entries are hidden and handled before `LocalRuntime::current`
 | --- | --- |
 | Manifest empty/over 64 KiB, unknown field/schema, duplicate/missing target | `release_manifest_invalid`; no candidate fetch/daemon contact |
 | Signature not 64 bytes, bad exact bytes, or production key unavailable | `release_signature_invalid`; no candidate execution |
+| Key-derivation stdin is empty, non-lowercase-hex, not 64 bytes plus optional LF, or over 65 bytes | Fail with no public-key stdout and no seed text in the error |
 | Archive over 128 MiB, wrong length/hash/inventory or candidate mismatch | `release_artifact_invalid`; current executable/daemon/Sessions unchanged |
 | Fetch timeout/status/redirect/size failure from fixed origin | `release_unavailable`; errors contain no URL query/body |
 | Noncanonical tag, same version, or downgrade | `update_rejected` |
@@ -136,14 +148,18 @@ The installer-only entries are hidden and handled before `LocalRuntime::current`
   digest, target, version, and candidate self-checks finish.
 - Bad: treating GitHub HTTPS/attestation as a replacement for the embedded
   Ed25519 manifest signature, or allowing an environment/config URL override.
+- Bad: deriving the first reviewed public key through an ad hoc OpenSSL/DER
+  parser or printing the seed so that shell tooling can reuse it.
 
 ### 6. Tests Required
 
 - `cargo test -p zterm-core release::tests` asserts exact-byte authentication,
   schema/inventory/size/classification boundaries, monotonic versions, and
   bounded streaming digest.
-- `cargo test -p zterm-release-tool` asserts byte-identical archives and that a
-  four-target manifest mechanically renders POSIX-valid installer metadata.
+- `cargo test -p zterm-release-tool` asserts byte-identical archives, that a
+  four-target manifest mechanically renders POSIX-valid installer metadata,
+  and that `derive-public-key` matches RFC 8032 while rejecting oversized input
+  without stdout or seed-bearing diagnostics.
 - `cargo test -p zterm-daemon distribution::tests` asserts valid preparation,
   bad archive rejection before candidate execution, and canonical exact/latest
   selection.
@@ -173,6 +189,12 @@ let archive = fetch(user_configured_url).await?;
 fs::write(current_executable, archive)?;
 ```
 
+```sh
+# A second derivation implementation can disagree with Ring or leak the seed.
+echo "$release_seed_hex"
+openssl pkey -in release-private-key.pem -pubout
+```
+
 #### Correct
 
 ```rust
@@ -183,6 +205,16 @@ require_force_if_needed(&impact, force)?;
 client.stop(force).await?;
 let activation = activate_verified_candidate(&prepared)?;
 postcheck_or_rollback(activation, &prepared)?;
+```
+
+```sh
+# The reviewed tool receives the seed only on stdin and prints only public data.
+set +x
+release_public_hex=$(printf '%s\n' "$release_seed_hex" \
+  | zterm-release-tool derive-public-key)
+printf '%s' "$release_seed_hex" \
+  | gh secret set ZTERM_RELEASE_SIGNING_KEY --env release --repo OWNER/REPO
+unset release_seed_hex
 ```
 
 The ordering is the safety property: authentication precedes impact, explicit

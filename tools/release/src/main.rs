@@ -41,6 +41,10 @@ fn run() -> Result<()> {
             require_end(arguments)?;
             assets::sign(&directory)
         }
+        Some("derive-public-key") => {
+            require_end(arguments)?;
+            assets::derive_public_key()
+        }
         Some("verify") => {
             let directory = required_path(&mut arguments, "release directory")?;
             require_end(arguments)?;
@@ -85,6 +89,6 @@ fn require_end(mut arguments: env::ArgsOs) -> Result<()> {
 
 fn usage<T>() -> Result<T> {
     bail!(
-        "usage: zterm-release-tool <archive|prepare|sign|verify|verify-unsigned|render-test-installer> ..."
+        "usage: zterm-release-tool <archive|prepare|sign|derive-public-key|verify|verify-unsigned|render-test-installer> ..."
     )
 }
