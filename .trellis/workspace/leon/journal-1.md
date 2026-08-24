@@ -155,3 +155,24 @@ Implemented and independently verified daemon-owned Iroh transport, connection b
 ### Status
 
 [OK] **Completed**
+
+
+## Session 7: Close remote CLI and plan Phase 1 release acceptance
+
+**Date**: 2026-08-24
+**Task**: Close remote CLI and plan Phase 1 release acceptance
+**Branch**: `main`
+
+### Summary
+
+Recorded hosted CI evidence without overclaiming remote Session behavior, archived the M7-M8 implementation child, and created approved M9 signed distribution plus M10 installed-binary acceptance plans.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `3ae4c3a` | (see git log) |
+
+### Status
+
+[OK] **Completed**
