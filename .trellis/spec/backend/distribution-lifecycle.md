@@ -118,7 +118,9 @@ stdout: 64 lowercase hexadecimal Ed25519 public-key bytes plus LF
   validation. A human may push the exact `v` + Cargo-version tag only afterward.
 - Containerized native jobs must add only the exact quoted `$GITHUB_WORKSPACE`
   as Git `safe.directory` after checkout and before Git-backed source-policy
-  checks. A wildcard or broader trusted path is forbidden.
+  checks. A wildcard or broader trusted path is forbidden. Tool paths must be
+  derived from the runtime `$HOME` (for example `$HOME/.cargo/bin`), never from
+  the container user's assumed passwd home such as `/root`.
 - `.github/workflows/release.yml` is tag-triggered, GitHub-hosted, and
   action/image digest-pinned. It rejects a tag without a successful `ci.yml`
   `push` run on `main` for that exact commit before signing or Release state.
@@ -149,6 +151,7 @@ stdout: 64 lowercase hexadecimal Ed25519 public-key bytes plus LF
 | Uninstall state validation/deletion fails | Keep executable so retry remains possible |
 | Tagged commit lacks a successful `ci.yml` push run on `main` for the same SHA | Stop before Environment approval, signing secret, or Release creation |
 | Container checkout has mismatched ownership | Trust only the exact `$GITHUB_WORKSPACE` before source-policy; never use wildcard `safe.directory` |
+| Container tool installs under runtime `$HOME` | Export `$HOME/.cargo/bin`; a fixed `/root/.cargo/bin` is invalid even when the job runs as euid 0 |
 
 ### 5. Good/Base/Bad Cases
 
@@ -185,9 +188,9 @@ stdout: 64 lowercase hexadecimal Ed25519 public-key bytes plus LF
   reinstall identity-rotation evidence.
 - `sh tests/release/static.sh` asserts exact-tag triggering, exact green-main-CI
   gating, four main-push release-mode builds, pinned release dependencies, one
-  Environment/secret reference, exact non-wildcard container `safe.directory`,
-  verified draft publication, and installer no-side-effect tokens. Hosted
-  four-target jobs own `shellcheck`, local HTTPS happy path,
+  Environment/secret reference, runtime-HOME Cargo path, exact non-wildcard
+  container `safe.directory`, verified draft publication, and installer
+  no-side-effect tokens. Hosted four-target jobs own `shellcheck`, local HTTPS happy path,
   existing-destination preflight, digest failure, native execution, glibc/Mach-O
   floor inspection, signed round-trip, attestation, and immutable formal
   publication.
@@ -212,6 +215,9 @@ openssl pkey -in release-private-key.pem -pubout
 
 # Wildcard trust hides unrelated checkout-ownership mistakes.
 git config --global --add safe.directory '*'
+
+# Euid 0 does not imply that Actions configured HOME=/root.
+echo "/root/.cargo/bin" >> "$GITHUB_PATH"
 ```
 
 #### Correct
@@ -237,6 +243,7 @@ unset release_seed_hex
 
 # Container ownership exception is scoped to this exact Actions checkout.
 git config --global --add safe.directory "$GITHUB_WORKSPACE"
+echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 sh tests/source-policy.sh
 ```
 

@@ -90,14 +90,24 @@ for target in aarch64-apple-darwin x86_64-apple-darwin \
 done
 grep -Eq 'image: .*@sha256:[0-9a-f]{64}$' "$ci_workflow" \
     || fail "CI glibc-floor image must be digest-pinned"
-safe_directory_rules=$(grep -Fc \
-    "git config --global --add safe.directory \"\$GITHUB_WORKSPACE\"" \
-    "$ci_workflow" || true)
-[ "$safe_directory_rules" -eq 1 ] \
-    || fail "CI must trust only the exact checked-out container workspace"
-if grep -F 'safe.directory' "$ci_workflow" | grep -Fq '*'; then
-    fail "CI must never trust a wildcard Git safe.directory"
-fi
+for container_workflow in "$ci_workflow" "$workflow"; do
+    cargo_path_rules=$(grep -Fc \
+        "echo \"\$HOME/.cargo/bin\" >> \"\$GITHUB_PATH\"" \
+        "$container_workflow" || true)
+    [ "$cargo_path_rules" -eq 1 ] \
+        || fail "container workflow must use the runtime HOME Cargo path: $container_workflow"
+    if grep -Fq '/root/.cargo/bin' "$container_workflow"; then
+        fail "container workflow must not assume root HOME: $container_workflow"
+    fi
+    safe_directory_rules=$(grep -Fc \
+        "git config --global --add safe.directory \"\$GITHUB_WORKSPACE\"" \
+        "$container_workflow" || true)
+    [ "$safe_directory_rules" -eq 1 ] \
+        || fail "container workflow must trust only its exact workspace: $container_workflow"
+    if grep -F 'safe.directory' "$container_workflow" | grep -Fq '*'; then
+        fail "container workflow must never trust a wildcard Git safe.directory"
+    fi
+done
 if grep -Fq 'std::env::var("GITHUB_SHA")' "$build_script"; then
     fail "ambient ordinary-CI SHA must not mark a managed distribution build"
 fi

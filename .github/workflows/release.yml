@@ -172,13 +172,16 @@ jobs:
           ref: ${{ needs.validate.outputs.commit }}
           persist-credentials: false
 
+      - name: Trust only the checked-out workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Install exact Rust toolchain
         shell: bash
         run: |
           set -euo pipefail
           curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
             https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.98.0
-          echo "/root/.cargo/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Build and inspect the native candidate
         shell: bash
