@@ -87,4 +87,6 @@ only the hosted target runner is acceptance evidence.
   owner received the operation before waiting. Verify eventual process/thread
   cleanup separately under one realistic absolute deadline. Do not use a
   sub-grace-period wall-clock bound on OS scheduling, signal delivery, or reap
-  as a proxy for concurrency.
+  as a proxy for concurrency. If the expected behavior depends on child startup
+  code such as a signal trap, the child must emit readiness after that setup;
+  `spawn()` returning or a parent-side sleep is not a readiness barrier.

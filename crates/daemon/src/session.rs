@@ -5844,10 +5844,35 @@ mod tests {
     #[test]
     fn failed_publication_retains_name_until_timeout_cleanup_reaps_the_actor() {
         let temporary = tempfile::tempdir().expect("temporary cleanup-timeout fixture");
-        let service = unix_fixture_service(
+        let working_directory = temporary.path().to_path_buf();
+        let shell = [Path::new("/bin/sh"), Path::new("/usr/bin/sh")]
+            .into_iter()
+            .find(|path| path.is_file())
+            .expect("POSIX shell fixture")
+            .to_path_buf();
+        let service = SessionService::with_spawner(
             DeviceId::from_array([71; 32]),
-            temporary.path().to_path_buf(),
-            "trap '' HUP; while :; do :; done",
+            ResourceLimits::default(),
+            move |size, requested| {
+                let cwd = requested.unwrap_or(&working_directory).to_path_buf();
+                let session = PtyHost::new()
+                    .spawn(
+                        ExplicitPtyCommand::new(&shell, &cwd)
+                            .arg("-c")
+                            .arg("trap '' HUP; : > .cleanup-timeout-ready; while :; do :; done"),
+                        PtySize::new(size.rows, size.columns),
+                    )
+                    .map_err(map_pty_error)?;
+                let ready = cwd.join(".cleanup-timeout-ready");
+                let ready_deadline = Instant::now() + Duration::from_secs(2);
+                while !ready.is_file() {
+                    if Instant::now() >= ready_deadline {
+                        return Err(synchronization_error("cleanup-timeout child readiness"));
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Ok((session, cwd))
+            },
         );
         let principal = service.local_principal(AttachmentId::from_array([71; 16]));
         let lease = service

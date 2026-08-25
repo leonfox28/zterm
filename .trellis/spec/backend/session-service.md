@@ -254,6 +254,12 @@ they must not duplicate registry, replay, resource, or controller logic.
   ownership to be released under the final absolute deadline. It must not use
   a fixed process-reap interval shorter than the platform PTY library's signal
   grace period as a proxy for concurrent initiation.
+- A cleanup-timeout fixture which depends on a child-installed signal trap must
+  wait for a child-authored readiness marker emitted after the trap is active.
+  `PtyHost::spawn` returning proves only that the process exists; it does not
+  prove that the shell has executed its setup commands. Only after readiness may
+  the test inject publication failure and require `deadline_exceeded` instead
+  of the original registration error.
 
 ## 7. Wrong vs Correct
 
@@ -276,6 +282,19 @@ actor.try_submit(command)?;               // bounded per-session mailbox
 
 Creation and cleanup additionally compare one ownership token across the name,
 provisional/live actor, and resource projection before removing anything.
+
+Signal-sensitive fixture ordering follows the same ownership rule:
+
+```rust
+// Wrong: the child may receive HUP before its shell installs this trap.
+let child = spawn("trap '' HUP; while :; do :; done")?;
+inject_publication_failure(child);
+
+// Correct: the child emits ready only after installing the trap.
+let child = spawn("trap '' HUP; emit_ready; while :; do :; done")?;
+wait_for_child_ready()?;
+inject_publication_failure(child);
+```
 
 ## Forbidden patterns
 
