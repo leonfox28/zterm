@@ -124,6 +124,10 @@ stdout: 64 lowercase hexadecimal Ed25519 public-key bytes plus LF
 - `.github/workflows/release.yml` is tag-triggered, GitHub-hosted, and
   action/image digest-pinned. It rejects a tag without a successful `ci.yml`
   `push` run on `main` for that exact commit before signing or Release state.
+  The Ubuntu assembly owner must require ShellCheck exactly once over the
+  generated formal installer before protected signing. The four-platform
+  installer matrix must not assume ShellCheck is installed; every entry still
+  runs POSIX syntax validation and the authenticated local-HTTPS fixture.
   Protected `release` Environment approval gates only the single seed-bearing
   signing job; verified draft creation, round-trip verification, attestation,
   and immutable publication then proceed without a second approval.
@@ -150,6 +154,7 @@ stdout: 64 lowercase hexadecimal Ed25519 public-key bytes plus LF
 | Current binary is development/ordinary CI or key is `UNCONFIGURED` | `path_unsafe`; no update fetch, uninstall preflight, state deletion, or executable replacement |
 | Uninstall state validation/deletion fails | Keep executable so retry remains possible |
 | Tagged commit lacks a successful `ci.yml` push run on `main` for the same SHA | Stop before Environment approval, signing secret, or Release creation |
+| ShellCheck is unavailable on its Ubuntu assembly owner, or rejects the generated installer | Stop before Environment approval/signing; do not upload the unsigned inventory |
 | Container checkout has mismatched ownership | Trust only the exact `$GITHUB_WORKSPACE` before source-policy; never use wildcard `safe.directory` |
 | Container tool installs under runtime `$HOME` | Export `$HOME/.cargo/bin`; a fixed `/root/.cargo/bin` is invalid even when the job runs as euid 0 |
 
@@ -166,6 +171,8 @@ stdout: 64 lowercase hexadecimal Ed25519 public-key bytes plus LF
   Ed25519 manifest signature, or allowing an environment/config URL override.
 - Bad: deriving the first reviewed public key through an ad hoc OpenSSL/DER
   parser or printing the seed so that shell tooling can reuse it.
+- Bad: requiring a tool merely because one hosted runner image happens to
+  provide it, or silently skipping the lint when the tool is absent.
 
 ### 6. Tests Required
 
@@ -189,11 +196,13 @@ stdout: 64 lowercase hexadecimal Ed25519 public-key bytes plus LF
 - `sh tests/release/static.sh` asserts exact-tag triggering, exact green-main-CI
   gating, four main-push release-mode builds, pinned release dependencies, one
   Environment/secret reference, runtime-HOME Cargo path, exact non-wildcard
-  container `safe.directory`, verified draft publication, and installer
-  no-side-effect tokens. Hosted four-target jobs own `shellcheck`, local HTTPS happy path,
-  existing-destination preflight, digest failure, native execution, glibc/Mach-O
-  floor inspection, signed round-trip, attestation, and immutable formal
-  publication.
+  container `safe.directory`, one fail-closed Ubuntu generated-installer
+  ShellCheck owner before signing, no ShellCheck assumption in the installer
+  matrix, verified draft publication, and installer no-side-effect tokens.
+  Exact-main CI ShellChecks maintained shell sources. Hosted four-target jobs
+  own POSIX syntax, local HTTPS happy path, existing-destination preflight,
+  digest failure, native execution, glibc/Mach-O floor inspection, signed
+  round-trip, attestation, and immutable formal publication.
 - Do not execute real Iroh/Endpoint acceptance on a developer macOS host merely
   to validate this distribution contract.
 
@@ -218,6 +227,10 @@ git config --global --add safe.directory '*'
 
 # Euid 0 does not imply that Actions configured HOME=/root.
 echo "/root/.cargo/bin" >> "$GITHUB_PATH"
+
+# A tool present on Ubuntu is not implicitly present on every matrix OS.
+command -v shellcheck
+shellcheck generated-installer.sh
 ```
 
 #### Correct
@@ -245,6 +258,11 @@ unset release_seed_hex
 git config --global --add safe.directory "$GITHUB_WORKSPACE"
 echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 sh tests/source-policy.sh
+
+# One explicit Ubuntu owner lints the exact generated artifact before signing;
+# every platform separately runs portable syntax and behavior gates.
+command -v shellcheck
+shellcheck -s sh release-output/zterm-install.sh
 ```
 
 The ordering is the safety property: authentication precedes impact, explicit

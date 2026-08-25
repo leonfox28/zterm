@@ -70,6 +70,34 @@ grep -Fq 'target/release/zterm-release-tool sign release-output' "$workflow" \
     || fail "the signing step must execute the tool built before secret exposure"
 grep -Fq "git rev-list -n 1 \"\$RELEASE_TAG\"" "$workflow" \
     || fail "publication must recheck the existing tag against the validated commit"
+
+assemble_job=$(sed -n '/^  assemble:/,/^  sign:/p' "$workflow")
+release_shellcheck_requirements=$(grep -Fc 'command -v shellcheck' "$workflow" || true)
+[ "$release_shellcheck_requirements" -eq 1 ] \
+    || fail "release must have exactly one fail-closed ShellCheck requirement"
+printf '%s\n' "$assemble_job" | grep -Fq 'runs-on: ubuntu-24.04' \
+    || fail "generated installer ShellCheck must run on the Ubuntu assembly runner"
+printf '%s\n' "$assemble_job" \
+    | grep -Fq -- '- name: Check the generated installer with ShellCheck' \
+    || fail "the generated formal installer must have one required ShellCheck gate"
+printf '%s\n' "$assemble_job" | grep -Fq 'command -v shellcheck' \
+    || fail "the generated installer gate must require ShellCheck"
+printf '%s\n' "$assemble_job" \
+    | grep -Fq 'shellcheck -s sh release-output/zterm-install.sh' \
+    || fail "the generated formal installer must be checked before signing"
+grep -Fq 'shellcheck -s sh install/install.sh tests/release/*.sh' "$ci_workflow" \
+    || fail "exact-main CI must ShellCheck the maintained installer sources"
+
+installer_job=$(sed -n '/^  installer:/,/^  publish:/p' "$workflow")
+if printf '%s\n' "$installer_job" | grep -Fiq 'shellcheck'; then
+    fail "the four-platform installer matrix must not assume ShellCheck is preinstalled"
+fi
+printf '%s\n' "$installer_job" \
+    | grep -Fq 'sh -n install/install.sh tests/release/installer-fixture.sh' \
+    || fail "every installer platform must retain the POSIX syntax gate"
+printf '%s\n' "$installer_job" \
+    | grep -Fq 'sh tests/release/installer-fixture.sh' \
+    || fail "every installer platform must exercise the authenticated fixture"
 for ci_gate in 'actions/workflows/ci.yml/runs' '-f branch=main' '-f event=push' \
     '-f status=success' "-f head_sha=\"\$commit\""; do
     grep -Fq -- "$ci_gate" "$workflow" \

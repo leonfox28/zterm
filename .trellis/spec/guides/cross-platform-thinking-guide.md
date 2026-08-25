@@ -90,3 +90,19 @@ only the hosted target runner is acceptance evidence.
   as a proxy for concurrency. If the expected behavior depends on child startup
   code such as a signal trap, the child must emit readiness after that setup;
   `spawn()` returning or a parent-side sleep is not a readiness barrier.
+
+## Incident: Ubuntu Tool Availability Was Assumed on macOS
+
+- **Root cause categories**: implicit assumption plus test coverage gap. A
+  four-platform release matrix required `command -v shellcheck` in every job
+  even though only the Ubuntu runner contract provided ShellCheck.
+- **Evidence**: the same signed installer passed both Linux jobs, while both
+  macOS jobs exited before syntax or fixture execution at the tool-presence
+  probe. Signing had already required human approval.
+- **Prevention**: assign each host tool to one explicit runner owner and test
+  that ownership in workflow policy. Run platform-independent lint once on the
+  generated artifact before approval/signing, then keep portable syntax checks
+  and real behavior fixtures on every target. Never put an unconditional
+  `command -v <tool>` in a multi-OS matrix unless every runner explicitly
+  installs that tool or the repository has executable evidence that it is part
+  of every selected image.

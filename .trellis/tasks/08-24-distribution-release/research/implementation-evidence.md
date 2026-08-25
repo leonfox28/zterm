@@ -1,4 +1,4 @@
-# M9 implementation evidence (local / external checkpoint pending)
+# M9 implementation evidence
 
 ## Step 0 snapshot
 
@@ -86,9 +86,12 @@ the destructive primitives and, separately, that a repository/development
 binary cannot reach them merely because its path, owner, and mode look safe.
 
 The developer host has no `shellcheck`; this is not silently skipped in the
-release workflow or CI. The hosted installer jobs own `shellcheck`. A full
-`cargo test --workspace` was intentionally not run on this macOS host because
-it includes real Iroh/Endpoint targets whose execution is hosted-Linux-owned.
+release workflow or CI. The Ubuntu release-policy job checks maintained shell
+sources, while the Ubuntu assembly job checks the generated formal installer
+exactly once before protected signing. Every macOS/Linux installer job
+independently retains POSIX syntax and the real platform fixture. A full
+`cargo test --workspace` was intentionally not run on this macOS host because it
+includes real Iroh/Endpoint targets whose execution is hosted-Linux-owned.
 
 ## External checkpoint / remaining evidence
 
@@ -127,8 +130,29 @@ and protected signing passed, but every installer matrix job stopped at hosted
 ShellCheck `SC2015` before executing the fixture. No draft Release, attestation,
 or published client artifact was created. The failed tag is not moved, deleted,
 or reused; the explicit-POSIX-`if` generator fix advances the next candidate to
-`v0.1.3`, which still requires a green exact-main CI before its new tag is
-created.
+`v0.1.3`.
+
+The next comprehensive `ci.yml` run `32805701943` passed at exact main commit
+`3f67d2477078a54b4adf8678b976839ab4979ec1`. Its immutable historical
+`v0.1.3` tag triggered release run `32806708978`: exact-source validation, all
+four formal builds, unsigned assembly, and protected signing passed. Both Linux
+installer jobs then passed, proving the generated shell fix, while both macOS
+installer jobs stopped before the fixture at `command -v shellcheck` because
+the hosted macOS images do not provide that Ubuntu-preinstalled tool. The
+publish job was skipped, so no draft, attestation, or `v0.1.3` Release exists.
+The tag is not moved, deleted, or reused. The workflow now owns one fail-closed
+ShellCheck gate on its Ubuntu assembly runner before protected signing and
+keeps POSIX syntax plus the real fixture on every platform; the next candidate
+advances to `v0.1.4` and still requires a new green exact-main CI before a
+human creates that tag.
+
+The focused `v0.1.4` repair gate passed the release-tool's three unit tests,
+the seven shared release-contract tests, release-tool Clippy with `-D warnings`,
+formatting, workflow/static policy, POSIX syntax, workspace-version, Relay
+publication, source-checkout, secret-scan, task-context, YAML-parse, and diff
+checks. ShellCheck is deliberately not claimed locally because the developer
+host does not provide it; the exact-main Ubuntu policy job and tag-time Ubuntu
+assembly job remain its executable owners.
 
 ## Independent checker fixes and final local gate (2026-08-25)
 

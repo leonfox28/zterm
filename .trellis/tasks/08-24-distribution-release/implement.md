@@ -40,7 +40,10 @@ rebuilds, signed asset round-trip, attestation, and immutable publication.
 - [x] Prove install creates no `~/.zterm`, identity, config, socket, daemon, PTY, login item, or shell-rc change; existing managed/unrelated destinations are not overwritten.
 - [x] Add one hosted local-HTTPS happy path plus existing-destination/no-request and bad-manifest-digest negatives; keep signature/schema/target/truncation cases at their core/tool owners rather than duplicating a shell matrix.
 
-Focused gate: `shellcheck`, POSIX syntax, installer fixture suite on macOS/Linux x86_64/arm64 hosted runners.
+Focused gate: exact-main CI `shellcheck` for maintained shell sources, one
+required Ubuntu `shellcheck` pass over the generated formal installer before
+signing, plus POSIX syntax and the installer fixture suite on macOS/Linux
+x86_64/arm64 hosted runners.
 
 ## Step 4: Explicit update, rollback, and uninstall
 

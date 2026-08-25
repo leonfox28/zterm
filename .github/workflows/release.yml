@@ -247,6 +247,11 @@ jobs:
             verify-unsigned release-output
           sh tests/release/static.sh
 
+      - name: Check the generated installer with ShellCheck
+        run: |
+          command -v shellcheck
+          shellcheck -s sh release-output/zterm-install.sh
+
       - name: Upload the unsigned exact inventory
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -346,11 +351,8 @@ jobs:
           name: installer-fixture-${{ github.ref_name }}
           path: fixture
 
-      - name: Check installer syntax and policy
+      - name: Check installer POSIX syntax and fixture prerequisites
         run: |
-          command -v shellcheck
-          shellcheck -s sh install/install.sh tests/release/installer-fixture.sh \
-            fixture/zterm-install-test.sh
           sh -n install/install.sh tests/release/installer-fixture.sh \
             fixture/zterm-install-test.sh
           python3 -m py_compile tests/release/https_fixture.py
