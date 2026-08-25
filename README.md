@@ -61,12 +61,12 @@ the signed native Release path and its trust/recovery boundaries.
 
 zterm uses one lockstep SemVer for the product rather than independent
 component versions. The root `[workspace.package].version` is the source for
-all product crates and is currently `0.1.4`; future CLI, daemon, desktop/mobile
+all product crates and is currently `0.1.5`; future CLI, daemon, desktop/mobile
 apps, protocol artifacts, and the zterm Relay wrapper advance together.
 
 A GitHub Release tag must equal `v` plus Cargo's resolved workspace version.
 The same tag is used unchanged for the versioned GHCR image, so release
-`v0.1.4` publishes `zterm-relay:v0.1.4` and the stable `latest` alias. GitHub
+`v0.1.5` publishes `zterm-relay:v0.1.5` and the stable `latest` alias. GitHub
 prereleases and manual builds publish only to `zterm-relay-dev`; manual tags are
 used unchanged except that `latest` is reserved. Internal validation tools such
 as the isolated Relay handshake probe are not product deliverables and keep

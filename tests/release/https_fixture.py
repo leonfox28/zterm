@@ -5,8 +5,20 @@ from __future__ import annotations
 
 import http.server
 import pathlib
+import socketserver
 import ssl
 import sys
+
+
+class FixtureHTTPServer(http.server.ThreadingHTTPServer):
+    """HTTP server whose bind path never performs a hostname lookup."""
+
+    def server_bind(self) -> None:
+        # The standard HTTP bind hook performs a fully qualified hostname
+        # lookup, which can stall behind macOS local-network privacy after the
+        # socket is bound but before it listens. TCPServer binds without DNS.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
 
 def main() -> None:
@@ -23,7 +35,7 @@ def main() -> None:
             with log_file.open("a", encoding="utf-8") as output:
                 output.write(f"{self.path}\n")
 
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server = FixtureHTTPServer(("127.0.0.1", 0), Handler)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(certificate, key)
     server.socket = context.wrap_socket(server.socket, server_side=True)

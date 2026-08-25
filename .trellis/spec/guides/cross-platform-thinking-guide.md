@@ -106,3 +106,19 @@ only the hosted target runner is acceptance evidence.
   `command -v <tool>` in a multi-OS matrix unless every runner explicitly
   installs that tool or the repository has executable evidence that it is part
   of every selected image.
+
+## Incident: Python HTTPServer Resolved a Hostname Before Listening
+
+- **Root cause categories**: implicit assumption plus test coverage gap. The
+  HTTPS fixture used a numeric loopback address but inherited
+  `HTTPServer.server_bind`, which still performs a fully qualified hostname
+  lookup after binding and before listening.
+- **Evidence**: both Linux installer jobs passed while both GitHub-hosted macOS
+  jobs timed out waiting for the fixture port file. GitHub runner maintainers
+  confirmed that `socket.getfqdn()` can stall in this interval behind macOS
+  local-network privacy ([runner-images#14409](https://github.com/actions/runner-images/issues/14409)).
+- **Prevention**: a numeric-loopback fixture must bind through
+  `socketserver.TCPServer.server_bind`, derive its published address from the
+  bound socket, and have a socket-free source-policy regression that rejects
+  the inherited FQDN path. Do not convert an unnecessary lookup into a longer
+  timeout or retry loop.

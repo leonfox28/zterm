@@ -128,6 +128,9 @@ stdout: 64 lowercase hexadecimal Ed25519 public-key bytes plus LF
   generated formal installer before protected signing. The four-platform
   installer matrix must not assume ShellCheck is installed; every entry still
   runs POSIX syntax validation and the authenticated local-HTTPS fixture.
+  That fixture binds its numeric loopback address through the test-only
+  `TCPServer` path, publishes the already-bound address, and performs no
+  hostname/FQDN lookup; this is fixture portability, not product behavior.
   Protected `release` Environment approval gates only the single seed-bearing
   signing job; verified draft creation, round-trip verification, attestation,
   and immutable publication then proceed without a second approval.
@@ -155,6 +158,7 @@ stdout: 64 lowercase hexadecimal Ed25519 public-key bytes plus LF
 | Uninstall state validation/deletion fails | Keep executable so retry remains possible |
 | Tagged commit lacks a successful `ci.yml` push run on `main` for the same SHA | Stop before Environment approval, signing secret, or Release creation |
 | ShellCheck is unavailable on its Ubuntu assembly owner, or rejects the generated installer | Stop before Environment approval/signing; do not upload the unsigned inventory |
+| Local HTTPS fixture inherits `HTTPServer.server_bind` or calls `getfqdn` | Static policy failure; bypass the unnecessary lookup rather than extending startup timeouts |
 | Container checkout has mismatched ownership | Trust only the exact `$GITHUB_WORKSPACE` before source-policy; never use wildcard `safe.directory` |
 | Container tool installs under runtime `$HOME` | Export `$HOME/.cargo/bin`; a fixed `/root/.cargo/bin` is invalid even when the job runs as euid 0 |
 
@@ -173,6 +177,9 @@ stdout: 64 lowercase hexadecimal Ed25519 public-key bytes plus LF
   parser or printing the seed so that shell tooling can reuse it.
 - Bad: requiring a tool merely because one hosted runner image happens to
   provide it, or silently skipping the lint when the tool is absent.
+- Bad: treating a socket bound on numeric loopback as proof that a framework
+  will not resolve a hostname before listening, or hiding that lookup behind a
+  longer fixture timeout.
 
 ### 6. Tests Required
 
@@ -198,7 +205,8 @@ stdout: 64 lowercase hexadecimal Ed25519 public-key bytes plus LF
   Environment/secret reference, runtime-HOME Cargo path, exact non-wildcard
   container `safe.directory`, one fail-closed Ubuntu generated-installer
   ShellCheck owner before signing, no ShellCheck assumption in the installer
-  matrix, verified draft publication, and installer no-side-effect tokens.
+  matrix, direct numeric-loopback fixture binding with no FQDN path, verified
+  draft publication, and installer no-side-effect tokens.
   Exact-main CI ShellChecks maintained shell sources. Hosted four-target jobs
   own POSIX syntax, local HTTPS happy path, existing-destination preflight,
   digest failure, native execution, glibc/Mach-O floor inspection, signed
@@ -231,6 +239,10 @@ echo "/root/.cargo/bin" >> "$GITHUB_PATH"
 # A tool present on Ubuntu is not implicitly present on every matrix OS.
 command -v shellcheck
 shellcheck generated-installer.sh
+
+# Numeric loopback does not prevent HTTPServer.server_bind from resolving a
+# hostname before listen on every platform.
+http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
 ```
 
 #### Correct
@@ -263,6 +275,13 @@ sh tests/source-policy.sh
 # every platform separately runs portable syntax and behavior gates.
 command -v shellcheck
 shellcheck -s sh release-output/zterm-install.sh
+```
+
+```python
+class FixtureHTTPServer(http.server.ThreadingHTTPServer):
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 ```
 
 The ordering is the safety property: authentication precedes impact, explicit

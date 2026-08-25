@@ -166,6 +166,23 @@ removes the duplicate race; the exact test then passed 100/100 repetitions and
 independent review. No `v0.1.4` tag was created from this failed CI commit; a
 new green exact-main push remains required.
 
+The replacement exact-main CI run `32821921982` passed all twelve jobs at
+commit `62f5a3152581679028558227fa01a5100894632b`. Its immutable historical
+`v0.1.4` tag triggered formal run `32830702052`: exact-source validation, all
+four builds, unsigned assembly, protected signing, and both Linux installer
+jobs passed. Both macOS installer jobs timed out waiting ten seconds for the
+fixture port file because Python's `HTTPServer.server_bind` performs
+`socket.getfqdn` after binding and before listening; on the affected GitHub
+macOS runner images, local-network privacy can stall that lookup for about 35
+seconds ([actions/runner-images#14409](https://github.com/actions/runner-images/issues/14409)).
+The late publish job was skipped, so no draft, attestation, or `v0.1.4` Release
+was created. The tag is not moved, deleted, or reused. The fixture now overrides
+only that test-server bind path, delegates directly to `TCPServer.server_bind`,
+and assigns the already-bound address without DNS. A socket-free source-policy
+regression rejects restoring `getfqdn` or the inherited HTTP-server bind path;
+the next lockstep candidate advances to `v0.1.5` and requires a new exact-main
+CI success before a human-created tag.
+
 ## Independent checker fixes and final local gate (2026-08-25)
 
 The independent checker verified and fixed six concrete boundary defects:

@@ -7,6 +7,7 @@ ci_workflow="$repo_root/.github/workflows/ci.yml"
 bootstrap="$repo_root/install/install.sh"
 template="$repo_root/install/versioned.sh.in"
 build_script="$repo_root/crates/core/build.rs"
+https_fixture_bind_test="$repo_root/tests/release/https_fixture_bind_test.py"
 
 fail() {
     echo "release policy check failed: $*" >&2
@@ -14,6 +15,8 @@ fail() {
 }
 
 sh -n "$bootstrap" || fail "mutable bootstrap is not POSIX shell syntax"
+PYTHONDONTWRITEBYTECODE=1 python3 "$https_fixture_bind_test" \
+    || fail "installer fixture bind override violated its socket-free contract"
 for invalid_tag in v1 v1.2 v01.2.3 v1.02.3 v1.2.03 v1.2.3-01 v1.2.3-; do
     if sh "$bootstrap" --version "$invalid_tag" >/dev/null 2>&1; then
         fail "mutable bootstrap accepted noncanonical SemVer tag: $invalid_tag"
