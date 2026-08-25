@@ -116,6 +116,9 @@ stdout: 64 lowercase hexadecimal Ed25519 public-key bytes plus LF
 - A successful `ci.yml` push run on `main` owns release-mode compilation on all
   four native distribution platforms while retaining Windows shared-boundary
   validation. A human may push the exact `v` + Cargo-version tag only afterward.
+- Containerized native jobs must add only the exact quoted `$GITHUB_WORKSPACE`
+  as Git `safe.directory` after checkout and before Git-backed source-policy
+  checks. A wildcard or broader trusted path is forbidden.
 - `.github/workflows/release.yml` is tag-triggered, GitHub-hosted, and
   action/image digest-pinned. It rejects a tag without a successful `ci.yml`
   `push` run on `main` for that exact commit before signing or Release state.
@@ -145,6 +148,7 @@ stdout: 64 lowercase hexadecimal Ed25519 public-key bytes plus LF
 | Current binary is development/ordinary CI or key is `UNCONFIGURED` | `path_unsafe`; no update fetch, uninstall preflight, state deletion, or executable replacement |
 | Uninstall state validation/deletion fails | Keep executable so retry remains possible |
 | Tagged commit lacks a successful `ci.yml` push run on `main` for the same SHA | Stop before Environment approval, signing secret, or Release creation |
+| Container checkout has mismatched ownership | Trust only the exact `$GITHUB_WORKSPACE` before source-policy; never use wildcard `safe.directory` |
 
 ### 5. Good/Base/Bad Cases
 
@@ -181,11 +185,12 @@ stdout: 64 lowercase hexadecimal Ed25519 public-key bytes plus LF
   reinstall identity-rotation evidence.
 - `sh tests/release/static.sh` asserts exact-tag triggering, exact green-main-CI
   gating, four main-push release-mode builds, pinned release dependencies, one
-  Environment/secret reference, verified draft publication, and installer
-  no-side-effect tokens. Hosted four-target jobs own `shellcheck`, local HTTPS
-  happy path, existing-destination preflight, digest failure, native execution,
-  glibc/Mach-O floor inspection, signed round-trip, attestation, and immutable
-  formal publication.
+  Environment/secret reference, exact non-wildcard container `safe.directory`,
+  verified draft publication, and installer no-side-effect tokens. Hosted
+  four-target jobs own `shellcheck`, local HTTPS happy path,
+  existing-destination preflight, digest failure, native execution, glibc/Mach-O
+  floor inspection, signed round-trip, attestation, and immutable formal
+  publication.
 - Do not execute real Iroh/Endpoint acceptance on a developer macOS host merely
   to validate this distribution contract.
 
@@ -204,6 +209,9 @@ fs::write(current_executable, archive)?;
 # A second derivation implementation can disagree with Ring or leak the seed.
 echo "$release_seed_hex"
 openssl pkey -in release-private-key.pem -pubout
+
+# Wildcard trust hides unrelated checkout-ownership mistakes.
+git config --global --add safe.directory '*'
 ```
 
 #### Correct
@@ -226,6 +234,10 @@ release_public_hex=$(printf '%s\n' "$release_seed_hex" \
 printf '%s' "$release_seed_hex" \
   | gh secret set ZTERM_RELEASE_SIGNING_KEY --env release --repo OWNER/REPO
 unset release_seed_hex
+
+# Container ownership exception is scoped to this exact Actions checkout.
+git config --global --add safe.directory "$GITHUB_WORKSPACE"
+sh tests/source-policy.sh
 ```
 
 The ordering is the safety property: authentication precedes impact, explicit

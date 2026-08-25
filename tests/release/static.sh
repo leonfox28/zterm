@@ -35,7 +35,7 @@ if grep -Eq 'immutable_release_checkpoint|enabled-and-reviewed' "$workflow"; the
 fi
 grep -Fq -- '--draft' "$workflow" \
     || fail "release workflow must create a draft"
-grep -Fq 'gh release edit "$RELEASE_TAG" --draft=false' "$workflow" \
+grep -Fq "gh release edit \"\$RELEASE_TAG\" --draft=false" "$workflow" \
     || fail "release workflow must publish the verified draft"
 grep -Fq '.immutable == true' "$workflow" \
     || fail "release workflow must verify the published Release is immutable"
@@ -71,7 +71,7 @@ grep -Fq 'target/release/zterm-release-tool sign release-output' "$workflow" \
 grep -Fq "git rev-list -n 1 \"\$RELEASE_TAG\"" "$workflow" \
     || fail "publication must recheck the existing tag against the validated commit"
 for ci_gate in 'actions/workflows/ci.yml/runs' '-f branch=main' '-f event=push' \
-    '-f status=success' '-f head_sha="$commit"'; do
+    '-f status=success' "-f head_sha=\"\$commit\""; do
     grep -Fq -- "$ci_gate" "$workflow" \
         || fail "release validation must require exact successful main push CI: $ci_gate"
 done
@@ -90,6 +90,14 @@ for target in aarch64-apple-darwin x86_64-apple-darwin \
 done
 grep -Eq 'image: .*@sha256:[0-9a-f]{64}$' "$ci_workflow" \
     || fail "CI glibc-floor image must be digest-pinned"
+safe_directory_rules=$(grep -Fc \
+    "git config --global --add safe.directory \"\$GITHUB_WORKSPACE\"" \
+    "$ci_workflow" || true)
+[ "$safe_directory_rules" -eq 1 ] \
+    || fail "CI must trust only the exact checked-out container workspace"
+if grep -F 'safe.directory' "$ci_workflow" | grep -Fq '*'; then
+    fail "CI must never trust a wildcard Git safe.directory"
+fi
 if grep -Fq 'std::env::var("GITHUB_SHA")' "$build_script"; then
     fail "ambient ordinary-CI SHA must not mark a managed distribution build"
 fi
