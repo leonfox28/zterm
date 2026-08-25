@@ -3446,25 +3446,22 @@ mod tests {
         let after_explicit_snapshot: v1::TerminalSnapshot = after_explicit_snapshot
             .decode_message(WireKind::TerminalSnapshot)
             .expect("authoritative snapshot after explicit detach");
-        let final_attachment: AttachmentId = after_explicit_snapshot
+        after_explicit_snapshot
             .attachment_id
-            .expect("final attachment ID")
-            .try_into()
-            .expect("fixed-width final attachment ID");
+            .expect("authoritative snapshot carries a final attachment ID");
+        // The prior stream already proved explicit detach. Leave this
+        // observation-only reconnect unsynchronized and close its transport;
+        // an unsynchronized attachment cannot create a resume checkpoint.
         after_explicit
-            .send(
-                WireKind::TerminalDetach,
-                2,
-                &v1::TerminalDetach {
-                    attachment_id: Some(final_attachment.into()),
-                },
-            )
-            .await;
+            .stream
+            .shutdown()
+            .await
+            .expect("finish final cleanup transport");
         tokio::time::timeout(Duration::from_secs(2), after_explicit_task)
             .await
-            .expect("final detach server task completes")
-            .expect("final detach server task")
-            .expect("final detach succeeds");
+            .expect("cleanup EOF server task completes")
+            .expect("cleanup EOF server task")
+            .expect("cleanup EOF succeeds");
         sessions.shutdown().expect("checkpoint fixture shuts down");
     }
 

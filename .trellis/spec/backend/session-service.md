@@ -248,7 +248,10 @@ they must not duplicate registry, replay, resource, or controller logic.
 - `session_wire` drives a pure authenticated duplex/PTY fixture through active
   snapshot acknowledgement and proves transport EOF moves the exact checkpoint,
   while explicit detach and a typed protocol failure both force the next
-  reconnect to receive a full snapshot.
+  reconnect to receive a full snapshot. The synchronized stream owns the one
+  explicit-detach assertion; a final observation-only reconnect must remain
+  unacknowledged and end by transport EOF rather than duplicate detach without
+  the activation barrier.
 - Concurrent shutdown evidence observes that every actor has received its end
   request before cleanup waiting, then separately requires all child PIDs and
   ownership to be released under the final absolute deadline. It must not use

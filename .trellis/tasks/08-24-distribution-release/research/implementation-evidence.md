@@ -154,6 +154,18 @@ checks. ShellCheck is deliberately not claimed locally because the developer
 host does not provide it; the exact-main Ubuntu policy job and tag-time Ubuntu
 assembly job remain its executable owners.
 
+The first `v0.1.4` exact-main candidate, commit
+`389fcf5573820427d72a3f834dfbb9e172c5d07d`, ran CI as `32818194923`.
+Eleven of twelve jobs passed, including every release-mode target, Windows,
+Relay, dependency, and release-policy owner. Ubuntu x86_64 alone exposed a
+test-only cleanup race in the socket-free `session_wire` checkpoint fixture:
+the observation-only final reconnect repeated an unacknowledged explicit
+detach after the synchronized stream had already proved that contract. Its
+clean EOF replacement preserves the authoritative full-snapshot assertion and
+removes the duplicate race; the exact test then passed 100/100 repetitions and
+independent review. No `v0.1.4` tag was created from this failed CI commit; a
+new green exact-main push remains required.
+
 ## Independent checker fixes and final local gate (2026-08-25)
 
 The independent checker verified and fixed six concrete boundary defects:
