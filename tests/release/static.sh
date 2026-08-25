@@ -129,7 +129,7 @@ for bounded_installer in "$bootstrap" "$template"; do
     grep -Fq -- '--max-filesize' "$bounded_installer" \
         || fail "curl installer download must enforce its byte bound"
 done
-grep -Fq "[ ! -L \"\$candidate\" ] && [ -f \"\$candidate\" ]" "$template" \
+grep -Fq "if [ -L \"\$candidate\" ] || [ ! -f \"\$candidate\" ]; then" "$template" \
     || fail "versioned installer must reject a symlink/non-file candidate before chmod"
 
 public_key=$(tr -d '[:space:]' < "$repo_root/release/public-key.hex")

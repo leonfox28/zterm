@@ -755,13 +755,26 @@ mod tests {
 
         let installer = render_installer(&manifest, &raw, false).expect("installer");
 
-        assert!(installer.contains("release_tag='v0.1.2'"));
+        assert!(installer.contains(&format!("release_tag='v{}'", env!("CARGO_PKG_VERSION"))));
         assert!(installer.contains("test_mode='0'"));
         for target in SUPPORTED_RELEASE_TARGETS {
             assert!(installer.contains(target));
             assert!(installer.contains(&artifact_filename(target).expect("filename")));
         }
         assert!(!installer.contains('@'));
+        let mut logical_command = String::new();
+        for line in installer.lines() {
+            logical_command.push_str(line.trim_end_matches([' ', '\\']));
+            if line.trim_end().ends_with('\\') {
+                logical_command.push(' ');
+                continue;
+            }
+            assert!(
+                !(logical_command.contains("&&") && logical_command.contains("|| fail")),
+                "generated installer must use explicit if blocks for compound validation"
+            );
+            logical_command.clear();
+        }
         let mut syntax = Command::new("sh")
             .arg("-n")
             .stdin(std::process::Stdio::piped())
@@ -778,6 +791,8 @@ mod tests {
 
     fn fixture_manifest() -> ReleaseManifest {
         let source_commit = "0123456789abcdef0123456789abcdef01234567";
+        let version = env!("CARGO_PKG_VERSION");
+        let tag = format!("v{version}");
         let artifacts = SUPPORTED_RELEASE_TARGETS
             .iter()
             .map(|target| {
@@ -786,13 +801,13 @@ mod tests {
                 ReleaseArtifact {
                     filename: filename.clone(),
                     target: (*target).to_owned(),
-                    url: immutable_asset_url("v0.1.2", &filename),
+                    url: immutable_asset_url(&tag, &filename),
                     length: 42,
                     sha256: "ab".repeat(32),
                     minimum_macos: apple.then(|| MINIMUM_MACOS.to_owned()),
                     minimum_glibc: (!apple).then(|| MINIMUM_GLIBC.to_owned()),
                     build: ReleaseBuildIdentity {
-                        version: "0.1.2".to_owned(),
+                        version: version.to_owned(),
                         target: (*target).to_owned(),
                         source_commit: source_commit.to_owned(),
                         wire_major: WIRE_MAJOR,
@@ -806,8 +821,8 @@ mod tests {
         ReleaseManifest {
             schema: RELEASE_MANIFEST_SCHEMA,
             product: "zterm".to_owned(),
-            version: "0.1.2".to_owned(),
-            tag: "v0.1.2".to_owned(),
+            version: version.to_owned(),
+            tag,
             classification: ReleaseClassification::Stable,
             source_commit: source_commit.to_owned(),
             released_at: "2026-08-24T12:00:00Z".to_owned(),

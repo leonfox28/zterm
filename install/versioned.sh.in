@@ -96,8 +96,9 @@ case "$install_dir" in
 esac
 [ ! -L "$install_dir" ] || fail "install directory must not be a symlink"
 mkdir -p "$install_dir" || fail "unable to create install directory"
-[ -d "$install_dir" ] && [ -w "$install_dir" ] \
-    || fail "install directory must be a writable directory owned by this user"
+if [ ! -d "$install_dir" ] || [ ! -w "$install_dir" ]; then
+    fail "install directory must be a writable directory owned by this user"
+fi
 destination="$install_dir/zterm"
 if [ -e "$destination" ] || [ -L "$destination" ]; then
     fail "destination already exists; use the installed binary's explicit 'zterm update' command"
@@ -181,8 +182,10 @@ archive="$temporary/$archive_name"
 download "$release_base/zterm-release.json" "$manifest" 65536 \
     || fail "unable to download signed release manifest"
 manifest_length=$(wc -c < "$manifest" | tr -d '[:space:]')
-[ "$manifest_length" -gt 0 ] 2>/dev/null && [ "$manifest_length" -le 65536 ] 2>/dev/null \
-    || fail "release manifest size is invalid"
+if ! [ "$manifest_length" -gt 0 ] 2>/dev/null \
+    || ! [ "$manifest_length" -le 65536 ] 2>/dev/null; then
+    fail "release manifest size is invalid"
+fi
 [ "$(sha256_file "$manifest")" = "$manifest_sha256" ] \
     || fail "release manifest digest does not match this immutable installer"
 
@@ -201,8 +204,9 @@ download "$release_base/$archive_name" "$archive" "$archive_length" \
     || fail "release archive inventory is invalid"
 tar -xzf "$archive" -C "$temporary" || fail "unable to extract release candidate"
 candidate="$temporary/zterm"
-[ ! -L "$candidate" ] && [ -f "$candidate" ] \
-    || fail "release candidate is not a direct regular file"
+if [ -L "$candidate" ] || [ ! -f "$candidate" ]; then
+    fail "release candidate is not a direct regular file"
+fi
 chmod 700 "$candidate" || fail "unable to secure release candidate"
 "$candidate" --internal-release-self-check >/dev/null \
     || fail "release candidate self-check failed"

@@ -17,7 +17,7 @@
   actions despite the broader repository setting.
 - GitHub has no Environment. Immutable Releases report
   `enabled=false,enforced_by_owner=false`.
-- Product version is fixed at `0.1.2`; four targets, glibc 2.28/macOS 13 floors,
+- The initial candidate version was fixed at `0.1.2`; four targets, glibc 2.28/macOS 13 floors,
   64 KiB manifest and 128 MiB compressed-artifact limits are executable core
   constants.
 - `release/public-key.hex` is the explicit `UNCONFIGURED` placeholder. Signing,
@@ -120,17 +120,15 @@ rederive the stored secret without violating the boundary. The protected signed
 Release run remains the executable proof that the stored seed matches the
 reviewed public key.
 
-Still required:
-
-1. commit/push the revised CI/release workflow and retain the successful
-   `ci.yml` `push` run on `main`, including all four release-mode jobs;
-2. only then create/push the exact reviewed `v0.1.2` tag and retain the
-   automatic workflow's seed/public-key match, run ID, four digests, signed
-   manifest key ID, installer matrix, verified round-trip, attestation, and
-   immutable published Release.
-
-No tag, release workflow run, Release, attestation, or published client
-artifact exists yet.
+The comprehensive `ci.yml` run `32801933744` passed at `afd7f2f`, including all
+four release-mode jobs. The immutable historical `v0.1.2` tag then triggered
+release run `32802895706`: all four formal builds, unsigned inventory checks,
+and protected signing passed, but every installer matrix job stopped at hosted
+ShellCheck `SC2015` before executing the fixture. No draft Release, attestation,
+or published client artifact was created. The failed tag is not moved, deleted,
+or reused; the explicit-POSIX-`if` generator fix advances the next candidate to
+`v0.1.3`, which still requires a green exact-main CI before its new tag is
+created.
 
 ## Independent checker fixes and final local gate (2026-08-25)
 
