@@ -1,27 +1,21 @@
 name: signed native release
 
 on:
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: Existing exact v-prefixed Cargo version tag
-        required: true
-        type: string
-      immutable_release_checkpoint:
-        description: Repo admin confirmed immutable Releases are enabled (enter enabled-and-reviewed)
-        required: true
-        type: string
+  push:
+    tags:
+      - "v*"
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
-  group: signed-native-release-${{ inputs.tag }}
+  group: signed-native-release-${{ github.ref_name }}
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
-  RELEASE_TAG: ${{ inputs.tag }}
+  RELEASE_TAG: ${{ github.ref_name }}
 
 jobs:
   validate:
@@ -29,6 +23,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       commit: ${{ steps.source.outputs.commit }}
+      ci_run_id: ${{ steps.source.outputs.ci_run_id }}
       source_epoch: ${{ steps.source.outputs.source_epoch }}
       released_at: ${{ steps.source.outputs.released_at }}
       prerelease: ${{ steps.source.outputs.prerelease }}
@@ -36,22 +31,22 @@ jobs:
       - name: Check out the exact existing tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: refs/tags/${{ inputs.tag }}
+          ref: ${{ github.ref }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Install exact Rust toolchain
         run: rustup toolchain install 1.98.0 --profile minimal
 
-      - name: Validate tag, version, commit, and release vacancy
+      - name: Validate tag, version, green main CI, and release vacancy
         id: source
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          IMMUTABLE_RELEASE_CHECKPOINT: ${{ inputs.immutable_release_checkpoint }}
         run: |
           set -euo pipefail
-          test "$IMMUTABLE_RELEASE_CHECKPOINT" = enabled-and-reviewed
+          test "$GITHUB_REF_TYPE" = tag
+          test "$GITHUB_REF" = "refs/tags/$RELEASE_TAG"
           version=$(cargo +1.98.0 metadata --locked --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name == "zterm-cli") | .version')
           test "$RELEASE_TAG" = "v$version"
@@ -61,6 +56,17 @@ jobs:
             exit 1
           fi
           commit=$(git rev-parse HEAD)
+          ci_run_id=$(gh api --method GET \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+            -f branch=main -f event=push -f status=success \
+            -f head_sha="$commit" -f per_page=1 \
+            --jq '.workflow_runs[] | select(.event == "push" and .head_branch == "main" and .status == "completed" and .conclusion == "success") | .id')
+          if [ -z "$ci_run_id" ]; then
+            echo "the tagged commit has no successful ci push run on main" >&2
+            exit 1
+          fi
           source_epoch=$(git show -s --format=%ct HEAD)
           released_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
           case "$version" in
@@ -69,6 +75,7 @@ jobs:
           esac
           {
             echo "commit=$commit"
+            echo "ci_run_id=$ci_run_id"
             echo "source_epoch=$source_epoch"
             echo "released_at=$released_at"
             echo "prerelease=$prerelease"
@@ -240,7 +247,7 @@ jobs:
       - name: Upload the unsigned exact inventory
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: unsigned-release-${{ inputs.tag }}
+          name: unsigned-release-${{ github.ref_name }}
           path: release-output/
           if-no-files-found: error
           retention-days: 7
@@ -265,7 +272,7 @@ jobs:
       - name: Download the unsigned inventory
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: unsigned-release-${{ inputs.tag }}
+          name: unsigned-release-${{ github.ref_name }}
           path: release-output
 
       - name: Build the reviewed signing tool without the signing secret
@@ -286,7 +293,7 @@ jobs:
       - name: Upload the signed exact inventory
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: signed-release-${{ inputs.tag }}
+          name: signed-release-${{ github.ref_name }}
           path: release-output/
           if-no-files-found: error
           retention-days: 7
@@ -294,7 +301,7 @@ jobs:
       - name: Upload the fixture-only installer separately
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: installer-fixture-${{ inputs.tag }}
+          name: installer-fixture-${{ github.ref_name }}
           path: fixture/zterm-install-test.sh
           if-no-files-found: error
           retention-days: 7
@@ -327,13 +334,13 @@ jobs:
       - name: Download the signed inventory
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: signed-release-${{ inputs.tag }}
+          name: signed-release-${{ github.ref_name }}
           path: release-output
 
       - name: Download the fixture-only installer
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: installer-fixture-${{ inputs.tag }}
+          name: installer-fixture-${{ github.ref_name }}
           path: fixture
 
       - name: Check installer syntax and policy
@@ -350,13 +357,12 @@ jobs:
           sh tests/release/installer-fixture.sh
           "$PWD/release-output" "$PWD/fixture/zterm-install-test.sh"
 
-  draft:
-    name: Approve and create verified draft for immutable publication
+  publish:
+    name: Create, verify, attest, and publish the immutable Release
     needs:
       - validate
       - installer
     runs-on: ubuntu-24.04
-    environment: release
     permissions:
       contents: write
       id-token: write
@@ -374,7 +380,7 @@ jobs:
       - name: Download and verify the signed inventory
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: signed-release-${{ inputs.tag }}
+          name: signed-release-${{ github.ref_name }}
           path: release-output
 
       - name: Re-verify before creating external state
@@ -382,7 +388,7 @@ jobs:
           cargo +1.98.0 run --locked --release --package zterm-release-tool --
           verify release-output
 
-      - name: Create one draft after the reviewed immutable-release checkpoint
+      - name: Create one draft from the frozen tag
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -428,3 +434,18 @@ jobs:
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
           subject-path: roundtrip/*
+
+      - name: Publish and verify the immutable formal Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release edit "$RELEASE_TAG" --draft=false
+          gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+            | jq -e --arg tag "$RELEASE_TAG" \
+              '.tag_name == $tag and .draft == false and .immutable == true' \
+              >/dev/null

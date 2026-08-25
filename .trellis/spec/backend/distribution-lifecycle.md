@@ -113,11 +113,19 @@ stdout: 64 lowercase hexadecimal Ed25519 public-key bytes plus LF
 - Uninstall first proves the exact running managed executable, then reuses identity
   reset/Session force/managed-inventory deletion and removes the executable
   last. It never sends `RevokeSelf` or performs setup.
-- `.github/workflows/release.yml` is manual, GitHub-hosted, action/image
-  digest-pinned, and draft-only. Protected `release` Environment approval gates
-  signing and draft creation. A repo admin separately confirms immutable
-  Releases and supplies the exact `enabled-and-reviewed` checkpoint; do not add
-  an administration PAT just to query that setting from Actions.
+- A successful `ci.yml` push run on `main` owns release-mode compilation on all
+  four native distribution platforms while retaining Windows shared-boundary
+  validation. A human may push the exact `v` + Cargo-version tag only afterward.
+- `.github/workflows/release.yml` is tag-triggered, GitHub-hosted, and
+  action/image digest-pinned. It rejects a tag without a successful `ci.yml`
+  `push` run on `main` for that exact commit before signing or Release state.
+  Protected `release` Environment approval gates only the single seed-bearing
+  signing job; verified draft creation, round-trip verification, attestation,
+  and immutable publication then proceed without a second approval.
+- A repo admin separately enables immutable Releases. The default workflow
+  token must not receive an administration PAT merely to query that setting;
+  the environment reviewer owns that precondition, and the published Release
+  response must report `immutable: true`.
 
 ### 4. Validation & Error Matrix
 
@@ -136,6 +144,7 @@ stdout: 64 lowercase hexadecimal Ed25519 public-key bytes plus LF
 | Installer destination exists/symlink/foreign/unsafe | `path_unsafe`; do not overwrite |
 | Current binary is development/ordinary CI or key is `UNCONFIGURED` | `path_unsafe`; no update fetch, uninstall preflight, state deletion, or executable replacement |
 | Uninstall state validation/deletion fails | Keep executable so retry remains possible |
+| Tagged commit lacks a successful `ci.yml` push run on `main` for the same SHA | Stop before Environment approval, signing secret, or Release creation |
 
 ### 5. Good/Base/Bad Cases
 
@@ -170,11 +179,13 @@ stdout: 64 lowercase hexadecimal Ed25519 public-key bytes plus LF
   failure, and incompatible daemon rejection at their authoritative owners.
   The signed hosted candidate owns positive pre-setup/configured uninstall and
   reinstall identity-rotation evidence.
-- `sh tests/release/static.sh` asserts manual/draft-only workflow, pinned
-  dependencies, one secret reference, protected checkpoints, and installer
+- `sh tests/release/static.sh` asserts exact-tag triggering, exact green-main-CI
+  gating, four main-push release-mode builds, pinned release dependencies, one
+  Environment/secret reference, verified draft publication, and installer
   no-side-effect tokens. Hosted four-target jobs own `shellcheck`, local HTTPS
   happy path, existing-destination preflight, digest failure, native execution,
-  glibc/Mach-O floor inspection, signed draft round-trip, and attestation.
+  glibc/Mach-O floor inspection, signed round-trip, attestation, and immutable
+  formal publication.
 - Do not execute real Iroh/Endpoint acceptance on a developer macOS host merely
   to validate this distribution contract.
 

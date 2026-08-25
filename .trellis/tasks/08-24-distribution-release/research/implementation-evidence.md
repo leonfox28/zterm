@@ -31,11 +31,14 @@
 - Deterministic single-file archive plus unsigned prepare, protected signing,
   exact-inventory verification, checksums, generated installer, and SPDX
   creation in the non-product release tool.
-- Manual/draft-only four-target workflow with pinned Action commits and Debian
-  10/glibc-2.28 image digest; signing and draft creation use the protected
-  `release` Environment and no self-hosted runner. All downstream jobs use the
-  validate job's frozen commit, draft creation rechecks the tag, and the
-  signing tool is built before the seed-bearing step.
+- Comprehensive `main` CI adds native release-mode builds for both macOS
+  architectures and both digest-pinned Debian 10/glibc-2.28 Linux
+  architectures while retaining Windows shared-boundary validation. The
+  separate exact-tag workflow requires a successful `ci.yml` `push` run on
+  `main` for the same SHA, rebuilds all four assets, and uses the protected
+  `release` Environment only for signing. It then tests, round-trips, attests,
+  publishes, and verifies the immutable formal Release without a second
+  Environment approval.
 - Mutable bootstrap, generated versioned installer, and hosted local-HTTPS
   acceptance fixture. Installer activation is owned by the authenticated
   candidate and is atomic no-clobber.
@@ -114,20 +117,20 @@ GitHub exposes only the secret's metadata, never its value. Independent
 repository review can therefore confirm the secret's existence, the exact
 public-key source shape, and the fail-closed signing comparison, but cannot
 rederive the stored secret without violating the boundary. The protected signed
-draft rehearsal remains the executable proof that the stored seed matches the
+Release run remains the executable proof that the stored seed matches the
 reviewed public key.
 
 Still required:
 
-1. commit/push the reviewed public key and derivation command, then retain the
-   resulting green hosted CI run;
-2. create the exact reviewed `v0.1.2` tag and run the manual workflow with
-   `enabled-and-reviewed`, and retain the successful seed/public-key match
-   check, run ID, four digests, signed manifest key ID, installer matrix,
-   attestation, and verified draft round-trip.
+1. commit/push the revised CI/release workflow and retain the successful
+   `ci.yml` `push` run on `main`, including all four release-mode jobs;
+2. only then create/push the exact reviewed `v0.1.2` tag and retain the
+   automatic workflow's seed/public-key match, run ID, four digests, signed
+   manifest key ID, installer matrix, verified round-trip, attestation, and
+   immutable published Release.
 
-The workflow still deliberately leaves the Release as a draft. No tag, release
-workflow run, Release, attestation, or published client artifact exists yet.
+No tag, release workflow run, Release, attestation, or published client
+artifact exists yet.
 
 ## Independent checker fixes and final local gate (2026-08-25)
 
@@ -161,4 +164,4 @@ warnings only), release/Relay/source/version/secret static checks, Trellis
 context validation, and `git diff --check`. It intentionally did not execute
 real Iroh/Endpoint/UDP/DNS tests or mutate GitHub settings, keys, tags,
 environments, workflows, or Releases. Signed four-target hosted evidence
-remains the explicit external checkpoint above.
+remains the exact-main-CI then human-tag checkpoint above.

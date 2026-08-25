@@ -83,8 +83,8 @@ their own non-product version.
 - `tests/relay/` — architecture, checksum, minimal configuration, and health checks.
 - `install/` and `tools/release/` — the reviewed bootstrap/template and private
   signed native-asset assembler.
-- `.github/workflows/release.yml` — manual, protected, draft-only native
-  Release workflow for the four supported Unix targets.
+- `.github/workflows/release.yml` — protected exact-tag native Release workflow
+  for the four supported Unix targets.
 - `docs/development.md` — exact local toolchain baseline and repeatable commands.
 - `docs/relay.md` — relay trust boundary, publication, and deployment.
 - `docs/phase-zero-verification.md` — evidence from the completed local gate.

@@ -3,6 +3,7 @@ set -eu
 
 repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 workflow="$repo_root/.github/workflows/release.yml"
+ci_workflow="$repo_root/.github/workflows/ci.yml"
 bootstrap="$repo_root/install/install.sh"
 template="$repo_root/install/versioned.sh.in"
 build_script="$repo_root/crates/core/build.rs"
@@ -19,22 +20,27 @@ for invalid_tag in v1 v1.2 v01.2.3 v1.02.3 v1.2.03 v1.2.3-01 v1.2.3-; do
     fi
 done
 
-grep -Eq '^[[:space:]]{2}workflow_dispatch:' "$workflow" \
-    || fail "release workflow must be manual-only"
-if grep -Eq '^[[:space:]]{2}(push|pull_request|release):' "$workflow"; then
-    fail "release workflow must not have an automatic trigger"
+grep -Eq '^[[:space:]]{2}push:' "$workflow" \
+    || fail "release workflow must run on tag push"
+grep -Fq '      - "v*"' "$workflow" \
+    || fail "release workflow must accept only v-prefixed tag pushes"
+if grep -Eq '^[[:space:]]{2}(workflow_dispatch|pull_request|release):' "$workflow"; then
+    fail "release workflow must not have a second trigger"
 fi
 environment_gates=$(grep -Fc 'environment: release' "$workflow" || true)
-[ "$environment_gates" -eq 2 ] \
-    || fail "signing and draft creation must each use the protected release Environment"
-grep -Fq 'immutable_release_checkpoint' "$workflow" \
-    || fail "workflow must require the repo-admin immutable Release checkpoint"
-grep -Fq 'enabled-and-reviewed' "$workflow" \
-    || fail "workflow must fail closed until the immutable Release checkpoint"
+[ "$environment_gates" -eq 1 ] \
+    || fail "only the signing job may use the protected release Environment"
+if grep -Eq 'immutable_release_checkpoint|enabled-and-reviewed' "$workflow"; then
+    fail "release workflow must not use a self-asserted checkpoint input"
+fi
 grep -Fq -- '--draft' "$workflow" \
     || fail "release workflow must create a draft"
-if grep -Eq -- '--draft=false|gh release edit|gh release delete' "$workflow"; then
-    fail "M9 workflow must leave the verified Release as a draft"
+grep -Fq 'gh release edit "$RELEASE_TAG" --draft=false' "$workflow" \
+    || fail "release workflow must publish the verified draft"
+grep -Fq '.immutable == true' "$workflow" \
+    || fail "release workflow must verify the published Release is immutable"
+if grep -Fq 'gh release delete' "$workflow"; then
+    fail "release workflow must never replace a failed Release"
 fi
 if grep -Fq 'self-hosted' "$workflow"; then
     fail "release workflow must use only GitHub-hosted runners"
@@ -48,6 +54,10 @@ fi
 unpinned_actions=$(grep -E '^[[:space:]]*uses:' "$workflow" \
     | grep -Ev '@[0-9a-f]{40}([[:space:]]|$)' || true)
 [ -z "$unpinned_actions" ] || fail "all release actions must use commit SHAs"
+unpinned_ci_actions=$(grep -E '^[[:space:]]*uses:' "$ci_workflow" \
+    | grep -Ev '@[0-9a-f]{40}([[:space:]]|$)' || true)
+[ -z "$unpinned_ci_actions" ] \
+    || fail "all CI actions used by the release gate must use commit SHAs"
 
 secret_references=$(grep -Ec \
     'secrets[.]ZTERM_RELEASE_SIGNING_KEY' "$workflow" || true)
@@ -59,7 +69,27 @@ frozen_checkouts=$(grep -Fc "ref: \${{ needs.validate.outputs.commit }}" "$workf
 grep -Fq 'target/release/zterm-release-tool sign release-output' "$workflow" \
     || fail "the signing step must execute the tool built before secret exposure"
 grep -Fq "git rev-list -n 1 \"\$RELEASE_TAG\"" "$workflow" \
-    || fail "draft creation must recheck the existing tag against the validated commit"
+    || fail "publication must recheck the existing tag against the validated commit"
+for ci_gate in 'actions/workflows/ci.yml/runs' '-f branch=main' '-f event=push' \
+    '-f status=success' '-f head_sha="$commit"'; do
+    grep -Fq -- "$ci_gate" "$workflow" \
+        || fail "release validation must require exact successful main push CI: $ci_gate"
+done
+
+main_release_gates=$(grep -Fc \
+    "if: github.event_name == 'push' && github.ref == 'refs/heads/main'" \
+    "$ci_workflow" || true)
+[ "$main_release_gates" -eq 2 ] \
+    || fail "CI must have exactly two main-push-only native release-mode jobs"
+grep -Fq 'windows-latest' "$ci_workflow" \
+    || fail "CI must retain the Windows shared-boundary runner"
+for target in aarch64-apple-darwin x86_64-apple-darwin \
+    aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
+    grep -Fq "target: $target" "$ci_workflow" \
+        || fail "CI release-mode matrix is missing $target"
+done
+grep -Eq 'image: .*@sha256:[0-9a-f]{64}$' "$ci_workflow" \
+    || fail "CI glibc-floor image must be digest-pinned"
 if grep -Fq 'std::env::var("GITHUB_SHA")' "$build_script"; then
     fail "ambient ordinary-CI SHA must not mark a managed distribution build"
 fi

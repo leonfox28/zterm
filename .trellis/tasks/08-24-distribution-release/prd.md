@@ -7,7 +7,7 @@
 ## Background
 
 - 父任务已经确定 direct installer + 手动 `zterm update`，不采用 npm、Homebrew、mise、Nix、branch build 或 GitHub Actions 临时 artifact 作为第一阶段官方渠道。
-- 官方仓库是 `leonfox28/zterm`；当前只有 Relay release，没有 zterm 客户端原生 release workflow、安装签名 secret 或 protected release environment。
+- 任务启动时官方仓库 `leonfox28/zterm` 只有 Relay release，尚无 zterm 客户端原生 release workflow、安装签名 secret 或 protected release environment。
 - 当前 `install/` 只有保留边界；M7–M8 的实现与现有 hosted matrix 先独立收口，正式安装后的 public CLI/remote Session 证据由 M10 负责，不阻塞 M9 开始。
 - 用户明确不进行中间开发版安装；M9 与 M10 完成后才使用正式 installer 统一验收。
 
@@ -31,7 +31,7 @@
 - [ ] manifest/signature/checksum/size/target/version/self-check 任一故障都发生在 daemon stop 前，当前 binary 与 Session 不变。
 - [ ] 活动 Session 的 update/uninstall 默认拒绝；明确确认或 force 后才结束 PTY。更新失败恢复旧 binary；卸载后 state 与 binary 均移除，重装/setup 生成新 EndpointId。
 - [ ] installer 在下载 artifact 前明确拒绝 unsupported target；PATH、手工审阅安装、immutable release、签名密钥轮换和紧急恢复边界有准确文档。
-- [ ] 独立 Trellis checker、完整 CI/release dry-run 与供应链扫描通过后，才允许创建供 M10 使用的正式候选 Release。
+- [ ] 独立 Trellis checker 与完整 main CI（含四平台 release-mode build）通过后才允许人工创建精确 tag；tag workflow 必须在签名、安装矩阵、round-trip 与 attestation 全部成功后自动发布供 M10 使用的 immutable 正式候选 Release。
 
 ## Out of Scope
 
@@ -42,4 +42,5 @@
 
 - 正式 manifest 使用长期 Ed25519 release key。私钥只保存为 GitHub `release` Environment secret；引用该 environment 的发布 job 必须在 GitHub-hosted runner 上运行，并在读取 secret 前等待人工批准。普通 CI、pull request、self-hosted runner、artifact、日志和仓库均不得接触私钥。
 - 发布同时启用 GitHub immutable releases 与 artifact/release provenance attestation。它们补充但不替代 zterm updater 对 detached manifest signature 的验证。
+- CI 不创建 tag；人工只在精确 main commit 的 push CI 成功后创建并推送 `v*` tag。tag 自动触发发布，且只有读取签名 seed 的 job 使用一次 protected `release` Environment 审批。
 - 用户接受 GitHub 托管密钥相对于完全离线签名的信任取舍，以换取可重复、低人工差错的正式发布流程。

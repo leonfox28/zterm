@@ -17,7 +17,8 @@ No second daemon lifecycle, state root, HTTP control plane, updater service, or 
 ## 2. Trust chain
 
 ```text
-reviewed source tag
+successful comprehensive main CI (including four native release-mode builds)
+  -> human-created exact reviewed source tag
   -> native GitHub-hosted builds
   -> checksums + bounded exact-byte manifest
   -> Ed25519 signature inside protected release Environment
@@ -30,7 +31,8 @@ reviewed source tag
 The long-lived Ed25519 seed exists only as the `ZTERM_RELEASE_SIGNING_KEY` secret in the GitHub `release` Environment. The signing/publish job:
 
 - runs only on a GitHub-hosted runner;
-- is reached only by a manual release workflow for an existing exact tag;
+- is reached only by an exact `v*` tag push whose commit already has a
+  successful `ci.yml` `push` run on `main`;
 - cannot read the secret until the configured reviewer approves the environment;
 - receives no pull-request-controlled code or inputs after approval;
 - builds the reviewed signing tool before the secret-bearing step, so Cargo,
@@ -139,11 +141,15 @@ Failure is retryable from the surviving binary or documented versioned installer
 
 - macOS artifacts build natively on GitHub arm64 and Intel runners.
 - Linux artifacts build natively inside digest-pinned glibc 2.28 build containers on GitHub x86_64 and arm64 runners. The release gate inspects ELF symbol versions and rejects a higher glibc floor.
+- Every `main` push runs release-mode builds in those same four native
+  platform/floor environments before a human may create the tag. Release still
+  rebuilds the exact tag rather than promoting ordinary-CI artifacts.
 - archives use a fixed file inventory, ownership, permissions, ordering, and source timestamp. A repeated-build comparison is evidence only after platform-specific nondeterminism is measured; the workflow must not claim bit-for-bit reproducibility without a matching digest.
 - Windows shared compilation remains CI evidence only and produces no M9 artifact.
-- The validate job freezes the tag's peeled commit; every later checkout uses
-  that commit, and draft creation rechecks that the existing tag still peels to
-  it before creating external state.
+- The validate job proves the exact commit has a successful `ci.yml` `push` run
+  on `main`, freezes the tag's peeled commit, and every later checkout uses that
+  commit. Draft creation rechecks that the existing tag still peels to it
+  before creating external state.
 
 ## 10. Failure and rollback boundaries
 
@@ -156,7 +162,8 @@ Failure is retryable from the surviving binary or documented versioned installer
 | daemon cannot fully stop | do not replace binary |
 | atomic activation/post-check fails | restore old binary; report PTYs already ended |
 | uninstall state deletion incomplete | keep binary for retry |
-| release workflow asset validation fails | leave draft unpublished; secret is not reused by automatic retry loops |
+| release workflow fails before draft creation | create no Release; do not use automatic retry loops |
+| draft round-trip or attestation fails | leave the draft unpublished; never delete or replace it automatically |
 
 ## 11. Scope control
 

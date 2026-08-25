@@ -16,15 +16,21 @@
 
 Focused gate: release-contract units, fixture verification, secret/debug scan, package check/Clippy.
 
-## Step 2: Native artifact and draft-release workflow
+## Step 2: Native CI and exact-tag release workflow
 
 - [ ] Build four native artifacts with fixed inventory/timestamps/modes and embed exact build identity.
 - [ ] Build Linux artifacts in pinned glibc 2.28 containers and inspect ELF symbol versions; build both macOS architectures on native hosted runners.
 - [x] Generate checksums, signed manifest, versioned installer, SBOM, and provenance attestations from one asset inventory.
-- [x] Add a manual workflow that verifies tag = `v` + Cargo version, builds without secrets, waits on the protected `release` Environment only for signing/draft creation, assembles a draft, verifies all downloaded draft assets, and leaves it unpublished for independent approval.
+- [x] Add four `main`-push-only release-mode CI builds in the native macOS and
+  glibc 2.28 Linux environments while retaining Windows shared-boundary CI.
+- [x] Trigger release only from an exact pushed tag whose commit has a
+  successful `ci.yml` `push` run on `main`; rebuild without secrets, use one
+  protected `release` Environment approval for signing, verify/attest the draft,
+  then publish it and require the formal Release to report immutable.
 - [x] Pin third-party actions and keep release permissions job-scoped; no PR or self-hosted path may reach the signing environment.
 
-Focused gate: workflow/static policy, local unsigned dry-run, four hosted artifact builds, draft asset round-trip.
+Focused gate: workflow/static policy, green main CI, four hosted artifact
+rebuilds, signed asset round-trip, attestation, and immutable publication.
 
 ## Step 3: Official installer
 
@@ -51,13 +57,18 @@ Focused gate: CLI side-effect tests, local daemon lifecycle tests, activation fa
 
 - [x] Document reviewed-script, one-line, exact-version, manual checksum/signature, update, rollback, uninstall, PATH, support floor, bootstrap trust, key rotation, and emergency recovery paths.
 - [x] Update README/help/specs only where behavior is directly implemented; keep M10 real-network and user acceptance pending.
-- [ ] Run one four-target unsigned workflow rehearsal and one protected signed draft rehearsal. Do not publish a stable Release until all M9 checks and an independent checker pass.
+- [ ] Run the comprehensive main CI, then push the human-reviewed exact tag and
+  retain the protected signed/published workflow evidence. Do not push the tag
+  until all local M9 checks and an independent checker pass.
 - [ ] Run the final hosted workspace/platform/release gate, then independent `trellis-check`; fix only concrete findings.
 
 ## Step 6: M9 completion handoff
 
-- [ ] Save exact commit, workflow run, four artifact digests, manifest/public-key ID, draft/signed rehearsal, and installer matrix evidence.
-- [ ] Publish the exact formal candidate required by M10 only after the approved release checkpoint.
+- [ ] Save exact commit, green main CI run, tag-triggered release run, four
+  artifact digests, manifest/public-key ID, signed round-trip, attestation,
+  immutable Release, and installer matrix evidence.
+- [ ] Create/push the exact formal-candidate tag required by M10 only after the
+  approved release checkpoint; the workflow publishes it automatically.
 - [x] Update parent M9 evidence without marking M10 or first-stage completion.
 
 ## Guardrails and stop conditions
@@ -71,6 +82,8 @@ Focused gate: CLI side-effect tests, local daemon lifecycle tests, activation fa
 ## Rollback points
 
 - Contract/tooling commits precede workflow/external GitHub configuration.
-- Workflow stays manual and draft-only until local/hosted asset verification is green.
+- No tag is created until the exact `main` commit has green comprehensive CI;
+  tag-triggered publication remains unable to pass signing without the one
+  protected Environment approval.
 - Product update/uninstall remains unreachable from public help until its fault and lifecycle gates pass.
 - A failed external secret/environment setup leaves ordinary CI and current releases unchanged.

@@ -142,7 +142,7 @@ unknown file or bypass signature/hash verification merely to force a rollback.
 
 ## Release-operator checkpoint
 
-The manual draft workflow remains locked until a repository administrator has:
+Before any formal tag is pushed, a repository administrator must have:
 
 1. enabled immutable Releases and confirmed it with
    `gh api repos/leonfox28/zterm/immutable-releases`;
@@ -150,18 +150,26 @@ The manual draft workflow remains locked until a repository administrator has:
 3. generated the long-lived Ed25519 seed outside logs/artifacts, committed only
    its reviewed public key, and stored the lowercase seed as the Environment
    secret `ZTERM_RELEASE_SIGNING_KEY`;
-4. reviewed the exact existing tag and entered the workflow checkpoint phrase
-   `enabled-and-reviewed`.
+4. reviewed a successful `ci.yml` push run on `main` for the exact commit,
+   including all four native release-mode builds.
 
 The default workflow token cannot read the repository Administration setting,
 so the workflow does not pretend to verify immutable Releases through an
-underprivileged API call and does not request a PAT. Every downstream job uses
-the validate job's frozen commit, and draft creation rechecks the existing tag.
-The signing tool is built before the sole seed-bearing step so Cargo/build
-scripts never inherit the secret. The workflow runs only on GitHub-hosted
-runners, tests all four installers, creates and round-trips one draft, emits
-provenance attestations, and leaves the Release unpublished for independent
-review.
+underprivileged API call and does not request a PAT. The environment reviewer
+must confirm that immutable Releases remain enabled before approving the sole
+seed-bearing signing job.
+
+CI never creates a tag. After the exact `main` push run succeeds, a human
+creates and pushes the canonical `v` + Cargo-version tag. That push starts the
+release workflow automatically. Its validate job uses the Actions API to
+require a successful `ci.yml` `push` run on `main` for the same commit before
+the signing Environment or any Release state is reached. Every downstream job
+uses the frozen commit, and draft creation rechecks the tag. The signing tool is
+built before the only seed-bearing step so Cargo/build scripts never inherit
+the secret. The GitHub-hosted workflow rebuilds four native assets, tests all
+four installers, creates and round-trips one draft, emits provenance
+attestations, publishes it automatically, and requires the published Release
+API response to report `immutable: true`.
 
 A normal key rotation first ships a binary that trusts the next reviewed key
 through a manifest signed by the current key. If the current private key may be

@@ -45,7 +45,7 @@ jobs:
           - ubuntu-24.04-arm
           - windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check source checkout policy
         shell: bash
         run: sh tests/source-policy.sh
@@ -79,11 +79,101 @@ jobs:
         if: runner.os != 'Windows'
         run: cargo +1.98.0 run --quiet --package zterm-cli
 
+  release-mode-macos:
+    name: Release-mode build (${{ matrix.target }})
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            architecture: arm64
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            architecture: x86_64
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check source checkout policy
+        run: sh tests/source-policy.sh
+      - name: Install exact Rust toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal
+      - name: Build and inspect the release-mode boundary
+        shell: bash
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+          RELEASE_ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          set -euo pipefail
+          test "$(rustc +1.98.0 -vV | sed -n 's/^host: //p')" = "$RELEASE_TARGET"
+          cargo +1.98.0 build --locked --release \
+            --package zterm-cli --package zterm-release-tool
+          file target/release/zterm | grep -F "$RELEASE_ARCHITECTURE"
+          test "$(otool -l target/release/zterm | awk '$1 == "minos" {print $2}' | sort -u)" = "13.0"
+
+  release-mode-linux:
+    name: Release-mode build (${{ matrix.target }}, glibc 2.28)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: debian:10-slim@sha256:bb3dc79fddbca7e8903248ab916bb775c96ec61014b3d02b4f06043b604726dc
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - name: Select the frozen Debian 10 package snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -i \
+            -e 's|^# deb http://snapshot|deb [check-valid-until=no] http://snapshot|' \
+            -e 's|^deb http://deb|# deb http://deb|' \
+            /etc/apt/sources.list
+          apt-get -o Acquire::Check-Valid-Until=false update
+          DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+            binutils build-essential ca-certificates curl git pkg-config
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check source checkout policy
+        run: sh tests/source-policy.sh
+      - name: Install exact Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+            https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.98.0
+          echo "/root/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Build and inspect the release-mode boundary
+        shell: bash
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          test "$(rustc -vV | sed -n 's/^host: //p')" = "$RELEASE_TARGET"
+          test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.28"
+          cargo build --locked --release \
+            --package zterm-cli --package zterm-release-tool
+          maximum_glibc=$(readelf --version-info target/release/zterm \
+            | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)
+          test -n "$maximum_glibc"
+          test "$(printf '%s\n%s\n' "$maximum_glibc" GLIBC_2.28 | sort -V | tail -1)" = GLIBC_2.28
+
   dependencies:
     name: Dependency policy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install exact Rust toolchain
         run: rustup toolchain install 1.98.0 --profile minimal
       - name: Install cargo-deny 0.20.2
@@ -97,7 +187,7 @@ jobs:
     name: Official relay bundle
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install exact Rust toolchain
         run: >-
           rustup toolchain install 1.98.0 --profile minimal
@@ -109,9 +199,9 @@ jobs:
       - name: Check POSIX shell syntax
         run: sh -n deploy/relay/*.sh tests/relay/*.sh
       - name: Register cross-architecture emulation
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
       - name: Create a BuildKit builder
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - name: Validate metadata and Compose exposure
         run: sh tests/relay/static.sh
       - name: Validate publication channels
