@@ -35,7 +35,7 @@ rebuilds, signed asset round-trip, attestation, and immutable publication.
 ## Step 3: Official installer
 
 - [x] Implement the small mutable bootstrap and generated immutable `zterm-install.sh` stages from the design.
-- [x] Detect target/glibc/NixOS/musl and destination ownership before artifact download.
+- [x] Detect target/glibc/NixOS/musl and validate destination path/writability before artifact download.
 - [x] Verify embedded manifest/archive metadata, then candidate signature/self-check, before same-directory atomic install.
 - [x] Prove install creates no `~/.zterm`, identity, config, socket, daemon, PTY, login item, or shell-rc change; existing managed/unrelated destinations are not overwritten.
 - [x] Add one hosted local-HTTPS happy path plus existing-destination/no-request and bad-manifest-digest negatives; keep signature/schema/target/truncation cases at their core/tool owners rather than duplicating a shell matrix.

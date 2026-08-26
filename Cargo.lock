@@ -4559,7 +4559,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zterm-cli"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "clap",
  "futures-util",
@@ -4577,7 +4577,7 @@ dependencies = [
 
 [[package]]
 name = "zterm-core"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "ring",
  "semver",
@@ -4589,7 +4589,7 @@ dependencies = [
 
 [[package]]
 name = "zterm-daemon"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "flate2",
@@ -4619,7 +4619,7 @@ dependencies = [
 
 [[package]]
 name = "zterm-platform"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "nix 0.28.0",
  "portable-pty",
@@ -4629,7 +4629,7 @@ dependencies = [
 
 [[package]]
 name = "zterm-proto"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "base64",
  "prost",
@@ -4641,7 +4641,7 @@ dependencies = [
 
 [[package]]
 name = "zterm-release-tool"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "flate2",

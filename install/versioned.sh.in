@@ -97,36 +97,16 @@ esac
 [ ! -L "$install_dir" ] || fail "install directory must not be a symlink"
 mkdir -p "$install_dir" || fail "unable to create install directory"
 if [ ! -d "$install_dir" ] || [ ! -w "$install_dir" ]; then
-    fail "install directory must be a writable directory owned by this user"
+    fail "install directory must be a writable directory"
 fi
 destination="$install_dir/zterm"
 if [ -e "$destination" ] || [ -L "$destination" ]; then
     fail "destination already exists; use the installed binary's explicit 'zterm update' command"
 fi
 
-for tool in tar wc tr chmod mktemp awk id stat; do
+for tool in tar wc tr chmod mktemp awk; do
     command -v "$tool" >/dev/null 2>&1 || fail "$tool is required"
 done
-
-current_uid=$(id -u 2>/dev/null) || fail "unable to determine the current user"
-case "$os" in
-    Darwin)
-        directory_uid=$(stat -f '%u' "$install_dir" 2>/dev/null) \
-            || fail "unable to inspect install directory ownership"
-        directory_mode=$(stat -f '%Lp' "$install_dir" 2>/dev/null) \
-            || fail "unable to inspect install directory permissions"
-        ;;
-    Linux)
-        directory_uid=$(stat -c '%u' "$install_dir" 2>/dev/null) \
-            || fail "unable to inspect install directory ownership"
-        directory_mode=$(stat -c '%a' "$install_dir" 2>/dev/null) \
-            || fail "unable to inspect install directory permissions"
-        ;;
-esac
-[ "$directory_uid" = "$current_uid" ] || fail "install directory must be owned by this user"
-case "$directory_mode" in
-    *[2367][0-7]|*[0-7][2367]) fail "install directory must not be writable by group or other users" ;;
-esac
 if command -v sha256sum >/dev/null 2>&1; then
     sha256_file() { sha256sum "$1" | awk '{print $1}'; }
 elif command -v shasum >/dev/null 2>&1; then

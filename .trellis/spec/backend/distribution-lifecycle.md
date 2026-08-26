@@ -96,14 +96,20 @@ stdout: 64 lowercase hexadecimal Ed25519 public-key bytes plus LF
   generated immutable installer performs target/floor/destination validation
   before artifact download, verifies embedded manifest/archive hashes before
   executing the candidate, then uses only the three hidden entries above.
+- An install directory must be absolute, a direct directory rather than a
+  symlink, and writable for the current process. The installer does not reject
+  it based on directory UID or group/other-write mode; this permits the common
+  existing `0775` `~/.local/bin` created by a user-private group and `umask
+  0002`. The installed executable itself remains a direct current-UID file
+  without group/other write bits.
 - Installer activation is same-directory, fsynced, and atomic no-clobber. It
   creates no zterm state and refuses every existing destination. Setup writes
   mode-`0600` `install.json`; metadata is diagnostic, never identity authority.
 - Installer activation, update, and uninstall first require a configured
   reviewed public key plus canonical official build identity. This proof does
-  not constrain a user-selected safe install directory, but it rejects
-  repository, development, ordinary-CI, and `UNCONFIGURED` binaries before a
-  network request or destructive state observation.
+  not constrain a user-selected absolute writable install directory, but it
+  rejects repository, development, ordinary-CI, and `UNCONFIGURED` binaries
+  before a network request or destructive state observation.
 - Update proves the current executable locally, then fully
   prepares/authenticates the candidate before daemon contact.
   Incompatible CLI/daemon, active Sessions without `--force`, or failed stop
@@ -153,7 +159,7 @@ stdout: 64 lowercase hexadecimal Ed25519 public-key bytes plus LF
 | Active Sessions and no `--force` | `update_rejected`; no stop/activation |
 | Stop or lifecycle ownership release fails | Preserve installed binary; return typed lifecycle error |
 | Activation/post-check/metadata fails | Restore retained executable; report ended Sessions as ended |
-| Installer destination exists/symlink/foreign/unsafe | `path_unsafe`; do not overwrite |
+| Installer destination exists, or install directory is relative/symlink/non-directory/unwritable | Refuse before download or activation; do not overwrite |
 | Current binary is development/ordinary CI or key is `UNCONFIGURED` | `path_unsafe`; no update fetch, uninstall preflight, state deletion, or executable replacement |
 | Uninstall state validation/deletion fails | Keep executable so retry remains possible |
 | Tagged commit lacks a successful `ci.yml` push run on `main` for the same SHA | Stop before Environment approval, signing secret, or Release creation |
@@ -167,8 +173,9 @@ stdout: 64 lowercase hexadecimal Ed25519 public-key bytes plus LF
 - Good: signed newer target archive verifies, zero Sessions are active, daemon
   stops, candidate activates/post-checks, metadata commits, daemon remains
   stopped, and the rollback file is removed.
-- Base: install to an empty owned `~/.local/bin`, observe no `~/.zterm`, then
-  run setup separately; pre-setup uninstall removes only that executable.
+- Base: install through an existing writable mode-`0775` default
+  `~/.local/bin`, observe no `~/.zterm`, then run setup separately; pre-setup
+  uninstall removes only that executable.
 - Bad: downloading or stopping a daemon before exact-byte signature, length,
   digest, target, version, and candidate self-checks finish.
 - Bad: treating GitHub HTTPS/attestation as a replacement for the embedded
@@ -193,8 +200,9 @@ stdout: 64 lowercase hexadecimal Ed25519 public-key bytes plus LF
 - `cargo test -p zterm-daemon distribution::tests` asserts valid preparation,
   bad archive rejection before candidate execution, and canonical exact/latest
   selection.
-- Platform executable tests assert owner/mode/symlink rejection, no-clobber
-  install, retained-backup rollback, and exact removal.
+- Platform executable tests assert installed-file owner/mode/symlink rejection,
+  install-directory shape, no-clobber install, retained-backup rollback, and
+  exact removal.
 - Operations tests assert development/ordinary-CI refusal before update network
   or uninstall state access, mode-`0600` metadata, active-Session force, stop
   failure, and incompatible daemon rejection at their authoritative owners.
@@ -208,9 +216,11 @@ stdout: 64 lowercase hexadecimal Ed25519 public-key bytes plus LF
   matrix, direct numeric-loopback fixture binding with no FQDN path, verified
   draft publication, and installer no-side-effect tokens.
   Exact-main CI ShellChecks maintained shell sources. Hosted four-target jobs
-  own POSIX syntax, local HTTPS happy path, existing-destination preflight,
-  digest failure, native execution, glibc/Mach-O floor inspection, signed
-  round-trip, attestation, and immutable formal publication.
+  own POSIX syntax, a local HTTPS happy path through an existing default
+  `0775` directory created under `umask 0002` without `chmod`,
+  existing-destination preflight, digest failure, native execution,
+  glibc/Mach-O floor inspection, signed round-trip, attestation, and immutable
+  formal publication.
 - Do not execute real Iroh/Endpoint acceptance on a developer macOS host merely
   to validate this distribution contract.
 

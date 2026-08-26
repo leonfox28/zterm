@@ -60,12 +60,23 @@ while [ ! -s "$temporary/port" ]; do
 done
 fixture_base="https://127.0.0.1:$(cat "$temporary/port")"
 fixture_home="$temporary/home"
-install_directory="$fixture_home/bin"
-mkdir -p "$fixture_home"
+install_directory="$fixture_home/.local/bin"
+(
+    umask 0077
+    mkdir -p "$fixture_home/.local"
+)
+(
+    umask 0002
+    mkdir "$install_directory"
+)
+case "$(LC_ALL=C ls -ld "$install_directory")" in
+    drwxrwxr-x*) ;;
+    *) fail "fixture did not create an existing 0775 default install directory" ;;
+esac
 
 HOME=$fixture_home CURL_CA_BUNDLE=$temporary/server.crt \
     ZTERM_INSTALL_TEST_BASE_URL=$fixture_base \
-    sh "$test_installer" --install-dir "$install_directory" \
+    sh "$test_installer" \
     > "$temporary/happy.output" 2>&1 \
     || fail "authenticated installer happy path failed"
 [ -x "$install_directory/zterm" ] || fail "installed executable is missing"
@@ -78,7 +89,7 @@ grep -Fq "Add $install_directory to PATH" "$temporary/happy.output" \
 requests_before=$(wc -l < "$temporary/requests.log" | tr -d '[:space:]')
 if HOME=$fixture_home CURL_CA_BUNDLE=$temporary/server.crt \
     ZTERM_INSTALL_TEST_BASE_URL=$fixture_base \
-    sh "$test_installer" --install-dir "$install_directory" \
+    sh "$test_installer" \
     > "$temporary/existing.output" 2>&1; then
     fail "installer overwrote an existing destination"
 fi

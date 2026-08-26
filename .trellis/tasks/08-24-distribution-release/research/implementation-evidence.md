@@ -253,3 +253,22 @@ remains the exact-main-CI then human-tag checkpoint above.
 - `v0.1.5` remains immutable and is never moved or reused. The repaired
   lockstep candidate advances to `v0.1.6`. Formal configured update/uninstall,
   reinstall identity rotation, and final user acceptance remain pending.
+
+## Published v0.1.6 Linux installer finding (2026-08-26)
+
+- The user successfully installed and started the immutable `v0.1.6` macOS
+  build after removing the prior local state; this is user acceptance evidence,
+  not a substitute for the hosted release matrix.
+- A separate ordinary-account Linux one-line install stopped before artifact
+  download with `install directory must not be writable by group or other
+  users`. The observed account home and `~/.local` were mode `0700`, while the
+  pre-existing `~/.local/bin` was mode `0775`, consistent with a user-private
+  group and `umask 0002`. No successful Linux install is claimed yet.
+- The installer directory UID/mode preflight is stricter than the requested
+  writable-directory contract and rejects this common layout. The `v0.1.7`
+  candidate removes those directory permission checks and their `id`/`stat`
+  tool dependencies, while retaining absolute/direct/writable directory
+  checks, existing-target no-clobber activation, authenticated assets, and
+  current-UID non-group-writable executable validation. One POSIX local-HTTPS
+  fixture owns the existing-default-`0775` regression without adding a
+  permission matrix.

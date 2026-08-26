@@ -450,7 +450,7 @@ pub fn validate_owned_executable(path: &Path, uid: u32) -> Result<(), PathError>
     let parent = path
         .parent()
         .ok_or_else(|| PathError::NotAbsolute(path.to_path_buf()))?;
-    validate_executable_parent(parent, uid)?;
+    validate_executable_parent(parent)?;
     let metadata = fs::symlink_metadata(path).map_err(|error| io_error(path, error))?;
     if metadata.file_type().is_symlink() {
         return Err(PathError::Symlink(path.to_path_buf()));
@@ -538,7 +538,7 @@ pub fn install_executable(source: &Path, target: &Path, uid: u32) -> Result<(), 
     let parent = target
         .parent()
         .ok_or_else(|| PathError::NotAbsolute(target.to_path_buf()))?;
-    validate_executable_parent(parent, uid)?;
+    validate_executable_parent(parent)?;
     if fs::symlink_metadata(target).is_ok() {
         return Err(PathError::Io {
             path: target.to_path_buf(),
@@ -837,7 +837,7 @@ fn create_new_executable(path: &Path) -> Result<File, PathError> {
     options.open(path).map_err(|error| io_error(path, error))
 }
 
-fn validate_executable_parent(path: &Path, uid: u32) -> Result<(), PathError> {
+fn validate_executable_parent(path: &Path) -> Result<(), PathError> {
     ensure_absolute(path)?;
     let metadata = fs::symlink_metadata(path).map_err(|error| io_error(path, error))?;
     if metadata.file_type().is_symlink() {
@@ -846,31 +846,7 @@ fn validate_executable_parent(path: &Path, uid: u32) -> Result<(), PathError> {
     if !metadata.is_dir() {
         return Err(PathError::WrongType(path.to_path_buf()));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if metadata.uid() != uid {
-            return Err(PathError::WrongOwner {
-                path: path.to_path_buf(),
-                expected: uid,
-                actual: metadata.uid(),
-            });
-        }
-        let actual = metadata.mode() & 0o777;
-        if actual & 0o022 != 0 {
-            return Err(PathError::WrongMode {
-                path: path.to_path_buf(),
-                expected: 0o755,
-                actual,
-            });
-        }
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = uid;
-        Err(PathError::UnsupportedPlatform)
-    }
+    Ok(())
 }
 
 fn configure_secure_open(options: &mut OpenOptions) {
@@ -1211,7 +1187,7 @@ mod tests {
     }
 
     #[test]
-    fn executable_install_is_atomic_no_clobber() {
+    fn executable_lifecycle_accepts_group_writable_parent_and_preserves_no_clobber() {
         use nix::unistd::Uid;
         use std::os::unix::fs::PermissionsExt;
 
@@ -1224,7 +1200,7 @@ mod tests {
         fs::create_dir(&destination_directory).expect("destination directory");
         fs::set_permissions(&source_directory, fs::Permissions::from_mode(0o700))
             .expect("source directory mode");
-        fs::set_permissions(&destination_directory, fs::Permissions::from_mode(0o755))
+        fs::set_permissions(&destination_directory, fs::Permissions::from_mode(0o775))
             .expect("destination directory mode");
         let source = source_directory.join("zterm");
         fs::write(&source, b"candidate").expect("candidate bytes");
@@ -1234,12 +1210,45 @@ mod tests {
 
         install_executable(&source, &target, uid).expect("first install");
         assert_eq!(fs::read(&target).expect("installed bytes"), b"candidate");
+        assert_eq!(
+            fs::metadata(&target)
+                .expect("installed metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
         assert!(
             !home.join(".zterm").exists(),
             "binary install must not create product state"
         );
         assert!(install_executable(&source, &target, uid).is_err());
         assert_eq!(fs::read(&target).expect("unclobbered bytes"), b"candidate");
+
+        let activation = activate_executable(&target, uid, |file| file.write_all(b"updated"))
+            .expect("activate update through group-writable parent");
+        activation.commit().expect("commit update");
+        assert_eq!(fs::read(&target).expect("updated bytes"), b"updated");
+        assert_eq!(
+            fs::metadata(&target)
+                .expect("updated metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+
+        remove_owned_executable(&target, uid)
+            .expect("remove executable through group-writable parent");
+        assert!(!target.exists());
+        assert_eq!(
+            fs::metadata(&destination_directory)
+                .expect("destination directory metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o775
+        );
         assert!(!home.join(".zterm").exists());
     }
 

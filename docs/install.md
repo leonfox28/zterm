@@ -43,9 +43,12 @@ sh /tmp/zterm-install.sh --install-dir "$HOME/bin"
 
 The default destination is `~/.local/bin/zterm`. If that directory is not on
 `PATH`, the installer prints the required guidance; it does not edit shell
-startup files. It refuses an existing destination, symlinked/foreign-owned
-directory, unsafe permissions, unsupported target, NixOS, musl, an old OS or
-glibc, and any incomplete or mismatched Release asset.
+startup files. An existing writable `~/.local/bin`, including the ordinary
+`0775` user-private-group directory produced by `umask 0002`, is accepted
+without requiring `chmod`. The installer refuses an existing destination, a
+relative, symlinked, non-directory, or unwritable install path, an unsupported
+target, NixOS, musl, an old OS or glibc, and any incomplete or mismatched
+Release asset.
 
 Installation does not run `setup`, create `~/.zterm`, generate an identity,
 start a daemon, register a service, invoke `sudo`, or change shell files. Run
@@ -64,14 +67,14 @@ source and GitHub. The versioned script embeds its exact tag, manifest digest,
 and four-target artifact table.
 
 Before publishing a binary, the versioned script checks target/support floor,
-destination ownership, bounded download sizes, exact manifest/archive hashes,
-and the archive's single-file inventory. Only then does it execute the
-candidate's side-effect-free self-check. The candidate verifies the detached
-Ed25519 signature over the exact manifest bytes and cross-checks version,
-target, source commit, wire/schema versions, and release-key ID before an
-fsynced, atomic no-clobber install. GitHub immutable Releases and provenance
-attestations additionally bind the tag and assets inside GitHub's supply-chain
-audit layer.
+absolute directory shape and basic writability, bounded download sizes, exact
+manifest/archive hashes, and the archive's single-file inventory. Only then
+does it execute the candidate's side-effect-free self-check. The candidate
+verifies the detached Ed25519 signature over the exact manifest bytes and
+cross-checks version, target, source commit, wire/schema versions, and
+release-key ID before an fsynced, atomic no-clobber install. GitHub immutable
+Releases and provenance attestations additionally bind the tag and assets
+inside GitHub's supply-chain audit layer.
 
 For a manual audit, download `SHA256SUMS`, `zterm-release.json`, its `.sig`, the
 target archive, and `zterm-install.sh` from one exact Release. Verify the listed
@@ -106,8 +109,8 @@ stops the daemon.
 Update and uninstall are available only from an official managed Release
 binary. A source-tree, ordinary-CI, or `UNCONFIGURED` build is rejected before
 an update request reaches the network and before uninstall observes or deletes
-state. Official binaries may still be installed in any safe user-owned
-directory; the proof is about build identity, not a hard-coded path.
+state. Official binaries may still be installed in any user-selected absolute
+writable directory; the proof is about build identity, not a hard-coded path.
 
 If live Sessions would be ended, update refuses unless `--force` is explicit.
 After approval, zterm stops the daemon, atomically activates the candidate,
