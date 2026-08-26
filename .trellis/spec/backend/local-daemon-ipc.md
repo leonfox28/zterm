@@ -49,6 +49,9 @@ LocalRuntime::reset_identity(&self, expected_device_id: Option<DeviceId>, force:
 
 run_terminal(request: TerminalRequest, runtime: &LocalRuntime)
     -> Result<(), CliError>
+
+spawn_inside_runtime<T>(runtime: &tokio::runtime::Runtime, spawn: impl FnOnce() -> T)
+    -> T
 ```
 
 Unary IPC is `varint length + WireFrame + write-half EOF -> one response`.
@@ -229,6 +232,13 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
 - Detached spawn redirects stdio, uses a stable home cwd, and the child calls
   safe `setsid()` before runtime threads. It does not use `pre_exec` or unsafe
   code.
+- The detached daemon composes synchronous owners before building its
+  current-thread Tokio runtime. Every daemon-owned `tokio::spawn` performed
+  from that synchronous path must run inside this exact runtime's `enter()`
+  guard. The guard covers only task creation and is released before the
+  listener loop; subsequent `runtime.block_on` calls drive the bound tasks.
+  Production startup must never rely on an ambient runtime inherited from the
+  launcher or from a `#[tokio::test]`.
 - Local session and terminal calls use the single transport-independent
   `SessionService`; they never pair, resolve an alias, bind Iroh, or self-dial.
   `LocalAttachmentClient` is a daemon-internal/test-facing real socket adapter,
@@ -270,6 +280,7 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
 | stop cleanup or response flush fails | keep listener/socket and ownership available for status/retry |
 | fatal accept while a child remains owned | exact-token rebind under held daemon lock; resume service |
 | socket path was replaced after bind | never unlink or overwrite the replacement |
+| synchronous daemon composition calls `tokio::spawn` outside its owned runtime | invalid startup boundary; the pure runtime regression fails deterministically before release |
 
 ## 5. Good / Base / Bad Cases
 
@@ -288,6 +299,10 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   current-thread runtime on PTY work, or remove a socket by pathname without
   comparing the listener's device/inode/change-time token. It is also invalid
   to infer Active from independent resize/viewport notifications.
+- **Good:** enter the daemon-owned runtime only while spawning an async owner,
+  release the guard, then let the existing listener `block_on` drive it.
+- **Bad:** call a production spawn seam from synchronous startup merely because
+  all existing tests happen to run inside `#[tokio::test]`.
 
 ## 6. Tests Required
 
@@ -302,6 +317,11 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
 - Multi-process tests prove concurrent launch singleflight, live/stale socket
   behavior, detach, bounded stop, restart identity preservation, and no
   spontaneous post-crash restart.
+- A pure synchronous lifecycle unit builds the same current-thread runtime,
+  spawns through `spawn_inside_runtime`, and joins the task with that runtime.
+  Removing the `enter()` guard must reproduce Tokio's no-reactor failure. The
+  companion network lifecycle test injects every failure before Endpoint bind;
+  neither test may open UDP, perform DNS, or contact a Relay.
 - CLI tests own the complete help/side-effect matrix: the public tree has no
   state/identity/socket/ticket override; bare before/after setup, help/version,
   parse errors, every inspection command, daemon stop/restart, and each
@@ -364,6 +384,16 @@ let reply = spawn_blocking(move || service.dispatch(request)).await??;
 remove_socket_only_if_token_matches(socket_path, listener_token)?;
 ```
 
+```rust
+// Wrong: constructing a runtime does not make it ambient on this thread.
+let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+let supervisor = startup.spawn(handle); // tokio::spawn panics: no reactor
+
+// Correct: bind task creation to the owned runtime, then release the guard.
+let supervisor = spawn_inside_runtime(&runtime, || startup.spawn(handle));
+runtime.block_on(serve_local(...))?;
+```
+
 The duplex branch retains the same decoder leftovers and uses bounded control
 state plus latest-only watches instead of a per-revision queue.
 
@@ -379,6 +409,8 @@ phase when their synchronization can race input.
   the CLI or remote adapter.
 - Calling a blocking `SessionService`/PTY operation inline on the current-thread
   Tokio runtime.
+- Calling `tokio::spawn` from synchronous daemon startup outside the exact
+  daemon-owned runtime's `enter()` guard.
 - Removing or rebinding a socket without the held daemon lock and exact
   device/inode/change-time ownership token.
 - Reporting successful stop before every registry-owned child/thread/reservation

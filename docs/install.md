@@ -6,31 +6,35 @@ x86_64 GNU/Linux with glibc 2.28 or newer. Windows, Alpine/musl, and NixOS are
 not supported by this installer. Package-manager channels and background
 updates are intentionally absent.
 
-The repository currently contains an explicit `UNCONFIGURED` release-public-key
-placeholder. Installer signature verification and `zterm update` fail closed
-until the external release-key checkpoint is completed and the reviewed public
-key is committed. Existing Relay-era Releases are not native zterm installers.
-
 ## Install
 
-The review-first path is:
+The normal path installs the latest stable native Release through one fixed
+bootstrap URL:
 
 ```bash
-curl --proto '=https' --tlsv1.2 --fail --location \
+curl -fsSL https://raw.githubusercontent.com/leonfox28/zterm/main/install/install.sh | sh
+```
+
+To inspect the bootstrap before running it, use the optional review-first path:
+
+```bash
+curl -fsSL \
   --output /tmp/zterm-install.sh \
   https://raw.githubusercontent.com/leonfox28/zterm/main/install/install.sh
 less /tmp/zterm-install.sh
 sh /tmp/zterm-install.sh
 ```
 
-After a formal native Release exists, the shorter disclosed-bootstrap path is:
+Select one exact stable or prerelease tag, or another user-owned destination:
 
 ```bash
-curl --proto '=https' --tlsv1.2 --fail --location \
-  https://raw.githubusercontent.com/leonfox28/zterm/main/install/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/leonfox28/zterm/main/install/install.sh \
+  | sh -s -- --version vX.Y.Z
+curl -fsSL https://raw.githubusercontent.com/leonfox28/zterm/main/install/install.sh \
+  | sh -s -- --install-dir "$HOME/bin"
 ```
 
-Select one exact stable or prerelease tag, or another user-owned destination:
+The downloaded review-first script accepts the same options:
 
 ```bash
 sh /tmp/zterm-install.sh --version vX.Y.Z

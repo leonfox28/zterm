@@ -216,3 +216,40 @@ context validation, and `git diff --check`. It intentionally did not execute
 real Iroh/Endpoint/UDP/DNS tests or mutate GitHub settings, keys, tags,
 environments, workflows, or Releases. Signed four-target hosted evidence
 remains the exact-main-CI then human-tag checkpoint above.
+
+## Published v0.1.5 evidence and formal-install finding (2026-08-26)
+
+- Exact-main CI run `32845499734` passed all 12 jobs at commit
+  `4f7ed091038b5965bf77a32e98451373eb242a1f`.
+- The immutable `v0.1.5` tag triggered formal release run `32846644770`; all
+  12 jobs passed, including four native builds, protected signing, all four
+  hosted HTTPS installer jobs, signed round-trip verification, publication,
+  and attestations. Release API record `376385174` reports `draft=false`,
+  `prerelease=false`, and `immutable=true`.
+- The published manifest uses key ID `zterm-release-ed25519-v1`. Its four
+  archive SHA-256 values, confirmed against the public Release API assets, are:
+  `e70fa7ab6be7ea934191239c91bcf7102ab80f9b549ee9c2a9da7f39ba0fd7eb`
+  (`aarch64-apple-darwin`),
+  `c99803f71c403665675bfa5edc440a5218d3a9fdcdc9aa4ddf6b1b55be07e75e`
+  (`x86_64-apple-darwin`),
+  `456e55b2f87451624d4c873ebb9f4accd7bef8f4a47a447908b78874a00c7d91`
+  (`aarch64-unknown-linux-gnu`), and
+  `6d27eca4c38197eba5ef3329da3f659fd858845bcd6701a948d9febd1d4e8c70`
+  (`x86_64-unknown-linux-gnu`). No signing secret was read or recorded.
+- The user's first formal `v0.1.5` installation succeeded. `zterm setup
+  --name my-mac` committed configuration and identity, then the detached daemon
+  exited with status 101 before readiness. Post-failure observation was
+  `configured_stopped`, zero Sessions, and a network Endpoint that had never
+  bound.
+- The daemon log identified one exact panic at
+  `crates/daemon/src/network.rs:533`: `tokio::spawn(self.run())` ran with
+  `there is no reactor running`. `run_owned_daemon_listener` had built its
+  current-thread runtime but called `startup.spawn(handle)` outside
+  `runtime.block_on` or `runtime.enter`.
+- The minimum repair enters that owned runtime only while spawning the network
+  supervisor. A pure current-thread Tokio regression reproduces the boundary
+  without constructing or binding an Endpoint; the existing injected pre-bind
+  network lifecycle test remains the no-UDP/DNS companion evidence.
+- `v0.1.5` remains immutable and is never moved or reused. The repaired
+  lockstep candidate advances to `v0.1.6`. Formal configured update/uninstall,
+  reinstall identity rotation, and final user acceptance remain pending.

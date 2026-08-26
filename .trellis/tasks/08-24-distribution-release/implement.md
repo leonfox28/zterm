@@ -18,8 +18,8 @@ Focused gate: release-contract units, fixture verification, secret/debug scan, p
 
 ## Step 2: Native CI and exact-tag release workflow
 
-- [ ] Build four native artifacts with fixed inventory/timestamps/modes and embed exact build identity.
-- [ ] Build Linux artifacts in pinned glibc 2.28 containers and inspect ELF symbol versions; build both macOS architectures on native hosted runners.
+- [x] Build four native artifacts with fixed inventory/timestamps/modes and embed exact build identity.
+- [x] Build Linux artifacts in pinned glibc 2.28 containers and inspect ELF symbol versions; build both macOS architectures on native hosted runners.
 - [x] Generate checksums, signed manifest, versioned installer, SBOM, and provenance attestations from one asset inventory.
 - [x] Add four `main`-push-only release-mode CI builds in the native macOS and
   glibc 2.28 Linux environments while retaining Windows shared-boundary CI.
@@ -60,17 +60,17 @@ Focused gate: CLI side-effect tests, local daemon lifecycle tests, activation fa
 
 - [x] Document reviewed-script, one-line, exact-version, manual checksum/signature, update, rollback, uninstall, PATH, support floor, bootstrap trust, key rotation, and emergency recovery paths.
 - [x] Update README/help/specs only where behavior is directly implemented; keep M10 real-network and user acceptance pending.
-- [ ] Run the comprehensive main CI, then push the human-reviewed exact tag and
+- [x] Run the comprehensive main CI, then push the human-reviewed exact tag and
   retain the protected signed/published workflow evidence. Do not push the tag
   until all local M9 checks and an independent checker pass.
-- [ ] Run the final hosted workspace/platform/release gate, then independent `trellis-check`; fix only concrete findings.
+- [x] Run the final hosted workspace/platform/release gate, then independent `trellis-check`; fix only concrete findings.
 
 ## Step 6: M9 completion handoff
 
-- [ ] Save exact commit, green main CI run, tag-triggered release run, four
+- [x] Save exact commit, green main CI run, tag-triggered release run, four
   artifact digests, manifest/public-key ID, signed round-trip, attestation,
   immutable Release, and installer matrix evidence.
-- [ ] Create/push the exact formal-candidate tag required by M10 only after the
+- [x] Create/push the exact formal-candidate tag required by M10 only after the
   approved release checkpoint; the workflow publishes it automatically.
 - [x] Update parent M9 evidence without marking M10 or first-stage completion.
 

@@ -391,7 +391,9 @@ fn run_owned_daemon_listener(
                 format!("unable to build daemon runtime: {error}"),
             )
         })?;
-    let mut network = network.map(|(startup, handle)| startup.spawn(handle));
+    let mut network = spawn_inside_runtime(&runtime, || {
+        network.map(|(startup, handle)| startup.spawn(handle))
+    });
     loop {
         let server_result = runtime.block_on(crate::local_ipc::serve_local_with_limits(
             listener,
@@ -490,6 +492,12 @@ fn run_owned_daemon_listener(
             }
         }
     }
+}
+
+#[cfg(unix)]
+fn spawn_inside_runtime<T>(runtime: &tokio::runtime::Runtime, spawn: impl FnOnce() -> T) -> T {
+    let _runtime_guard = runtime.enter();
+    spawn()
 }
 
 /// Runs the exact owned-listener recovery loop with deterministic limits.
@@ -625,4 +633,20 @@ fn unsupported() -> DaemonError {
         DomainErrorKind::UnsupportedPlatform,
         "local daemon lifecycle is Unix-only in the current milestone",
     )
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::spawn_inside_runtime;
+
+    #[test]
+    fn daemon_owned_tasks_spawn_inside_their_runtime() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread daemon runtime");
+        let task = spawn_inside_runtime(&runtime, || tokio::spawn(async { 17_u8 }));
+
+        assert_eq!(runtime.block_on(task).expect("spawned task joins"), 17);
+    }
 }

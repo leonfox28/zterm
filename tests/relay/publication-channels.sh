@@ -64,12 +64,12 @@ write_workspace_fixture() {
 stable_output="$test_dir/stable"
 EVENT_NAME=release \
 GITHUB_REPOSITORY_OWNER=LeonFox28 \
-RELEASE_TAG=v0.1.5 \
+RELEASE_TAG=v0.1.6 \
 RELEASE_PRERELEASE=false \
 GITHUB_OUTPUT="$stable_output" \
     sh "$resolver"
 assert_output "$stable_output" 'image=ghcr.io/leonfox28/zterm-relay'
-assert_output "$stable_output" 'version=v0.1.5'
+assert_output "$stable_output" 'version=v0.1.6'
 assert_output "$stable_output" 'publish_latest=true'
 assert_output_count "$stable_output" 3
 
@@ -100,9 +100,9 @@ assert_output "$manual_output" 'publish_latest=false'
 assert_output_count "$manual_output" 3
 
 assert_rejected version-mismatch \
-    'release tag v0.1.6 does not match workspace tag v0.1.5' \
+    'release tag v0.1.7 does not match workspace tag v0.1.6' \
     EVENT_NAME=release GITHUB_REPOSITORY_OWNER=leonfox28 \
-    RELEASE_TAG=v0.1.6 RELEASE_PRERELEASE=false
+    RELEASE_TAG=v0.1.7 RELEASE_PRERELEASE=false
 
 assert_rejected invalid-manual-tag \
     'version is not a valid OCI image tag' \
