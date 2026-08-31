@@ -6,7 +6,7 @@
 {"file":".trellis/spec/backend/relay-deployment.md","reason":"Separates official-n0, optional self-hosted Relay, deployment, and evidence boundaries."}
 {"file":".trellis/spec/backend/quality-guidelines.md","reason":"Defines full release/platform/security/documentation gates."}
 {"file":".trellis/spec/guides/evidence-driven-simplicity.md","reason":"Prevents duplicated daemon harnesses, overclaim, excessive stress, and unbounded verification."}
-{"file":".trellis/tasks/08-23-remote-cli/research/current-boundary.md","reason":"Maps the unique SessionService, broker, remote adapter, reconnect bridge, and CLI ownership seams."}
-{"file":".trellis/tasks/08-23-remote-cli/research/execution-retrospective.md","reason":"Binding limits for hosted evidence, worker count, checks, flakes, and provider/billing safety."}
+{"file":".trellis/tasks/archive/2026-08/08-23-remote-cli/research/current-boundary.md","reason":"Maps the unique SessionService, broker, remote adapter, reconnect bridge, and CLI ownership seams."}
+{"file":".trellis/tasks/archive/2026-08/08-23-remote-cli/research/execution-retrospective.md","reason":"Binding limits for hosted evidence, worker count, checks, flakes, and provider/billing safety."}
 {"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/terminal-reconnect-state.md","reason":"Provides the approved reconnect/snapshot/input-drop state semantics."}
 {"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/cloud-trust-boundary.md","reason":"Owns E2EE, metadata, Relay, address discovery, and cloud non-ownership claims."}

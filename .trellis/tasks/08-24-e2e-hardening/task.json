@@ -3,7 +3,7 @@
   "name": "e2e-hardening",
   "title": "Complete Phase 1 end-to-end release acceptance",
   "description": "完成第一阶段 M10：真实网络、正式安装产物、跨平台端到端、安全与发布验收。",
-  "status": "planning",
+  "status": "in_progress",
   "dev_type": null,
   "scope": null,
   "package": null,
@@ -21,6 +21,6 @@
   "children": [],
   "parent": "08-20-cross-platform-relay-terminal-mvp",
   "relatedFiles": [],
-  "notes": "",
+  "notes": "2026-08-31 physical official-n0 Direct accepted on cellular macOS -> Debian behind RouterOS IPv4 NAT after removing OpenClash Fake-IP interception for iroh.link and bypassing endpoint UDP. Both peers reported direct=1, relay=0 with an active stream and terminal interaction. Initial attachment returned operation_outcome_unknown three times before succeeding; defer and reproduce/fix separately. The temporary RouterOS ein-dnat accept rule remained at zero packets after success, did not participate, and was removed.",
   "meta": {}
 }

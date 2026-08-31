@@ -38,6 +38,8 @@ tokio = { workspace = true, features = ["test-util"] }
 nix = { workspace = true, features = ["signal", "term"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
+iroh = { workspace = true, features = ["unstable-net-report"] }
+iroh-relay.workspace = true
 patchbay.workspace = true
 
 [[test]]

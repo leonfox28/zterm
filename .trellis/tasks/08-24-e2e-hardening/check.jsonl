@@ -8,5 +8,5 @@
 {"file":".trellis/spec/backend/quality-guidelines.md","reason":"Run full workspace/platform/dependency/docs/source/secret/release acceptance."}
 {"file":".trellis/spec/guides/cross-platform-thinking-guide.md","reason":"Require native platform execution and precise compile-only versus runtime claims."}
 {"file":".trellis/spec/guides/evidence-driven-simplicity.md","reason":"Check every new harness/gate has one current claim and enforce stop/time/delegation budgets."}
-{"file":".trellis/tasks/08-23-remote-cli/research/execution-retrospective.md","reason":"Ensure deleted redundant infrastructure and provider/billing mistakes are not reintroduced."}
+{"file":".trellis/tasks/archive/2026-08/08-23-remote-cli/research/execution-retrospective.md","reason":"Ensure deleted redundant infrastructure and provider/billing mistakes are not reintroduced."}
 {"file":".trellis/tasks/08-20-cross-platform-relay-terminal-mvp/research/cloud-trust-boundary.md","reason":"Audit E2EE and cloud/Relay metadata claims against the approved trust model."}

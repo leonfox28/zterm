@@ -8,7 +8,7 @@ use std::{
     io::ErrorKind,
     net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs},
     process::Command,
-    sync::mpsc,
+    sync::{Arc, mpsc},
     time::Duration,
     time::Instant,
 };
@@ -16,12 +16,22 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use futures_util::StreamExt;
 use iroh::{
-    Endpoint, EndpointAddr, SecretKey, TransportAddr,
-    endpoint::{Connection, PathEvent},
+    Endpoint, EndpointAddr, RelayConfig, RelayMap, RelayMode, SecretKey, TransportAddr, Watcher,
+    address_lookup::AddrFilter,
+    endpoint::{Connection, PathEvent, presets},
+    tls::CaTlsConfig,
+    unstable_net_report::NetReport,
+};
+use iroh_relay::{
+    RelayQuicConfig,
+    server::{
+        AllowAll, CertConfig, QuicConfig, RelayConfig as RelayServerConfig, Server, ServerConfig,
+        TlsConfig, testing::self_signed_tls_certs_and_config,
+    },
 };
 use patchbay::{Device, Lab, Nat};
 use tokio::{sync::oneshot, task::JoinHandle, time::timeout};
-use zterm_daemon::transport::{InfrastructureProfile, ZTERM_ALPN};
+use zterm_daemon::transport::{InfrastructureProfile, ZTERM_ALPN, ZTERM_PAIR_ALPN};
 
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -34,6 +44,10 @@ const RAW_CONTROL_PORT_A: u16 = 42_101;
 const RAW_CONTROL_PORT_B: u16 = 42_102;
 const REFLECTOR_PORT: u16 = 43_101;
 const RAW_CONTROL_TIMEOUT: Duration = Duration::from_secs(8);
+const NET_REPORT_TIMEOUT: Duration = Duration::from_secs(30);
+const CONTROLLED_RELAY_START_TIMEOUT: Duration = Duration::from_secs(15);
+const CONTROLLED_RELAY_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+const CONTROLLED_RELAY_HOST: &str = "relay.test";
 const RELAY_IPV4_OVERRIDES_ENV: &str = "ZTERM_GATE_RELAY_IPV4_OVERRIDES";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,6 +55,7 @@ enum GateCase {
     Product,
     ConfigCandidate,
     RelayFallback,
+    ControlledQad,
 }
 
 impl GateCase {
@@ -49,6 +64,7 @@ impl GateCase {
             Self::Product => "A",
             Self::ConfigCandidate => "B",
             Self::RelayFallback => "C",
+            Self::ControlledQad => "D",
         }
     }
 
@@ -57,6 +73,7 @@ impl GateCase {
             Self::Product => 0,
             Self::ConfigCandidate => 1,
             Self::RelayFallback => 2,
+            Self::ControlledQad => 3,
         }
     }
 
@@ -64,8 +81,19 @@ impl GateCase {
         match self {
             Self::Product | Self::ConfigCandidate => Duration::from_secs(15),
             Self::RelayFallback => Duration::from_secs(5),
+            Self::ControlledQad => Duration::from_secs(15),
         }
     }
+
+    fn uses_official_relays(self) -> bool {
+        self != Self::ControlledQad
+    }
+}
+
+#[derive(Clone)]
+enum GateRelayProfile {
+    Official,
+    Controlled(RelayMap),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,7 +122,18 @@ impl fmt::Display for PathKind {
 #[derive(Clone, Debug)]
 struct EndpointEvidence {
     relay_urls: Vec<String>,
-    candidate_sources: Vec<&'static str>,
+    candidate_sources: BTreeMap<&'static str, usize>,
+    candidate_count: usize,
+    net_report: NetReportEvidence,
+}
+
+#[derive(Clone, Debug, Default)]
+struct NetReportEvidence {
+    udp_v4: bool,
+    udp_v6: bool,
+    global_v4_present: bool,
+    global_v6_present: bool,
+    mapping_varies_by_destination: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -131,6 +170,12 @@ struct CaseOutcome {
     non_dns_udp_blocked: bool,
 }
 
+struct ControlledRelay {
+    map: RelayMap,
+    shutdown: oneshot::Sender<()>,
+    task: JoinHandle<Result<()>>,
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires the disposable privileged Colima network Gate container"]
 async fn double_nat_public_relay_gate() -> Result<()> {
@@ -141,23 +186,30 @@ async fn double_nat_public_relay_gate() -> Result<()> {
     let case_a = run_case(GateCase::Product, &relays).await;
     let case_b = run_case(GateCase::ConfigCandidate, &relays).await;
     let case_c = run_case(GateCase::RelayFallback, &relays).await;
+    let case_d = run_case(GateCase::ControlledQad, &relays).await;
 
     print_case_result(GateCase::Product, &case_a);
     print_case_result(GateCase::ConfigCandidate, &case_b);
     print_case_result(GateCase::RelayFallback, &case_c);
+    print_case_result(GateCase::ControlledQad, &case_d);
 
     let case_a = case_a.context("Case A product profile failed to complete")?;
     let case_b = case_b.context("Case B configured-candidate control failed to complete")?;
     let case_c = case_c.context("Case C Relay fallback failed to complete")?;
+    let case_d = case_d.context("Case D controlled QAD discovery failed to complete")?;
 
-    ensure_relay_contract(&case_a, &relays)?;
-    ensure_relay_contract(&case_b, &relays)?;
-    ensure_relay_contract(&case_c, &relays)?;
-    match classify_network_gate(&case_a, &case_b, &case_c)? {
+    ensure_relay_contract(GateCase::Product, &case_a, &relays)?;
+    ensure_relay_contract(GateCase::ConfigCandidate, &case_b, &relays)?;
+    ensure_relay_contract(GateCase::RelayFallback, &case_c, &relays)?;
+    ensure_relay_contract(GateCase::ControlledQad, &case_d, &relays)?;
+    match classify_network_gate(&case_a, &case_b, &case_c, &case_d)? {
         NetworkGateVerdict::Go => println!("NETWORK_GATE=GO"),
-        NetworkGateVerdict::GoWithDeferredAddressDiscovery => println!(
-            "NETWORK_GATE=GO_WITH_DEFERRED_ADDRESS_DISCOVERY: Case A stayed relayed in the nested Colima/Patchbay/TUN lab; Case B became direct; Case C official WSS/TCP Relay fallback passed; real two-network automatic discovery is deferred to parent M10"
-        ),
+        NetworkGateVerdict::GoWithDeferredAddressDiscovery => {
+            println!("{}", deferred_product_diagnostic(&case_a));
+            println!(
+                "NETWORK_GATE=GO_WITH_DEFERRED_ADDRESS_DISCOVERY: Case A official-n0 stayed relayed; Case B injected-candidate direct, Case C official WSS/TCP Relay fallback, and Case D controlled-QAD automatic direct all passed; real two-network official-n0 discovery remains a separate M10 acceptance item"
+            );
+        }
     }
     Ok(())
 }
@@ -166,6 +218,7 @@ fn classify_network_gate(
     case_a: &CaseOutcome,
     case_b: &CaseOutcome,
     case_c: &CaseOutcome,
+    case_d: &CaseOutcome,
 ) -> Result<NetworkGateVerdict> {
     ensure!(
         case_b.raw_udp_control
@@ -178,6 +231,13 @@ fn classify_network_gate(
             && !case_c.client.path.direct_selected
             && case_c.client.path.final_selected == PathKind::Relay,
         "NETWORK_GATE=NO_GO_RELAY: Case C did not prove WSS/TCP Relay fallback while non-DNS UDP was blocked"
+    );
+    ensure!(
+        endpoint_has_qad_v4(&case_d.server)
+            && endpoint_has_qad_v4(&case_d.client.endpoint)
+            && case_d.client.path.direct_selected
+            && case_d.client.path.final_selected == PathKind::Direct,
+        "NETWORK_GATE=NO_GO_CONTROLLED_QAD: Case D did not discover redacted global-v4 candidates through its controlled QAD server and retain an automatic direct path"
     );
 
     match (
@@ -192,6 +252,34 @@ fn classify_network_gate(
     }
 }
 
+fn endpoint_has_qad_v4(evidence: &EndpointEvidence) -> bool {
+    evidence.net_report.udp_v4
+        && evidence.net_report.global_v4_present
+        && evidence
+            .candidate_sources
+            .get("NetReportGlobalMatch")
+            .is_some_and(|count| *count > 0)
+}
+
+fn deferred_product_diagnostic(case_a: &CaseOutcome) -> &'static str {
+    if endpoint_has_qad_v4(&case_a.server) && endpoint_has_qad_v4(&case_a.client.endpoint) {
+        if case_a.server.net_report.mapping_varies_by_destination == Some(true)
+            || case_a
+                .client
+                .endpoint
+                .net_report
+                .mapping_varies_by_destination
+                == Some(true)
+        {
+            "OFFICIAL_N0_DIAGNOSTIC=QAD_GLOBAL_V4_PRESENT_MAPPING_VARIES_BY_DEST: official QAD discovery completed on both endpoints, but at least one outer mapping varied by QAD destination; the shared outer Colima/TUN NAT and its hairpin behavior remain lab-specific blockers"
+        } else {
+            "OFFICIAL_N0_DIAGNOSTIC=QAD_GLOBAL_V4_PRESENT_BUT_DIRECT_NOT_SELECTED: official QAD discovery completed on both endpoints; the shared outer Colima/TUN NAT and its hairpin behavior remain lab-specific blockers"
+        }
+    } else {
+        "OFFICIAL_N0_DIAGNOSTIC=QAD_GLOBAL_V4_MISSING: controlled inner QAD succeeded, while at least one official-n0 endpoint did not expose QAD/global-v4 evidence; investigate official UDP/QAD public-egress reachability"
+    }
+}
+
 async fn run_case(case: GateCase, relays: &[ResolvedRelay]) -> Result<CaseOutcome> {
     let lab = Lab::builder()
         .allow_real_root()
@@ -199,13 +287,29 @@ async fn run_case(case: GateCase, relays: &[ResolvedRelay]) -> Result<CaseOutcom
         .build()
         .await
         .with_context(|| format!("create Patchbay lab for Case {}", case.label()))?;
-    let _public_egress = configure_public_egress(&lab, case.index())?;
+    let _public_egress = if case.uses_official_relays() {
+        Some(configure_public_egress(&lab, case.index())?)
+    } else {
+        None
+    };
 
     let dns = lab.dns_server().context("start Patchbay DNS")?;
-    for relay in relays {
-        dns.set_host(&relay.host, IpAddr::V4(relay.ipv4))
-            .with_context(|| format!("install pre-resolved A record for {}", relay.host))?;
+    if case.uses_official_relays() {
+        for relay in relays {
+            dns.set_host(&relay.host, IpAddr::V4(relay.ipv4))
+                .with_context(|| format!("install pre-resolved A record for {}", relay.host))?;
+        }
     }
+    let controlled_relay = if case == GateCase::ControlledQad {
+        Some(spawn_controlled_relay(&lab).await?)
+    } else {
+        None
+    };
+    let relay_profile = controlled_relay
+        .as_ref()
+        .map_or(GateRelayProfile::Official, |relay| {
+            GateRelayProfile::Controlled(relay.map.clone())
+        });
 
     let nat_a = lab
         .add_router("nat-a")
@@ -282,11 +386,14 @@ async fn run_case(case: GateCase, relays: &[ResolvedRelay]) -> Result<CaseOutcom
 
     let (advert_tx, advert_rx) = oneshot::channel();
     let (done_tx, done_rx) = oneshot::channel();
-    let server =
-        endpoint_a.spawn(move |_device| server_task(bind_a, external_a, advert_tx, done_rx))?;
+    let server_profile = relay_profile.clone();
+    let server = endpoint_a.spawn(move |_device| {
+        server_task(server_profile, bind_a, external_a, advert_tx, done_rx)
+    })?;
     let observation_timeout = case.observation_timeout();
     let client = endpoint_b.spawn(move |_device| {
         client_task(
+            relay_profile,
             bind_b,
             external_b,
             advert_rx,
@@ -296,19 +403,116 @@ async fn run_case(case: GateCase, relays: &[ResolvedRelay]) -> Result<CaseOutcom
         )
     })?;
 
-    let (server, client) = timeout(CASE_TIMEOUT, async {
+    let endpoints_result = match timeout(CASE_TIMEOUT, async {
         tokio::try_join!(join_device_task(server), join_device_task(client))
     })
     .await
-    .with_context(|| format!("Case {} exceeded {CASE_TIMEOUT:?}", case.label()))??;
+    {
+        Ok(result) => result,
+        Err(error) => Err(anyhow!(error))
+            .with_context(|| format!("Case {} exceeded {CASE_TIMEOUT:?}", case.label())),
+    };
+    let relay_shutdown_result = match controlled_relay {
+        Some(relay) => relay.shutdown().await,
+        None => Ok(()),
+    };
 
     drop(lab);
+    let (server, client) = endpoints_result?;
+    relay_shutdown_result.context("stop controlled Relay/QAD fixture")?;
     Ok(CaseOutcome {
         server,
         client,
         raw_udp_control,
         non_dns_udp_blocked,
     })
+}
+
+async fn spawn_controlled_relay(lab: &Lab) -> Result<ControlledRelay> {
+    let relay_router = lab
+        .add_router("controlled-relay-router")
+        .build()
+        .await
+        .context("build controlled Relay router")?;
+    let relay_device = lab
+        .add_device("controlled-relay")
+        .uplink(relay_router.id())
+        .build()
+        .await
+        .context("build controlled Relay device")?;
+    let relay_ipv4 = relay_device
+        .ip()
+        .context("controlled Relay device has no IPv4 address")?;
+    lab.dns_server()
+        .context("open Patchbay DNS for controlled Relay")?
+        .set_host(CONTROLLED_RELAY_HOST, IpAddr::V4(relay_ipv4))
+        .context("register redacted controlled Relay hostname")?;
+
+    let (map_tx, map_rx) = oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = relay_device.spawn(move |_device| async move {
+        let server = spawn_controlled_relay_server()
+            .await
+            .context("spawn controlled Relay/QAD server")?;
+        let https_port = server
+            .https_addr()
+            .context("controlled Relay has no HTTPS listener")?
+            .port();
+        let qad_port = server
+            .quic_addr()
+            .context("controlled Relay has no QAD listener")?
+            .port();
+        let relay_url = format!("https://{CONTROLLED_RELAY_HOST}:{https_port}")
+            .parse()
+            .context("construct controlled Relay URL")?;
+        let map = RelayConfig::new(relay_url, Some(RelayQuicConfig::new(qad_port))).into();
+        map_tx
+            .send(map)
+            .map_err(|_| anyhow!("network Gate stopped before controlled Relay startup"))?;
+
+        let _ = shutdown_rx.await;
+        timeout(CONTROLLED_RELAY_STOP_TIMEOUT, server.shutdown())
+            .await
+            .context("controlled Relay graceful shutdown timed out")?
+            .context("controlled Relay graceful shutdown failed")
+    })?;
+    let map = timeout(CONTROLLED_RELAY_START_TIMEOUT, map_rx)
+        .await
+        .context("controlled Relay startup timed out")?
+        .context("controlled Relay task exited during startup")?;
+    Ok(ControlledRelay {
+        map,
+        shutdown: shutdown_tx,
+        task,
+    })
+}
+
+async fn spawn_controlled_relay_server() -> Result<Server> {
+    let (_certificates, server_config) = self_signed_tls_certs_and_config();
+    let tls = TlsConfig::new(
+        (Ipv4Addr::UNSPECIFIED, 0),
+        CertConfig::Manual { server_config },
+    );
+    let mut relay = RelayServerConfig::new((Ipv4Addr::UNSPECIFIED, 0));
+    relay.tls = Some(tls);
+    relay.key_cache_capacity = Some(1024);
+    relay.access = Arc::new(AllowAll);
+
+    let mut config = ServerConfig::default();
+    config.relay = Some(relay);
+    config.quic = Some(QuicConfig::new((Ipv4Addr::UNSPECIFIED, 0)));
+    Server::spawn(config).await.map_err(anyhow::Error::from)
+}
+
+impl ControlledRelay {
+    async fn shutdown(self) -> Result<()> {
+        let Self { shutdown, task, .. } = self;
+        let _ = shutdown.send(());
+        timeout(CONTROLLED_RELAY_STOP_TIMEOUT, join_device_task(task))
+            .await
+            .context("controlled Relay task shutdown timed out")??;
+        Ok(())
+    }
 }
 
 fn verify_raw_udp_holepunch(
@@ -422,14 +626,14 @@ fn reflected_addr(socket: &std::net::UdpSocket, reflector: SocketAddr) -> Result
 }
 
 async fn server_task(
+    relay_profile: GateRelayProfile,
     bind_port: Option<u16>,
     external_addr: Option<SocketAddr>,
     advert_tx: oneshot::Sender<ServerAdvert>,
     done_rx: oneshot::Receiver<()>,
 ) -> Result<EndpointEvidence> {
-    let endpoint = bind_endpoint(bind_port, external_addr).await?;
-    let addr = endpoint.addr();
-    let evidence = endpoint_evidence(&addr, external_addr);
+    let endpoint = bind_endpoint(relay_profile, bind_port, external_addr).await?;
+    let (addr, evidence) = endpoint_evidence(&endpoint, external_addr).await?;
     let dial_addr = EndpointAddr::from_parts(
         addr.id,
         addr.addrs.into_iter().filter(|addr| {
@@ -477,6 +681,7 @@ async fn server_task(
 }
 
 async fn client_task(
+    relay_profile: GateRelayProfile,
     bind_port: Option<u16>,
     external_addr: Option<SocketAddr>,
     advert_rx: oneshot::Receiver<ServerAdvert>,
@@ -484,8 +689,8 @@ async fn client_task(
     observation_timeout: Duration,
     case_label: &'static str,
 ) -> Result<ClientEvidence> {
-    let endpoint = bind_endpoint(bind_port, external_addr).await?;
-    let evidence = endpoint_evidence(&endpoint.addr(), external_addr);
+    let endpoint = bind_endpoint(relay_profile, bind_port, external_addr).await?;
+    let (_, evidence) = endpoint_evidence(&endpoint, external_addr).await?;
     let advert = timeout(STREAM_TIMEOUT, advert_rx)
         .await
         .context("client address exchange timed out")?
@@ -518,11 +723,20 @@ async fn client_task(
 }
 
 async fn bind_endpoint(
+    relay_profile: GateRelayProfile,
     bind_port: Option<u16>,
     external_addr: Option<SocketAddr>,
 ) -> Result<Endpoint> {
-    let profile = InfrastructureProfile::zterm();
-    let mut builder = profile.endpoint_builder(SecretKey::generate());
+    let secret_key = SecretKey::generate();
+    let mut builder = match relay_profile {
+        GateRelayProfile::Official => InfrastructureProfile::zterm().endpoint_builder(secret_key),
+        GateRelayProfile::Controlled(relay_map) => Endpoint::builder(presets::Minimal)
+            .secret_key(secret_key)
+            .relay_mode(RelayMode::Custom(relay_map))
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .addr_filter(AddrFilter::relay_only())
+            .alpns(vec![ZTERM_ALPN.to_vec(), ZTERM_PAIR_ALPN.to_vec()]),
+    };
     if let Some(port) = bind_port {
         builder = builder
             .bind_addr(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port))
@@ -546,31 +760,59 @@ async fn bind_endpoint(
     }
     timeout(ONLINE_TIMEOUT, endpoint.online())
         .await
-        .context("endpoint did not connect to an official production Relay")?;
+        .context("endpoint did not connect to its configured Relay")?;
     Ok(endpoint)
 }
 
-fn endpoint_evidence(
-    addr: &EndpointAddr,
+async fn endpoint_evidence(
+    endpoint: &Endpoint,
     configured_external: Option<SocketAddr>,
-) -> EndpointEvidence {
+) -> Result<(EndpointAddr, EndpointEvidence)> {
+    let mut net_reports = endpoint.net_report();
+    let report = timeout(NET_REPORT_TIMEOUT, net_reports.initialized())
+        .await
+        .context("Iroh net-report evidence timed out")?;
+    let addr = endpoint.addr();
     let relay_urls = addr.relay_urls().map(ToString::to_string).collect();
-    let candidate_sources = addr
-        .ip_addrs()
-        .map(|candidate| {
-            if configured_external == Some(*candidate) {
-                "Config"
-            } else {
-                // EndpointAddr intentionally omits Iroh's internal
-                // DirectAddrType, so QAD/port-mapped/local cannot be
-                // distinguished at this public boundary.
-                "Unclassified"
-            }
-        })
-        .collect();
-    EndpointEvidence {
+    let candidates = addr.ip_addrs().copied().collect::<Vec<_>>();
+    let mut candidate_sources = BTreeMap::new();
+    for candidate in &candidates {
+        let source = candidate_source(*candidate, configured_external, &report);
+        *candidate_sources.entry(source).or_insert(0) += 1;
+    }
+    let evidence = EndpointEvidence {
         relay_urls,
+        candidate_count: candidates.len(),
         candidate_sources,
+        net_report: NetReportEvidence {
+            udp_v4: report.udp_v4,
+            udp_v6: report.udp_v6,
+            global_v4_present: report.global_v4.is_some(),
+            global_v6_present: report.global_v6.is_some(),
+            mapping_varies_by_destination: report.mapping_varies_by_dest(),
+        },
+    };
+    Ok((addr, evidence))
+}
+
+fn candidate_source(
+    candidate: SocketAddr,
+    configured_external: Option<SocketAddr>,
+    report: &NetReport,
+) -> &'static str {
+    if configured_external == Some(candidate) {
+        "Config"
+    } else if report.global_v4.map(SocketAddr::V4) == Some(candidate)
+        || report.global_v6.map(SocketAddr::V6) == Some(candidate)
+    {
+        // Equality proves that QAD observed this address, not the erased
+        // DirectAddrType: a port-mapped address may have the same value.
+        "NetReportGlobalMatch"
+    } else {
+        // EndpointAddr is intentionally source-erased at Iroh's public API.
+        // This bucket can include local, port-mapped, or QAD-derived variants;
+        // the Gate never prints the address to guess more than the API proves.
+        "PublicApiUnclassified"
     }
 }
 
@@ -914,7 +1156,11 @@ fn relay_ipv4_overrides() -> Result<BTreeMap<String, Ipv4Addr>> {
     )
 }
 
-fn ensure_relay_contract(outcome: &CaseOutcome, relays: &[ResolvedRelay]) -> Result<()> {
+fn ensure_relay_contract(
+    case: GateCase,
+    outcome: &CaseOutcome,
+    relays: &[ResolvedRelay],
+) -> Result<()> {
     let official_urls = InfrastructureProfile::zterm()
         .summary()
         .relays
@@ -925,23 +1171,35 @@ fn ensure_relay_contract(outcome: &CaseOutcome, relays: &[ResolvedRelay]) -> Res
         outcome.server.relay_urls.len() == 1 && outcome.client.endpoint.relay_urls.len() == 1,
         "each endpoint must expose exactly one home Relay"
     );
-    ensure!(
-        relays.len() == official_urls.len()
-            && outcome
+    if case.uses_official_relays() {
+        ensure!(
+            relays.len() == official_urls.len()
+                && outcome
+                    .server
+                    .relay_urls
+                    .iter()
+                    .chain(&outcome.client.endpoint.relay_urls)
+                    .all(|url| official_urls.contains(url)),
+            "each endpoint home Relay must belong to the official n0 production map"
+        );
+    } else {
+        ensure!(
+            outcome
                 .server
                 .relay_urls
                 .iter()
                 .chain(&outcome.client.endpoint.relay_urls)
-                .all(|url| official_urls.contains(url)),
-        "each endpoint home Relay must belong to the official n0 production map"
-    );
+                .all(|url| url.starts_with(&format!("https://{CONTROLLED_RELAY_HOST}:"))),
+            "Case D endpoints must use only the controlled Relay hostname"
+        );
+    }
     ensure!(
         outcome.client.stream_count == STREAM_COUNT,
         "each Case must verify {STREAM_COUNT} independent bidi streams"
     );
     ensure!(
         outcome.client.path.initial == PathKind::Relay,
-        "the Iroh connection must begin on an official production Relay"
+        "the Iroh connection must begin on its configured Relay"
     );
     Ok(())
 }
@@ -949,7 +1207,7 @@ fn ensure_relay_contract(outcome: &CaseOutcome, relays: &[ResolvedRelay]) -> Res
 fn print_case_result(case: GateCase, result: &Result<CaseOutcome>) {
     match result {
         Ok(outcome) => println!(
-            "CASE={} STATUS=complete RAW_UDP_CONTROL={} NON_DNS_UDP_BLOCKED={} RELAY_TRANSPORT={} INITIAL={} FINAL={} DIRECT={} STREAMS={} SERVER_RELAYS={:?} CLIENT_RELAYS={:?} SERVER_CANDIDATES={:?} CLIENT_CANDIDATES={:?} TIMELINE={:?}",
+            "CASE={} STATUS=complete RAW_UDP_CONTROL={} NON_DNS_UDP_BLOCKED={} RELAY_TRANSPORT={} INITIAL={} FINAL={} DIRECT={} STREAMS={} SERVER_RELAYS={:?} CLIENT_RELAYS={:?} SERVER_CANDIDATE_COUNT={} CLIENT_CANDIDATE_COUNT={} SERVER_CANDIDATE_SOURCES={:?} CLIENT_CANDIDATE_SOURCES={:?} SERVER_UDP_V4={} CLIENT_UDP_V4={} SERVER_UDP_V6={} CLIENT_UDP_V6={} SERVER_GLOBAL_V4_PRESENT={} CLIENT_GLOBAL_V4_PRESENT={} SERVER_GLOBAL_V6_PRESENT={} CLIENT_GLOBAL_V6_PRESENT={} SERVER_MAPPING_VARIES_BY_DEST={:?} CLIENT_MAPPING_VARIES_BY_DEST={:?} TIMELINE={:?}",
             case.label(),
             if outcome.raw_udp_control {
                 "passed"
@@ -969,8 +1227,24 @@ fn print_case_result(case: GateCase, result: &Result<CaseOutcome>) {
             outcome.client.stream_count,
             outcome.server.relay_urls,
             outcome.client.endpoint.relay_urls,
+            outcome.server.candidate_count,
+            outcome.client.endpoint.candidate_count,
             outcome.server.candidate_sources,
             outcome.client.endpoint.candidate_sources,
+            outcome.server.net_report.udp_v4,
+            outcome.client.endpoint.net_report.udp_v4,
+            outcome.server.net_report.udp_v6,
+            outcome.client.endpoint.net_report.udp_v6,
+            outcome.server.net_report.global_v4_present,
+            outcome.client.endpoint.net_report.global_v4_present,
+            outcome.server.net_report.global_v6_present,
+            outcome.client.endpoint.net_report.global_v6_present,
+            outcome.server.net_report.mapping_varies_by_destination,
+            outcome
+                .client
+                .endpoint
+                .net_report
+                .mapping_varies_by_destination,
             outcome.client.path.timeline,
         ),
         Err(error) => println!("CASE={} STATUS=error ERROR={error:#}", case.label()),
@@ -1003,17 +1277,26 @@ mod tests {
         direct_selected: bool,
         raw_udp_control: bool,
         non_dns_udp_blocked: bool,
+        qad_v4: bool,
     ) -> CaseOutcome {
-        CaseOutcome {
-            server: EndpointEvidence {
-                relay_urls: Vec::new(),
-                candidate_sources: Vec::new(),
+        let endpoint = || EndpointEvidence {
+            relay_urls: Vec::new(),
+            candidate_sources: if qad_v4 {
+                BTreeMap::from([("NetReportGlobalMatch", 1)])
+            } else {
+                BTreeMap::new()
             },
+            candidate_count: usize::from(qad_v4),
+            net_report: NetReportEvidence {
+                udp_v4: qad_v4,
+                global_v4_present: qad_v4,
+                ..NetReportEvidence::default()
+            },
+        };
+        CaseOutcome {
+            server: endpoint(),
             client: ClientEvidence {
-                endpoint: EndpointEvidence {
-                    relay_urls: Vec::new(),
-                    candidate_sources: Vec::new(),
-                },
+                endpoint: endpoint(),
                 path: PathEvidence {
                     initial: PathKind::Relay,
                     final_selected,
@@ -1028,39 +1311,46 @@ mod tests {
     }
 
     fn retained_b_direct() -> CaseOutcome {
-        outcome(PathKind::Direct, true, true, false)
+        outcome(PathKind::Direct, true, true, false, false)
     }
 
     fn retained_c_relay() -> CaseOutcome {
-        outcome(PathKind::Relay, false, false, true)
+        outcome(PathKind::Relay, false, false, true, false)
+    }
+
+    fn retained_d_qad_direct() -> CaseOutcome {
+        outcome(PathKind::Direct, true, false, false, true)
     }
 
     #[test]
-    fn verdict_requires_the_exact_retained_a_b_c_paths() {
+    fn verdict_requires_the_exact_retained_a_b_c_d_paths() {
         assert_eq!(
             classify_network_gate(
-                &outcome(PathKind::Relay, false, false, false),
+                &outcome(PathKind::Relay, false, false, false, false),
                 &retained_b_direct(),
                 &retained_c_relay(),
+                &retained_d_qad_direct(),
             )
-            .expect("retained relay/direct/relay evidence is valid"),
+            .expect("retained relay/direct/relay/controlled-QAD-direct evidence is valid"),
             NetworkGateVerdict::GoWithDeferredAddressDiscovery,
         );
         assert_eq!(
             classify_network_gate(
-                &outcome(PathKind::Direct, true, false, false),
+                &outcome(PathKind::Direct, true, false, false, false),
                 &retained_b_direct(),
                 &retained_c_relay(),
+                &retained_d_qad_direct(),
             )
-            .expect("retained direct/direct/relay evidence is valid"),
+            .expect("retained direct/direct/relay/controlled-QAD-direct evidence is valid"),
             NetworkGateVerdict::Go,
         );
 
         assert!(
             classify_network_gate(
-                &outcome(PathKind::Unknown, false, false, false),
+                &outcome(PathKind::Unknown, false, false, false, false),
                 &retained_b_direct(),
                 &retained_c_relay(),
+                &retained_d_qad_direct(),
             )
             .expect_err("unknown Case A path must not become a deferred verdict")
             .to_string()
@@ -1069,13 +1359,14 @@ mod tests {
     }
 
     #[test]
-    fn verdict_keeps_case_b_and_c_as_hard_failures() {
-        let retained_a_relay = outcome(PathKind::Relay, false, false, false);
+    fn verdict_keeps_case_b_c_and_d_as_hard_failures() {
+        let retained_a_relay = outcome(PathKind::Relay, false, false, false, false);
         assert!(
             classify_network_gate(
                 &retained_a_relay,
-                &outcome(PathKind::Relay, true, true, false),
+                &outcome(PathKind::Relay, true, true, false, false),
                 &retained_c_relay(),
+                &retained_d_qad_direct(),
             )
             .expect_err("Case B must finish on direct")
             .to_string()
@@ -1085,11 +1376,23 @@ mod tests {
             classify_network_gate(
                 &retained_a_relay,
                 &retained_b_direct(),
-                &outcome(PathKind::Direct, true, false, true),
+                &outcome(PathKind::Direct, true, false, true, false),
+                &retained_d_qad_direct(),
             )
             .expect_err("Case C must remain on Relay")
             .to_string()
             .contains("NO_GO_RELAY")
+        );
+        assert!(
+            classify_network_gate(
+                &retained_a_relay,
+                &retained_b_direct(),
+                &retained_c_relay(),
+                &outcome(PathKind::Relay, false, false, false, false),
+            )
+            .expect_err("Case D must prove controlled automatic QAD direct")
+            .to_string()
+            .contains("NO_GO_CONTROLLED_QAD")
         );
     }
 }

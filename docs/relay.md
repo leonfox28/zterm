@@ -192,15 +192,25 @@ not require QAD.
 
 The current deployment sets `enable_quic_addr_discovery = false` and publishes
 no UDP port because an HTTP reverse proxy cannot forward QAD. Phase One's
-[Foundation Gate](foundation-gate.md) instead exercised the product-default
-official Iroh production map: Case A remained relayed in the nested
-Colima/Patchbay/TUN lab and is retained as environment-specific deferred
-address-discovery evidence; the controlled known-candidate Case B selected a
-direct path; and Case C completed three encrypted streams through the official
-WSS/TCP Relay after endpoint non-DNS UDP was blocked. B and C permit Foundation
-work to continue, but Case A neither passes automatic discovery nor establishes
-that official QAD generally fails on ordinary physical networks. Parent M10
-must test the unchanged profile across two real networks. That evidence, or a
+[Foundation Gate](foundation-gate.md) instead exercises four isolated network
+controls. In the current nested Colima/Patchbay/TUN run, official-n0 Case A
+completed QAD IPv4 and obtained global-v4 candidates on both endpoints, but
+the observed mappings varied by QAD destination and the connection remained
+relayed. Case B selected Direct after exact known candidates were injected;
+Case C completed three encrypted streams through official WSS/TCP Relay with
+non-DNS UDP blocked; and M10 Case D used a disposable lab-only Relay/QAD to
+promote Relay to Direct automatically without `external_addr`.
+
+Case D proves the retained Iroh candidate discovery/exchange path inside the
+controlled double-NAT lab; it is not a supported self-hosted product profile.
+Case A still neither passes Direct selection nor establishes that official QAD
+generally fails on ordinary physical networks. A later M10 physical run used
+the unchanged official-n0 profile from cellular macOS to Debian behind a home
+IPv4 NAT. After removing deployment-local fake-IP interception of Iroh DNS and
+UDP, both installed peers selected Direct with no Relay path and carried an
+interactive terminal. That accepts Direct for the tested topology, not every
+NAT or network. M10 remains open for the separately recorded initial-attachment
+correlation defect and its other release-acceptance items. This evidence, or a
 concrete self-hosting requirement without a reverse proxy, can justify a
 separately reviewed UDP/TLS deployment later.
 

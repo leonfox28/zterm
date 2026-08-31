@@ -10,6 +10,28 @@ discovery across two real networks to parent milestone M10. The parent task may
 now enter M2; this conclusion does not claim that automatic NAT traversal has
 been validated on representative physical networks.
 
+## M10 diagnostic addendum — 2026-08-31
+
+The report below is the retained Foundation A/B/C record and is not rewritten
+as though its original run included later evidence. M10 subsequently extended
+the executable Gate with Case D and redacted Iroh NetReport observations:
+
+- A fresh official-n0 Case A completed QAD IPv4 on both endpoints and exposed
+  global-v4 candidates, but both reports observed mappings that varied by QAD
+  destination and the connection remained Relay -> Relay.
+- Case D placed a disposable test-only HTTPS Relay plus QAD on Patchbay's
+  simulated Internet. Two independent Home-NAT endpoints received no injected
+  direct address, began on Relay, and automatically promoted to Direct.
+- Case D had only one controlled QAD destination, so
+  `mapping_varies_by_dest = None` is recorded as unknown, not "does not vary."
+
+This narrows the simulated failure to the shared outer Colima/TUN mapping or
+hairpin boundary and proves that zterm's retained Iroh candidate-discovery and
+promotion path functions in the inner double-NAT lab. It does not identify the
+cause of the user's company/home result and does not replace M10's two-real-
+network official-n0 acceptance. The current redacted record is
+`.trellis/tasks/08-24-e2e-hardening/research/controlled-qad-double-nat.md`.
+
 ## Scope and environment
 
 - Rust 1.98.0 (`aarch64-apple-darwin` host; `aarch64-unknown-linux-gnu` Gate
@@ -113,7 +135,7 @@ claiming they are local, QAD, or port-mapped.
 
 ## Network hard-checkpoint conclusion
 
-The current aggregate evaluator maps the retained A/B/C evidence to:
+The retained Foundation aggregate evaluator mapped its A/B/C evidence to:
 
 ```text
 NETWORK_GATE=GO_WITH_DEFERRED_ADDRESS_DISCOVERY: Case A stayed relayed in the nested Colima/Patchbay/TUN lab; Case B became direct; Case C official WSS/TCP Relay fallback passed; real two-network automatic discovery is deferred to parent M10
