@@ -1403,7 +1403,6 @@ fn terminal_protocol_error(detail: &'static str) -> DaemonError {
     DaemonError::new(DomainErrorKind::MalformedFrame, detail)
 }
 
-#[cfg(unix)]
 /// Side-effect-free impact projection for an identity reset confirmation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IdentityResetPreflight {
