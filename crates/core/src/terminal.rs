@@ -714,7 +714,7 @@ impl TerminalModel {
         self.resource_projection = resource_projection;
         self.history_epoch = next_revision;
         self.retained_history_rows = if active_screen(self.parser.screen()) == ActiveScreen::Main {
-            retained_history_rows(self.parser.screen())
+            retained_history_rows(self.parser.screen_mut())
         } else {
             self.retained_history_rows
         };
@@ -964,7 +964,7 @@ impl TerminalModel {
         if active_screen(self.parser.screen()) != ActiveScreen::Main {
             return;
         }
-        let retained = retained_history_rows(self.parser.screen());
+        let retained = retained_history_rows(self.parser.screen_mut());
         let reached_capacity = self.scrollback_rows > 0
             && retained == self.scrollback_rows
             && self.retained_history_rows <= retained;
@@ -1302,10 +1302,12 @@ const fn alternate_scroll_ansi(enabled: bool) -> &'static [u8] {
     }
 }
 
-fn retained_history_rows(screen: &vt100::Screen) -> usize {
-    let mut history = screen.clone();
-    history.set_scrollback(usize::MAX);
-    history.scrollback()
+fn retained_history_rows(screen: &mut vt100::Screen) -> usize {
+    let previous_offset = screen.scrollback();
+    screen.set_scrollback(usize::MAX);
+    let retained = screen.scrollback();
+    screen.set_scrollback(previous_offset);
+    retained
 }
 
 fn formatted_history_rows(
@@ -1513,6 +1515,24 @@ mod tests {
                 .expect("typed stale result"),
             TerminalHistoryResult::HistoryChanged { .. }
         ));
+    }
+
+    #[test]
+    fn retained_history_count_restores_scrollback_offset() {
+        let mut model =
+            TerminalModel::new(TerminalSize::new(2, 12), 8).expect("bounded history terminal");
+        model
+            .ingest(b"one\r\ntwo\r\nthree\r\nfour")
+            .expect("seed retained history");
+        let screen = model.parser.screen_mut();
+        screen.set_scrollback(1);
+        let previous_offset = screen.scrollback();
+        assert_eq!(previous_offset, 1);
+
+        let retained = retained_history_rows(screen);
+
+        assert!(retained >= previous_offset);
+        assert_eq!(screen.scrollback(), previous_offset);
     }
 
     #[test]

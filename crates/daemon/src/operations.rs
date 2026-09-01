@@ -7,9 +7,11 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use zterm_core::terminal::{
-    ActiveScreen, TerminalHistoryCursor, TerminalHistoryDirection, TerminalHistoryPage,
-    TerminalHistoryResult, TerminalModes, TerminalMouseEncoding, TerminalMouseMode, TerminalSize,
+    ActiveScreen, TerminalHistoryCursor, TerminalHistoryDirection, TerminalHistoryResult,
+    TerminalModes, TerminalSize,
 };
+#[cfg(unix)]
+use zterm_core::terminal::{TerminalHistoryPage, TerminalMouseEncoding, TerminalMouseMode};
 use zterm_core::{
     AttachmentId, AuthGeneration, AuthorizationStatus, DeviceAlias, DeviceId, DeviceSummary,
     DomainErrorKind, Revision, SessionId, SessionName, SessionSelector,

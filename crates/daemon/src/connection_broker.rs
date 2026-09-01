@@ -9,7 +9,9 @@ use std::future::pending;
 use std::pin::Pin;
 #[cfg(unix)]
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+#[cfg(unix)]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -453,6 +455,7 @@ struct Candidate {
     cancel: watch::Sender<bool>,
     actor_started: AtomicBool,
     primary: AtomicBool,
+    #[cfg(unix)]
     remote_capabilities: AtomicU64,
     admission: CandidateAdmission,
     metrics: Arc<BrokerMetrics>,
@@ -499,6 +502,7 @@ pub struct ConnectionDemand {
 }
 
 /// Address-free selected-path status for one currently promoted connection.
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct SelectedPathObservation {
     pub(crate) path: PathKind,
@@ -509,11 +513,13 @@ pub(crate) struct SelectedPathObservation {
 /// service stream. Keeping this handle with the stream prevents a later
 /// primary replacement from changing the capabilities or path reported for an
 /// already-open epoch.
+#[cfg(unix)]
 #[derive(Clone)]
 pub(crate) struct SelectedCandidateObserver {
     candidate: Arc<Candidate>,
 }
 
+#[cfg(unix)]
 impl SelectedCandidateObserver {
     /// Observes only the selected path class and its current RTT estimate.
     /// Remote addresses and relay URLs never cross this boundary.
@@ -713,6 +719,7 @@ pub struct AuthenticatedBiStream {
     remote: DeviceId,
     remote_generation: AuthGeneration,
     candidate: ConnectionCandidateKey,
+    #[cfg(unix)]
     candidate_observer: SelectedCandidateObserver,
     purpose: StreamPurpose,
     _stream_permit: OwnedSemaphorePermit,
@@ -751,6 +758,7 @@ impl AuthenticatedBiStream {
     }
 
     /// Cloneable observations tied to the candidate that opened this stream.
+    #[cfg(unix)]
     pub(crate) fn candidate_observer(&self) -> SelectedCandidateObserver {
         self.candidate_observer.clone()
     }
@@ -1681,6 +1689,7 @@ impl ConnectionDemand {
                         remote: self.slot.remote,
                         remote_generation: generation,
                         candidate: candidate.key,
+                        #[cfg(unix)]
                         candidate_observer: SelectedCandidateObserver {
                             candidate: Arc::clone(&candidate),
                         },
@@ -2019,6 +2028,7 @@ impl ConnectionBroker {
                     "remote selected an incompatible wire major",
                 ));
             }
+            #[cfg(unix)]
             candidate.set_remote_capabilities(welcome.capabilities());
             {
                 let mut state = slot.state.lock().await;
@@ -2094,6 +2104,7 @@ impl ConnectionBroker {
             Arc::clone(&self.inner.metrics),
             self.inner.limits,
         )?;
+        #[cfg(unix)]
         candidate.set_remote_capabilities(hello.capabilities());
         let slot = self.peer_slot(remote);
         self.register_candidate(&slot, Arc::clone(&candidate))
@@ -2549,6 +2560,7 @@ impl Candidate {
             cancel,
             actor_started: AtomicBool::new(false),
             primary: AtomicBool::new(false),
+            #[cfg(unix)]
             remote_capabilities: AtomicU64::new(0),
             admission: CandidateAdmission::new(limits),
             metrics,
@@ -2575,11 +2587,13 @@ impl Candidate {
         self.metrics.publish();
     }
 
+    #[cfg(unix)]
     fn set_remote_capabilities(&self, capabilities: Capabilities) {
         self.remote_capabilities
             .store(capabilities.bits(), Ordering::Release);
     }
 
+    #[cfg(unix)]
     fn supports(&self, capability: u64) -> bool {
         Capabilities::from_bits_retain(self.remote_capabilities.load(Ordering::Acquire))
             .contains(capability)
@@ -3376,6 +3390,7 @@ fn bounded_u32(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
 
+#[cfg(unix)]
 fn round_rtt_millis(rtt: Duration) -> u32 {
     let rounded = rtt.as_nanos().saturating_add(500_000) / 1_000_000;
     u32::try_from(rounded).unwrap_or(u32::MAX)
@@ -3426,6 +3441,7 @@ mod tests {
         RelayHint::new(url).expect("test relay is valid")
     }
 
+    #[cfg(unix)]
     #[test]
     fn selected_path_rtt_rounds_to_nearest_millisecond_and_clamps() {
         assert_eq!(round_rtt_millis(Duration::from_micros(499)), 0);

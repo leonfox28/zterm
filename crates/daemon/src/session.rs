@@ -17,9 +17,12 @@ use std::time::{Duration, Instant};
 use iroh::SecretKey;
 use tokio::sync::watch;
 use zterm_core::terminal::{
-    TerminalDelta, TerminalDeltaResult, TerminalHistoryCursor, TerminalHistoryDirection,
-    TerminalHistoryResult, TerminalModel, TerminalResourceProjection, TerminalSize,
+    TerminalDelta, TerminalDeltaResult, TerminalModel, TerminalResourceProjection, TerminalSize,
     TerminalSnapshot,
+};
+#[cfg(unix)]
+use zterm_core::terminal::{
+    TerminalHistoryCursor, TerminalHistoryDirection, TerminalHistoryResult,
 };
 use zterm_core::{
     AttachmentId, AttachmentPrincipal, ControllerLease, DaemonIncarnation, DeviceId,
@@ -279,6 +282,7 @@ impl SessionAttachment {
 
     /// Returns one bounded page from the daemon-authoritative main-screen
     /// history without changing the attachment's live-render checkpoint.
+    #[cfg(unix)]
     pub(crate) fn history_page_until(
         &self,
         direction: TerminalHistoryDirection,
@@ -2569,6 +2573,7 @@ enum SessionCommand {
         known_revision: Revision,
         reply: SyncSender<Result<TerminalSnapshot, DaemonError>>,
     },
+    #[cfg(unix)]
     HistoryPage {
         meta: CommandMeta,
         attachment_id: AttachmentId,
@@ -3203,6 +3208,7 @@ fn dispatch_command(
         } => respond(actor, meta, reply, || {
             sync_latest(runtime, attachment_id, known_revision)
         }),
+        #[cfg(unix)]
         SessionCommand::HistoryPage {
             meta,
             attachment_id,
@@ -3644,6 +3650,7 @@ fn sync_latest(
     Ok(snapshot)
 }
 
+#[cfg(unix)]
 fn history_page(
     runtime: &SessionRuntime,
     attachment_id: AttachmentId,
