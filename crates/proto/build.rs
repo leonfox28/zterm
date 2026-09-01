@@ -49,6 +49,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ".zterm.v1.TerminalSnapshot",
         ".zterm.v1.TerminalDelta",
         ".zterm.v1.TerminalInput",
+        ".zterm.v1.TerminalHistoryPage",
     ]);
     config.compile_protos(&schemas, &[proto_root])?;
 

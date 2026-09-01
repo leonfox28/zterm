@@ -1,0 +1,10 @@
+{"file":".trellis/spec/backend/terminal-model.md","reason":"Check that history pages and alternate-scroll remain zterm-owned, bounded, replay-safe, parser-private, and content-redacted."}
+{"file":".trellis/spec/backend/terminal-driver.md","reason":"Check that paging/status do not retain PTY owners, clone scrollback into checkpoints, or make transport control Session lifetime."}
+{"file":".trellis/spec/backend/session-service.md","reason":"Check attachment identity, synchronization, controller, lifecycle, queue, and deterministic race behavior end to end."}
+{"file":".trellis/spec/backend/local-daemon-ipc.md","reason":"Check same-UID-only status, new message validation, closure precedence, terminal restoration, and typed diagnostics."}
+{"file":".trellis/spec/backend/transport-auth.md","reason":"Check selected-path mode/RTT accuracy, reconnect behavior, redaction, and remote bridge correlation/no replay."}
+{"file":".trellis/spec/backend/core-wire-domain.md","reason":"Check additive message registration, capability fallback, unknown-field compatibility, correlation, and all size limits."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Audit complete data flow and ensure every payload is decoded/projected once rather than recast by consumers."}
+{"file":".trellis/spec/guides/evidence-driven-simplicity.md","reason":"Reject redundant parsers, fallback owners, stress matrices, external providers, and tests without a distinct contract."}
+{"file":".trellis/tasks/08-31-remote-terminal-ux/research/herdr-tmux-terminal-history.md","reason":"Compare actual wheel/Page/full-screen/status behavior against the approved Herdr/tmux model."}
+{"file":".trellis/tasks/08-31-remote-terminal-ux/research/terminal-theme-status-colors.md","reason":"Verify exact three-field order, complete reverse background, theme behavior, and style isolation."}

@@ -34,6 +34,8 @@ TerminalAttachment::wait_for_revision_after(revision: Revision, timeout) -> Resu
 TerminalAttachment::sync_latest(&mut self) -> Result<TerminalDeltaResult, TerminalDriverError>
 TerminalAttachment::discard_checkpoint(&mut self)
 TerminalAttachment::latest_snapshot(&self) -> Result<TerminalSnapshot, TerminalDriverError>
+TerminalAttachment::history_page(direction, cursor, maximum_rows)
+    -> Result<TerminalHistoryResult, TerminalDriverError>
 ```
 
 ### 3. Contracts
@@ -57,6 +59,9 @@ blocking PtyReader
   mark cannot exceed configured capacity.
 - Attachments hold shared terminal-state access and one opaque checkpoint only.
   They never hold a PTY session, reader, writer, child, or close capability.
+- History paging is a read-only attachment operation delegated to the one
+  authoritative model. It neither advances the attachment checkpoint nor
+  changes controller lease, PTY lifetime, revision delivery, or resize state.
 - At startup the driver consumes `PtySession` into three owner-only parts: one
   reader, one `PtyIo` writer/master, and independent `PtyChild` control. A PTY
   write/flush or resize may hold only the I/O mutex; it cannot prevent the
@@ -129,6 +134,9 @@ No environment variable or network object participates in this data path.
 - Slow attachment: pause beyond multiple bounded queue windows, discard the old
   checkpoint, resync once, and compare replayed semantic state with a separate
   latest authoritative snapshot.
+- History projection: request a bounded page through a retained attachment and
+  prove its live checkpoint/revision delivery and controller ownership are
+  unchanged.
 - Bounded queue: assert `maximum_pending_chunks <= capacity` while processed
   chunks exceed one complete queue window.
 - Query/wait regression: a raw-mode child sends DSR and exits only after

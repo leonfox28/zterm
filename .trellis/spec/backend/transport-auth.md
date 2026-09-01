@@ -163,6 +163,20 @@ outbound-known and inbound-authorization directions explicit.
   drains input and coalesces viewport through one fixed 250 ms cancellable delay,
   then retries with `create_main = false`. First-ever occupancy and every other
   typed initial attach error remain terminal.
+- Every opened attachment epoch owns an address-free observer for the exact
+  candidate that opened its service stream. Its `HISTORY_PAGING` gate and
+  selected Iroh path sample must use only that observer; a later deterministic
+  primary replacement cannot change an already-open epoch, and only a fresh
+  reconnect epoch may observe the replacement candidate. RTT is rounded to the
+  nearest millisecond and clamped to `u32`; addresses, candidate keys, DeviceIds,
+  and relay URLs never cross or appear in Debug at this observation boundary.
+  The attachment bridge samples changed values at most once per second and
+  clears the local-only projection to unknown on reconnect.
+- History paging is ordinary authenticated remote attachment control guarded by
+  the negotiated `HISTORY_PAGING` capability. One request occupies an existing
+  bounded pending-control cell, is correlated to one page, and is resolved—not
+  replayed—when its stream epoch ends. Connection-status events are never valid
+  normal-ALPN service kinds.
 - Apply normal QUIC limits immediately after connect/accept and before
   Hello/Welcome: advertise `max_bi_streams_per_connection` and zero
   unidirectional streams. Pair connections advertise one bidirectional and zero
@@ -313,6 +327,8 @@ outbound-known and inbound-authorization directions explicit.
 | remote Session context is self, generation zero/stale, or targets local/wrong DeviceId | generic `unauthorized`; no Session/PTY effect |
 | malformed, trailing, oversized, stalled, or panicking remote service stream | close/fail only that stream; retain primary connection, Session, PTY, and other streams |
 | reconnect delta baseline is inconsistent | consume and validate `TerminalSyncRequired`, then require a same-attachment snapshot at its declared revision |
+| selected path changes direct/relay or disappears | emit a redacted changed local observation no faster than 1 Hz; reconnect displays unknown |
+| history request loses its remote stream | resolve once with typed transport failure; do not retry on another stream epoch |
 | active epoch changes to a full snapshot | emit one local `Synchronizing` event before snapshot bytes; suppress duplicates until the view becomes active again |
 | remote write/control peer stops reading | operation deadline releases the stream epoch and eventually the desired-view demand |
 | continuously ready accept branch with completed handler tasks | reap completed `JoinSet` entries before the next accept; retained task ownership stays bounded |

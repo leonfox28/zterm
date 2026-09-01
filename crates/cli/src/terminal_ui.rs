@@ -45,14 +45,19 @@ mod unix {
     use rustix::event::{PollFd, PollFlags, poll};
     use tokio::signal::unix::{Signal, SignalKind, signal};
     use tokio::sync::{mpsc, watch};
+    use unicode_width::UnicodeWidthChar;
     use zterm_core::terminal::{
-        ALTERNATE_SCREEN_SELECTION_ANSI, ActiveScreen, MAIN_SCREEN_SELECTION_ANSI, TerminalSize,
+        ALTERNATE_SCREEN_SELECTION_ANSI, ActiveScreen, MAIN_SCREEN_SELECTION_ANSI,
+        MAX_HISTORY_PAGE_ROWS, TerminalHistoryCursor, TerminalHistoryDirection,
+        TerminalHistoryPage, TerminalHistoryResult, TerminalModes, TerminalMouseEncoding,
+        TerminalMouseMode, TerminalSize,
     };
-    use zterm_core::{DomainErrorKind, Revision, SessionId};
+    use zterm_core::{DomainErrorKind, RESERVED_DEVICE_ALIAS, Revision, SessionId};
     use zterm_daemon::error::DaemonError;
     use zterm_daemon::operations::{
-        LocalRuntime, PreparedTerminalView, TerminalViewDelta, TerminalViewEndReason,
-        TerminalViewEvent, TerminalViewSnapshot, TerminalViewTransportState,
+        LocalRuntime, PreparedTerminalView, TerminalViewConnectionPath,
+        TerminalViewConnectionStatus, TerminalViewDelta, TerminalViewEndReason, TerminalViewEvent,
+        TerminalViewSnapshot, TerminalViewTransportState,
     };
 
     use super::super::{CliError, TerminalRequest, TerminalRequestKind};
@@ -61,8 +66,15 @@ mod unix {
     const STDIN_CHUNK_BYTES: usize = 4 * 1024;
     const CONTROL_PREFIX_TIMEOUT: Duration = Duration::from_secs(1);
     const DETACH_TIMEOUT: Duration = Duration::from_secs(2);
-    const ENTER_TERMINAL_UI: &[u8] = b"\x1b[?1049h\x1b[?25l";
+    const HOST_INPUT_CAPTURE: &[u8] = b"\x1b[?1003h\x1b[?1006h";
+    const ENTER_TERMINAL_UI: &[u8] = b"\x1b[?1049h\x1b[?25l\x1b[?1003h\x1b[?1006h";
     const RECONNECTING_STATUS: &[u8] = b"\r\n[zterm: reconnecting]\r\n";
+    const HOST_SEQUENCE_BOUND: usize = 64;
+    const RESUME_INPUT_BOUND: usize = 1024 * 1024 - 1024;
+    const PAGE_UP: &[u8] = b"\x1b[5~";
+    const PAGE_DOWN: &[u8] = b"\x1b[6~";
+    const PASTE_START: &[u8] = b"\x1b[200~";
+    const PASTE_END: &[u8] = b"\x1b[201~";
     const RESTORE_TERMINAL_UI: &[u8] = concat!(
         "\x1b[?9l",
         "\x1b[?1000l",
@@ -183,7 +195,9 @@ mod unix {
         if let Some(cancellation) = current_terminal_cancellation(cancellation_receiver) {
             return Err(cancellation.error(None));
         }
-        let initial_size = terminal_size(stdout)?;
+        let initial_physical_size = terminal_size(stdout)?;
+        let remote_request = terminal_request_is_remote(&request);
+        let initial_size = child_terminal_size(initial_physical_size, remote_request);
         let escape = request.escape;
         let stateful_prepare = matches!(
             &request.kind,
@@ -210,6 +224,7 @@ mod unix {
                 resize_coalescer: &mut resize_coalescer,
                 current_input_epoch,
                 preserve_submitted_result: stateful_prepare,
+                remote: remote_request,
             },
         )
         .await?
@@ -230,13 +245,26 @@ mod unix {
             }
         };
         let session_id = prepared.session_id();
-        let latest_size = terminal_size(stdout)?;
-        if latest_size != initial_size {
+        let physical_size = terminal_size(stdout)?;
+        let latest_size = child_terminal_size(physical_size, remote_request);
+        if latest_size != initial_size || resize_coalescer.pending.is_some() {
             let _ = resize_coalescer.observe(latest_size, transport_state);
+        }
+
+        let remote_alias = prepared.remote_alias().map(str::to_owned);
+        if remote_alias.is_some() != remote_request {
+            drop(prepared);
+            stdin_pump.shutdown()?;
+            return Err(terminal_daemon_error(
+                DomainErrorKind::MalformedFrame,
+                "resolved terminal target changed local/remote class",
+            ));
         }
 
         let mut renderer = TerminalRenderer::new();
         render_snapshot_stdout(&mut renderer, prepared.initial_snapshot())?;
+        let mut status_renderer = StatusRenderer::new(remote_alias, physical_size);
+        render_status_stdout(&mut status_renderer, transport_state)?;
         if let Some(cancellation) = current_terminal_cancellation(cancellation_receiver) {
             drop(prepared);
             stdin_pump.shutdown()?;
@@ -256,6 +284,7 @@ mod unix {
                 resize_coalescer: &mut resize_coalescer,
                 current_input_epoch,
                 preserve_submitted_result: false,
+                remote: remote_request,
             },
         )
         .await?
@@ -276,16 +305,35 @@ mod unix {
         };
         let (mut events, writer) = view.split();
         let mut sync_requested = false;
+        let mut viewport = ViewportController::new(latest_size);
+        let mut input_codec = HostInputCodec::new();
+        let mut deferred_active = false;
 
         let loop_result = 'terminal: loop {
             if prefix
                 .deadline()
                 .is_some_and(|deadline| Instant::now() >= deadline)
             {
-                if let Some(bytes) = take_pending_active_input(&mut prefix, transport_state)
-                    && let Err(error) = writer.write_input(bytes).await
-                {
-                    break Err(error.into());
+                if let Some(bytes) = prefix.flush_pending() {
+                    if viewport.is_live() && transport_state == TerminalViewTransportState::Active {
+                        if let Err(error) = writer.write_input(bytes).await {
+                            break Err(error.into());
+                        }
+                    } else if !viewport.is_live() {
+                        let effect = viewport.retain_or_resume(bytes)?;
+                        if apply_viewport_effect(
+                            effect,
+                            &viewport,
+                            &writer,
+                            renderer.revision(),
+                            &mut status_renderer,
+                            transport_state,
+                        )
+                        .await?
+                        {
+                            sync_requested = true;
+                        }
+                    }
                 }
                 continue;
             }
@@ -301,10 +349,21 @@ mod unix {
                             "SIGWINCH handler closed",
                         ));
                     }
-                    let latest = match terminal_size(stdout) {
+                    let latest_physical = match terminal_size(stdout) {
                         Ok(size) => size,
                         Err(error) => break Err(error),
                     };
+                    let latest = child_terminal_size(latest_physical, remote_request);
+                    viewport.resize(latest);
+                    status_renderer.resize(latest_physical);
+                    if viewport.is_history()
+                        && let Err(error) = render_history_stdout(&viewport)
+                    {
+                        break Err(error);
+                    }
+                    if let Err(error) = render_status_stdout(&mut status_renderer, transport_state) {
+                        break Err(error);
+                    }
                     if let Some(size) = resize_coalescer.observe(latest, transport_state)
                         && let Err(error) = writer.resize(size).await
                     {
@@ -314,10 +373,26 @@ mod unix {
                 // The explicit expired-deadline check above makes this local
                 // timeout independent of continuously ready terminal output.
                 () = wait_for_prefix_deadline(prefix_deadline), if prefix_deadline.is_some() => {
-                    if let Some(bytes) = take_pending_active_input(&mut prefix, transport_state)
-                        && let Err(error) = writer.write_input(bytes).await
-                    {
-                        break Err(error.into());
+                    if let Some(bytes) = prefix.flush_pending() {
+                        if viewport.is_live()
+                            && transport_state == TerminalViewTransportState::Active
+                        {
+                            if let Err(error) = writer.write_input(bytes).await {
+                                break Err(error.into());
+                            }
+                        } else if !viewport.is_live() {
+                            let effect = viewport.retain_or_resume(bytes)?;
+                            if apply_viewport_effect(
+                                effect,
+                                &viewport,
+                                &writer,
+                                renderer.revision(),
+                                &mut status_renderer,
+                                transport_state,
+                            ).await? {
+                                sync_requested = true;
+                            }
+                        }
                     }
                 }
                 event = events.read_event() => {
@@ -333,30 +408,41 @@ mod unix {
                     };
                     match event {
                         TerminalViewEvent::TransportState(state) => {
-                            if state != transport_state {
-                                if let Err(error) = transition_input_state(
-                                    stdin,
-                                    &input_epoch,
-                                    &mut current_input_epoch,
-                                    &mut stdin_pump,
-                                    &mut prefix,
-                                    state,
-                                ) {
-                                    break 'terminal Err(error);
-                                }
-                                if let Err(error) = render_transport_state_stdout(state) {
-                                    break 'terminal Err(error);
-                                }
+                            if should_defer_active_for_paste(state, &viewport, &input_codec) {
+                                deferred_active = true;
+                                continue;
+                            }
+                            deferred_active = false;
+                            if let Err(error) = apply_transport_state_transition(
+                                stdin,
+                                &input_epoch,
+                                &mut current_input_epoch,
+                                &mut stdin_pump,
+                                &mut prefix,
+                                transport_state,
+                                state,
+                                &mut viewport,
+                                &mut status_renderer,
+                                &mut resize_coalescer,
+                                &writer,
+                            ).await {
+                                break 'terminal Err(error);
                             }
                             transport_state = state;
-                            if let Some(size) = resize_coalescer.transport_state(state)
-                                && let Err(error) = writer.resize(size).await
+                        }
+                        TerminalViewEvent::ConnectionStatus(status) => {
+                            status_renderer.observe(status)?;
+                            if let Err(error) =
+                                render_status_stdout(&mut status_renderer, transport_state)
                             {
-                                break Err(error.into());
+                                break Err(error);
                             }
                         }
                         TerminalViewEvent::Snapshot(snapshot) => {
-                            if transport_state != TerminalViewTransportState::Synchronizing {
+                            let preserving_resume_input = viewport.is_resume_pending();
+                            if transport_state != TerminalViewTransportState::Synchronizing
+                                && !preserving_resume_input
+                            {
                                 if let Err(error) = transition_input_state(
                                     stdin,
                                     &input_epoch,
@@ -369,7 +455,13 @@ mod unix {
                                 }
                                 transport_state = TerminalViewTransportState::Synchronizing;
                             }
+                            viewport.observe_snapshot();
                             if let Err(error) = render_snapshot_stdout(&mut renderer, &snapshot) {
+                                break Err(error);
+                            }
+                            if let Err(error) =
+                                render_status_stdout(&mut status_renderer, transport_state)
+                            {
                                 break Err(error);
                             }
                             prefix.clear_pending();
@@ -379,9 +471,23 @@ mod unix {
                             }
                         }
                         TerminalViewEvent::Delta(delta) => {
-                            match render_delta_stdout(&mut renderer, &delta) {
+                            let rendered_live = viewport.is_live();
+                            let delta_result = if rendered_live {
+                                render_delta_stdout(&mut renderer, &delta)
+                            } else {
+                                renderer.observe_delta((&delta).into())
+                            };
+                            match delta_result {
                                 Ok(DeltaRender::Applied) => {
                                     sync_requested = false;
+                                    if rendered_live
+                                        && let Err(error) = render_status_stdout(
+                                            &mut status_renderer,
+                                            transport_state,
+                                        )
+                                    {
+                                        break Err(error);
+                                    }
                                     if transport_state == TerminalViewTransportState::Synchronizing
                                         && let Err(error) = writer
                                             .snapshot_applied(delta.to_revision())
@@ -391,8 +497,10 @@ mod unix {
                                     }
                                 }
                                 Ok(DeltaRender::Gap) => {
+                                    viewport.begin_resume(Vec::new())?;
                                     if transport_state
                                         != TerminalViewTransportState::Synchronizing
+                                        && !viewport.is_resume_pending()
                                     {
                                         if let Err(error) = transition_input_state(
                                             stdin,
@@ -420,19 +528,27 @@ mod unix {
                                 Err(error) => break Err(error),
                             }
                         }
+                        TerminalViewEvent::History(result) => {
+                            viewport.apply_history(result)?;
+                            if let Err(error) = render_history_stdout(&viewport) {
+                                break Err(error);
+                            }
+                            if let Err(error) =
+                                render_status_stdout(&mut status_renderer, transport_state)
+                            {
+                                break Err(error);
+                            }
+                        }
                         TerminalViewEvent::SyncRequired { .. } => {
+                            viewport.begin_resume(Vec::new())?;
                             if transport_state != TerminalViewTransportState::Synchronizing {
-                                if let Err(error) = transition_input_state(
-                                    stdin,
-                                    &input_epoch,
-                                    &mut current_input_epoch,
-                                    &mut stdin_pump,
-                                    &mut prefix,
-                                    TerminalViewTransportState::Synchronizing,
+                                transport_state = TerminalViewTransportState::Synchronizing;
+                                if let Err(error) = render_status_stdout(
+                                    &mut status_renderer,
+                                    transport_state,
                                 ) {
                                     break 'terminal Err(error);
                                 }
-                                transport_state = TerminalViewTransportState::Synchronizing;
                             }
                             if !sync_requested {
                                 sync_requested = true;
@@ -457,22 +573,181 @@ mod unix {
                         Some(StdinEvent::Bytes { epoch, bytes })
                             if input_epoch_is_current(epoch, current_input_epoch) =>
                         {
-                            let actions = prefix.feed(&bytes, Instant::now());
-                            for action in actions {
-                                match action {
-                                    PrefixAction::Input(bytes)
-                                        if transport_state == TerminalViewTransportState::Active =>
-                                    {
-                                        if let Err(error) = writer.write_input(bytes).await {
+                            let host_events = match input_codec.feed(&bytes) {
+                                Ok(events) => events,
+                                Err(error) => break 'terminal Err(error),
+                            };
+                            for host_event in host_events {
+                                match host_event {
+                                    HostInputEvent::Bytes(bytes) => {
+                                        for action in prefix.feed(&bytes, Instant::now()) {
+                                            match action {
+                                                PrefixAction::Input(bytes) if viewport.is_live()
+                                                    && transport_state
+                                                        == TerminalViewTransportState::Active =>
+                                                {
+                                                    if let Err(error) = writer.write_input(bytes).await {
+                                                        break 'terminal Err(error.into());
+                                                    }
+                                                }
+                                                PrefixAction::Input(bytes) if !viewport.is_live() => {
+                                                    let effect = viewport.retain_or_resume(bytes)?;
+                                                    if apply_viewport_effect(
+                                                        effect,
+                                                        &viewport,
+                                                        &writer,
+                                                        renderer.revision(),
+                                                        &mut status_renderer,
+                                                        transport_state,
+                                                    ).await? {
+                                                        sync_requested = true;
+                                                    }
+                                                }
+                                                PrefixAction::Input(_) => {}
+                                                PrefixAction::Detach => break,
+                                            }
+                                        }
+                                    }
+                                    HostInputEvent::Paste(bytes) => {
+                                        if viewport.is_live()
+                                            && transport_state
+                                                == TerminalViewTransportState::Active
+                                        {
+                                            if let Err(error) = writer.write_input(bytes).await {
+                                                break 'terminal Err(error.into());
+                                            }
+                                        } else if !viewport.is_live() {
+                                            let effect = viewport.retain_or_resume(bytes)?;
+                                            if apply_viewport_effect(
+                                                effect,
+                                                &viewport,
+                                                &writer,
+                                                renderer.revision(),
+                                                &mut status_renderer,
+                                                transport_state,
+                                            ).await? {
+                                                sync_requested = true;
+                                            }
+                                        }
+                                    }
+                                    HostInputEvent::PageUp | HostInputEvent::PageDown => {
+                                        let older = matches!(host_event, HostInputEvent::PageUp);
+                                        let raw = if older { PAGE_UP } else { PAGE_DOWN };
+                                        if viewport.is_resume_pending() {
+                                            viewport.retain_resume_input(raw)?;
+                                        } else if viewport.is_history()
+                                            || history_owns_gestures(
+                                                renderer.active_screen(),
+                                                renderer.modes(),
+                                            )
+                                        {
+                                            let effect = viewport.navigate(
+                                                older,
+                                                usize::from(viewport.content_size().rows)
+                                                    .saturating_sub(1)
+                                                    .max(1),
+                                            );
+                                            if apply_viewport_effect(
+                                                effect,
+                                                &viewport,
+                                                &writer,
+                                                renderer.revision(),
+                                                &mut status_renderer,
+                                                transport_state,
+                                            ).await? {
+                                                sync_requested = true;
+                                            }
+                                        } else if transport_state
+                                            == TerminalViewTransportState::Active
+                                            && let Err(error) = writer.write_input(raw.to_vec()).await
+                                        {
                                             break 'terminal Err(error.into());
                                         }
                                     }
-                                    PrefixAction::Input(_) => {}
-                                    PrefixAction::Detach => break,
+                                    HostInputEvent::Mouse(mouse) => {
+                                        if mouse.row > viewport.content_size().rows {
+                                            continue;
+                                        }
+                                        if viewport.is_history() && mouse.is_wheel() {
+                                            let effect = viewport.navigate(mouse.wheel_is_up(), 3);
+                                            if apply_viewport_effect(
+                                                effect,
+                                                &viewport,
+                                                &writer,
+                                                renderer.revision(),
+                                                &mut status_renderer,
+                                                transport_state,
+                                            ).await? {
+                                                sync_requested = true;
+                                            }
+                                            continue;
+                                        }
+                                        let routed = route_mouse_to_child(
+                                            &mouse,
+                                            renderer.active_screen(),
+                                            renderer.modes(),
+                                        );
+                                        match routed {
+                                            Some(bytes) if viewport.is_resume_pending() => {
+                                                viewport.retain_resume_input(&bytes)?;
+                                            }
+                                            Some(bytes) if viewport.is_live()
+                                                && transport_state
+                                                    == TerminalViewTransportState::Active =>
+                                            {
+                                                if let Err(error) = writer.write_input(bytes).await {
+                                                    break 'terminal Err(error.into());
+                                                }
+                                            }
+                                            Some(_) => {}
+                                            None if viewport.is_live()
+                                                && mouse.is_wheel()
+                                                && history_owns_gestures(
+                                                    renderer.active_screen(),
+                                                    renderer.modes(),
+                                                ) =>
+                                            {
+                                                let effect = viewport.navigate(mouse.wheel_is_up(), 3);
+                                                if apply_viewport_effect(
+                                                    effect,
+                                                    &viewport,
+                                                    &writer,
+                                                    renderer.revision(),
+                                                    &mut status_renderer,
+                                                    transport_state,
+                                                ).await? {
+                                                    sync_requested = true;
+                                                }
+                                            }
+                                            None => {}
+                                        }
+                                    }
+                                }
+                                if prefix.detached() {
+                                    break;
                                 }
                             }
                             if prefix.detached() {
                                 break Ok(TerminalCompletion::Detached);
+                            }
+                            if deferred_active && !input_codec.paste_in_progress() {
+                                if let Err(error) = apply_transport_state_transition(
+                                    stdin,
+                                    &input_epoch,
+                                    &mut current_input_epoch,
+                                    &mut stdin_pump,
+                                    &mut prefix,
+                                    transport_state,
+                                    TerminalViewTransportState::Active,
+                                    &mut viewport,
+                                    &mut status_renderer,
+                                    &mut resize_coalescer,
+                                    &writer,
+                                ).await {
+                                    break 'terminal Err(error);
+                                }
+                                transport_state = TerminalViewTransportState::Active;
+                                deferred_active = false;
                             }
                         }
                         Some(StdinEvent::Bytes { .. }) => {}
@@ -480,7 +755,8 @@ mod unix {
                             if let Some(bytes) = take_pending_active_input(
                                 &mut prefix,
                                 transport_state,
-                            ) && let Err(error) = writer.write_input(bytes).await
+                            ) && viewport.is_live()
+                                && let Err(error) = writer.write_input(bytes).await
                             {
                                 break Err(error.into());
                             }
@@ -506,6 +782,7 @@ mod unix {
         resize_coalescer: &'a mut ResizeCoalescer,
         current_input_epoch: u64,
         preserve_submitted_result: bool,
+        remote: bool,
     }
 
     async fn await_while_inactive<T>(
@@ -521,6 +798,7 @@ mod unix {
             resize_coalescer,
             current_input_epoch,
             preserve_submitted_result,
+            remote,
         } = context;
         tokio::pin!(future);
         loop {
@@ -549,7 +827,7 @@ mod unix {
                             "SIGWINCH handler closed",
                         ));
                     }
-                    let latest = terminal_size(stdout)?;
+                    let latest = child_terminal_size(terminal_size(stdout)?, remote);
                     let _ = resize_coalescer.observe(
                         latest,
                         TerminalViewTransportState::Synchronizing,
@@ -634,6 +912,83 @@ mod unix {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn transition_transport_input_state(
+        stdin: &impl AsFd,
+        input_epoch: &InputEpoch,
+        current_input_epoch: &mut u64,
+        stdin_pump: &mut StdinPump,
+        prefix: &mut PrefixParser,
+        previous: TerminalViewTransportState,
+        next: TerminalViewTransportState,
+        viewport: &mut ViewportController,
+    ) -> Result<Option<Vec<u8>>, CliError> {
+        if next != previous
+            && (!viewport.is_resume_pending() || next == TerminalViewTransportState::Active)
+        {
+            transition_input_state(
+                stdin,
+                input_epoch,
+                current_input_epoch,
+                stdin_pump,
+                prefix,
+                next,
+            )?;
+        }
+        Ok((next == TerminalViewTransportState::Active)
+            .then(|| viewport.finish_resume())
+            .flatten())
+    }
+
+    fn should_defer_active_for_paste(
+        next: TerminalViewTransportState,
+        viewport: &ViewportController,
+        input_codec: &HostInputCodec,
+    ) -> bool {
+        next == TerminalViewTransportState::Active
+            && viewport.is_resume_pending()
+            && input_codec.paste_in_progress()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_transport_state_transition(
+        stdin: &impl AsFd,
+        input_epoch: &InputEpoch,
+        current_input_epoch: &mut u64,
+        stdin_pump: &mut StdinPump,
+        prefix: &mut PrefixParser,
+        previous: TerminalViewTransportState,
+        next: TerminalViewTransportState,
+        viewport: &mut ViewportController,
+        status_renderer: &mut StatusRenderer,
+        resize_coalescer: &mut ResizeCoalescer,
+        writer: &zterm_daemon::operations::TerminalViewCommandWriter,
+    ) -> Result<(), CliError> {
+        let resume_input = transition_transport_input_state(
+            stdin,
+            input_epoch,
+            current_input_epoch,
+            stdin_pump,
+            prefix,
+            previous,
+            next,
+            viewport,
+        )?;
+        if next != previous && !status_renderer.enabled() {
+            render_transport_state_stdout(next)?;
+        }
+        render_status_stdout(status_renderer, next)?;
+        if let Some(size) = resize_coalescer.transport_state(next) {
+            writer.resize(size).await?;
+        }
+        if let Some(bytes) = resume_input
+            && !bytes.is_empty()
+        {
+            writer.write_input(bytes).await?;
+        }
+        Ok(())
+    }
+
     const fn input_epoch_is_current(observed: u64, current: u64) -> bool {
         observed == current
     }
@@ -704,6 +1059,21 @@ mod unix {
                     runtime.attach_created(&created, Some(viewport)).await,
                 )
             }
+        }
+    }
+
+    fn terminal_request_is_remote(request: &TerminalRequest) -> bool {
+        match &request.kind {
+            TerminalRequestKind::Attach { target, .. }
+            | TerminalRequestKind::Create { target, .. } => target != RESERVED_DEVICE_ALIAS,
+        }
+    }
+
+    const fn child_terminal_size(physical: TerminalSize, remote: bool) -> TerminalSize {
+        if remote && physical.rows > 1 {
+            TerminalSize::new(physical.rows - 1, physical.columns)
+        } else {
+            physical
         }
     }
 
@@ -1486,9 +1856,684 @@ mod unix {
         }
     }
 
+    struct StatusRenderer {
+        device: Option<String>,
+        physical_size: TerminalSize,
+        path: TerminalViewConnectionPath,
+        rtt_ms: Option<u32>,
+        previous_row: Option<u16>,
+    }
+
+    impl StatusRenderer {
+        fn new(device: Option<String>, physical_size: TerminalSize) -> Self {
+            Self {
+                device,
+                physical_size,
+                path: TerminalViewConnectionPath::Unknown,
+                rtt_ms: None,
+                previous_row: None,
+            }
+        }
+
+        fn enabled(&self) -> bool {
+            self.device.is_some() && self.physical_size.rows > 1
+        }
+
+        fn resize(&mut self, physical_size: TerminalSize) {
+            self.physical_size = physical_size;
+        }
+
+        fn observe(&mut self, status: TerminalViewConnectionStatus) -> Result<(), CliError> {
+            if self.device.as_deref() != Some(status.device()) {
+                return Err(terminal_daemon_error(
+                    DomainErrorKind::MalformedFrame,
+                    "terminal connection status changed its frozen device alias",
+                ));
+            }
+            self.path = status.path();
+            self.rtt_ms = status.rtt_ms();
+            Ok(())
+        }
+
+        fn render(
+            &mut self,
+            writer: &mut impl Write,
+            transport_state: TerminalViewTransportState,
+        ) -> Result<(), CliError> {
+            let current_row = self.enabled().then_some(self.physical_size.rows);
+            let mut bytes = Vec::new();
+            if let Some(previous) = self.previous_row
+                && Some(previous) != current_row
+                && previous <= self.physical_size.rows
+            {
+                bytes.extend_from_slice(b"\x1b7\x1b[");
+                bytes.extend_from_slice(previous.to_string().as_bytes());
+                bytes.extend_from_slice(b";1H\x1b[0m\x1b[2K\x1b8");
+            }
+            if let (Some(row), Some(device)) = (current_row, self.device.as_deref()) {
+                let (path, latency) = if transport_state == TerminalViewTransportState::Active {
+                    match self.path {
+                        TerminalViewConnectionPath::Direct => {
+                            ("direct", self.rtt_ms.map(|rtt| format!("{rtt} ms")))
+                        }
+                        TerminalViewConnectionPath::Relay => {
+                            ("relay", self.rtt_ms.map(|rtt| format!("{rtt} ms")))
+                        }
+                        TerminalViewConnectionPath::Unknown => ("--", None),
+                    }
+                } else {
+                    ("--", None)
+                };
+                let text = format!("{device} | {path} | {}", latency.as_deref().unwrap_or("--"));
+                let (clipped, width) = clip_display_width(&text, self.physical_size.columns);
+                bytes.extend_from_slice(b"\x1b7\x1b[");
+                bytes.extend_from_slice(row.to_string().as_bytes());
+                bytes.extend_from_slice(b";1H\x1b[0;7m\x1b[2K");
+                bytes.extend_from_slice(clipped.as_bytes());
+                bytes.extend(std::iter::repeat_n(
+                    b' ',
+                    usize::from(self.physical_size.columns).saturating_sub(width),
+                ));
+                bytes.extend_from_slice(b"\x1b[0m\x1b8");
+            }
+            self.previous_row = current_row;
+            if bytes.is_empty() {
+                return Ok(());
+            }
+            writer
+                .write_all(&bytes)
+                .and_then(|()| writer.flush())
+                .map_err(|error| terminal_io("render terminal status", error))
+        }
+    }
+
+    fn clip_display_width(text: &str, maximum: u16) -> (String, usize) {
+        let maximum = usize::from(maximum);
+        let mut clipped = String::new();
+        let mut width: usize = 0;
+        for character in text.chars() {
+            let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+            if width.saturating_add(character_width) > maximum {
+                break;
+            }
+            clipped.push(character);
+            width += character_width;
+        }
+        (clipped, width)
+    }
+
+    #[derive(Clone, Copy)]
+    struct HistoryRequest {
+        direction: TerminalHistoryDirection,
+        cursor: Option<TerminalHistoryCursor>,
+    }
+
+    enum ViewportEffect {
+        None,
+        Render,
+        Request(HistoryRequest),
+        Resume,
+    }
+
+    struct HistoryViewport {
+        page: Option<TerminalHistoryPage>,
+        offset: usize,
+        pending: Option<TerminalHistoryDirection>,
+        notice: Option<&'static str>,
+    }
+
+    enum ViewportState {
+        Live,
+        History(HistoryViewport),
+        ResumePending {
+            retained_input: Vec<u8>,
+            snapshot_applied: bool,
+        },
+    }
+
+    struct ViewportController {
+        state: ViewportState,
+        content_size: TerminalSize,
+    }
+
+    type VisibleHistoryRows<'a> = (&'a [Vec<u8>], usize, Option<&'static str>);
+
+    impl ViewportController {
+        const fn new(content_size: TerminalSize) -> Self {
+            Self {
+                state: ViewportState::Live,
+                content_size,
+            }
+        }
+
+        const fn content_size(&self) -> TerminalSize {
+            self.content_size
+        }
+
+        const fn is_live(&self) -> bool {
+            matches!(&self.state, ViewportState::Live)
+        }
+
+        const fn is_history(&self) -> bool {
+            matches!(&self.state, ViewportState::History(_))
+        }
+
+        const fn is_resume_pending(&self) -> bool {
+            matches!(&self.state, ViewportState::ResumePending { .. })
+        }
+
+        fn resize(&mut self, content_size: TerminalSize) {
+            self.content_size = content_size;
+            if let ViewportState::History(history) = &mut self.state
+                && let Some(page) = &history.page
+            {
+                history.offset = history.offset.min(
+                    page.rows
+                        .len()
+                        .saturating_sub(usize::from(content_size.rows)),
+                );
+            }
+        }
+
+        fn navigate(&mut self, older: bool, amount: usize) -> ViewportEffect {
+            if matches!(self.state, ViewportState::Live) {
+                if !older {
+                    return ViewportEffect::None;
+                }
+                self.state = ViewportState::History(HistoryViewport {
+                    page: None,
+                    offset: 0,
+                    pending: Some(TerminalHistoryDirection::Newest),
+                    notice: Some("[zterm: loading retained history]"),
+                });
+                return ViewportEffect::Request(HistoryRequest {
+                    direction: TerminalHistoryDirection::Newest,
+                    cursor: None,
+                });
+            }
+            let ViewportState::History(history) = &mut self.state else {
+                return ViewportEffect::None;
+            };
+            if history.pending.is_some() {
+                return ViewportEffect::None;
+            }
+            let Some(page) = &history.page else {
+                if older {
+                    history.notice = Some("[zterm: loading retained history]");
+                    history.pending = Some(TerminalHistoryDirection::Newest);
+                    return ViewportEffect::Request(HistoryRequest {
+                        direction: TerminalHistoryDirection::Newest,
+                        cursor: None,
+                    });
+                }
+                return self.start_resume(Vec::new());
+            };
+            let maximum_offset = page
+                .rows
+                .len()
+                .saturating_sub(usize::from(self.content_size.rows));
+            if older {
+                if history.offset > 0 {
+                    history.offset = history.offset.saturating_sub(amount);
+                    return ViewportEffect::Render;
+                }
+                if page.cursor.start_row > page.cursor.oldest_row {
+                    history.pending = Some(TerminalHistoryDirection::Older);
+                    return ViewportEffect::Request(HistoryRequest {
+                        direction: TerminalHistoryDirection::Older,
+                        cursor: Some(page.cursor),
+                    });
+                }
+                ViewportEffect::None
+            } else if history.offset < maximum_offset {
+                history.offset = history.offset.saturating_add(amount).min(maximum_offset);
+                ViewportEffect::Render
+            } else if page
+                .cursor
+                .start_row
+                .saturating_add(u64::from(page.cursor.row_count))
+                < page.cursor.newest_row
+            {
+                history.pending = Some(TerminalHistoryDirection::Newer);
+                ViewportEffect::Request(HistoryRequest {
+                    direction: TerminalHistoryDirection::Newer,
+                    cursor: Some(page.cursor),
+                })
+            } else {
+                self.start_resume(Vec::new())
+            }
+        }
+
+        fn apply_history(&mut self, result: TerminalHistoryResult) -> Result<(), CliError> {
+            let ViewportState::History(history) = &mut self.state else {
+                return Err(terminal_daemon_error(
+                    DomainErrorKind::MalformedFrame,
+                    "terminal history page arrived without a pending history view",
+                ));
+            };
+            let direction = history.pending.take().ok_or_else(|| {
+                terminal_daemon_error(
+                    DomainErrorKind::MalformedFrame,
+                    "terminal history page arrived without a pending request",
+                )
+            })?;
+            match result {
+                TerminalHistoryResult::Page(page) => {
+                    history.offset = match direction {
+                        TerminalHistoryDirection::Newest | TerminalHistoryDirection::Older => page
+                            .rows
+                            .len()
+                            .saturating_sub(usize::from(self.content_size.rows)),
+                        TerminalHistoryDirection::Newer => 0,
+                    };
+                    history.notice = page
+                        .rows
+                        .is_empty()
+                        .then_some("[zterm: no retained history]");
+                    history.page = Some(page);
+                }
+                TerminalHistoryResult::HistoryChanged { .. } => {
+                    history.page = None;
+                    history.offset = 0;
+                    history.notice = Some(
+                        "[zterm: retained history changed; press a normal key to return live]",
+                    );
+                }
+                TerminalHistoryResult::HistoryGap { .. } => {
+                    history.page = None;
+                    history.offset = 0;
+                    history.notice = Some(
+                        "[zterm: retained history is no longer available; press a normal key to return live]",
+                    );
+                }
+            }
+            Ok(())
+        }
+
+        fn retain_or_resume(&mut self, bytes: Vec<u8>) -> Result<ViewportEffect, CliError> {
+            match &mut self.state {
+                ViewportState::Live => Ok(ViewportEffect::None),
+                ViewportState::History(_) => self.begin_resume(bytes),
+                ViewportState::ResumePending { retained_input, .. } => {
+                    append_resume_input(retained_input, &bytes)?;
+                    Ok(ViewportEffect::None)
+                }
+            }
+        }
+
+        fn begin_resume(&mut self, bytes: Vec<u8>) -> Result<ViewportEffect, CliError> {
+            match &mut self.state {
+                ViewportState::ResumePending { retained_input, .. } => {
+                    append_resume_input(retained_input, &bytes)?;
+                    Ok(ViewportEffect::None)
+                }
+                ViewportState::Live | ViewportState::History(_) => {
+                    if bytes.len() > RESUME_INPUT_BOUND {
+                        return Err(resume_input_overflow());
+                    }
+                    Ok(self.start_resume(bytes))
+                }
+            }
+        }
+
+        fn start_resume(&mut self, retained_input: Vec<u8>) -> ViewportEffect {
+            self.state = ViewportState::ResumePending {
+                retained_input,
+                snapshot_applied: false,
+            };
+            ViewportEffect::Resume
+        }
+
+        fn retain_resume_input(&mut self, bytes: &[u8]) -> Result<(), CliError> {
+            let ViewportState::ResumePending { retained_input, .. } = &mut self.state else {
+                return Ok(());
+            };
+            append_resume_input(retained_input, bytes)
+        }
+
+        fn observe_snapshot(&mut self) {
+            match &mut self.state {
+                ViewportState::Live => {}
+                ViewportState::History(_) => {
+                    self.state = ViewportState::ResumePending {
+                        retained_input: Vec::new(),
+                        snapshot_applied: true,
+                    };
+                }
+                ViewportState::ResumePending {
+                    snapshot_applied, ..
+                } => *snapshot_applied = true,
+            }
+        }
+
+        fn finish_resume(&mut self) -> Option<Vec<u8>> {
+            let ViewportState::ResumePending {
+                snapshot_applied: true,
+                ..
+            } = &self.state
+            else {
+                return None;
+            };
+            let ViewportState::ResumePending { retained_input, .. } =
+                std::mem::replace(&mut self.state, ViewportState::Live)
+            else {
+                unreachable!();
+            };
+            Some(retained_input)
+        }
+
+        fn visible_history_rows(&self) -> Option<VisibleHistoryRows<'_>> {
+            let ViewportState::History(history) = &self.state else {
+                return None;
+            };
+            let rows = history.page.as_ref().map_or(&[][..], |page| {
+                let end = history
+                    .offset
+                    .saturating_add(usize::from(self.content_size.rows))
+                    .min(page.rows.len());
+                &page.rows[history.offset.min(end)..end]
+            });
+            Some((rows, usize::from(self.content_size.rows), history.notice))
+        }
+
+        fn resume_notice(&self) -> Option<(&'static str, usize)> {
+            matches!(self.state, ViewportState::ResumePending { .. }).then_some((
+                "[zterm: returning to the live terminal]",
+                usize::from(self.content_size.rows),
+            ))
+        }
+    }
+
+    fn append_resume_input(retained: &mut Vec<u8>, bytes: &[u8]) -> Result<(), CliError> {
+        let combined = retained
+            .len()
+            .checked_add(bytes.len())
+            .ok_or_else(resume_input_overflow)?;
+        if combined > RESUME_INPUT_BOUND {
+            return Err(resume_input_overflow());
+        }
+        retained.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn resume_input_overflow() -> CliError {
+        terminal_daemon_error(
+            DomainErrorKind::ResourceExhausted,
+            "terminal input retained while returning from history exceeded its fixed bound",
+        )
+    }
+
+    #[derive(Clone, Eq, PartialEq)]
+    enum HostInputEvent {
+        Bytes(Vec<u8>),
+        Paste(Vec<u8>),
+        PageUp,
+        PageDown,
+        Mouse(SgrMouse),
+    }
+
+    struct HostInputCodec {
+        pending: Vec<u8>,
+        in_paste: bool,
+    }
+
+    impl HostInputCodec {
+        const fn new() -> Self {
+            Self {
+                pending: Vec::new(),
+                in_paste: false,
+            }
+        }
+
+        fn feed(&mut self, bytes: &[u8]) -> Result<Vec<HostInputEvent>, CliError> {
+            self.pending.extend_from_slice(bytes);
+            let mut events = Vec::new();
+            loop {
+                if self.pending.is_empty() {
+                    break;
+                }
+                if self.in_paste {
+                    if let Some(index) = find_bytes(&self.pending, PASTE_END) {
+                        let end = index + PASTE_END.len();
+                        if end > RESUME_INPUT_BOUND {
+                            return Err(paste_input_overflow());
+                        }
+                        events.push(HostInputEvent::Paste(self.pending.drain(..end).collect()));
+                        self.in_paste = false;
+                        continue;
+                    }
+                    if self.pending.len() > RESUME_INPUT_BOUND {
+                        return Err(paste_input_overflow());
+                    }
+                    break;
+                }
+                if self.pending.starts_with(PASTE_START) {
+                    self.in_paste = true;
+                    continue;
+                }
+                if self.pending.starts_with(PAGE_UP) {
+                    self.pending.drain(..PAGE_UP.len());
+                    events.push(HostInputEvent::PageUp);
+                    continue;
+                }
+                if self.pending.starts_with(PAGE_DOWN) {
+                    self.pending.drain(..PAGE_DOWN.len());
+                    events.push(HostInputEvent::PageDown);
+                    continue;
+                }
+                if self.pending.starts_with(b"\x1b[<") {
+                    if let Some(end) = self
+                        .pending
+                        .iter()
+                        .position(|byte| matches!(byte, b'M' | b'm'))
+                    {
+                        let length = end + 1;
+                        let raw: Vec<u8> = self.pending.drain(..length).collect();
+                        if let Some(mouse) = SgrMouse::parse(raw.clone()) {
+                            events.push(HostInputEvent::Mouse(mouse));
+                        } else {
+                            push_host_bytes(&mut events, raw);
+                        }
+                        continue;
+                    }
+                    if self.pending.len() < HOST_SEQUENCE_BOUND {
+                        break;
+                    }
+                }
+                if known_host_prefix(&self.pending) {
+                    break;
+                }
+                push_host_bytes(&mut events, vec![self.pending.remove(0)]);
+            }
+            Ok(events)
+        }
+
+        const fn paste_in_progress(&self) -> bool {
+            self.in_paste
+        }
+    }
+
+    #[derive(Clone, Eq, PartialEq)]
+    struct SgrMouse {
+        code: u16,
+        column: u16,
+        row: u16,
+        release: bool,
+        raw: Vec<u8>,
+    }
+
+    impl SgrMouse {
+        fn parse(raw: Vec<u8>) -> Option<Self> {
+            let release = *raw.last()? == b'm';
+            let body = raw
+                .strip_prefix(b"\x1b[<")?
+                .get(..raw.len().checked_sub(4)?)?;
+            let mut fields = body.split(|byte| *byte == b';');
+            let code = parse_decimal(fields.next()?)?;
+            let column = parse_decimal(fields.next()?)?;
+            let row = parse_decimal(fields.next()?)?;
+            if fields.next().is_some() || column == 0 || row == 0 {
+                return None;
+            }
+            Some(Self {
+                code,
+                column,
+                row,
+                release,
+                raw,
+            })
+        }
+
+        const fn is_wheel(&self) -> bool {
+            self.code & 64 != 0
+        }
+
+        const fn wheel_is_up(&self) -> bool {
+            self.code & 1 == 0
+        }
+    }
+
+    fn parse_decimal(bytes: &[u8]) -> Option<u16> {
+        if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let mut value = 0_u16;
+        for byte in bytes {
+            value = value
+                .checked_mul(10)?
+                .checked_add(u16::from(*byte - b'0'))?;
+        }
+        Some(value)
+    }
+
+    fn known_host_prefix(bytes: &[u8]) -> bool {
+        [PAGE_UP, PAGE_DOWN, PASTE_START]
+            .into_iter()
+            .any(|sequence| sequence.starts_with(bytes))
+            || b"\x1b[<".starts_with(bytes)
+    }
+
+    fn find_bytes(bytes: &[u8], needle: &[u8]) -> Option<usize> {
+        bytes
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
+    fn push_host_bytes(events: &mut Vec<HostInputEvent>, bytes: Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
+        if let Some(HostInputEvent::Bytes(previous)) = events.last_mut() {
+            previous.extend_from_slice(&bytes);
+        } else {
+            events.push(HostInputEvent::Bytes(bytes));
+        }
+    }
+
+    fn paste_input_overflow() -> CliError {
+        terminal_daemon_error(
+            DomainErrorKind::ResourceExhausted,
+            "bracketed terminal paste exceeded its fixed input bound",
+        )
+    }
+
+    fn history_owns_gestures(active_screen: ActiveScreen, modes: TerminalModes) -> bool {
+        active_screen == ActiveScreen::Main
+            && !modes.alternate_scroll
+            && modes.mouse_mode == TerminalMouseMode::None
+    }
+
+    fn route_mouse_to_child(
+        mouse: &SgrMouse,
+        active_screen: ActiveScreen,
+        modes: TerminalModes,
+    ) -> Option<Vec<u8>> {
+        if modes.mouse_mode != TerminalMouseMode::None {
+            return mouse_event_allowed(mouse, modes.mouse_mode)
+                .then(|| encode_child_mouse(mouse, modes.mouse_encoding))
+                .flatten();
+        }
+        if mouse.is_wheel() && (active_screen == ActiveScreen::Alternate || modes.alternate_scroll)
+        {
+            return Some(emulated_wheel_cursor_keys(
+                mouse.wheel_is_up(),
+                modes.application_cursor,
+            ));
+        }
+        None
+    }
+
+    fn mouse_event_allowed(mouse: &SgrMouse, mode: TerminalMouseMode) -> bool {
+        if mouse.is_wheel() {
+            return true;
+        }
+        let motion = mouse.code & 32 != 0;
+        if motion {
+            return match mode {
+                TerminalMouseMode::ButtonMotion => mouse.code & 3 != 3,
+                TerminalMouseMode::AnyMotion => true,
+                TerminalMouseMode::None
+                | TerminalMouseMode::Press
+                | TerminalMouseMode::PressRelease => false,
+            };
+        }
+        if mouse.release {
+            matches!(
+                mode,
+                TerminalMouseMode::PressRelease
+                    | TerminalMouseMode::ButtonMotion
+                    | TerminalMouseMode::AnyMotion
+            )
+        } else {
+            true
+        }
+    }
+
+    fn encode_child_mouse(mouse: &SgrMouse, encoding: TerminalMouseEncoding) -> Option<Vec<u8>> {
+        if encoding == TerminalMouseEncoding::Sgr {
+            return Some(mouse.raw.clone());
+        }
+        let code = if mouse.release {
+            (mouse.code & !3) | 3
+        } else {
+            mouse.code
+        };
+        let values = [code, mouse.column, mouse.row];
+        let mut bytes = b"\x1b[M".to_vec();
+        match encoding {
+            TerminalMouseEncoding::Default => {
+                for value in values {
+                    bytes.push(u8::try_from(value.checked_add(32)?).ok()?);
+                }
+            }
+            TerminalMouseEncoding::Utf8 => {
+                for value in values {
+                    bytes.extend_from_slice(
+                        char::from_u32(u32::from(value.checked_add(32)?))?
+                            .encode_utf8(&mut [0; 4])
+                            .as_bytes(),
+                    );
+                }
+            }
+            TerminalMouseEncoding::Sgr => unreachable!(),
+        }
+        Some(bytes)
+    }
+
+    fn emulated_wheel_cursor_keys(up: bool, application_cursor: bool) -> Vec<u8> {
+        let sequence: &[u8] = match (up, application_cursor) {
+            (true, true) => b"\x1bOA",
+            (false, true) => b"\x1bOB",
+            (true, false) => b"\x1b[A",
+            (false, false) => b"\x1b[B",
+        };
+        sequence.repeat(3)
+    }
+
     struct TerminalRenderer {
         revision: Option<Revision>,
         active_screen: ActiveScreen,
+        modes: TerminalModes,
     }
 
     impl TerminalRenderer {
@@ -1496,6 +2541,15 @@ mod unix {
             Self {
                 revision: None,
                 active_screen: ActiveScreen::Main,
+                modes: TerminalModes {
+                    application_keypad: false,
+                    application_cursor: false,
+                    bracketed_paste: false,
+                    focus_reporting: false,
+                    alternate_scroll: false,
+                    mouse_mode: TerminalMouseMode::None,
+                    mouse_encoding: TerminalMouseEncoding::Default,
+                },
             }
         }
 
@@ -1516,6 +2570,7 @@ mod unix {
                 .map_err(|error| terminal_io("render terminal snapshot", error))?;
             self.revision = Some(snapshot.revision);
             self.active_screen = snapshot.active_screen;
+            self.modes = snapshot.modes;
             Ok(())
         }
 
@@ -1524,8 +2579,41 @@ mod unix {
             writer: &mut impl Write,
             delta: RenderDelta<'_>,
         ) -> Result<DeltaRender, CliError> {
-            if self.revision != Some(delta.from_revision) {
+            let Some(ansi) = self.validate_delta(delta)? else {
                 return Ok(DeltaRender::Gap);
+            };
+            let reassert_host_capture =
+                child_transition_disables_host_capture(self.modes, delta.modes);
+            writer
+                .write_all(ansi)
+                .and_then(|()| {
+                    if reassert_host_capture {
+                        writer.write_all(HOST_INPUT_CAPTURE)
+                    } else {
+                        Ok(())
+                    }
+                })
+                .and_then(|()| writer.flush())
+                .map_err(|error| terminal_io("render terminal delta", error))?;
+            self.revision = Some(delta.to_revision);
+            self.active_screen = delta.active_screen;
+            self.modes = delta.modes;
+            Ok(DeltaRender::Applied)
+        }
+
+        fn observe_delta(&mut self, delta: RenderDelta<'_>) -> Result<DeltaRender, CliError> {
+            if self.validate_delta(delta)?.is_none() {
+                return Ok(DeltaRender::Gap);
+            }
+            self.revision = Some(delta.to_revision);
+            self.active_screen = delta.active_screen;
+            self.modes = delta.modes;
+            Ok(DeltaRender::Applied)
+        }
+
+        fn validate_delta<'a>(&self, delta: RenderDelta<'a>) -> Result<Option<&'a [u8]>, CliError> {
+            if self.revision != Some(delta.from_revision) {
+                return Ok(None);
             }
             if delta.to_revision.get() <= delta.from_revision.get() {
                 return Err(terminal_daemon_error(
@@ -1533,26 +2621,39 @@ mod unix {
                     "terminal delta revision did not advance",
                 ));
             }
-            let ansi = delta_screen_ansi(delta.ansi, self.active_screen, delta.active_screen)
-                .map_err(|error| terminal_io("validate terminal delta", error))?;
-            writer
-                .write_all(ansi)
-                .and_then(|()| writer.flush())
-                .map_err(|error| terminal_io("render terminal delta", error))?;
-            self.revision = Some(delta.to_revision);
-            self.active_screen = delta.active_screen;
-            Ok(DeltaRender::Applied)
+            delta_screen_ansi(delta.ansi, self.active_screen, delta.active_screen)
+                .map(Some)
+                .map_err(|error| terminal_io("validate terminal delta", error))
         }
 
         fn revision(&self) -> Revision {
             self.revision
                 .expect("the initial snapshot is rendered before event processing")
         }
+
+        const fn active_screen(&self) -> ActiveScreen {
+            self.active_screen
+        }
+
+        const fn modes(&self) -> TerminalModes {
+            self.modes
+        }
+    }
+
+    const fn child_transition_disables_host_capture(
+        previous: TerminalModes,
+        current: TerminalModes,
+    ) -> bool {
+        (matches!(previous.mouse_mode, TerminalMouseMode::AnyMotion)
+            && matches!(current.mouse_mode, TerminalMouseMode::None))
+            || (matches!(previous.mouse_encoding, TerminalMouseEncoding::Sgr)
+                && matches!(current.mouse_encoding, TerminalMouseEncoding::Default))
     }
 
     struct RenderSnapshot<'a> {
         revision: Revision,
         active_screen: ActiveScreen,
+        modes: TerminalModes,
         recent_history_ansi: &'a [u8],
         screen_ansi: &'a [u8],
     }
@@ -1562,16 +2663,19 @@ mod unix {
             Self {
                 revision: snapshot.revision(),
                 active_screen: snapshot.active_screen(),
+                modes: snapshot.modes(),
                 recent_history_ansi: snapshot.recent_history_ansi(),
                 screen_ansi: snapshot.screen_ansi(),
             }
         }
     }
 
+    #[derive(Clone, Copy)]
     struct RenderDelta<'a> {
         from_revision: Revision,
         to_revision: Revision,
         active_screen: ActiveScreen,
+        modes: TerminalModes,
         ansi: &'a [u8],
     }
 
@@ -1581,6 +2685,7 @@ mod unix {
                 from_revision: delta.from_revision(),
                 to_revision: delta.to_revision(),
                 active_screen: delta.active_screen(),
+                modes: delta.modes(),
                 ansi: delta.ansi(),
             }
         }
@@ -1614,6 +2719,87 @@ mod unix {
         let stdout = io::stdout();
         let mut output = stdout.lock();
         render_transport_state(&mut output, state)
+    }
+
+    fn render_status_stdout(
+        renderer: &mut StatusRenderer,
+        state: TerminalViewTransportState,
+    ) -> Result<(), CliError> {
+        let stdout = io::stdout();
+        let mut output = stdout.lock();
+        renderer.render(&mut output, state)
+    }
+
+    fn render_history_stdout(viewport: &ViewportController) -> Result<(), CliError> {
+        let stdout = io::stdout();
+        let mut output = stdout.lock();
+        render_history(&mut output, viewport)
+    }
+
+    fn render_history(
+        writer: &mut impl Write,
+        viewport: &ViewportController,
+    ) -> Result<(), CliError> {
+        let (rows, height, notice) =
+            if let Some((rows, height, notice)) = viewport.visible_history_rows() {
+                (rows, height, notice)
+            } else if let Some((notice, height)) = viewport.resume_notice() {
+                (&[][..], height, Some(notice))
+            } else {
+                return Ok(());
+            };
+        let top_padding = height.saturating_sub(rows.len());
+        writer
+            .write_all(b"\x1b[?25l\x1b[0m")
+            .and_then(|()| {
+                for terminal_row in 0..height {
+                    write!(writer, "\x1b[{};1H\x1b[0m\x1b[2K", terminal_row + 1)?;
+                    if terminal_row == 0
+                        && let Some(notice) = notice
+                    {
+                        writer.write_all(notice.as_bytes())?;
+                    } else if terminal_row >= top_padding {
+                        let index = terminal_row - top_padding;
+                        if let Some(row) = rows.get(index) {
+                            writer.write_all(row)?;
+                        }
+                    }
+                }
+                writer.flush()
+            })
+            .map_err(|error| terminal_io("render terminal history", error))
+    }
+
+    async fn apply_viewport_effect(
+        effect: ViewportEffect,
+        viewport: &ViewportController,
+        writer: &zterm_daemon::operations::TerminalViewCommandWriter,
+        revision: Revision,
+        status: &mut StatusRenderer,
+        transport_state: TerminalViewTransportState,
+    ) -> Result<bool, CliError> {
+        match effect {
+            ViewportEffect::None => Ok(false),
+            ViewportEffect::Render => {
+                render_history_stdout(viewport)?;
+                render_status_stdout(status, transport_state)?;
+                Ok(false)
+            }
+            ViewportEffect::Request(request) => {
+                render_history_stdout(viewport)?;
+                render_status_stdout(status, transport_state)?;
+                writer
+                    .request_history(request.direction, request.cursor, MAX_HISTORY_PAGE_ROWS)
+                    .await?;
+                Ok(false)
+            }
+            ViewportEffect::Resume => {
+                render_history_stdout(viewport)?;
+                render_status_stdout(status, transport_state)?;
+                writer.request_sync(revision).await?;
+                Ok(true)
+            }
+        }
     }
 
     fn render_transport_state(
@@ -1884,19 +3070,69 @@ mod unix {
                     .expect("input-fence PTY duplicate");
                 let thread_epoch = input_epoch.clone();
                 let (result_sender, result_receiver) = sync_channel(1);
+                let mut retained = vec![b'k', b'e', b'y', b'0' + cycle];
+                let mut viewport = ViewportController {
+                    state: ViewportState::ResumePending {
+                        retained_input: retained.clone(),
+                        snapshot_applied: true,
+                    },
+                    content_size: TerminalSize::new(2, 20),
+                };
+                if cycle == 0 {
+                    let mut codec = HostInputCodec::new();
+                    assert!(
+                        codec
+                            .feed(b"\x1b[20")
+                            .expect("split paste prefix remains bounded")
+                            .is_empty()
+                    );
+                    assert!(
+                        codec
+                            .feed(b"0~paste-head\x1d.")
+                            .expect("bounded partial paste")
+                            .is_empty()
+                    );
+                    assert!(
+                        should_defer_active_for_paste(
+                            TerminalViewTransportState::Active,
+                            &viewport,
+                            &codec,
+                        ),
+                        "an Active event after Snapshot must wait for the unread paste tail"
+                    );
+                    assert!(
+                        codec
+                            .feed(b"-tail\x1b[201")
+                            .expect("split paste suffix remains bounded")
+                            .is_empty()
+                    );
+                    let events = codec
+                        .feed(b"~")
+                        .expect("the final delimiter completes one paste unit");
+                    let [HostInputEvent::Paste(paste)] = events.as_slice() else {
+                        panic!("split bracketed paste must produce exactly one Paste event");
+                    };
+                    assert!(!codec.paste_in_progress());
+                    viewport
+                        .retain_resume_input(paste)
+                        .expect("whole paste fits the resume-input bound");
+                    retained.extend_from_slice(paste);
+                }
                 let fence = std::thread::spawn(move || {
                     let mut pump = old_pump;
                     let mut epoch = stale_epoch;
                     let mut parser = prefix;
-                    let result = transition_input_state(
+                    let result = transition_transport_input_state(
                         &fence_input,
                         &thread_epoch,
                         &mut epoch,
                         &mut pump,
                         &mut parser,
+                        TerminalViewTransportState::Synchronizing,
                         TerminalViewTransportState::Active,
+                        &mut viewport,
                     );
-                    let _ = result_sender.send((result, pump, epoch, parser));
+                    let _ = result_sender.send((result, pump, epoch, parser, viewport));
                 });
 
                 let bound = rustix::event::Timespec {
@@ -1909,15 +3145,27 @@ mod unix {
                     1,
                     "the Active fence must wake the old reader before joining it"
                 );
+                assert!(
+                    matches!(
+                        result_receiver.try_recv(),
+                        Err(std::sync::mpsc::TryRecvError::Empty)
+                    ),
+                    "retained resume input must not become sendable before the old reader joins"
+                );
                 stale_control
                     .release
                     .send(())
                     .expect("release the old reader after cancellation is visible");
-                let (result, returned_pump, returned_epoch, returned_prefix) = result_receiver
-                    .recv_timeout(Duration::from_secs(2))
-                    .expect("Active fence completed within its bound");
+                let (result, returned_pump, returned_epoch, returned_prefix, viewport) =
+                    result_receiver
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("Active fence completed within its bound");
                 fence.join().expect("Active fence thread");
-                result.expect("replace stdin pump after Active fence");
+                assert_eq!(
+                    result.expect("replace stdin pump after Active fence"),
+                    Some(retained)
+                );
+                assert!(viewport.is_live());
                 stdin_pump = Some(returned_pump);
                 current_epoch = returned_epoch;
                 prefix = returned_prefix;
@@ -1989,6 +3237,196 @@ mod unix {
         }
 
         #[test]
+        fn remote_geometry_reserves_one_status_row_with_a_one_row_fallback() {
+            let ordinary = TerminalSize::new(24, 80);
+            assert_eq!(child_terminal_size(ordinary, false), ordinary);
+            assert_eq!(
+                child_terminal_size(ordinary, true),
+                TerminalSize::new(23, 80)
+            );
+            assert_eq!(
+                child_terminal_size(TerminalSize::new(2, 37), true),
+                TerminalSize::new(1, 37)
+            );
+            assert_eq!(
+                child_terminal_size(TerminalSize::new(1, 37), true),
+                TerminalSize::new(1, 37)
+            );
+        }
+
+        #[test]
+        fn status_row_is_reverse_video_full_width_exact_and_unicode_clipped() {
+            let mut renderer =
+                StatusRenderer::new(Some("开发机".to_owned()), TerminalSize::new(4, 26));
+            renderer.path = TerminalViewConnectionPath::Direct;
+            renderer.rtt_ms = Some(42);
+            let mut output = Vec::new();
+            renderer
+                .render(&mut output, TerminalViewTransportState::Active)
+                .expect("render active direct status");
+            assert_eq!(
+                output,
+                b"\x1b7\x1b[4;1H\x1b[0;7m\x1b[2K\xe5\xbc\x80\xe5\x8f\x91\xe6\x9c\xba | direct | 42 ms   \x1b[0m\x1b8"
+            );
+
+            let mut inactive =
+                StatusRenderer::new(Some("开发机".to_owned()), TerminalSize::new(3, 26));
+            inactive.path = TerminalViewConnectionPath::Relay;
+            inactive.rtt_ms = Some(7);
+            let mut inactive_output = Vec::new();
+            inactive
+                .render(
+                    &mut inactive_output,
+                    TerminalViewTransportState::Reconnecting,
+                )
+                .expect("render inactive status");
+            assert!(contains_bytes(
+                &inactive_output,
+                "开发机 | -- | --".as_bytes()
+            ));
+            assert!(!contains_bytes(&inactive_output, b"relay"));
+            assert!(!contains_bytes(&inactive_output, b"7 ms"));
+
+            let mut narrow =
+                StatusRenderer::new(Some("开发机".to_owned()), TerminalSize::new(2, 5));
+            narrow.path = TerminalViewConnectionPath::Direct;
+            narrow.rtt_ms = Some(42);
+            let mut narrow_output = Vec::new();
+            narrow
+                .render(&mut narrow_output, TerminalViewTransportState::Active)
+                .expect("render narrow Unicode status");
+            assert_eq!(
+                narrow_output,
+                b"\x1b7\x1b[2;1H\x1b[0;7m\x1b[2K\xe5\xbc\x80\xe5\x8f\x91 \x1b[0m\x1b8"
+            );
+        }
+
+        #[test]
+        fn host_codec_and_modes_route_page_and_wheel_without_program_branches() {
+            let mut codec = HostInputCodec::new();
+            assert!(
+                codec
+                    .feed(b"\x1b[5")
+                    .expect("partial page sequence remains bounded")
+                    .is_empty()
+            );
+            let page_events = codec
+                .feed(b"~\x1b[6~raw")
+                .expect("page and raw input decode");
+            assert!(matches!(page_events.first(), Some(HostInputEvent::PageUp)));
+            assert!(matches!(page_events.get(1), Some(HostInputEvent::PageDown)));
+            assert!(matches!(
+                page_events.get(2),
+                Some(HostInputEvent::Bytes(bytes)) if bytes == b"raw"
+            ));
+
+            let wheel_raw = b"\x1b[<64;5;4M";
+            let wheel_events = codec.feed(wheel_raw).expect("SGR mouse input decodes");
+            let Some(HostInputEvent::Mouse(wheel)) = wheel_events.first() else {
+                panic!("SGR wheel input must decode as one host mouse event");
+            };
+            assert!(wheel.is_wheel());
+            assert!(wheel.wheel_is_up());
+
+            let shell_modes = TerminalModes::default();
+            assert!(history_owns_gestures(ActiveScreen::Main, shell_modes));
+            assert_eq!(
+                route_mouse_to_child(wheel, ActiveScreen::Main, shell_modes),
+                None
+            );
+
+            let child_mouse = TerminalModes {
+                mouse_mode: TerminalMouseMode::PressRelease,
+                mouse_encoding: TerminalMouseEncoding::Sgr,
+                ..TerminalModes::default()
+            };
+            assert!(!history_owns_gestures(ActiveScreen::Main, child_mouse));
+            assert_eq!(
+                route_mouse_to_child(wheel, ActiveScreen::Main, child_mouse),
+                Some(wheel_raw.to_vec())
+            );
+
+            assert!(!history_owns_gestures(ActiveScreen::Alternate, shell_modes));
+            assert_eq!(
+                route_mouse_to_child(wheel, ActiveScreen::Alternate, shell_modes),
+                Some(b"\x1b[A\x1b[A\x1b[A".to_vec())
+            );
+
+            let alternate_scroll = TerminalModes {
+                alternate_scroll: true,
+                application_cursor: true,
+                ..TerminalModes::default()
+            };
+            assert!(!history_owns_gestures(ActiveScreen::Main, alternate_scroll));
+            assert_eq!(
+                route_mouse_to_child(wheel, ActiveScreen::Main, alternate_scroll),
+                Some(b"\x1bOA\x1bOA\x1bOA".to_vec())
+            );
+        }
+
+        #[test]
+        fn bracketed_paste_overflow_fails_without_emitting_a_partial_input_event() {
+            let mut codec = HostInputCodec::new();
+            assert!(
+                codec
+                    .feed(PASTE_START)
+                    .expect("paste prefix is within the bound")
+                    .is_empty()
+            );
+            let Err(CliError::Daemon(error)) = codec.feed(&vec![b'x'; RESUME_INPUT_BOUND]) else {
+                panic!("unterminated paste beyond the fixed bound must fail with a daemon error");
+            };
+            assert_eq!(error.kind(), DomainErrorKind::ResourceExhausted);
+        }
+
+        #[test]
+        fn viewport_resumes_authoritative_live_state_and_forwards_retained_input_once() {
+            let mut viewport = ViewportController::new(TerminalSize::new(2, 20));
+            let ViewportEffect::Request(request) = viewport.navigate(true, 1) else {
+                panic!("the first upward gesture must request newest retained history");
+            };
+            assert_eq!(request.direction, TerminalHistoryDirection::Newest);
+            assert_eq!(request.cursor, None);
+            assert!(viewport.is_history());
+
+            let cursor = TerminalHistoryCursor {
+                epoch: Revision::new(3),
+                revision: Revision::new(7),
+                start_row: 0,
+                row_count: 3,
+                oldest_row: 0,
+                newest_row: 3,
+            };
+            viewport
+                .apply_history(TerminalHistoryResult::Page(TerminalHistoryPage {
+                    cursor,
+                    rows: vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()],
+                }))
+                .expect("apply one authoritative history page");
+            let (visible, height, notice) = viewport
+                .visible_history_rows()
+                .expect("history remains pinned");
+            assert_eq!(visible, &[b"two".to_vec(), b"three".to_vec()]);
+            assert_eq!(height, 2);
+            assert_eq!(notice, None);
+
+            assert!(matches!(
+                viewport
+                    .retain_or_resume(b"key".to_vec())
+                    .expect("normal input begins bounded resume"),
+                ViewportEffect::Resume
+            ));
+            viewport
+                .retain_resume_input(b"-paste")
+                .expect("paste bytes stay bounded while the snapshot is pending");
+            assert_eq!(viewport.finish_resume(), None);
+            viewport.observe_snapshot();
+            assert_eq!(viewport.finish_resume(), Some(b"key-paste".to_vec()));
+            assert_eq!(viewport.finish_resume(), None);
+            assert!(viewport.is_live());
+        }
+
+        #[test]
         fn snapshot_history_precedes_screen_and_deltas_require_contiguity() {
             let mut renderer = TerminalRenderer::new();
             let mut output = Vec::new();
@@ -1998,6 +3436,7 @@ mod unix {
                     RenderSnapshot {
                         revision: Revision::new(4),
                         active_screen: ActiveScreen::Main,
+                        modes: TerminalModes::default(),
                         recent_history_ansi: b"history",
                         screen_ansi: b"\x1b[?1049lscreen",
                     },
@@ -2013,6 +3452,7 @@ mod unix {
                             from_revision: Revision::new(3),
                             to_revision: Revision::new(5),
                             active_screen: ActiveScreen::Main,
+                            modes: TerminalModes::default(),
                             ansi: b"stale",
                         },
                     )
@@ -2029,6 +3469,7 @@ mod unix {
                             from_revision: Revision::new(4),
                             to_revision: Revision::new(5),
                             active_screen: ActiveScreen::Alternate,
+                            modes: TerminalModes::default(),
                             ansi: b"\x1b[?1049hdelta",
                         },
                     )
@@ -2036,6 +3477,55 @@ mod unix {
                 DeltaRender::Applied
             );
             assert_eq!(output, b"historyscreendelta");
+        }
+
+        #[test]
+        fn renderer_reasserts_ui_mouse_capture_after_child_disables_matching_modes() {
+            let child_capture = TerminalModes {
+                mouse_mode: TerminalMouseMode::AnyMotion,
+                mouse_encoding: TerminalMouseEncoding::Sgr,
+                ..TerminalModes::default()
+            };
+            let mut renderer = TerminalRenderer::new();
+            renderer
+                .apply_snapshot(
+                    &mut Vec::new(),
+                    RenderSnapshot {
+                        revision: Revision::new(1),
+                        active_screen: ActiveScreen::Main,
+                        modes: child_capture,
+                        recent_history_ansi: b"",
+                        screen_ansi: b"\x1b[?1049l\x1b[?1003h\x1b[?1006h",
+                    },
+                )
+                .expect("establish child mouse modes");
+
+            let child_disable = b"\x1b[?1003l\x1b[?1006l";
+            let mut output = Vec::new();
+            assert_eq!(
+                renderer
+                    .apply_delta(
+                        &mut output,
+                        RenderDelta {
+                            from_revision: Revision::new(1),
+                            to_revision: Revision::new(2),
+                            active_screen: ActiveScreen::Main,
+                            modes: TerminalModes::default(),
+                            ansi: child_disable,
+                        },
+                    )
+                    .expect("apply child mouse disable"),
+                DeltaRender::Applied
+            );
+            assert_eq!(
+                output,
+                [child_disable.as_slice(), HOST_INPUT_CAPTURE].concat()
+            );
+            assert_eq!(renderer.modes(), TerminalModes::default());
+            assert!(history_owns_gestures(
+                renderer.active_screen(),
+                renderer.modes()
+            ));
         }
 
         #[test]
@@ -2087,6 +3577,7 @@ mod unix {
                     RenderSnapshot {
                         revision: Revision::new(9),
                         active_screen: ActiveScreen::Main,
+                        modes: TerminalModes::default(),
                         recent_history_ansi: b"history",
                         screen_ansi: b"\x1b[?1049lscreen",
                     },

@@ -24,12 +24,17 @@ pub const MAIN_SCREEN_SELECTION_ANSI: &[u8] = b"\x1b[?1049l";
 pub const ALTERNATE_SCREEN_SELECTION_ANSI: &[u8] = b"\x1b[?1049h";
 const FOCUS_REPORTING_ON: &[u8] = b"\x1b[?1004h";
 const FOCUS_REPORTING_OFF: &[u8] = b"\x1b[?1004l";
+const ALTERNATE_SCROLL_ON: &[u8] = b"\x1b[?1007h";
+const ALTERNATE_SCROLL_OFF: &[u8] = b"\x1b[?1007l";
 
 /// Maximum number of side events returned by one terminal update.
 pub const MAX_SIDE_EVENTS_PER_UPDATE: usize = 32;
 
 /// Maximum number of source bytes retained for a title or icon-name event.
 pub const MAX_TITLE_BYTES: usize = 256;
+
+/// Maximum number of daemon-authored rows returned by one history page.
+pub const MAX_HISTORY_PAGE_ROWS: usize = 80;
 
 /// Terminal viewport size in character cells.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -167,10 +172,81 @@ pub struct TerminalModes {
     pub bracketed_paste: bool,
     /// Focus events should be reported to the hosted application.
     pub focus_reporting: bool,
+    /// Wheel input should be translated to cursor keys on the alternate screen.
+    pub alternate_scroll: bool,
     /// Mouse event reporting mode.
     pub mouse_mode: TerminalMouseMode,
     /// Mouse event encoding.
     pub mouse_encoding: TerminalMouseEncoding,
+}
+
+/// Direction of one bounded history request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalHistoryDirection {
+    /// Return the newest retained history rows.
+    Newest,
+    /// Return rows immediately older than the supplied cursor.
+    Older,
+    /// Return rows immediately newer than the supplied cursor.
+    Newer,
+}
+
+/// Stable position of one daemon-authored history page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerminalHistoryCursor {
+    /// Epoch which changes whenever retained row identity may have changed.
+    pub epoch: Revision,
+    /// Model revision observed while producing this page.
+    pub revision: Revision,
+    /// Zero-based page start measured from the oldest retained history row.
+    pub start_row: u64,
+    /// Number of rows in this page.
+    pub row_count: u32,
+    /// Oldest retained row bound, currently always zero.
+    pub oldest_row: u64,
+    /// Exclusive newest retained row bound.
+    pub newest_row: u64,
+}
+
+/// One bounded daemon-formatted history page.
+#[derive(Clone, Eq, PartialEq)]
+pub struct TerminalHistoryPage {
+    /// Stable cursor and retained bounds for this page.
+    pub cursor: TerminalHistoryCursor,
+    /// Independently formatted ANSI rows in oldest-to-newest order.
+    pub rows: Vec<Vec<u8>>,
+}
+
+impl fmt::Debug for TerminalHistoryPage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalHistoryPage")
+            .field("cursor", &self.cursor)
+            .field("row_count", &self.rows.len())
+            .field("ansi_bytes", &self.rows.iter().map(Vec::len).sum::<usize>())
+            .finish()
+    }
+}
+
+/// Result of resolving a revision-bound history request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TerminalHistoryResult {
+    /// The requested rows were produced from one consistent retained epoch.
+    Page(TerminalHistoryPage),
+    /// The terminal or retained-history epoch changed; callers must start over.
+    HistoryChanged {
+        /// Current history epoch.
+        epoch: Revision,
+        /// Current model revision.
+        revision: Revision,
+    },
+    /// The supplied cursor or range no longer names retained rows.
+    HistoryGap {
+        /// Current history epoch.
+        epoch: Revision,
+        /// Current model revision.
+        revision: Revision,
+    },
 }
 
 /// Zterm-owned semantic projection used to compare terminal states.
@@ -458,6 +534,7 @@ pub struct TerminalCheckpoint {
     size: TerminalSize,
     active_screen: ActiveScreen,
     focus_reporting: bool,
+    alternate_scroll: bool,
     screen: vt100::Screen,
     retained_cell_capacity: usize,
 }
@@ -516,6 +593,13 @@ pub enum TerminalError {
         /// Scrollback capacity which could not be projected.
         scrollback_rows: usize,
     },
+    /// A history page requested zero rows or exceeded the fixed page bound.
+    InvalidHistoryPageSize {
+        /// Requested number of rows.
+        requested: usize,
+        /// Product maximum for one page.
+        maximum: usize,
+    },
 }
 
 impl fmt::Display for TerminalError {
@@ -535,6 +619,10 @@ impl fmt::Display for TerminalError {
                 "terminal resource projection overflow for {}x{} with {scrollback_rows} scrollback rows",
                 size.columns, size.rows
             ),
+            Self::InvalidHistoryPageSize { requested, maximum } => write!(
+                formatter,
+                "terminal history page size {requested} is outside 1..={maximum}",
+            ),
         }
     }
 }
@@ -547,6 +635,8 @@ pub struct TerminalModel {
     revision: Revision,
     scrollback_rows: usize,
     resource_projection: TerminalResourceProjection,
+    history_epoch: Revision,
+    retained_history_rows: usize,
 }
 
 impl TerminalModel {
@@ -573,6 +663,8 @@ impl TerminalModel {
             revision: Revision::ZERO,
             scrollback_rows,
             resource_projection,
+            history_epoch: Revision::ZERO,
+            retained_history_rows: 0,
         })
     }
 
@@ -605,6 +697,7 @@ impl TerminalModel {
         let next_revision = self.next_revision()?;
         self.parser.process(bytes);
         self.revision = next_revision;
+        self.refresh_history_epoch_after_ingest();
         let (replies, events) = self.parser.callbacks_mut().take_output();
         Ok(TerminalUpdate {
             revision: self.revision,
@@ -619,6 +712,12 @@ impl TerminalModel {
         self.parser.screen_mut().set_size(size.rows, size.columns);
         self.revision = next_revision;
         self.resource_projection = resource_projection;
+        self.history_epoch = next_revision;
+        self.retained_history_rows = if active_screen(self.parser.screen()) == ActiveScreen::Main {
+            retained_history_rows(self.parser.screen())
+        } else {
+            self.retained_history_rows
+        };
         Ok(TerminalUpdate {
             revision: self.revision,
             replies: Vec::new(),
@@ -644,9 +743,15 @@ impl TerminalModel {
         let size = self.size();
         let active_screen = active_screen(screen);
         let focus_reporting = self.parser.callbacks().focus_reporting;
+        let alternate_scroll = self.parser.callbacks().alternate_scroll;
         let mut baseline =
             vt100::Parser::new_with_callbacks(size.rows, size.columns, 0, SafeCallbacks::default());
-        baseline.process(&visible_screen_ansi(screen, active_screen, focus_reporting));
+        baseline.process(&visible_screen_ansi(
+            screen,
+            active_screen,
+            focus_reporting,
+            alternate_scroll,
+        ));
         let retained_cell_capacity = usize::from(size.rows)
             .saturating_mul(usize::from(size.columns))
             .saturating_mul(2);
@@ -655,6 +760,7 @@ impl TerminalModel {
             size,
             active_screen,
             focus_reporting,
+            alternate_scroll,
             screen: baseline.screen().clone(),
             retained_cell_capacity,
         }
@@ -665,8 +771,18 @@ impl TerminalModel {
     pub fn snapshot(&self) -> TerminalSnapshot {
         let screen = self.parser.screen();
         let active_screen = active_screen(screen);
-        let modes = terminal_modes(screen, self.parser.callbacks().focus_reporting);
-        let screen_ansi = visible_screen_ansi(screen, active_screen, modes.focus_reporting);
+        let callbacks = self.parser.callbacks();
+        let modes = terminal_modes(
+            screen,
+            callbacks.focus_reporting,
+            callbacks.alternate_scroll,
+        );
+        let screen_ansi = visible_screen_ansi(
+            screen,
+            active_screen,
+            modes.focus_reporting,
+            modes.alternate_scroll,
+        );
 
         TerminalSnapshot {
             revision: self.revision,
@@ -696,6 +812,9 @@ impl TerminalModel {
         }
         if checkpoint.focus_reporting != snapshot.modes.focus_reporting {
             ansi.extend_from_slice(focus_reporting_ansi(snapshot.modes.focus_reporting));
+        }
+        if checkpoint.alternate_scroll != snapshot.modes.alternate_scroll {
+            ansi.extend_from_slice(alternate_scroll_ansi(snapshot.modes.alternate_scroll));
         }
 
         let delta = TerminalDelta {
@@ -739,7 +858,11 @@ impl TerminalModel {
                 visible: !screen.hide_cursor(),
                 style: active_style(screen),
             },
-            modes: terminal_modes(screen, self.parser.callbacks().focus_reporting),
+            modes: terminal_modes(
+                screen,
+                self.parser.callbacks().focus_reporting,
+                self.parser.callbacks().alternate_scroll,
+            ),
             cells,
         }
     }
@@ -750,10 +873,105 @@ impl TerminalModel {
         self.resource_projection
     }
 
+    /// Returns one bounded, revision-aware page from retained main-screen history.
+    pub fn history_page(
+        &self,
+        direction: TerminalHistoryDirection,
+        cursor: Option<TerminalHistoryCursor>,
+        maximum_rows: usize,
+    ) -> Result<TerminalHistoryResult, TerminalError> {
+        if maximum_rows == 0 || maximum_rows > MAX_HISTORY_PAGE_ROWS {
+            return Err(TerminalError::InvalidHistoryPageSize {
+                requested: maximum_rows,
+                maximum: MAX_HISTORY_PAGE_ROWS,
+            });
+        }
+        if active_screen(self.parser.screen()) != ActiveScreen::Main {
+            return Ok(TerminalHistoryResult::HistoryChanged {
+                epoch: self.history_epoch,
+                revision: self.revision,
+            });
+        }
+
+        let total = self.retained_history_rows;
+        let total_u64 = u64::try_from(total).unwrap_or(u64::MAX);
+        let start = match direction {
+            TerminalHistoryDirection::Newest => total.saturating_sub(maximum_rows),
+            TerminalHistoryDirection::Older | TerminalHistoryDirection::Newer => {
+                let Some(cursor) = cursor else {
+                    return Ok(TerminalHistoryResult::HistoryGap {
+                        epoch: self.history_epoch,
+                        revision: self.revision,
+                    });
+                };
+                if cursor.epoch != self.history_epoch {
+                    return Ok(TerminalHistoryResult::HistoryChanged {
+                        epoch: self.history_epoch,
+                        revision: self.revision,
+                    });
+                }
+                let end = cursor.start_row.checked_add(u64::from(cursor.row_count));
+                if cursor.oldest_row != 0
+                    || cursor.start_row < cursor.oldest_row
+                    || end.is_none_or(|end| end > cursor.newest_row)
+                    || cursor.newest_row > total_u64
+                {
+                    return Ok(TerminalHistoryResult::HistoryGap {
+                        epoch: self.history_epoch,
+                        revision: self.revision,
+                    });
+                }
+                match direction {
+                    TerminalHistoryDirection::Older => usize::try_from(cursor.start_row)
+                        .unwrap_or(usize::MAX)
+                        .saturating_sub(maximum_rows),
+                    TerminalHistoryDirection::Newer => {
+                        usize::try_from(end.unwrap_or(total_u64)).unwrap_or(usize::MAX)
+                    }
+                    TerminalHistoryDirection::Newest => unreachable!(),
+                }
+            }
+        };
+        if start > total {
+            return Ok(TerminalHistoryResult::HistoryGap {
+                epoch: self.history_epoch,
+                revision: self.revision,
+            });
+        }
+        let count = maximum_rows.min(total - start);
+        let rows = formatted_history_rows(self.parser.screen(), total, start, count);
+        let row_count = u32::try_from(rows.len()).unwrap_or(u32::MAX);
+        Ok(TerminalHistoryResult::Page(TerminalHistoryPage {
+            cursor: TerminalHistoryCursor {
+                epoch: self.history_epoch,
+                revision: self.revision,
+                start_row: u64::try_from(start).unwrap_or(u64::MAX),
+                row_count,
+                oldest_row: 0,
+                newest_row: total_u64,
+            },
+            rows,
+        }))
+    }
+
     fn next_revision(&self) -> Result<Revision, TerminalError> {
         self.revision
             .checked_next()
             .ok_or(TerminalError::RevisionOverflow)
+    }
+
+    fn refresh_history_epoch_after_ingest(&mut self) {
+        if active_screen(self.parser.screen()) != ActiveScreen::Main {
+            return;
+        }
+        let retained = retained_history_rows(self.parser.screen());
+        let reached_capacity = self.scrollback_rows > 0
+            && retained == self.scrollback_rows
+            && self.retained_history_rows <= retained;
+        if retained < self.retained_history_rows || reached_capacity {
+            self.history_epoch = self.revision;
+        }
+        self.retained_history_rows = retained;
     }
 }
 
@@ -763,6 +981,7 @@ struct SafeCallbacks {
     events: Vec<TerminalSideEvent>,
     dropped_events: u64,
     focus_reporting: bool,
+    alternate_scroll: bool,
 }
 
 impl SafeCallbacks {
@@ -874,9 +1093,17 @@ impl vt100::Callbacks for SafeCallbacks {
         if intermediate_1 == Some(b'?')
             && intermediate_2.is_none()
             && matches!(command, 'h' | 'l')
-            && params.iter().any(|param| **param == [1004])
+            && params
+                .iter()
+                .any(|param| matches!(**param, [1004] | [1007]))
         {
-            self.focus_reporting = command == 'h';
+            for param in params {
+                match **param {
+                    [1004] => self.focus_reporting = command == 'h',
+                    [1007] => self.alternate_scroll = command == 'h',
+                    _ => {}
+                }
+            }
             return;
         }
 
@@ -958,12 +1185,17 @@ fn active_screen(screen: &vt100::Screen) -> ActiveScreen {
     }
 }
 
-fn terminal_modes(screen: &vt100::Screen, focus_reporting: bool) -> TerminalModes {
+fn terminal_modes(
+    screen: &vt100::Screen,
+    focus_reporting: bool,
+    alternate_scroll: bool,
+) -> TerminalModes {
     TerminalModes {
         application_keypad: screen.application_keypad(),
         application_cursor: screen.application_cursor(),
         bracketed_paste: screen.bracketed_paste(),
         focus_reporting,
+        alternate_scroll,
         mouse_mode: match screen.mouse_protocol_mode() {
             vt100::MouseProtocolMode::None => TerminalMouseMode::None,
             vt100::MouseProtocolMode::Press => TerminalMouseMode::Press,
@@ -983,6 +1215,7 @@ fn visible_screen_ansi(
     screen: &vt100::Screen,
     active_screen: ActiveScreen,
     focus_reporting: bool,
+    alternate_scroll: bool,
 ) -> Vec<u8> {
     let mut ansi = Vec::new();
     ansi.extend_from_slice(MAIN_SCREEN_SELECTION_ANSI);
@@ -991,6 +1224,7 @@ fn visible_screen_ansi(
     }
     ansi.extend_from_slice(&screen.state_formatted());
     ansi.extend_from_slice(focus_reporting_ansi(focus_reporting));
+    ansi.extend_from_slice(alternate_scroll_ansi(alternate_scroll));
     ansi
 }
 
@@ -1058,6 +1292,41 @@ const fn focus_reporting_ansi(enabled: bool) -> &'static [u8] {
     } else {
         FOCUS_REPORTING_OFF
     }
+}
+
+const fn alternate_scroll_ansi(enabled: bool) -> &'static [u8] {
+    if enabled {
+        ALTERNATE_SCROLL_ON
+    } else {
+        ALTERNATE_SCROLL_OFF
+    }
+}
+
+fn retained_history_rows(screen: &vt100::Screen) -> usize {
+    let mut history = screen.clone();
+    history.set_scrollback(usize::MAX);
+    history.scrollback()
+}
+
+fn formatted_history_rows(
+    screen: &vt100::Screen,
+    total: usize,
+    start: usize,
+    count: usize,
+) -> Vec<Vec<u8>> {
+    let mut history = screen.clone();
+    let (_, columns) = history.size();
+    let mut rows = Vec::with_capacity(count);
+    for index in start..start.saturating_add(count) {
+        history.set_scrollback(total.saturating_sub(index));
+        let mut row = b"\x1b[m".to_vec();
+        if let Some(formatted) = history.rows_formatted(0, columns).next() {
+            row.extend_from_slice(&formatted);
+        }
+        row.extend_from_slice(b"\x1b[m");
+        rows.push(row);
+    }
+    rows
 }
 
 fn recent_history_ansi(screen: &vt100::Screen) -> Vec<u8> {
@@ -1191,6 +1460,116 @@ mod tests {
         assert!(!snapshot.limit_ansi_payload(screen.len() - 1));
         assert_eq!(snapshot.screen_ansi, screen);
         assert!(snapshot.recent_history_ansi.is_empty());
+    }
+
+    #[test]
+    fn history_pages_are_ordered_revision_bound_and_non_mutating() {
+        let mut model =
+            TerminalModel::new(TerminalSize::new(2, 12), 8).expect("bounded history terminal");
+        model
+            .ingest(b"one\r\ntwo\r\nthree\r\nfour\r\nfive")
+            .expect("seed history");
+        let before = model.state();
+        let TerminalHistoryResult::Page(page) = model
+            .history_page(TerminalHistoryDirection::Newest, None, 2)
+            .expect("newest page")
+        else {
+            panic!("newest history must be available");
+        };
+        assert_eq!(page.rows.len(), 2);
+        assert!(String::from_utf8_lossy(&page.rows[0]).contains("two"));
+        assert!(String::from_utf8_lossy(&page.rows[1]).contains("three"));
+        assert_eq!(
+            model.state(),
+            before,
+            "paging never changes parser scrollback"
+        );
+
+        model.ingest(b"\r\nsix").expect("append below capacity");
+        let TerminalHistoryResult::Page(newer) = model
+            .history_page(
+                TerminalHistoryDirection::Newer,
+                Some(page.cursor),
+                MAX_HISTORY_PAGE_ROWS,
+            )
+            .expect("newer page after monotonic append")
+        else {
+            panic!("monotonic append keeps the history epoch");
+        };
+        assert_eq!(newer.cursor.epoch, page.cursor.epoch);
+        assert!(
+            newer
+                .rows
+                .iter()
+                .any(|row| String::from_utf8_lossy(row).contains("four"))
+        );
+
+        model
+            .resize(TerminalSize::new(3, 12))
+            .expect("resize invalidates row identity");
+        assert!(matches!(
+            model
+                .history_page(TerminalHistoryDirection::Older, Some(page.cursor), 2,)
+                .expect("typed stale result"),
+            TerminalHistoryResult::HistoryChanged { .. }
+        ));
+    }
+
+    #[test]
+    fn history_capacity_and_alternate_screen_fail_conservatively() {
+        let mut model = TerminalModel::new(TerminalSize::new(2, 10), 2)
+            .expect("small bounded history terminal");
+        model.ingest(b"one\r\ntwo\r\nthree").expect("fill history");
+        let TerminalHistoryResult::Page(page) = model
+            .history_page(TerminalHistoryDirection::Newest, None, 2)
+            .expect("initial page")
+        else {
+            panic!("initial page must exist");
+        };
+        model
+            .ingest(b"\r\nfour\r\nfive")
+            .expect("evict old history");
+        assert!(matches!(
+            model
+                .history_page(TerminalHistoryDirection::Older, Some(page.cursor), 2,)
+                .expect("typed eviction result"),
+            TerminalHistoryResult::HistoryChanged { .. }
+        ));
+
+        model
+            .ingest(b"\x1b[?1049h")
+            .expect("enter alternate screen");
+        assert!(matches!(
+            model
+                .history_page(TerminalHistoryDirection::Newest, None, 2)
+                .expect("typed alternate result"),
+            TerminalHistoryResult::HistoryChanged { .. }
+        ));
+    }
+
+    #[test]
+    fn alternate_scroll_round_trips_through_snapshots_and_deltas() {
+        let mut model =
+            TerminalModel::new(TerminalSize::new(2, 10), 2).expect("alternate-scroll model");
+        model.ingest(b"\x1b[?1007h").expect("enable mode");
+        assert!(model.snapshot().modes.alternate_scroll);
+        let checkpoint = model.checkpoint();
+        model.ingest(b"\x1b[?1007l").expect("disable mode");
+        assert!(!model.state().modes.alternate_scroll);
+        match model.delta_or_resync(&checkpoint) {
+            TerminalDeltaResult::Delta(delta) => {
+                assert!(!delta.modes.alternate_scroll);
+                assert!(
+                    delta
+                        .ansi
+                        .windows(ALTERNATE_SCROLL_OFF.len())
+                        .any(|bytes| { bytes == ALTERNATE_SCROLL_OFF })
+                );
+            }
+            TerminalDeltaResult::Resync(snapshot) => {
+                assert!(!snapshot.modes.alternate_scroll);
+            }
+        }
     }
 
     #[test]

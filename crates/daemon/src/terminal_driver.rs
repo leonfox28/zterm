@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use zterm_core::Revision;
 use zterm_core::terminal::{
-    TerminalCheckpoint, TerminalDeltaResult, TerminalError, TerminalModel, TerminalSize,
-    TerminalSnapshot,
+    TerminalCheckpoint, TerminalDeltaResult, TerminalError, TerminalHistoryCursor,
+    TerminalHistoryDirection, TerminalHistoryResult, TerminalModel, TerminalSize, TerminalSnapshot,
 };
 use zterm_platform::pty::{
     PtyChild, PtyChildInterrupt, PtyChildState, PtyError, PtyExitStatus, PtyIo, PtySession, PtySize,
@@ -574,6 +574,20 @@ impl TerminalAttachment {
     pub fn latest_snapshot(&self) -> Result<TerminalSnapshot, TerminalDriverError> {
         self.shared.check_failure()?;
         Ok(lock(&self.shared.model, "terminal model")?.snapshot())
+    }
+
+    /// Returns one bounded main-screen history page without advancing this
+    /// attachment's latest-state checkpoint.
+    pub fn history_page(
+        &self,
+        direction: TerminalHistoryDirection,
+        cursor: Option<TerminalHistoryCursor>,
+        maximum_rows: usize,
+    ) -> Result<TerminalHistoryResult, TerminalDriverError> {
+        self.shared.check_failure()?;
+        lock(&self.shared.model, "terminal model")?
+            .history_page(direction, cursor, maximum_rows)
+            .map_err(Into::into)
     }
 }
 

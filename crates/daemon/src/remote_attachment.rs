@@ -15,13 +15,18 @@ use std::time::{Duration, Instant};
 
 use iroh::SecretKey;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf};
-use zterm_core::{AttachmentId, DeviceId, DomainErrorKind, ResumeViewId, Revision, SessionId};
+use zterm_core::terminal::MAX_HISTORY_PAGE_ROWS;
+use zterm_core::{
+    AttachmentId, Capabilities, DeviceId, DomainErrorKind, ResumeViewId, Revision, SessionId,
+};
 use zterm_proto::{DecodedFrame, FrameDecoder, WireKind, encode_message, v1};
 
 use crate::connection_broker::{
-    AuthenticatedBiStream, ConnectionBroker, ConnectionDemand, StreamPurpose,
+    AuthenticatedBiStream, ConnectionBroker, ConnectionDemand, SelectedCandidateObserver,
+    SelectedPathObservation, StreamPurpose,
 };
 use crate::error::DaemonError;
+use crate::network::PathKind;
 use crate::remote_session::{
     SessionUnaryResponseStatus, decode_session_service_error, session_summary_from_wire,
     validate_session_unary_response,
@@ -40,6 +45,41 @@ impl<T> AsyncAttachmentStream for T where T: AsyncRead + AsyncWrite + Unpin + Se
 
 pub(super) type BoxAttachmentStream = Box<dyn AsyncAttachmentStream>;
 
+trait RemoteAttachmentEpochObserver: Send + Sync {
+    fn selected_path_observation(&self) -> SelectedPathObservation;
+
+    fn supports(&self, capability: u64) -> bool;
+}
+
+pub(super) struct OpenedAttachmentEpoch {
+    stream: BoxAttachmentStream,
+    observer: Arc<dyn RemoteAttachmentEpochObserver>,
+}
+
+#[cfg(test)]
+impl OpenedAttachmentEpoch {
+    pub(super) fn unobserved(stream: BoxAttachmentStream) -> Self {
+        Self {
+            stream,
+            observer: Arc::new(UnobservedAttachmentEpoch),
+        }
+    }
+}
+
+#[cfg(test)]
+struct UnobservedAttachmentEpoch;
+
+#[cfg(test)]
+impl RemoteAttachmentEpochObserver for UnobservedAttachmentEpoch {
+    fn selected_path_observation(&self) -> SelectedPathObservation {
+        SelectedPathObservation::default()
+    }
+
+    fn supports(&self, _capability: u64) -> bool {
+        false
+    }
+}
+
 pub(super) trait RemoteAttachmentTransport: Send + Sync {
     fn demand<'a>(
         &'a self,
@@ -48,11 +88,11 @@ pub(super) trait RemoteAttachmentTransport: Send + Sync {
     ) -> BoxFuture<'a, Result<Box<dyn RemoteAttachmentDemand>, DaemonError>>;
 }
 
-pub(super) trait RemoteAttachmentDemand: Send {
+pub(super) trait RemoteAttachmentDemand: Send + Sync {
     fn open<'a>(
         &'a mut self,
         deadline: Instant,
-    ) -> BoxFuture<'a, Result<BoxAttachmentStream, DaemonError>>;
+    ) -> BoxFuture<'a, Result<OpenedAttachmentEpoch, DaemonError>>;
 }
 
 /// One reconnecting daemon-side attachment client.
@@ -228,14 +268,28 @@ impl RemoteAttachmentDemand for BrokerAttachmentDemand {
     fn open<'a>(
         &'a mut self,
         deadline: Instant,
-    ) -> BoxFuture<'a, Result<BoxAttachmentStream, DaemonError>> {
+    ) -> BoxFuture<'a, Result<OpenedAttachmentEpoch, DaemonError>> {
         Box::pin(async move {
             let stream = self
                 .demand
                 .open_bi(StreamPurpose::Service, deadline)
                 .await?;
-            Ok(Box::new(BrokerAttachmentStream { stream }) as BoxAttachmentStream)
+            let observer = Arc::new(stream.candidate_observer());
+            Ok(OpenedAttachmentEpoch {
+                stream: Box::new(BrokerAttachmentStream { stream }) as BoxAttachmentStream,
+                observer,
+            })
         })
+    }
+}
+
+impl RemoteAttachmentEpochObserver for SelectedCandidateObserver {
+    fn selected_path_observation(&self) -> SelectedPathObservation {
+        self.selected_path_observation()
+    }
+
+    fn supports(&self, capability: u64) -> bool {
+        self.supports(capability)
     }
 }
 
@@ -302,7 +356,9 @@ struct BridgeState {
 struct RemoteEpoch {
     reader: FramedReader<ReadHalf<BoxAttachmentStream>>,
     writer: WriteHalf<BoxAttachmentStream>,
+    observer: Arc<dyn RemoteAttachmentEpochObserver>,
     attachment_id: AttachmentId,
+    initial_revision: Revision,
 }
 
 struct FramedReader<Reader> {
@@ -380,28 +436,30 @@ where
     'bridge: loop {
         let operation_timeout = limits.operation_timeout();
         let attempt_deadline = Instant::now() + operation_timeout;
-        let open = timeout_at(
-            attempt_deadline,
-            demand.open(attempt_deadline),
-            "remote attachment open exceeded its absolute deadline",
-        );
-        tokio::pin!(open);
-        let remote = loop {
-            tokio::select! {
-                opened = &mut open => break opened.and_then(|opened| opened),
-                local = local_reader.next() => {
-                    match local? {
-                        Some(frame) => {
-                            if process_offline_local_frame(
-                                frame,
-                                &mut state,
-                                local_writer,
-                                operation_timeout,
-                            ).await? {
-                                return Ok(());
+        let remote = {
+            let open = timeout_at(
+                attempt_deadline,
+                demand.open(attempt_deadline),
+                "remote attachment open exceeded its absolute deadline",
+            );
+            tokio::pin!(open);
+            loop {
+                tokio::select! {
+                    opened = &mut open => break opened.and_then(|opened| opened),
+                    local = local_reader.next() => {
+                        match local? {
+                            Some(frame) => {
+                                if process_offline_local_frame(
+                                    frame,
+                                    &mut state,
+                                    local_writer,
+                                    operation_timeout,
+                                ).await? {
+                                    return Ok(());
+                                }
                             }
+                            None => return Ok(()),
                         }
-                        None => return Ok(()),
                     }
                 }
             }
@@ -425,6 +483,10 @@ where
             Err(error) => return Err(error),
         };
 
+        let OpenedAttachmentEpoch {
+            stream: remote,
+            observer,
+        } = remote;
         let (remote_reader, mut remote_writer) = tokio::io::split(remote);
         let attach = remote_attach_request(&state);
         let attach = encode_message(
@@ -739,14 +801,15 @@ where
         let epoch = RemoteEpoch {
             reader: remote_reader,
             writer: remote_writer,
+            observer,
             attachment_id: accepted.remote_attachment_id,
+            initial_revision: accepted.revision,
         };
         let epoch_end = match run_epoch(
             epoch,
             local_reader,
             local_writer,
             &mut state,
-            accepted.revision,
             &mut phase,
             operation_timeout,
         )
@@ -829,7 +892,6 @@ async fn run_epoch<LocalReader, LocalWriter>(
     local_reader: &mut FramedReader<LocalReader>,
     local_writer: &mut LocalWriter,
     state: &mut BridgeState,
-    initial_revision: Revision,
     desired_phase: &mut DesiredViewPhase,
     operation_timeout: Duration,
 ) -> Result<EpochEnd, DaemonError>
@@ -837,11 +899,15 @@ where
     LocalReader: AsyncRead + Unpin,
     LocalWriter: AsyncWrite + Unpin,
 {
+    let history_paging = epoch.observer.supports(Capabilities::HISTORY_PAGING);
     let mut phase = EpochPhase::Synchronizing {
-        expected: initial_revision,
+        expected: epoch.initial_revision,
         acknowledged: false,
         needs_takeover: state.request.takeover && !state.ever_active,
     };
+    let mut path_observation = tokio::time::interval(Duration::from_secs(1));
+    path_observation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_path_observation = None;
     loop {
         tokio::select! {
             local = local_reader.next() => {
@@ -854,6 +920,23 @@ where
                     return Ok(EpochEnd::Detached);
                 };
                 let request_id = frame.request_id;
+                if frame.kind == WireKind::TerminalHistoryRequest && !history_paging {
+                    if let Err(error) = write_unsupported_history_gap(
+                        frame,
+                        state,
+                        local_writer,
+                        Instant::now() + operation_timeout,
+                    ).await {
+                        write_error_best_effort(
+                            local_writer,
+                            request_id,
+                            &error,
+                            Instant::now() + operation_timeout,
+                        ).await;
+                        return Ok(EpochEnd::Terminal);
+                    }
+                    continue;
+                }
                 match process_epoch_local_frame(
                     frame,
                     &mut epoch.writer,
@@ -924,6 +1007,18 @@ where
                     }
                 }
             }
+            _ = path_observation.tick(), if matches!(phase, EpochPhase::Active) => {
+                let observation = epoch.observer.selected_path_observation();
+                if last_path_observation != Some(observation) {
+                    write_connection_status(
+                        local_writer,
+                        state.local_view_id,
+                        observation,
+                        Instant::now() + operation_timeout,
+                    ).await?;
+                    last_path_observation = Some(observation);
+                }
+            }
         }
     }
 }
@@ -943,6 +1038,13 @@ where
             writer,
             state.local_view_id,
             v1::TerminalTransportState::Reconnecting,
+            Instant::now() + operation_timeout,
+        )
+        .await?;
+        write_connection_status(
+            writer,
+            state.local_view_id,
+            SelectedPathObservation::default(),
             Instant::now() + operation_timeout,
         )
         .await?;
@@ -1054,6 +1156,19 @@ where
             let request: v1::TerminalSyncRequest = decode(&frame)?;
             require_local_attachment(request.attachment_id, state.local_view_id)?;
             state.force_full = true;
+            Ok(false)
+        }
+        WireKind::TerminalHistoryRequest => {
+            let request: v1::TerminalHistoryRequest = decode(&frame)?;
+            require_local_attachment(request.attachment_id.clone(), state.local_view_id)?;
+            validate_history_request(&request)?;
+            write_service_error(
+                local_writer,
+                request_id,
+                &transport_unavailable("remote attachment is not active"),
+                Instant::now() + operation_timeout,
+            )
+            .await?;
             Ok(false)
         }
         WireKind::SessionTakeoverRequest => {
@@ -1385,6 +1500,42 @@ where
             .await?;
             Ok(None)
         }
+        WireKind::TerminalHistoryRequest => {
+            let mut request: v1::TerminalHistoryRequest = decode(&frame)?;
+            require_local_attachment(request.attachment_id.clone(), state.local_view_id)?;
+            validate_history_request(&request)?;
+            if !matches!(phase, EpochPhase::Active) {
+                write_service_error(
+                    local_writer,
+                    frame.request_id,
+                    &DaemonError::new(
+                        DomainErrorKind::NotSynchronized,
+                        "history paging requires an active remote attachment",
+                    ),
+                    Instant::now() + operation_timeout,
+                )
+                .await?;
+                return Ok(None);
+            }
+            request.attachment_id = Some(remote_attachment_id.into());
+            retain_pending(
+                &mut state.pending_control,
+                frame.request_id,
+                WireKind::TerminalHistoryPage,
+            )?;
+            if let Err(error) = forward_remote(
+                frame,
+                request,
+                remote_writer,
+                Instant::now() + operation_timeout,
+            )
+            .await
+            {
+                Ok(Some(EpochEnd::Reconnect(error)))
+            } else {
+                Ok(None)
+            }
+        }
         WireKind::SessionOperationLeaseRequest => {
             let request: v1::SessionOperationLeaseRequest = decode(&frame)?;
             require_exact_target(request.target.clone(), state.target)?;
@@ -1677,6 +1828,32 @@ where
             write_local(local_writer, &bytes, Instant::now() + operation_timeout).await?;
             Ok(Some(EpochEnd::Terminal))
         }
+        WireKind::TerminalHistoryPage => {
+            let expected = state
+                .pending_control
+                .get(&frame.request_id)
+                .copied()
+                .ok_or_else(|| malformed("unsolicited remote terminal history page"))?;
+            if expected != WireKind::TerminalHistoryPage {
+                return Err(malformed(
+                    "remote attachment control response kind mismatch",
+                ));
+            }
+            let mut page: v1::TerminalHistoryPage = decode(&frame)?;
+            require_remote_attachment(page.attachment_id.clone(), remote_attachment_id)?;
+            validate_history_page(&page)?;
+            page.attachment_id = Some(state.local_view_id.into());
+            let bytes = encode_message(
+                WireKind::TerminalHistoryPage,
+                frame.request_id,
+                frame.deadline_ms,
+                &page,
+            )
+            .map_err(protocol_error)?;
+            write_local(local_writer, &bytes, Instant::now() + operation_timeout).await?;
+            state.pending_control.remove(&frame.request_id);
+            Ok(None)
+        }
         WireKind::SessionOperationLeaseResponse | WireKind::SessionMutateResponse => {
             let expected = state
                 .pending_control
@@ -1835,7 +2012,9 @@ where
     let deadline = Instant::now() + operation_timeout;
     for (request_id, response_kind) in pending {
         let error = match response_kind {
-            WireKind::SessionOperationLeaseResponse => transport_error.clone(),
+            WireKind::SessionOperationLeaseResponse | WireKind::TerminalHistoryPage => {
+                transport_error.clone()
+            }
             WireKind::SessionMutateResponse => DaemonError::new(
                 DomainErrorKind::OperationOutcomeUnknown,
                 "remote takeover result was lost with its stream epoch",
@@ -2039,6 +2218,58 @@ fn validate_delta(delta: &v1::TerminalDelta) -> Result<(), DaemonError> {
     Ok(())
 }
 
+fn validate_history_request(request: &v1::TerminalHistoryRequest) -> Result<(), DaemonError> {
+    match v1::TerminalHistoryDirection::try_from(request.direction) {
+        Ok(v1::TerminalHistoryDirection::Newest)
+        | Ok(v1::TerminalHistoryDirection::Older)
+        | Ok(v1::TerminalHistoryDirection::Newer) => {}
+        Ok(v1::TerminalHistoryDirection::Unspecified) | Err(_) => {
+            return Err(malformed("terminal history direction is invalid"));
+        }
+    }
+    let maximum_rows = usize::try_from(request.maximum_rows)
+        .map_err(|_| malformed("terminal history page bound is not representable"))?;
+    if maximum_rows == 0 || maximum_rows > MAX_HISTORY_PAGE_ROWS {
+        return Err(malformed(
+            "terminal history page bound is outside the allowed range",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_history_page(page: &v1::TerminalHistoryPage) -> Result<(), DaemonError> {
+    let outcome = v1::TerminalHistoryOutcome::try_from(page.outcome)
+        .map_err(|_| malformed("terminal history outcome is invalid"))?;
+    if page.rows.len() > MAX_HISTORY_PAGE_ROWS {
+        return Err(malformed("terminal history page exceeded the row bound"));
+    }
+    match outcome {
+        v1::TerminalHistoryOutcome::Ok => {
+            let cursor = page
+                .cursor
+                .as_ref()
+                .ok_or_else(|| malformed("terminal history page omitted its cursor"))?;
+            if usize::try_from(cursor.row_count).ok() != Some(page.rows.len())
+                || cursor.epoch != page.current_epoch
+                || cursor.revision != page.current_revision
+            {
+                return Err(malformed("terminal history page cursor is inconsistent"));
+            }
+        }
+        v1::TerminalHistoryOutcome::Changed | v1::TerminalHistoryOutcome::Gap => {
+            if page.cursor.is_some() || !page.rows.is_empty() {
+                return Err(malformed(
+                    "terminal history reset outcome retained page content",
+                ));
+            }
+        }
+        v1::TerminalHistoryOutcome::Unspecified => {
+            return Err(malformed("terminal history outcome is invalid"));
+        }
+    }
+    Ok(())
+}
+
 fn decode<Message>(frame: &DecodedFrame) -> Result<Message, DaemonError>
 where
     Message: prost::Message + Default,
@@ -2061,6 +2292,60 @@ where
     };
     let bytes = encode_message(WireKind::TerminalTransportStateEvent, 0, 0, &message)
         .map_err(protocol_error)?;
+    write_local(writer, &bytes, deadline).await
+}
+
+async fn write_connection_status<Writer>(
+    writer: &mut Writer,
+    attachment_id: AttachmentId,
+    observation: SelectedPathObservation,
+    deadline: Instant,
+) -> Result<(), DaemonError>
+where
+    Writer: AsyncWrite + Unpin,
+{
+    let path = match observation.path {
+        PathKind::Unknown => v1::TerminalConnectionPath::Unknown,
+        PathKind::Direct => v1::TerminalConnectionPath::Direct,
+        PathKind::Relay => v1::TerminalConnectionPath::Relay,
+    };
+    let message = v1::TerminalConnectionStatusEvent {
+        attachment_id: Some(attachment_id.into()),
+        path: path as i32,
+        rtt_ms: observation.rtt_ms,
+    };
+    let bytes = encode_message(WireKind::TerminalConnectionStatusEvent, 0, 0, &message)
+        .map_err(protocol_error)?;
+    write_local(writer, &bytes, deadline).await
+}
+
+async fn write_unsupported_history_gap<Writer>(
+    frame: DecodedFrame,
+    state: &BridgeState,
+    writer: &mut Writer,
+    deadline: Instant,
+) -> Result<(), DaemonError>
+where
+    Writer: AsyncWrite + Unpin,
+{
+    let request: v1::TerminalHistoryRequest = decode(&frame)?;
+    require_local_attachment(request.attachment_id.clone(), state.local_view_id)?;
+    validate_history_request(&request)?;
+    let page = v1::TerminalHistoryPage {
+        attachment_id: Some(state.local_view_id.into()),
+        outcome: v1::TerminalHistoryOutcome::Gap as i32,
+        cursor: None,
+        rows: Vec::new(),
+        current_epoch: 0,
+        current_revision: 0,
+    };
+    let bytes = encode_message(
+        WireKind::TerminalHistoryPage,
+        frame.request_id,
+        frame.deadline_ms,
+        &page,
+    )
+    .map_err(protocol_error)?;
     write_local(writer, &bytes, deadline).await
 }
 
@@ -2237,9 +2522,49 @@ mod tests {
 
     enum FakeOpen {
         Stream(BoxAttachmentStream),
+        Observed(BoxAttachmentStream, Arc<dyn RemoteAttachmentEpochObserver>),
         Error(DomainErrorKind),
         Pending(oneshot::Sender<()>),
         After(oneshot::Receiver<()>, BoxAttachmentStream),
+    }
+
+    #[derive(Default)]
+    struct FakeEpochObserver {
+        history_paging: bool,
+        path_observations: Mutex<VecDeque<SelectedPathObservation>>,
+    }
+
+    impl FakeEpochObserver {
+        fn with_history_and_paths(
+            history_paging: bool,
+            observations: impl IntoIterator<Item = SelectedPathObservation>,
+        ) -> Self {
+            Self {
+                history_paging,
+                path_observations: Mutex::new(observations.into_iter().collect()),
+            }
+        }
+
+        fn remaining_path_observations(&self) -> usize {
+            self.path_observations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len()
+        }
+    }
+
+    impl RemoteAttachmentEpochObserver for FakeEpochObserver {
+        fn selected_path_observation(&self) -> SelectedPathObservation {
+            self.path_observations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front()
+                .unwrap_or_default()
+        }
+
+        fn supports(&self, capability: u64) -> bool {
+            capability == Capabilities::HISTORY_PAGING && self.history_paging
+        }
     }
 
     #[test]
@@ -2277,6 +2602,267 @@ mod tests {
         )
         .expect("reaping one correlation recovers one pending-control slot");
         assert_eq!(pending.len(), MAX_PENDING_CONTROL_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn peer_without_history_capability_returns_gap_and_keeps_epoch_active() {
+        let target = device(0x31);
+        let session_id = session(0x32);
+        let local_id = attachment(0x33);
+        let remote_id = attachment(0x34);
+        let revision = Revision::new(5);
+        let (remote_bridge, remote_host) = duplex(64 * 1024);
+        let remote_bridge: BoxAttachmentStream = Box::new(remote_bridge);
+        let (remote_read, remote_write) = tokio::io::split(remote_bridge);
+        let epoch = RemoteEpoch {
+            reader: FramedReader::fresh(remote_read),
+            writer: remote_write,
+            observer: Arc::new(FakeEpochObserver::default()),
+            attachment_id: remote_id,
+            initial_revision: revision,
+        };
+        let (local_cli, local_bridge) = duplex(64 * 1024);
+        let (local_read, mut local_writer) = tokio::io::split(local_bridge);
+        let mut local_reader = FramedReader::fresh(local_read);
+        let mut state = bridge_state(target, local_id, session_id, revision);
+        let task = tokio::spawn(async move {
+            let mut desired = DesiredViewPhase::Synchronizing;
+            run_epoch(
+                epoch,
+                &mut local_reader,
+                &mut local_writer,
+                &mut state,
+                &mut desired,
+                Duration::from_secs(1),
+            )
+            .await
+        });
+
+        let (local_read, mut local_write) = tokio::io::split(local_cli);
+        let mut local_read = FramedReader::fresh(local_read);
+        let (remote_read, _remote_write) = tokio::io::split(remote_host);
+        let mut remote_read = FramedReader::fresh(remote_read);
+
+        write_message(
+            &mut local_write,
+            WireKind::TerminalSnapshotApplied,
+            2,
+            &v1::TerminalSnapshotApplied {
+                attachment_id: Some(local_id.into()),
+                revision: revision.get(),
+            },
+        )
+        .await;
+        let acknowledgement = next_frame(&mut remote_read).await;
+        assert_eq!(acknowledgement.kind, WireKind::TerminalSnapshotApplied);
+        expect_transport_state(
+            &mut local_read,
+            local_id,
+            v1::TerminalTransportState::Active,
+        )
+        .await;
+
+        write_message(
+            &mut local_write,
+            WireKind::TerminalHistoryRequest,
+            3,
+            &v1::TerminalHistoryRequest {
+                attachment_id: Some(local_id.into()),
+                direction: v1::TerminalHistoryDirection::Newest as i32,
+                cursor: None,
+                maximum_rows: 10,
+            },
+        )
+        .await;
+        let gap = next_non_status_frame(&mut local_read, local_id).await;
+        assert_eq!(gap.kind, WireKind::TerminalHistoryPage);
+        assert_eq!(gap.request_id, 3);
+        let gap: v1::TerminalHistoryPage = gap
+            .decode_message(WireKind::TerminalHistoryPage)
+            .expect("unsupported-history gap page");
+        assert_eq!(
+            v1::TerminalHistoryOutcome::try_from(gap.outcome).expect("known history outcome"),
+            v1::TerminalHistoryOutcome::Gap
+        );
+        assert!(gap.cursor.is_none());
+        assert!(gap.rows.is_empty());
+        assert_eq!((gap.current_epoch, gap.current_revision), (0, 0));
+
+        write_message(
+            &mut local_write,
+            WireKind::TerminalInput,
+            4,
+            &v1::TerminalInput {
+                operation_id: None,
+                attachment_id: Some(local_id.into()),
+                bytes: b"still-active".to_vec(),
+            },
+        )
+        .await;
+        let input = next_frame(&mut remote_read).await;
+        assert_eq!(
+            input.kind,
+            WireKind::TerminalInput,
+            "no unsupported history frame may reach the old peer"
+        );
+        let input: v1::TerminalInput = input
+            .decode_message(WireKind::TerminalInput)
+            .expect("post-gap terminal input");
+        assert_eq!(input.bytes, b"still-active");
+        assert_eq!(
+            required_attachment_id(input.attachment_id).expect("rewritten remote attachment ID"),
+            remote_id
+        );
+
+        write_message(
+            &mut local_write,
+            WireKind::TerminalDetach,
+            5,
+            &v1::TerminalDetach {
+                attachment_id: Some(local_id.into()),
+            },
+        )
+        .await;
+        assert_eq!(
+            next_frame(&mut remote_read).await.kind,
+            WireKind::TerminalDetach
+        );
+        assert_eq!(
+            task.await
+                .expect("old-peer epoch task")
+                .expect("old-peer gap keeps the epoch valid"),
+            EpochEnd::Detached
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_epoch_emits_only_changed_direct_relay_and_unknown_samples_once_per_tick() {
+        let target = device(0x35);
+        let session_id = session(0x36);
+        let local_id = attachment(0x37);
+        let remote_id = attachment(0x38);
+        let revision = Revision::new(8);
+        let direct = SelectedPathObservation {
+            path: PathKind::Direct,
+            rtt_ms: Some(7),
+        };
+        let relay = SelectedPathObservation {
+            path: PathKind::Relay,
+            rtt_ms: Some(19),
+        };
+        let unknown = SelectedPathObservation::default();
+        let observer = Arc::new(FakeEpochObserver::with_history_and_paths(
+            false,
+            [direct, direct, relay, unknown],
+        ));
+
+        let (remote_bridge, remote_host) = duplex(64 * 1024);
+        let remote_bridge: BoxAttachmentStream = Box::new(remote_bridge);
+        let (remote_read, remote_write) = tokio::io::split(remote_bridge);
+        let epoch = RemoteEpoch {
+            reader: FramedReader::fresh(remote_read),
+            writer: remote_write,
+            observer: observer.clone(),
+            attachment_id: remote_id,
+            initial_revision: revision,
+        };
+        let (local_cli, local_bridge) = duplex(64 * 1024);
+        let (local_read, mut local_writer) = tokio::io::split(local_bridge);
+        let mut local_reader = FramedReader::fresh(local_read);
+        let mut state = bridge_state(target, local_id, session_id, revision);
+        let task = tokio::spawn(async move {
+            let mut desired = DesiredViewPhase::Synchronizing;
+            run_epoch(
+                epoch,
+                &mut local_reader,
+                &mut local_writer,
+                &mut state,
+                &mut desired,
+                Duration::from_secs(1),
+            )
+            .await
+        });
+
+        let (local_read, mut local_write) = tokio::io::split(local_cli);
+        let mut local_read = FramedReader::fresh(local_read);
+        let (remote_read, _remote_write) = tokio::io::split(remote_host);
+        let mut remote_read = FramedReader::fresh(remote_read);
+        write_message(
+            &mut local_write,
+            WireKind::TerminalSnapshotApplied,
+            2,
+            &v1::TerminalSnapshotApplied {
+                attachment_id: Some(local_id.into()),
+                revision: revision.get(),
+            },
+        )
+        .await;
+        assert_eq!(
+            next_paused_frame(&mut remote_read).await.kind,
+            WireKind::TerminalSnapshotApplied
+        );
+        expect_paused_transport_state(
+            &mut local_read,
+            local_id,
+            v1::TerminalTransportState::Active,
+        )
+        .await;
+
+        let first = expect_paused_connection_status(&mut local_read, local_id).await;
+        assert_eq!(
+            v1::TerminalConnectionPath::try_from(first.path).expect("known direct path"),
+            v1::TerminalConnectionPath::Direct
+        );
+        assert_eq!(first.rtt_ms, Some(7));
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            observer.remaining_path_observations(),
+            2,
+            "the unchanged sample is consumed without emitting a duplicate"
+        );
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let migrated = expect_paused_connection_status(&mut local_read, local_id).await;
+        assert_eq!(
+            v1::TerminalConnectionPath::try_from(migrated.path).expect("known relay path"),
+            v1::TerminalConnectionPath::Relay
+        );
+        assert_eq!(migrated.rtt_ms, Some(19));
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let disappeared = expect_paused_connection_status(&mut local_read, local_id).await;
+        assert_eq!(
+            v1::TerminalConnectionPath::try_from(disappeared.path).expect("known unknown path"),
+            v1::TerminalConnectionPath::Unknown
+        );
+        assert_eq!(disappeared.rtt_ms, None);
+        let redacted = format!(
+            "{:?}",
+            LocalAttachmentEvent::ConnectionStatus(disappeared.clone())
+        );
+        assert!(!redacted.contains(&target.to_string()));
+
+        write_message(
+            &mut local_write,
+            WireKind::TerminalDetach,
+            3,
+            &v1::TerminalDetach {
+                attachment_id: Some(local_id.into()),
+            },
+        )
+        .await;
+        assert_eq!(
+            next_paused_frame(&mut remote_read).await.kind,
+            WireKind::TerminalDetach
+        );
+        assert_eq!(
+            task.await
+                .expect("selected-path epoch task")
+                .expect("selected-path samples keep the epoch valid"),
+            EpochEnd::Detached
+        );
     }
 
     struct FakeDemand {
@@ -2351,7 +2937,7 @@ mod tests {
         fn open<'a>(
             &'a mut self,
             _deadline: Instant,
-        ) -> BoxFuture<'a, Result<BoxAttachmentStream, DaemonError>> {
+        ) -> BoxFuture<'a, Result<OpenedAttachmentEpoch, DaemonError>> {
             let open = {
                 let mut state = self
                     .state
@@ -2362,13 +2948,16 @@ mod tests {
             };
             Box::pin(async move {
                 match open {
-                    Some(FakeOpen::Stream(stream)) => Ok(stream),
+                    Some(FakeOpen::Stream(stream)) => Ok(OpenedAttachmentEpoch::unobserved(stream)),
+                    Some(FakeOpen::Observed(stream, observer)) => {
+                        Ok(OpenedAttachmentEpoch { stream, observer })
+                    }
                     Some(FakeOpen::Error(kind)) => {
                         Err(DaemonError::new(kind, "scripted attachment open failure"))
                     }
                     Some(FakeOpen::Pending(started)) => {
                         let _ = started.send(());
-                        std::future::pending::<Result<BoxAttachmentStream, DaemonError>>().await
+                        std::future::pending::<Result<OpenedAttachmentEpoch, DaemonError>>().await
                     }
                     Some(FakeOpen::After(released, stream)) => {
                         released.await.map_err(|_| {
@@ -2377,7 +2966,7 @@ mod tests {
                                 "test host detach barrier was dropped",
                             )
                         })?;
-                        Ok(stream)
+                        Ok(OpenedAttachmentEpoch::unobserved(stream))
                     }
                     None => Err(DaemonError::new(
                         DomainErrorKind::ResourceExhausted,
@@ -2397,6 +2986,55 @@ mod tests {
             state.active_demands = state.active_demands.saturating_sub(1);
             state.demand_drops += 1;
         }
+    }
+
+    #[tokio::test]
+    async fn opened_epoch_observer_remains_bound_across_primary_replacement() {
+        let direct = SelectedPathObservation {
+            path: PathKind::Direct,
+            rtt_ms: Some(7),
+        };
+        let relay = SelectedPathObservation {
+            path: PathKind::Relay,
+            rtt_ms: Some(19),
+        };
+        let candidate_a = Arc::new(FakeEpochObserver::with_history_and_paths(
+            false,
+            [direct, direct],
+        ));
+        let candidate_b = Arc::new(FakeEpochObserver::with_history_and_paths(true, [relay]));
+        let (first_stream, _first_peer) = duplex(1024);
+        let (second_stream, _second_peer) = duplex(1024);
+        let transport = FakeTransport::scripted([
+            FakeOpen::Observed(Box::new(first_stream), candidate_a),
+            FakeOpen::Observed(Box::new(second_stream), candidate_b),
+        ]);
+        let mut demand = FakeDemand {
+            state: Arc::clone(&transport.state),
+        };
+
+        let first = demand
+            .open(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("candidate A opens the first epoch");
+        assert!(!first.observer.supports(Capabilities::HISTORY_PAGING));
+        assert_eq!(first.observer.selected_path_observation(), direct);
+
+        let second = demand
+            .open(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("candidate B replaces the primary for the next epoch");
+        assert!(second.observer.supports(Capabilities::HISTORY_PAGING));
+        assert_eq!(second.observer.selected_path_observation(), relay);
+        assert!(
+            !first.observer.supports(Capabilities::HISTORY_PAGING),
+            "candidate B cannot change candidate A's open-epoch capability gate"
+        );
+        assert_eq!(
+            first.observer.selected_path_observation(),
+            direct,
+            "candidate B cannot change candidate A's open-epoch path observer"
+        );
     }
 
     struct FirstEpochEvidence {
@@ -2874,6 +3512,13 @@ mod tests {
             v1::TerminalTransportState::Reconnecting,
         )
         .await;
+        let reconnect_status = expect_paused_connection_status(&mut local_read, local_id).await;
+        assert_eq!(
+            v1::TerminalConnectionPath::try_from(reconnect_status.path)
+                .expect("known reconnect path"),
+            v1::TerminalConnectionPath::Unknown
+        );
+        assert_eq!(reconnect_status.rtt_ms, None);
         rejected_closed_rx
             .await
             .expect("bridge drops the rejected replacement epoch");
@@ -3710,13 +4355,13 @@ mod tests {
         )
         .await;
 
-        let lease_error = next_frame(&mut local_read).await;
+        let lease_error = next_non_status_frame(&mut local_read, local_id).await;
         assert_eq!(lease_error.request_id, 20);
         assert_eq!(
             service_error_kind(&lease_error),
             DomainErrorKind::TransportUnavailable
         );
-        let takeover_error = next_frame(&mut local_read).await;
+        let takeover_error = next_non_status_frame(&mut local_read, local_id).await;
         assert_eq!(takeover_error.request_id, 21);
         assert_eq!(
             service_error_kind(&takeover_error),
@@ -4322,11 +4967,11 @@ mod tests {
             },
         )
         .await;
-        let error = next_frame(&mut local_read).await;
+        let error = next_non_status_frame(&mut local_read, local_id).await;
         assert_eq!(error.kind, WireKind::ServiceErrorResponse);
         assert_eq!(error.request_id, 77);
         assert_eq!(service_error_kind(&error), DomainErrorKind::MalformedFrame);
-        let pending = next_frame(&mut local_read).await;
+        let pending = next_non_status_frame(&mut local_read, local_id).await;
         assert_eq!(pending.kind, WireKind::ServiceErrorResponse);
         assert_eq!(pending.request_id, 78);
         assert_eq!(
@@ -5037,8 +5682,9 @@ mod tests {
                         .expect("acknowledge bridge resume delta");
                     return revision;
                 }
-                LocalAttachmentEvent::TransportState(_) | LocalAttachmentEvent::SyncRequired(_) => {
-                }
+                LocalAttachmentEvent::TransportState(_)
+                | LocalAttachmentEvent::SyncRequired(_)
+                | LocalAttachmentEvent::ConnectionStatus(_) => {}
                 event => panic!("unexpected bridge synchronization event: {event:?}"),
             }
         }
@@ -5266,8 +5912,11 @@ mod tests {
     ) where
         Reader: AsyncRead + Unpin,
     {
-        let frame = next_frame(reader).await;
-        assert_transport_state(frame, attachment_id, expected);
+        assert_transport_state(
+            next_non_status_frame(reader, attachment_id).await,
+            attachment_id,
+            expected,
+        );
     }
 
     fn assert_transport_state(
@@ -5296,8 +5945,59 @@ mod tests {
     ) where
         Reader: AsyncRead + Unpin,
     {
-        let frame = next_paused_frame(reader).await;
-        assert_transport_state(frame, attachment_id, expected);
+        loop {
+            let frame = next_paused_frame(reader).await;
+            if frame.kind == WireKind::TerminalConnectionStatusEvent {
+                assert_connection_status(frame, attachment_id);
+                continue;
+            }
+            assert_transport_state(frame, attachment_id, expected);
+            return;
+        }
+    }
+
+    async fn expect_paused_connection_status<Reader>(
+        reader: &mut FramedReader<Reader>,
+        attachment_id: AttachmentId,
+    ) -> v1::TerminalConnectionStatusEvent
+    where
+        Reader: AsyncRead + Unpin,
+    {
+        assert_connection_status(next_paused_frame(reader).await, attachment_id)
+    }
+
+    fn assert_connection_status(
+        frame: DecodedFrame,
+        attachment_id: AttachmentId,
+    ) -> v1::TerminalConnectionStatusEvent {
+        assert_eq!(frame.kind, WireKind::TerminalConnectionStatusEvent);
+        let status: v1::TerminalConnectionStatusEvent = frame
+            .decode_message(WireKind::TerminalConnectionStatusEvent)
+            .expect("connection-status event");
+        assert_eq!(
+            required_attachment_id(status.attachment_id.clone())
+                .expect("connection-status attachment ID"),
+            attachment_id
+        );
+        v1::TerminalConnectionPath::try_from(status.path).expect("known connection path");
+        status
+    }
+
+    async fn next_non_status_frame<Reader>(
+        reader: &mut FramedReader<Reader>,
+        attachment_id: AttachmentId,
+    ) -> DecodedFrame
+    where
+        Reader: AsyncRead + Unpin,
+    {
+        loop {
+            let frame = next_frame(reader).await;
+            if frame.kind == WireKind::TerminalConnectionStatusEvent {
+                assert_connection_status(frame, attachment_id);
+            } else {
+                return frame;
+            }
+        }
     }
 
     async fn next_paused_frame<Reader>(reader: &mut FramedReader<Reader>) -> DecodedFrame

@@ -161,6 +161,9 @@ async fn unary_mutations_and_duplex_reconnect_share_one_live_registry() -> Resul
             LocalAttachmentEvent::Takeover(_) => {
                 return Err("unexpected takeover response before natural exit".into());
             }
+            LocalAttachmentEvent::ConnectionStatus(_) | LocalAttachmentEvent::HistoryPage(_) => {
+                return Err("unexpected remote terminal metadata before natural exit".into());
+            }
         }
     }
     assert!(
@@ -196,6 +199,9 @@ async fn unary_mutations_and_duplex_reconnect_share_one_live_registry() -> Resul
             }
             LocalAttachmentEvent::Takeover(_) => {
                 return Err("unexpected takeover response during daemon stop".into());
+            }
+            LocalAttachmentEvent::ConnectionStatus(_) | LocalAttachmentEvent::HistoryPage(_) => {
+                return Err("unexpected remote terminal metadata during daemon stop".into());
             }
         }
     };
@@ -953,7 +959,9 @@ async fn wait_for_lease_lost(client: &mut LocalAttachmentClient) -> Result<(), S
             | LocalAttachmentEvent::Snapshot(_)
             | LocalAttachmentEvent::SyncRequired(_)
             | LocalAttachmentEvent::TransportState(_)
-            | LocalAttachmentEvent::Takeover(_) => {}
+            | LocalAttachmentEvent::Takeover(_)
+            | LocalAttachmentEvent::ConnectionStatus(_)
+            | LocalAttachmentEvent::HistoryPage(_) => {}
             LocalAttachmentEvent::SessionEnded(_) => {
                 return Err("session ended while waiting for controller lease loss".into());
             }

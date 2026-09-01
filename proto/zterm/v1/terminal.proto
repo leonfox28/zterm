@@ -28,6 +28,7 @@ message TerminalModes {
   bool focus_reporting = 4;
   uint32 mouse_mode = 5;
   uint32 mouse_encoding = 6;
+  bool alternate_scroll = 7;
 }
 
 message TerminalSnapshot {
@@ -117,4 +118,57 @@ enum TerminalTransportState {
 message TerminalTransportStateEvent {
   AttachmentId attachment_id = 1;
   TerminalTransportState state = 2;
+}
+
+enum TerminalHistoryDirection {
+  TERMINAL_HISTORY_DIRECTION_UNSPECIFIED = 0;
+  TERMINAL_HISTORY_DIRECTION_NEWEST = 1;
+  TERMINAL_HISTORY_DIRECTION_OLDER = 2;
+  TERMINAL_HISTORY_DIRECTION_NEWER = 3;
+}
+
+message TerminalHistoryCursor {
+  uint64 epoch = 1;
+  uint64 revision = 2;
+  uint64 start_row = 3;
+  uint32 row_count = 4;
+  uint64 oldest_row = 5;
+  uint64 newest_row = 6;
+}
+
+message TerminalHistoryRequest {
+  AttachmentId attachment_id = 1;
+  TerminalHistoryDirection direction = 2;
+  TerminalHistoryCursor cursor = 3;
+  uint32 maximum_rows = 4;
+}
+
+enum TerminalHistoryOutcome {
+  TERMINAL_HISTORY_OUTCOME_UNSPECIFIED = 0;
+  TERMINAL_HISTORY_OUTCOME_OK = 1;
+  TERMINAL_HISTORY_OUTCOME_CHANGED = 2;
+  TERMINAL_HISTORY_OUTCOME_GAP = 3;
+}
+
+message TerminalHistoryPage {
+  AttachmentId attachment_id = 1;
+  TerminalHistoryOutcome outcome = 2;
+  TerminalHistoryCursor cursor = 3;
+  repeated bytes rows = 4;
+  uint64 current_epoch = 5;
+  uint64 current_revision = 6;
+}
+
+enum TerminalConnectionPath {
+  TERMINAL_CONNECTION_PATH_UNSPECIFIED = 0;
+  TERMINAL_CONNECTION_PATH_UNKNOWN = 1;
+  TERMINAL_CONNECTION_PATH_DIRECT = 2;
+  TERMINAL_CONNECTION_PATH_RELAY = 3;
+}
+
+// Same-UID local IPC only. It contains no address, relay URL, or device ID.
+message TerminalConnectionStatusEvent {
+  AttachmentId attachment_id = 1;
+  TerminalConnectionPath path = 2;
+  optional uint32 rtt_ms = 3;
 }

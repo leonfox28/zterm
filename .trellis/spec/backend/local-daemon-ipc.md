@@ -156,6 +156,19 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   and receives `SessionOccupied`, the bridge closes that rejected epoch and
   waits a fixed cancellable 250 ms while continuing the same input-drop and
   latest-viewport rules. A first-ever `SessionOccupied` remains terminal.
+- Remote history uses one correlated `TerminalHistoryRequest/Page` on the same
+  authenticated attachment stream. The local client permits one outstanding
+  page, revalidates attachment identity/outcome/cursor/row bounds, and the
+  bridge consumes one existing pending-control slot. Epoch loss resolves the
+  request once and never replays it on a replacement stream. If the currently
+  promoted peer did not advertise `HISTORY_PAGING`, the bridge returns an empty
+  correlated `Gap` locally, sends no unknown kind remotely, and keeps the live
+  attachment active.
+- `TerminalConnectionStatusEvent` is same-UID/local-only. The bridge emits an
+  initial/reattachment unknown sample and changed selected-path/RTT samples no
+  faster than once per second; operations combine them with the attach-time
+  frozen validated alias. Device IDs, addresses, relay URLs, tickets, and
+  terminal bytes never enter this event, Debug, status text, or logs.
 - A local or remote initial attachment has one deadline covering every
   pre-snapshot transport-state frame through the complete correlated snapshot
   or typed service error. For `create_main`, encode/connect failures before the
@@ -179,6 +192,30 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   tests own the exact reader-replacement ordering. The multiprocess PTY fixture
   uses the production `run_terminal` entry and bounded idempotent shell probes;
   it must not add renderer markers or test branches to the product loop.
+- The raw-terminal UI distinguishes physical size from child size: remote views
+  reserve the physical bottom row when rows are at least two, local/one-row
+  views do not. The remote-only row is exactly
+  `<device> | <direct|relay|--> | <integer ms|-->`, uses theme-default reverse
+  video across every cell, clips on display-cell boundaries, and saves/resets/
+  restores child cursor and style. Wheel/Page routing depends only on
+  authoritative main/alternate, mouse, and alternate-scroll modes; there are
+  no tmux/Herdr/application-name branches.
+- The UI history state is exhaustively `Live`, `History`, or `ResumePending`.
+  Pinned views drain live revisions without applying their ANSI; returning
+  live requests one full sync and retains at most the fixed input bound, then
+  forwards retained key/paste bytes exactly once only after snapshot
+  acknowledgement and `Active`. The sole host-input codec aggregates a complete
+  bracketed paste across stdin chunks into one bounded event, including its
+  delimiters. Paste content bypasses detach-prefix and gesture parsing; an
+  oversized unterminated or complete paste fails with a typed resource error
+  without forwarding a partial prefix. If `Active` arrives while a resume paste
+  is incomplete, the UI keeps consuming that paste under the old input epoch,
+  then performs the authoritative reader join/flush/new-epoch fence before
+  forwarding the complete retained unit exactly once.
+- Command-side EPIPE/reset-equivalent attachment closure enters one bounded
+  event-side correlation window. A buffered typed lease/session/service outcome
+  wins; otherwise one content-free normalized closure is returned. Raw OS error
+  text is never user-visible, and commands are not replayed.
 - A bridge retains at most eight correlated lease/takeover controls. Epoch loss
   completes every sent lease request with its original typed transport failure
   and every sent takeover with `operation_outcome_unknown`; neither is replayed.
@@ -263,6 +300,9 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
 | remote mutation outer envelope was partially/fully written but has no fully validated correlated response | `operation_outcome_unknown`; do not reconnect or replay the envelope |
 | read-only remote outer envelope has a post-write failure | retry once with identical envelope bytes and the same deadline |
 | remote attachment stream is lost with a pending lease / takeover | original typed transport failure / `operation_outcome_unknown`; remove the pending cell and never replay it |
+| remote attachment stream is lost with a pending history page | typed transport failure; remove the pending cell and never replay it |
+| history page is uncorrelated, oversized, or cursor-inconsistent | malformed frame scoped to the view; never render or retain its rows |
+| command write closure races a buffered typed lifecycle event | publish the typed event; suppress raw `Broken pipe`/OS text and do not retry the command |
 | `create_main` request was written but no complete correlated initial result is validated | `operation_outcome_unknown`; do not claim the default Session was absent or retry under a new identity |
 | existing-session initial attach receives states but no snapshot before its total deadline | `deadline_exceeded`; close only that view |
 | post-active frozen-session attach receives `session_occupied` while the old host reader is half-open | close the rejected epoch, remain reconnecting, drain/drop input and coalesce viewport for 250 ms, then retry the same SessionId without `create_main` |
@@ -357,6 +397,12 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   and state-event ordering over pure fake streams. The local attachment client
   separately proves routing and validated transport-state consumption over a
   real same-UID Unix duplex connection.
+- `terminal_ui` pure tests cover remote rows-minus-one/one-row geometry,
+  complete reverse-video Unicode-safe status output, mode-derived wheel/Page
+  routing, and exact-once input across Live/History/ResumePending. Operations
+  tests prove typed terminal end wins the command-closure race and plain EOF is
+  normalized without raw OS text. The tmux 3.7c and Herdr 0.8.2 black-box modes
+  must pass through the same generic path.
 - The CLI multiprocess PTY gate uses a task-private deterministic shell. The
   connect child proves ready -> eventual interactive echo -> default detach
   through the unmodified `run_terminal`; the bare child separately proves

@@ -29,6 +29,8 @@ SessionAttachment::snapshot_applied(revision) -> Result<(), DaemonError>
 SessionAttachment::next_update() -> Result<Option<AttachmentUpdate>, DaemonError>
 SessionAttachment::write_input(bytes) -> Result<(), DaemonError>
 SessionAttachment::resize(size) -> Result<Revision, DaemonError>
+SessionAttachment::history_page(direction, cursor, maximum_rows)
+    -> Result<TerminalHistoryResult, DaemonError>
 ```
 
 Adapters may call the deadline-bearing `*_until(..., Instant)` variants, but
@@ -107,6 +109,11 @@ they must not duplicate registry, replay, resource, or controller logic.
 - Every full snapshot must be acknowledged at its exact revision before input
   or resize. A mismatch discards the checkpoint and returns a latest snapshot;
   input is not queued while synchronization is pending.
+- History is a controller-only, active/main-screen read. The Session actor
+  validates attachment/controller ownership, synchronization state, direction,
+  cursor epoch/range, and the fixed row bound once, then asks the retained
+  driver/model for one page. Paging never mutates the lease, checkpoint, PTY,
+  lifecycle watermark, or live revision stream.
 - Revision and lifecycle notification use Tokio `watch` watermarks. There is
   no per-revision backlog. A slow view receives one merged delta or a full
   replacement snapshot. An adapter must inspect the current lifecycle value
@@ -188,6 +195,7 @@ they must not duplicate registry, replay, resource, or controller logic.
 | normal second controller | `session_occupied` |
 | overlapping first attach after one request owns/pends the controller | `session_occupied`; the registry still contains exactly one `main` |
 | input/resize before exact snapshot acknowledgement | `not_synchronized` |
+| history request is non-controller, non-active, alternate-screen, stale, or out of bounds | typed lease/sync/changed/gap/malformed result; no PTY or checkpoint mutation |
 | stale/replaced attachment | `lease_lost`, no PTY write |
 | missing session selector | `session_not_found` |
 | retained operation retry | exact prior success or typed error |
@@ -223,6 +231,9 @@ they must not duplicate registry, replay, resource, or controller logic.
   one SessionId, preserves process/cwd/screen continuity, proves ordinary
   attach never steals in either direction, and keeps another principal's
   independent Session progressing.
+- Session/unit wire tests cover bounded local and authenticated-remote history
+  routing, exact attachment/controller authorization, malformed row bounds,
+  and read-only behavior alongside interleaved live revisions.
 - `principal_detach`, `local_device_ipc`, and the `session_wire` revoke matrix
   cover matching-only detach across Sessions, stale-effect rejection,
   idempotence, preservation of local/other-remote attachments, durable restart

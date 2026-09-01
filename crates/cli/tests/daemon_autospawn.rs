@@ -713,22 +713,24 @@ async fn run_local_terminal_child(
         );
     }
     if mode == "bare-signal" {
-        rustix::termios::tcsetwinsize(
-            &master_writer,
-            rustix::termios::Winsize {
-                ws_row: 26,
-                ws_col: 82,
-                ws_xpixel: 0,
-                ws_ypixel: 0,
-            },
-        )
-        .expect("set post-output viewport");
+        set_terminal_child_size(&master_writer, 1, 5);
         kill(Pid::from_raw(child.id() as i32), Signal::SIGWINCH)
-            .expect("notify post-output viewport change");
+            .expect("notify narrow one-row viewport change");
+        let narrow_revision = wait_for_active_viewport(runtime, 1, 5).await;
+        assert!(
+            narrow_revision.get() > active_revision.get(),
+            "one-row SIGWINCH must advance the authoritative terminal revision"
+        );
+
+        for (rows, columns) in [(2, 37), (40, 120), (3, 9), (26, 82)] {
+            set_terminal_child_size(&master_writer, rows, columns);
+            kill(Pid::from_raw(child.id() as i32), Signal::SIGWINCH)
+                .expect("notify rapid viewport change");
+        }
         let resized_revision = wait_for_active_viewport(runtime, 26, 82).await;
         assert!(
-            resized_revision.get() > active_revision.get(),
-            "SIGWINCH must advance the authoritative terminal revision"
+            resized_revision.get() > narrow_revision.get(),
+            "rapid SIGWINCH coalescing must publish the final authoritative viewport"
         );
         kill(Pid::from_raw(child.id() as i32), Signal::SIGTERM)
             .expect("cancel resized terminal child");
@@ -756,6 +758,20 @@ async fn run_local_terminal_child(
         "rendered output must precede terminal cleanup"
     );
     bytes
+}
+
+#[cfg(unix)]
+fn set_terminal_child_size(output: &File, rows: u16, columns: u16) {
+    rustix::termios::tcsetwinsize(
+        output,
+        rustix::termios::Winsize {
+            ws_row: rows,
+            ws_col: columns,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        },
+    )
+    .expect("set terminal child viewport");
 }
 
 #[cfg(unix)]

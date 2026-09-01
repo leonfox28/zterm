@@ -6,7 +6,10 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use zterm_core::terminal::{ActiveScreen, TerminalSize};
+use zterm_core::terminal::{
+    ActiveScreen, TerminalHistoryCursor, TerminalHistoryDirection, TerminalHistoryPage,
+    TerminalHistoryResult, TerminalModes, TerminalMouseEncoding, TerminalMouseMode, TerminalSize,
+};
 use zterm_core::{
     AttachmentId, AuthGeneration, AuthorizationStatus, DeviceAlias, DeviceId, DeviceSummary,
     DomainErrorKind, Revision, SessionId, SessionName, SessionSelector,
@@ -23,7 +26,10 @@ use crate::error::DaemonError;
 use crate::lifecycle::acquire_lifecycle_lock;
 use crate::lifecycle::{DaemonLauncher, probe_readiness};
 #[cfg(unix)]
-use crate::local_ipc::{LocalAttachmentClient, LocalAttachmentEvent, LocalPairingClient};
+use crate::local_ipc::{
+    LocalAttachmentClient, LocalAttachmentEvent, LocalPairingClient,
+    is_attachment_command_stream_closed, is_attachment_stream_closed_without_event,
+};
 use crate::local_ipc::{LocalClient, LocalDeviceClient};
 use crate::pairing::PairTicketText;
 use crate::service::{DaemonReadiness, DaemonStatus, SessionImpact};
@@ -33,6 +39,8 @@ const MAX_LOG_BYTES: u64 = 1024 * 1024;
 const IDENTITY_RESET_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(unix)]
 const TERMINAL_DRIVER_CAPACITY: usize = 8;
+#[cfg(unix)]
+const TERMINAL_CLOSURE_CORRELATION_WINDOW: Duration = Duration::from_millis(100);
 
 /// Side-effect-free observation of local setup and daemon state.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -212,6 +220,7 @@ pub struct TerminalViewSnapshot {
     revision: Revision,
     size: TerminalSize,
     active_screen: ActiveScreen,
+    modes: TerminalModes,
     recent_history_ansi: Vec<u8>,
     screen_ansi: Vec<u8>,
 }
@@ -223,6 +232,7 @@ impl fmt::Debug for TerminalViewSnapshot {
             .field("revision", &self.revision)
             .field("size", &self.size)
             .field("active_screen", &self.active_screen)
+            .field("modes", &self.modes)
             .field("recent_history_ansi_len", &self.recent_history_ansi.len())
             .field("screen_ansi_len", &self.screen_ansi.len())
             .finish()
@@ -248,6 +258,12 @@ impl TerminalViewSnapshot {
         self.active_screen
     }
 
+    /// Authoritative child input modes represented by this replacement.
+    #[must_use]
+    pub const fn modes(&self) -> TerminalModes {
+        self.modes
+    }
+
     /// Bounded recent main-screen history, applied before [`Self::screen_ansi`].
     #[must_use]
     pub fn recent_history_ansi(&self) -> &[u8] {
@@ -268,6 +284,7 @@ pub struct TerminalViewDelta {
     to_revision: Revision,
     size: TerminalSize,
     active_screen: ActiveScreen,
+    modes: TerminalModes,
     ansi: Vec<u8>,
 }
 
@@ -279,6 +296,7 @@ impl fmt::Debug for TerminalViewDelta {
             .field("to_revision", &self.to_revision)
             .field("size", &self.size)
             .field("active_screen", &self.active_screen)
+            .field("modes", &self.modes)
             .field("ansi_len", &self.ansi.len())
             .finish()
     }
@@ -309,6 +327,12 @@ impl TerminalViewDelta {
         self.active_screen
     }
 
+    /// Authoritative child input modes after this update.
+    #[must_use]
+    pub const fn modes(&self) -> TerminalModes {
+        self.modes
+    }
+
     /// Daemon-authored ANSI for this contiguous update.
     #[must_use]
     pub fn ansi(&self) -> &[u8] {
@@ -327,6 +351,57 @@ pub enum TerminalViewTransportState {
     Active,
     /// The daemon is replacing a lost remote stream.
     Reconnecting,
+}
+
+/// Address-free selected network path for one remote terminal view.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalViewConnectionPath {
+    /// No current selected path has been observed.
+    Unknown,
+    /// Iroh selected a direct IP path.
+    Direct,
+    /// Iroh selected a relay path.
+    Relay,
+}
+
+/// Frozen remote device label plus current selected path and RTT.
+#[derive(Clone, Eq, PartialEq)]
+pub struct TerminalViewConnectionStatus {
+    device: String,
+    path: TerminalViewConnectionPath,
+    rtt_ms: Option<u32>,
+}
+
+impl fmt::Debug for TerminalViewConnectionStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalViewConnectionStatus")
+            .field("device", &"[REDACTED]")
+            .field("device_len", &self.device.len())
+            .field("path", &self.path)
+            .field("rtt_ms", &self.rtt_ms)
+            .finish()
+    }
+}
+
+impl TerminalViewConnectionStatus {
+    /// Frozen local alias for the exact remote device.
+    #[must_use]
+    pub fn device(&self) -> &str {
+        &self.device
+    }
+
+    /// Current selected Iroh path class.
+    #[must_use]
+    pub const fn path(&self) -> TerminalViewConnectionPath {
+        self.path
+    }
+
+    /// Current selected-path round-trip time in integer milliseconds.
+    #[must_use]
+    pub const fn rtt_ms(&self) -> Option<u32> {
+        self.rtt_ms
+    }
 }
 
 /// Stable reason that the daemon-owned Session ended.
@@ -369,10 +444,14 @@ impl fmt::Debug for TerminalViewEnded {
 pub enum TerminalViewEvent {
     /// Desired-view connectivity changed.
     TransportState(TerminalViewTransportState),
+    /// Selected path and RTT changed for this remote view.
+    ConnectionStatus(TerminalViewConnectionStatus),
     /// Replace the local rendered state atomically.
     Snapshot(TerminalViewSnapshot),
     /// Apply one merged update only when its baseline is contiguous.
     Delta(TerminalViewDelta),
+    /// One correlated bounded page from daemon-authoritative history.
+    History(TerminalHistoryResult),
     /// Discard the current baseline and request a replacement snapshot.
     SyncRequired {
         /// Latest host revision declared by the synchronization marker.
@@ -394,8 +473,13 @@ impl fmt::Debug for TerminalViewEvent {
                 .debug_tuple("TransportState")
                 .field(state)
                 .finish(),
+            Self::ConnectionStatus(status) => formatter
+                .debug_tuple("ConnectionStatus")
+                .field(status)
+                .finish(),
             Self::Snapshot(snapshot) => formatter.debug_tuple("Snapshot").field(snapshot).finish(),
             Self::Delta(delta) => formatter.debug_tuple("Delta").field(delta).finish(),
+            Self::History(history) => formatter.debug_tuple("History").field(history).finish(),
             Self::SyncRequired { latest_revision } => formatter
                 .debug_struct("SyncRequired")
                 .field("latest_revision", latest_revision)
@@ -420,7 +504,7 @@ pub struct PreparedTerminalView {
     attachment_id: AttachmentId,
     initial_snapshot: TerminalViewSnapshot,
     takeover: bool,
-    remote: bool,
+    remote_alias: Option<String>,
     #[cfg(unix)]
     client: LocalAttachmentClient,
 }
@@ -433,7 +517,8 @@ impl fmt::Debug for PreparedTerminalView {
             .field("attachment_id", &self.attachment_id)
             .field("initial_revision", &self.initial_snapshot.revision)
             .field("takeover", &self.takeover)
-            .field("remote", &self.remote)
+            .field("remote", &self.remote_alias.is_some())
+            .field("has_remote_alias", &self.remote_alias.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -463,6 +548,12 @@ impl PreparedTerminalView {
         &self.initial_snapshot
     }
 
+    /// Frozen local alias rendered by the remote-only status row.
+    #[must_use]
+    pub fn remote_alias(&self) -> Option<&str> {
+        self.remote_alias.as_deref()
+    }
+
     /// Acknowledges the exact flushed initial state and starts one typed driver.
     ///
     /// A requested takeover is initiated before the driver starts, so the same
@@ -476,7 +567,7 @@ impl PreparedTerminalView {
         if self.takeover {
             self.client.begin_takeover().await?;
         }
-        let initial_state = if self.remote || self.takeover {
+        let initial_state = if self.remote_alias.is_some() || self.takeover {
             TerminalViewTransportState::Synchronizing
         } else {
             TerminalViewTransportState::Active
@@ -484,7 +575,7 @@ impl PreparedTerminalView {
         Ok(spawn_terminal_driver(
             self.client,
             initial_state,
-            self.remote,
+            self.remote_alias,
             self.takeover,
         ))
     }
@@ -622,6 +713,31 @@ impl TerminalViewCommandWriter {
         }
     }
 
+    /// Requests one bounded main-screen history page. The driver permits only
+    /// one outstanding page request for this view.
+    pub async fn request_history(
+        &self,
+        direction: TerminalHistoryDirection,
+        cursor: Option<TerminalHistoryCursor>,
+        maximum_rows: usize,
+    ) -> Result<(), DaemonError> {
+        #[cfg(unix)]
+        {
+            self.submit(|response| TerminalDriverCommand::RequestHistory {
+                direction,
+                cursor,
+                maximum_rows,
+                response,
+            })
+            .await
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (direction, cursor, maximum_rows);
+            Err(unsupported_command_platform())
+        }
+    }
+
     /// Detaches this view while leaving the Session and PTY running.
     pub async fn detach(&self) -> Result<(), DaemonError> {
         #[cfg(unix)]
@@ -669,6 +785,12 @@ enum TerminalDriverCommand {
         known_revision: Revision,
         response: tokio::sync::oneshot::Sender<Result<(), DaemonError>>,
     },
+    RequestHistory {
+        direction: TerminalHistoryDirection,
+        cursor: Option<TerminalHistoryCursor>,
+        maximum_rows: usize,
+        response: tokio::sync::oneshot::Sender<Result<(), DaemonError>>,
+    },
     Detach {
         response: tokio::sync::oneshot::Sender<Result<(), DaemonError>>,
     },
@@ -678,7 +800,7 @@ enum TerminalDriverCommand {
 fn spawn_terminal_driver(
     client: LocalAttachmentClient,
     initial_state: TerminalViewTransportState,
-    remote: bool,
+    remote_alias: Option<String>,
     takeover: bool,
 ) -> TerminalViewIo {
     let (command_sender, command_receiver) = tokio::sync::mpsc::channel(TERMINAL_DRIVER_CAPACITY);
@@ -688,7 +810,7 @@ fn spawn_terminal_driver(
         command_receiver,
         event_sender,
         initial_state,
-        remote,
+        remote_alias,
         takeover,
     ));
     TerminalViewIo {
@@ -707,12 +829,22 @@ async fn run_terminal_driver(
     mut commands: tokio::sync::mpsc::Receiver<TerminalDriverCommand>,
     events: tokio::sync::mpsc::Sender<Result<TerminalViewEvent, DaemonError>>,
     initial_state: TerminalViewTransportState,
-    remote: bool,
+    remote_alias: Option<String>,
     takeover: bool,
 ) {
     use std::collections::VecDeque;
 
+    let remote = remote_alias.is_some();
     let mut pending = VecDeque::from([Ok(TerminalViewEvent::TransportState(initial_state))]);
+    if let Some(device) = remote_alias.as_ref() {
+        pending.push_back(Ok(TerminalViewEvent::ConnectionStatus(
+            TerminalViewConnectionStatus {
+                device: device.clone(),
+                path: TerminalViewConnectionPath::Unknown,
+                rtt_ms: None,
+            },
+        )));
+    }
     let mut stop_after_pending = false;
     let mut local_takeover_pending = takeover && !remote;
     let mut last_state = initial_state;
@@ -721,18 +853,17 @@ async fn run_terminal_driver(
         if pending.is_empty() {
             tokio::select! {
                 command = commands.recv() => {
-                    match handle_terminal_driver_command(command, &mut client).await {
-                        TerminalDriverCommandResult::Continue => {}
-                        TerminalDriverCommandResult::SnapshotApplied
-                            if !remote
-                                && !local_takeover_pending
-                                && last_state != TerminalViewTransportState::Active =>
-                        {
-                            last_state = TerminalViewTransportState::Active;
-                            pending.push_back(Ok(TerminalViewEvent::TransportState(last_state)));
-                        }
-                        TerminalDriverCommandResult::SnapshotApplied => {}
-                        TerminalDriverCommandResult::Stop => return,
+                    if apply_terminal_driver_command(
+                        command,
+                        &mut client,
+                        &mut pending,
+                        remote_alias.as_deref(),
+                        remote,
+                        &mut local_takeover_pending,
+                        &mut last_state,
+                        &mut stop_after_pending,
+                    ).await {
+                        return;
                     }
                 }
                 () = events.closed() => {
@@ -740,47 +871,14 @@ async fn run_terminal_driver(
                     return;
                 }
                 event = client.read_next_event() => {
-                    match event {
-                        Ok(LocalAttachmentEvent::Takeover(_)) if local_takeover_pending => {
-                            local_takeover_pending = false;
-                            last_state = TerminalViewTransportState::Active;
-                            pending.push_back(Ok(TerminalViewEvent::TransportState(last_state)));
-                        }
-                        Ok(LocalAttachmentEvent::Takeover(_)) => {}
-                        Ok(LocalAttachmentEvent::TransportState(state)) => {
-                            match terminal_transport_state_from_wire(state.state) {
-                                Ok(TerminalViewTransportState::Preparing) => {}
-                                Ok(state) if state == last_state => {}
-                                Ok(state) => {
-                                    last_state = state;
-                                    pending.push_back(Ok(TerminalViewEvent::TransportState(state)));
-                                }
-                                Err(error) => {
-                                    pending.push_back(Err(error));
-                                    stop_after_pending = true;
-                                }
-                            }
-                        }
-                        Ok(event) => {
-                            if local_event_requires_synchronizing(&event)
-                                && last_state != TerminalViewTransportState::Synchronizing
-                            {
-                                last_state = TerminalViewTransportState::Synchronizing;
-                                pending.push_back(Ok(TerminalViewEvent::TransportState(last_state)));
-                            }
-                            match terminal_event_from_local(event) {
-                                Ok(Some(event)) => pending.push_back(Ok(event)),
-                                Ok(None) => {}
-                                Err(error) => {
-                                    pending.push_back(Err(error));
-                                    stop_after_pending = true;
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            pending.push_back(Err(error));
-                            stop_after_pending = true;
-                        }
+                    if queue_local_attachment_event(
+                        event,
+                        &mut pending,
+                        remote_alias.as_deref(),
+                        &mut local_takeover_pending,
+                        &mut last_state,
+                    ) {
+                        stop_after_pending = true;
                     }
                 }
             }
@@ -789,18 +887,17 @@ async fn run_terminal_driver(
 
         tokio::select! {
             command = commands.recv() => {
-                match handle_terminal_driver_command(command, &mut client).await {
-                    TerminalDriverCommandResult::Continue => {}
-                    TerminalDriverCommandResult::SnapshotApplied
-                        if !remote
-                            && !local_takeover_pending
-                            && last_state != TerminalViewTransportState::Active =>
-                    {
-                        last_state = TerminalViewTransportState::Active;
-                        pending.push_back(Ok(TerminalViewEvent::TransportState(last_state)));
-                    }
-                    TerminalDriverCommandResult::SnapshotApplied => {}
-                    TerminalDriverCommandResult::Stop => return,
+                if apply_terminal_driver_command(
+                    command,
+                    &mut client,
+                    &mut pending,
+                    remote_alias.as_deref(),
+                    remote,
+                    &mut local_takeover_pending,
+                    &mut last_state,
+                    &mut stop_after_pending,
+                ).await {
+                    return;
                 }
             }
             permit = events.reserve() => {
@@ -814,6 +911,148 @@ async fn run_terminal_driver(
                     return;
                 }
             }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+async fn apply_terminal_driver_command(
+    command: Option<TerminalDriverCommand>,
+    client: &mut LocalAttachmentClient,
+    pending: &mut std::collections::VecDeque<Result<TerminalViewEvent, DaemonError>>,
+    remote_alias: Option<&str>,
+    remote: bool,
+    local_takeover_pending: &mut bool,
+    last_state: &mut TerminalViewTransportState,
+    stop_after_pending: &mut bool,
+) -> bool {
+    match handle_terminal_driver_command(command, client).await {
+        TerminalDriverCommandResult::Continue => false,
+        TerminalDriverCommandResult::SnapshotApplied
+            if !remote
+                && !*local_takeover_pending
+                && *last_state != TerminalViewTransportState::Active =>
+        {
+            *last_state = TerminalViewTransportState::Active;
+            pending.push_back(Ok(TerminalViewEvent::TransportState(*last_state)));
+            false
+        }
+        TerminalDriverCommandResult::SnapshotApplied => false,
+        TerminalDriverCommandResult::CommandStreamClosed { response } => {
+            correlate_terminal_command_closure(
+                client,
+                pending,
+                remote_alias,
+                local_takeover_pending,
+                last_state,
+                response,
+            )
+            .await;
+            *stop_after_pending = true;
+            false
+        }
+        TerminalDriverCommandResult::Stop => true,
+    }
+}
+
+#[cfg(unix)]
+async fn correlate_terminal_command_closure(
+    client: &mut LocalAttachmentClient,
+    pending: &mut std::collections::VecDeque<Result<TerminalViewEvent, DaemonError>>,
+    remote_alias: Option<&str>,
+    local_takeover_pending: &mut bool,
+    last_state: &mut TerminalViewTransportState,
+    response: tokio::sync::oneshot::Sender<Result<(), DaemonError>>,
+) {
+    let deadline = tokio::time::Instant::now() + TERMINAL_CLOSURE_CORRELATION_WINDOW;
+    loop {
+        let event = match tokio::time::timeout_at(deadline, client.read_next_event()).await {
+            Ok(Ok(event)) => Ok(event),
+            Ok(Err(error)) if !is_attachment_stream_closed_without_event(&error) => Err(error),
+            Ok(Err(_)) | Err(_) => {
+                pending.push_back(Err(terminal_command_outcome_unavailable()));
+                break;
+            }
+        };
+        if queue_local_attachment_event(
+            event,
+            pending,
+            remote_alias,
+            local_takeover_pending,
+            last_state,
+        ) {
+            break;
+        }
+    }
+    // The event side now owns the only user-visible terminal outcome, avoiding
+    // a race between a raw write failure and a queued typed lifecycle event.
+    let _ = response.send(Ok(()));
+}
+
+#[cfg(unix)]
+fn terminal_command_outcome_unavailable() -> DaemonError {
+    DaemonError::new(
+        DomainErrorKind::DaemonStopped,
+        "terminal attachment closed while a command was in flight",
+    )
+}
+
+#[cfg(unix)]
+fn queue_local_attachment_event(
+    event: Result<LocalAttachmentEvent, DaemonError>,
+    pending: &mut std::collections::VecDeque<Result<TerminalViewEvent, DaemonError>>,
+    remote_alias: Option<&str>,
+    local_takeover_pending: &mut bool,
+    last_state: &mut TerminalViewTransportState,
+) -> bool {
+    match event {
+        Ok(LocalAttachmentEvent::Takeover(_)) if *local_takeover_pending => {
+            *local_takeover_pending = false;
+            *last_state = TerminalViewTransportState::Active;
+            pending.push_back(Ok(TerminalViewEvent::TransportState(*last_state)));
+            false
+        }
+        Ok(LocalAttachmentEvent::Takeover(_)) => false,
+        Ok(LocalAttachmentEvent::TransportState(state)) => {
+            match terminal_transport_state_from_wire(state.state) {
+                Ok(TerminalViewTransportState::Preparing) => false,
+                Ok(state) if state == *last_state => false,
+                Ok(state) => {
+                    *last_state = state;
+                    pending.push_back(Ok(TerminalViewEvent::TransportState(state)));
+                    false
+                }
+                Err(error) => {
+                    pending.push_back(Err(error));
+                    true
+                }
+            }
+        }
+        Ok(event) => {
+            let terminal = matches!(
+                event,
+                LocalAttachmentEvent::LeaseLost(_) | LocalAttachmentEvent::SessionEnded(_)
+            );
+            if local_event_requires_synchronizing(&event)
+                && *last_state != TerminalViewTransportState::Synchronizing
+            {
+                *last_state = TerminalViewTransportState::Synchronizing;
+                pending.push_back(Ok(TerminalViewEvent::TransportState(*last_state)));
+            }
+            match terminal_event_from_local(event, remote_alias) {
+                Ok(Some(event)) => pending.push_back(Ok(event)),
+                Ok(None) => {}
+                Err(error) => {
+                    pending.push_back(Err(error));
+                    return true;
+                }
+            }
+            terminal
+        }
+        Err(error) => {
+            pending.push_back(Err(error));
+            true
         }
     }
 }
@@ -851,12 +1090,35 @@ async fn handle_terminal_driver_command(
             response,
             TerminalDriverCommandResult::Continue,
         ),
+        TerminalDriverCommand::RequestHistory {
+            direction,
+            cursor,
+            maximum_rows,
+            response,
+        } => (
+            client
+                .request_history(direction, cursor, maximum_rows)
+                .await,
+            response,
+            TerminalDriverCommandResult::Continue,
+        ),
         TerminalDriverCommand::Detach { response } => (
             client.detach().await,
             response,
             TerminalDriverCommandResult::Stop,
         ),
     };
+    if result
+        .as_ref()
+        .err()
+        .is_some_and(is_attachment_command_stream_closed)
+    {
+        if matches!(&success, TerminalDriverCommandResult::Stop) {
+            let _ = response.send(Ok(()));
+            return TerminalDriverCommandResult::Stop;
+        }
+        return TerminalDriverCommandResult::CommandStreamClosed { response };
+    }
     let failed = result.is_err();
     let _ = response.send(result);
     if failed {
@@ -870,6 +1132,9 @@ async fn handle_terminal_driver_command(
 enum TerminalDriverCommandResult {
     Continue,
     SnapshotApplied,
+    CommandStreamClosed {
+        response: tokio::sync::oneshot::Sender<Result<(), DaemonError>>,
+    },
     Stop,
 }
 
@@ -884,6 +1149,7 @@ fn local_event_requires_synchronizing(event: &LocalAttachmentEvent) -> bool {
 #[cfg(unix)]
 fn terminal_event_from_local(
     event: LocalAttachmentEvent,
+    remote_alias: Option<&str>,
 ) -> Result<Option<TerminalViewEvent>, DaemonError> {
     match event {
         LocalAttachmentEvent::Snapshot(snapshot) => terminal_snapshot_from_wire(snapshot)
@@ -892,6 +1158,37 @@ fn terminal_event_from_local(
         LocalAttachmentEvent::Delta(delta) => terminal_delta_from_wire(delta)
             .map(TerminalViewEvent::Delta)
             .map(Some),
+        LocalAttachmentEvent::HistoryPage(page) => terminal_history_from_wire(page)
+            .map(TerminalViewEvent::History)
+            .map(Some),
+        LocalAttachmentEvent::ConnectionStatus(status) => {
+            let device = remote_alias.ok_or_else(|| {
+                terminal_protocol_error("local terminal received remote connection status")
+            })?;
+            let path = match zterm_proto::v1::TerminalConnectionPath::try_from(status.path)
+                .map_err(|_| terminal_protocol_error("unknown terminal connection path"))?
+            {
+                zterm_proto::v1::TerminalConnectionPath::Unknown => {
+                    TerminalViewConnectionPath::Unknown
+                }
+                zterm_proto::v1::TerminalConnectionPath::Direct => {
+                    TerminalViewConnectionPath::Direct
+                }
+                zterm_proto::v1::TerminalConnectionPath::Relay => TerminalViewConnectionPath::Relay,
+                zterm_proto::v1::TerminalConnectionPath::Unspecified => {
+                    return Err(terminal_protocol_error(
+                        "terminal connection path was unspecified",
+                    ));
+                }
+            };
+            Ok(Some(TerminalViewEvent::ConnectionStatus(
+                TerminalViewConnectionStatus {
+                    device: device.to_owned(),
+                    path,
+                    rtt_ms: status.rtt_ms,
+                },
+            )))
+        }
         LocalAttachmentEvent::SyncRequired(required) => Ok(Some(TerminalViewEvent::SyncRequired {
             latest_revision: Revision::new(required.latest_revision),
         })),
@@ -938,6 +1235,7 @@ fn terminal_snapshot_from_wire(
         revision: Revision::new(snapshot.revision),
         size: terminal_size_from_wire(snapshot.rows, snapshot.columns)?,
         active_screen: terminal_active_screen_from_wire(snapshot.active_screen)?,
+        modes: terminal_modes_from_wire(snapshot.modes)?,
         recent_history_ansi: snapshot.recent_history_ansi,
         screen_ansi: snapshot.screen_ansi,
     })
@@ -952,8 +1250,48 @@ fn terminal_delta_from_wire(
         to_revision: Revision::new(delta.to_revision),
         size: terminal_size_from_wire(delta.rows, delta.columns)?,
         active_screen: terminal_active_screen_from_wire(delta.active_screen)?,
+        modes: terminal_modes_from_wire(delta.modes)?,
         ansi: delta.ansi,
     })
+}
+
+#[cfg(unix)]
+fn terminal_history_from_wire(
+    page: zterm_proto::v1::TerminalHistoryPage,
+) -> Result<TerminalHistoryResult, DaemonError> {
+    let outcome = zterm_proto::v1::TerminalHistoryOutcome::try_from(page.outcome)
+        .map_err(|_| terminal_protocol_error("unknown terminal history outcome"))?;
+    match outcome {
+        zterm_proto::v1::TerminalHistoryOutcome::Ok => {
+            let cursor = page
+                .cursor
+                .ok_or_else(|| terminal_protocol_error("terminal history page omitted cursor"))?;
+            Ok(TerminalHistoryResult::Page(TerminalHistoryPage {
+                cursor: TerminalHistoryCursor {
+                    epoch: Revision::new(cursor.epoch),
+                    revision: Revision::new(cursor.revision),
+                    start_row: cursor.start_row,
+                    row_count: cursor.row_count,
+                    oldest_row: cursor.oldest_row,
+                    newest_row: cursor.newest_row,
+                },
+                rows: page.rows,
+            }))
+        }
+        zterm_proto::v1::TerminalHistoryOutcome::Changed => {
+            Ok(TerminalHistoryResult::HistoryChanged {
+                epoch: Revision::new(page.current_epoch),
+                revision: Revision::new(page.current_revision),
+            })
+        }
+        zterm_proto::v1::TerminalHistoryOutcome::Gap => Ok(TerminalHistoryResult::HistoryGap {
+            epoch: Revision::new(page.current_epoch),
+            revision: Revision::new(page.current_revision),
+        }),
+        zterm_proto::v1::TerminalHistoryOutcome::Unspecified => Err(terminal_protocol_error(
+            "terminal history outcome was unspecified",
+        )),
+    }
 }
 
 #[cfg(unix)]
@@ -982,6 +1320,36 @@ fn terminal_active_screen_from_wire(value: i32) -> Result<ActiveScreen, DaemonEr
             "terminal active screen was unspecified",
         )),
     }
+}
+
+#[cfg(unix)]
+fn terminal_modes_from_wire(
+    modes: Option<zterm_proto::v1::TerminalModes>,
+) -> Result<TerminalModes, DaemonError> {
+    let modes = modes.ok_or_else(|| terminal_protocol_error("terminal update omitted modes"))?;
+    let mouse_mode = match modes.mouse_mode {
+        0 => TerminalMouseMode::None,
+        1 => TerminalMouseMode::Press,
+        2 => TerminalMouseMode::PressRelease,
+        3 => TerminalMouseMode::ButtonMotion,
+        4 => TerminalMouseMode::AnyMotion,
+        _ => return Err(terminal_protocol_error("unknown terminal mouse mode")),
+    };
+    let mouse_encoding = match modes.mouse_encoding {
+        0 => TerminalMouseEncoding::Default,
+        1 => TerminalMouseEncoding::Utf8,
+        2 => TerminalMouseEncoding::Sgr,
+        _ => return Err(terminal_protocol_error("unknown terminal mouse encoding")),
+    };
+    Ok(TerminalModes {
+        application_keypad: modes.application_keypad,
+        application_cursor: modes.application_cursor,
+        bracketed_paste: modes.bracketed_paste,
+        focus_reporting: modes.focus_reporting,
+        alternate_scroll: modes.alternate_scroll,
+        mouse_mode,
+        mouse_encoding,
+    })
 }
 
 #[cfg(unix)]
@@ -1744,6 +2112,24 @@ impl LocalRuntime {
     ) -> Result<PreparedTerminalView, DaemonError> {
         #[cfg(unix)]
         {
+            let remote_alias = if let Some(device_id) = target.device_id() {
+                let devices = LocalDeviceClient::new(self.paths.socket().to_path_buf())
+                    .list()
+                    .await?;
+                let alias = devices
+                    .into_iter()
+                    .find(|device| device.device_id() == device_id)
+                    .and_then(|device| device.alias().cloned())
+                    .ok_or_else(|| {
+                        DaemonError::new(
+                            DomainErrorKind::DeviceNotFound,
+                            "the exact remote target no longer has a local alias",
+                        )
+                    })?;
+                Some(alias.as_str().to_owned())
+            } else {
+                None
+            };
             let client = LocalAttachmentClient::connect_resolved(
                 self.paths.socket(),
                 target,
@@ -1759,7 +2145,7 @@ impl LocalRuntime {
                 attachment_id: client.attachment_id(),
                 initial_snapshot,
                 takeover,
-                remote: client.is_remote(),
+                remote_alias,
                 client,
             })
         }
@@ -2521,6 +2907,67 @@ mod tests {
         assert!(!debug.contains("SENSITIVE_TERMINAL_SIGNAL_SENTINEL"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn connection_status_projection_keeps_the_frozen_alias_and_redacts_private_identity() {
+        const ALIAS_SENTINEL: &str = "远程-Mac-STATUS_ALIAS_SENTINEL";
+        const ATTACHMENT_SENTINEL: &[u8; AttachmentId::LENGTH] = b"STATUS_ID_SENTIN";
+        let attachment_id = AttachmentId::from_array(*ATTACHMENT_SENTINEL);
+        let project = |path, rtt_ms| {
+            terminal_event_from_local(
+                LocalAttachmentEvent::ConnectionStatus(v1::TerminalConnectionStatusEvent {
+                    attachment_id: Some(attachment_id.into()),
+                    path,
+                    rtt_ms,
+                }),
+                Some(ALIAS_SENTINEL),
+            )
+            .expect("same-UID status projects")
+            .expect("same-UID status remains visible")
+        };
+
+        for (event, expected_path, expected_rtt) in [
+            (
+                project(v1::TerminalConnectionPath::Unknown as i32, None),
+                TerminalViewConnectionPath::Unknown,
+                None,
+            ),
+            (
+                project(v1::TerminalConnectionPath::Direct as i32, Some(7)),
+                TerminalViewConnectionPath::Direct,
+                Some(7),
+            ),
+            (
+                project(v1::TerminalConnectionPath::Relay as i32, Some(19)),
+                TerminalViewConnectionPath::Relay,
+                Some(19),
+            ),
+        ] {
+            let TerminalViewEvent::ConnectionStatus(status) = event else {
+                panic!("connection status projects to its typed view event");
+            };
+            assert_eq!(status.device(), ALIAS_SENTINEL);
+            assert_eq!(status.path(), expected_path);
+            assert_eq!(status.rtt_ms(), expected_rtt);
+            let rendered = format!("{status:?}");
+            assert!(!rendered.contains(ALIAS_SENTINEL));
+            assert!(!rendered.contains(
+                std::str::from_utf8(ATTACHMENT_SENTINEL).expect("ASCII attachment sentinel")
+            ));
+        }
+
+        let error = terminal_event_from_local(
+            LocalAttachmentEvent::ConnectionStatus(v1::TerminalConnectionStatusEvent {
+                attachment_id: Some(attachment_id.into()),
+                path: v1::TerminalConnectionPath::Direct as i32,
+                rtt_ms: Some(7),
+            }),
+            None,
+        )
+        .expect_err("local-only views cannot accept remote connection status");
+        assert_eq!(error.kind(), DomainErrorKind::MalformedFrame);
+    }
+
     #[test]
     fn doctor_check_debug_redacts_detail_without_changing_public_diagnostics() {
         const DETAIL_SENTINEL: &str = "/private/tmp/DOCTOR_DETAIL_SENTINEL_69ba/state.sqlite3";
@@ -2805,6 +3252,279 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn terminal_command_closure_prefers_typed_end_and_normalizes_plain_eof() {
+        let session_id = SessionId::from_array([0xc1; SessionId::LENGTH]);
+        let attachment_id = AttachmentId::from_array([0xc2; AttachmentId::LENGTH]);
+        let (mut client, mut peer) = LocalAttachmentClient::terminal_driver_test_pair(
+            ResolvedSessionTarget::local(),
+            session_id,
+            attachment_id,
+        );
+        peer.write_all(
+            &encode_message(
+                WireKind::TerminalSessionEnded,
+                0,
+                0,
+                &v1::TerminalSessionEnded {
+                    session_id: Some(session_id.into()),
+                    attachment_id: Some(attachment_id.into()),
+                    reason: v1::TerminalSessionEndReason::NaturalExit as i32,
+                    exit_code: 0,
+                    signal: String::new(),
+                },
+            )
+            .expect("encode typed terminal end"),
+        )
+        .await
+        .expect("queue typed terminal end before command closure");
+        peer.flush().await.expect("flush typed terminal end");
+
+        let mut pending = VecDeque::new();
+        let mut takeover_pending = false;
+        let mut last_state = TerminalViewTransportState::Active;
+        let (response, received) = tokio::sync::oneshot::channel();
+        correlate_terminal_command_closure(
+            &mut client,
+            &mut pending,
+            None,
+            &mut takeover_pending,
+            &mut last_state,
+            response,
+        )
+        .await;
+        assert_eq!(received.await.expect("command response owner"), Ok(()));
+        assert!(matches!(
+            pending.pop_front(),
+            Some(Ok(TerminalViewEvent::SessionEnded(TerminalViewEnded {
+                reason: TerminalViewEndReason::NaturalExit,
+                ..
+            })))
+        ));
+        assert!(pending.is_empty());
+
+        let (mut eof_client, eof_peer) = LocalAttachmentClient::terminal_driver_test_pair(
+            ResolvedSessionTarget::local(),
+            session_id,
+            attachment_id,
+        );
+        drop(eof_peer);
+        let mut eof_pending = VecDeque::new();
+        let (response, received) = tokio::sync::oneshot::channel();
+        correlate_terminal_command_closure(
+            &mut eof_client,
+            &mut eof_pending,
+            None,
+            &mut takeover_pending,
+            &mut last_state,
+            response,
+        )
+        .await;
+        assert_eq!(received.await.expect("EOF command response owner"), Ok(()));
+        let Some(Err(error)) = eof_pending.pop_front() else {
+            panic!("plain attachment EOF must become one normalized typed error");
+        };
+        assert_eq!(error.kind(), DomainErrorKind::DaemonStopped);
+        assert!(!error.detail().contains("Broken pipe"));
+        assert!(!error.detail().contains("os error"));
+        assert!(eof_pending.is_empty());
+    }
+
+    #[cfg(unix)]
+    async fn closed_resize_schedule(
+        session_id: SessionId,
+        attachment_id: AttachmentId,
+        frames: impl IntoIterator<Item = Vec<u8>>,
+        remote_alias: Option<&str>,
+    ) -> (
+        VecDeque<Result<TerminalViewEvent, DaemonError>>,
+        TerminalViewTransportState,
+    ) {
+        let (mut client, mut peer) = LocalAttachmentClient::terminal_driver_test_pair(
+            ResolvedSessionTarget::local(),
+            session_id,
+            attachment_id,
+        );
+        for frame in frames {
+            peer.write_all(&frame)
+                .await
+                .expect("queue closure-schedule frame");
+        }
+        peer.flush().await.expect("flush closure-schedule frames");
+        drop(peer);
+
+        let mut pending = VecDeque::new();
+        let mut takeover_pending = false;
+        let mut last_state = TerminalViewTransportState::Active;
+        let mut stop_after_pending = false;
+        let (response, received) = tokio::sync::oneshot::channel();
+        assert!(
+            !apply_terminal_driver_command(
+                Some(TerminalDriverCommand::Resize {
+                    size: TerminalSize::new(31, 97),
+                    response,
+                }),
+                &mut client,
+                &mut pending,
+                remote_alias,
+                remote_alias.is_some(),
+                &mut takeover_pending,
+                &mut last_state,
+                &mut stop_after_pending,
+            )
+            .await,
+            "a correlated closure drains its typed outcome before the driver stops"
+        );
+        assert!(stop_after_pending);
+        assert_eq!(received.await.expect("resize response owner"), Ok(()));
+        (pending, last_state)
+    }
+
+    #[cfg(unix)]
+    fn closure_schedule_frame<Message: prost::Message>(
+        kind: WireKind,
+        message: &Message,
+    ) -> Vec<u8> {
+        encode_message(kind, 0, 0, message).expect("encode closure-schedule frame")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resize_closure_schedules_preserve_typed_end_lease_error_and_remote_resync_order() {
+        let session_id = SessionId::from_array([0xc3; SessionId::LENGTH]);
+        let attachment_id = AttachmentId::from_array([0xc4; AttachmentId::LENGTH]);
+
+        let (mut ended, _) = closed_resize_schedule(
+            session_id,
+            attachment_id,
+            [closure_schedule_frame(
+                WireKind::TerminalSessionEnded,
+                &v1::TerminalSessionEnded {
+                    session_id: Some(session_id.into()),
+                    attachment_id: Some(attachment_id.into()),
+                    reason: v1::TerminalSessionEndReason::DaemonStop as i32,
+                    exit_code: 0,
+                    signal: String::new(),
+                },
+            )],
+            None,
+        )
+        .await;
+        assert!(matches!(
+            ended.pop_front(),
+            Some(Ok(TerminalViewEvent::SessionEnded(TerminalViewEnded {
+                reason: TerminalViewEndReason::DaemonStop,
+                ..
+            })))
+        ));
+        assert!(ended.is_empty());
+
+        let (mut lost, _) = closed_resize_schedule(
+            session_id,
+            attachment_id,
+            [closure_schedule_frame(
+                WireKind::TerminalLeaseLost,
+                &v1::TerminalLeaseLost {
+                    attachment_id: Some(attachment_id.into()),
+                    generation: 23,
+                },
+            )],
+            None,
+        )
+        .await;
+        assert!(matches!(
+            lost.pop_front(),
+            Some(Ok(TerminalViewEvent::LeaseLost { generation: 23 }))
+        ));
+        assert!(lost.is_empty());
+
+        let (mut resync, last_state) = closed_resize_schedule(
+            session_id,
+            attachment_id,
+            [
+                closure_schedule_frame(
+                    WireKind::TerminalTransportStateEvent,
+                    &v1::TerminalTransportStateEvent {
+                        attachment_id: Some(attachment_id.into()),
+                        state: v1::TerminalTransportState::Reconnecting as i32,
+                    },
+                ),
+                closure_schedule_frame(
+                    WireKind::TerminalConnectionStatusEvent,
+                    &v1::TerminalConnectionStatusEvent {
+                        attachment_id: Some(attachment_id.into()),
+                        path: v1::TerminalConnectionPath::Unknown as i32,
+                        rtt_ms: None,
+                    },
+                ),
+                closure_schedule_frame(
+                    WireKind::TerminalSyncRequired,
+                    &v1::TerminalSyncRequired {
+                        attachment_id: Some(attachment_id.into()),
+                        latest_revision: 29,
+                    },
+                ),
+            ],
+            Some("frozen-peer"),
+        )
+        .await;
+        assert!(matches!(
+            resync.pop_front(),
+            Some(Ok(TerminalViewEvent::TransportState(
+                TerminalViewTransportState::Reconnecting
+            )))
+        ));
+        assert!(matches!(
+            resync.pop_front(),
+            Some(Ok(TerminalViewEvent::ConnectionStatus(_)))
+        ));
+        assert!(matches!(
+            resync.pop_front(),
+            Some(Ok(TerminalViewEvent::TransportState(
+                TerminalViewTransportState::Synchronizing
+            )))
+        ));
+        assert!(matches!(
+            resync.pop_front(),
+            Some(Ok(TerminalViewEvent::SyncRequired {
+                latest_revision
+            })) if latest_revision == Revision::new(29)
+        ));
+        let Some(Err(resync_closed)) = resync.pop_front() else {
+            panic!("an incomplete resync followed by EOF is normalized once");
+        };
+        assert_eq!(resync_closed.kind(), DomainErrorKind::DaemonStopped);
+        assert!(!resync_closed.detail().contains("Broken pipe"));
+        assert!(resync.is_empty());
+        assert_eq!(last_state, TerminalViewTransportState::Synchronizing);
+
+        let typed_error = DaemonError::new(
+            DomainErrorKind::Unauthorized,
+            "BUFFERED_TYPED_ERROR_SENTINEL",
+        );
+        let (mut failed, _) = closed_resize_schedule(
+            session_id,
+            attachment_id,
+            [closure_schedule_frame(
+                WireKind::ServiceErrorResponse,
+                &v1::ServiceError {
+                    code: typed_error.kind().code().to_owned(),
+                    message: typed_error.detail().to_owned(),
+                },
+            )],
+            None,
+        )
+        .await;
+        let Some(Err(error)) = failed.pop_front() else {
+            panic!("buffered typed service error wins the resize closure race");
+        };
+        assert_eq!(error.kind(), DomainErrorKind::Unauthorized);
+        assert_eq!(error.detail(), "BUFFERED_TYPED_ERROR_SENTINEL");
+        assert!(!error.detail().contains("Broken pipe"));
+        assert!(failed.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn terminal_driver_local_exact_ack_activates_once_with_bounded_channels() {
         let (prepared, mut daemon, _, attachment_id) = terminal_test_view(false);
         let server = tokio::spawn(async move {
@@ -2837,8 +3557,15 @@ mod tests {
                 .await
                 .expect("write lease-lost marker");
 
-            let detach = read_terminal_test_frame(&mut daemon, &mut decoder, &mut queued).await;
-            assert_eq!(detach.kind, WireKind::TerminalDetach);
+            let mut after_terminal = [0_u8; 1];
+            assert_eq!(
+                daemon
+                    .read(&mut after_terminal)
+                    .await
+                    .expect("read the driver's terminal-event shutdown"),
+                0,
+                "the typed lease-loss event closes the local driver"
+            );
         });
 
         let view = prepared
@@ -2861,7 +3588,7 @@ mod tests {
             events.read_event().await.expect("post-ack marker"),
             Some(TerminalViewEvent::LeaseLost { generation: 7 })
         ));
-        writer.detach().await.expect("detach local view");
+        drop(writer);
         server.await.expect("local driver server");
     }
 
@@ -2905,6 +3632,15 @@ mod tests {
                 .expect("write correlated takeover response");
             let detach = read_terminal_test_frame(&mut daemon, &mut decoder, &mut queued).await;
             assert_eq!(detach.kind, WireKind::TerminalDetach);
+            let mut after_detach = [0_u8; 1];
+            assert_eq!(
+                daemon
+                    .read(&mut after_detach)
+                    .await
+                    .expect("read the takeover driver's detach shutdown"),
+                0,
+                "the takeover driver half-closes after the detach frame"
+            );
         });
 
         let view = prepared
@@ -3022,7 +3758,7 @@ mod tests {
                 attachment_id,
                 initial_snapshot,
                 takeover,
-                remote: false,
+                remote_alias: None,
                 client,
             },
             peer,

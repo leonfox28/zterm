@@ -1,0 +1,10 @@
+{"file":".trellis/spec/backend/terminal-model.md","reason":"Preserve the single daemon-authoritative VT parser, snapshot/delta, modes, redaction, frame, and resource contracts while adding bounded history projection."}
+{"file":".trellis/spec/backend/terminal-driver.md","reason":"Keep PTY drain, latest-only attachment state, checkpoints, resize, and lifetime independent from UI/history/transport."}
+{"file":".trellis/spec/backend/session-service.md","reason":"Add read-only history routing without changing controller leases, synchronization, Session lifetime, or bounded attachment queues."}
+{"file":".trellis/spec/backend/local-daemon-ipc.md","reason":"Own same-UID attachment events, command/event closure correlation, exact error projection, and raw-terminal lifecycle."}
+{"file":".trellis/spec/backend/transport-auth.md","reason":"Project selected Iroh path/RTT and bridge history requests without exposing routes or adding a reconnect owner."}
+{"file":".trellis/spec/backend/core-wire-domain.md","reason":"Register additive bounded protobuf/wire kinds and capability negotiation consistently across core, proto, daemon, and CLI."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Trace history, status, modes, and errors through every typed boundary with one validation owner."}
+{"file":".trellis/spec/guides/evidence-driven-simplicity.md","reason":"Keep one implementation owner, bounded tests, no external provider, and no redundant recovery or compatibility machinery."}
+{"file":".trellis/tasks/08-31-remote-terminal-ux/research/herdr-tmux-terminal-history.md","reason":"Implement the approved daemon-owned live/pinned history and mode-derived input behavior based on Herdr/tmux evidence."}
+{"file":".trellis/tasks/08-31-remote-terminal-ux/research/terminal-theme-status-colors.md","reason":"Implement the confirmed three-field full-row reverse-video status contract without fixed colors or host palette queries."}

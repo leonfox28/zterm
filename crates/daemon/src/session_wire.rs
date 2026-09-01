@@ -21,6 +21,10 @@ use tokio::sync::{mpsc, oneshot};
 #[cfg(unix)]
 use zeroize::Zeroizing;
 #[cfg(unix)]
+use zterm_core::terminal::{
+    MAX_HISTORY_PAGE_ROWS, TerminalHistoryCursor, TerminalHistoryDirection,
+};
+#[cfg(unix)]
 use zterm_core::{
     AttachmentId, AttachmentPrincipal, AuthGeneration, DeviceId, DomainErrorKind, OperationId,
     ResourceLimits, ResumeViewId, Revision, SessionId, SessionName, SessionSelector,
@@ -1171,6 +1175,40 @@ async fn process_attachment_frame(
             send_resync(frame.request_id, attachment, snapshot, outbound, deadline).await?;
             Ok(false)
         }
+        WireKind::TerminalHistoryRequest => {
+            let request: v1::TerminalHistoryRequest = frame
+                .decode_message(WireKind::TerminalHistoryRequest)
+                .map_err(protocol_error)?;
+            require_attachment_id(request.attachment_id, attachment)?;
+            let direction = terminal_history_direction(request.direction)?;
+            let cursor = request.cursor.map(terminal_history_cursor);
+            let maximum_rows = usize::try_from(request.maximum_rows)
+                .map_err(|_| malformed("terminal history page bound is not representable"))?;
+            if maximum_rows == 0 || maximum_rows > MAX_HISTORY_PAGE_ROWS {
+                return Err(malformed(
+                    "terminal history page bound is outside the allowed range",
+                ));
+            }
+            let attachment_worker = Arc::clone(attachment);
+            let result = request_context
+                .run_effect(&server.sessions, deadline, move |_sessions, _principal| {
+                    attachment_worker.history_page_until(direction, cursor, maximum_rows, deadline)
+                })
+                .await?;
+            let message =
+                zterm_proto::terminal_history_page_message(attachment.attachment_id(), result);
+            send_attachment_outbound_until(
+                outbound,
+                AttachmentOutbound::queued(
+                    encode_message(WireKind::TerminalHistoryPage, frame.request_id, 0, &message)
+                        .map_err(protocol_error)?,
+                    deadline,
+                ),
+                deadline,
+            )
+            .await?;
+            Ok(false)
+        }
         WireKind::TerminalInput => {
             let request: v1::TerminalInput = frame
                 .decode_message(WireKind::TerminalInput)
@@ -1737,6 +1775,30 @@ fn local_request_view_id(request_id: u64) -> AttachmentId {
     let mut bytes = [0_u8; 16];
     bytes[..8].copy_from_slice(&request_id.to_le_bytes());
     AttachmentId::from_array(bytes)
+}
+
+#[cfg(unix)]
+fn terminal_history_direction(value: i32) -> Result<TerminalHistoryDirection, DaemonError> {
+    match v1::TerminalHistoryDirection::try_from(value) {
+        Ok(v1::TerminalHistoryDirection::Newest) => Ok(TerminalHistoryDirection::Newest),
+        Ok(v1::TerminalHistoryDirection::Older) => Ok(TerminalHistoryDirection::Older),
+        Ok(v1::TerminalHistoryDirection::Newer) => Ok(TerminalHistoryDirection::Newer),
+        Ok(v1::TerminalHistoryDirection::Unspecified) | Err(_) => {
+            Err(malformed("terminal history direction is invalid"))
+        }
+    }
+}
+
+#[cfg(unix)]
+fn terminal_history_cursor(value: v1::TerminalHistoryCursor) -> TerminalHistoryCursor {
+    TerminalHistoryCursor {
+        epoch: Revision::new(value.epoch),
+        revision: Revision::new(value.revision),
+        start_row: value.start_row,
+        row_count: value.row_count,
+        oldest_row: value.oldest_row,
+        newest_row: value.newest_row,
+    }
 }
 
 #[cfg(unix)]
@@ -2321,6 +2383,30 @@ mod tests {
         })
     }
 
+    fn unix_script_wire_service(
+        own: DeviceId,
+        working_directory: PathBuf,
+        script: &'static str,
+    ) -> SessionService {
+        let shell = [Path::new("/bin/sh"), Path::new("/usr/bin/sh")]
+            .into_iter()
+            .find(|path| path.is_file())
+            .expect("POSIX shell fixture")
+            .to_path_buf();
+        SessionService::with_spawner(own, ResourceLimits::default(), move |size, requested| {
+            let cwd = requested.unwrap_or(&working_directory).to_path_buf();
+            let session = PtyHost::new()
+                .spawn(
+                    ExplicitPtyCommand::new(&shell, &cwd).arg("-c").arg(script),
+                    PtySize::new(size.rows, size.columns),
+                )
+                .map_err(|error| {
+                    DaemonError::new(DomainErrorKind::StoreUnavailable, error.to_string())
+                })?;
+            Ok((session, cwd))
+        })
+    }
+
     fn activate_attachment(prepared: &PreparedAttachment) {
         let replacement = prepared
             .attachment
@@ -2330,6 +2416,48 @@ mod tests {
             replacement.is_none(),
             "exact matrix snapshot acknowledgement cannot require replacement",
         );
+    }
+
+    async fn wait_for_attachment_text(prepared: &PreparedAttachment, expected: &[u8]) {
+        let contains = |snapshot: &zterm_core::terminal::TerminalSnapshot| {
+            snapshot
+                .recent_history_ansi
+                .windows(expected.len())
+                .chain(snapshot.screen_ansi.windows(expected.len()))
+                .any(|bytes| bytes == expected)
+        };
+        if contains(&prepared.snapshot) {
+            return;
+        }
+
+        let mut revisions = prepared
+            .attachment
+            .revision_watch()
+            .expect("history fixture revision watermark");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                revisions
+                    .changed()
+                    .await
+                    .expect("history fixture driver remains live");
+                let snapshot = prepared
+                    .attachment
+                    .sync_latest(prepared.snapshot.revision)
+                    .expect("history fixture latest snapshot");
+                if contains(&snapshot) {
+                    assert!(
+                        prepared
+                            .attachment
+                            .snapshot_applied(snapshot.revision)
+                            .expect("acknowledge history fixture snapshot")
+                            .is_none()
+                    );
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("history fixture output deadline");
     }
 
     fn session_summary(sessions: &SessionService, session_id: SessionId) -> SessionSummary {
@@ -2621,6 +2749,120 @@ mod tests {
         .await;
         result.expect("typed local-target rejection is a complete unary response");
         assert_eq!(service_error_kind(&response), DomainErrorKind::Unauthorized);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_uid_and_authenticated_remote_history_route_to_one_session_owner() {
+        let temporary = tempfile::tempdir().expect("temporary history routing fixture");
+        let own = device(0x19);
+        let remote = device(0x1a);
+        let accepted = generation(4);
+        let sessions = unix_script_wire_service(
+            own,
+            temporary.path().to_path_buf(),
+            "i=0; while [ \"$i\" -lt 12 ]; do printf 'history-%02d\\r\\n' \"$i\"; i=$((i + 1)); done; exec /bin/cat",
+        );
+        let local = sessions.local_principal(AttachmentId::from_array([0x1b; 16]));
+        let lease = sessions
+            .issue_operation_lease(local)
+            .expect("history fixture create lease");
+        let summary = sessions
+            .create(
+                local,
+                OperationId { lease, sequence: 1 },
+                SessionName::new("history-routing").expect("history fixture Session name"),
+                None,
+                Some(TerminalSize::new(3, 24)),
+            )
+            .expect("history fixture Session creates");
+        let local_attachment = sessions
+            .prepare_attach(
+                local,
+                Some(SessionSelector::Id(summary.session_id)),
+                false,
+                false,
+                None,
+            )
+            .expect("same-UID attachment prepares");
+        activate_attachment(&local_attachment);
+        wait_for_attachment_text(&local_attachment, b"history-11").await;
+        let local_page = local_attachment
+            .attachment
+            .history_page_until(
+                TerminalHistoryDirection::Newest,
+                None,
+                8,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .expect("same-UID history request reaches the Session owner");
+        let zterm_core::terminal::TerminalHistoryResult::Page(local_page) = local_page else {
+            panic!("stable same-UID history returns a page");
+        };
+        assert!(!local_page.rows.is_empty());
+        drop(local_attachment);
+
+        let authorization = authorized_registry(remote, accepted);
+        let (mut peer, task) = start_remote_attachment(
+            SessionWireServer::new(sessions),
+            remote_context(own, remote, accepted, authorization),
+            remote_attach_request(
+                own,
+                summary.session_id,
+                ResumeViewId::from_array([0x1c; 16]),
+                None,
+            ),
+        )
+        .await;
+        let snapshot = peer.next().await;
+        assert_eq!(snapshot.kind, WireKind::TerminalSnapshot);
+        let snapshot: v1::TerminalSnapshot = snapshot
+            .decode_message(WireKind::TerminalSnapshot)
+            .expect("authenticated remote history snapshot");
+        let attachment_id: AttachmentId = snapshot
+            .attachment_id
+            .expect("authenticated remote attachment ID")
+            .try_into()
+            .expect("fixed-width authenticated remote attachment ID");
+        acknowledge_and_barrier(
+            &mut peer,
+            own,
+            attachment_id,
+            Revision::new(snapshot.revision),
+        )
+        .await;
+
+        peer.send(
+            WireKind::TerminalHistoryRequest,
+            7,
+            &v1::TerminalHistoryRequest {
+                attachment_id: Some(attachment_id.into()),
+                direction: v1::TerminalHistoryDirection::Newest as i32,
+                cursor: None,
+                maximum_rows: 8,
+            },
+        )
+        .await;
+        let page = peer.next().await;
+        assert_eq!(page.kind, WireKind::TerminalHistoryPage);
+        assert_eq!(page.request_id, 7);
+        let page: v1::TerminalHistoryPage = page
+            .decode_message(WireKind::TerminalHistoryPage)
+            .expect("authenticated remote history page");
+        assert_eq!(
+            v1::TerminalHistoryOutcome::try_from(page.outcome).expect("known history outcome"),
+            v1::TerminalHistoryOutcome::Ok
+        );
+        assert_eq!(page.rows, local_page.rows);
+
+        peer.stream
+            .shutdown()
+            .await
+            .expect("finish authenticated remote history fixture");
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("authenticated remote history server task deadline")
+            .expect("authenticated remote history server task")
+            .expect("authenticated remote history transport EOF is normal");
     }
 
     #[tokio::test]

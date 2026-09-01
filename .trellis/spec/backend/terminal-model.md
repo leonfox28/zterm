@@ -33,6 +33,8 @@ TerminalModel::delta_or_resync(&self, checkpoint: &TerminalCheckpoint)
     -> TerminalDeltaResult
 TerminalModel::state(&self) -> TerminalState
 TerminalModel::resource_projection(&self) -> TerminalResourceProjection
+TerminalModel::history_page(direction, cursor, maximum_rows)
+    -> Result<TerminalHistoryResult, TerminalError>
 TerminalSnapshot::limit_ansi_payload(&mut self, maximum_bytes: usize) -> bool
 ```
 
@@ -43,7 +45,8 @@ conversions, and the daemon driver. `TerminalSnapshot` carries `revision`, `size
 `TerminalCheckpoint` is opaque. No public field or signature may expose a
 `vt100` type.
 
-One update retains at most `MAX_SIDE_EVENTS_PER_UPDATE = 32` events. A title
+One history page retains at most `MAX_HISTORY_PAGE_ROWS = 80` daemon-formatted
+rows. One update retains at most `MAX_SIDE_EVENTS_PER_UPDATE = 32` events. A title
 or icon-name event retains at most `MAX_TITLE_BYTES = 256` source bytes.
 
 ## 3. Contracts
@@ -55,6 +58,15 @@ or icon-name event retains at most `MAX_TITLE_BYTES = 256` source bytes.
   visible cells and styles, cursor and active style, and supported input modes.
 - A reconnect client applies `recent_history_ansi` before `screen_ansi`.
   Snapshot replay into a fresh model must reproduce the latest semantic state.
+- `TerminalModel` is the only history/VT owner. History paging clones only its
+  screen view, never changes the authoritative scrollback offset, returns rows
+  oldest-to-newest, and exposes only zterm-owned cursor/page/result types. A
+  cursor binds an epoch, observed revision, and retained bounds; monotonic append
+  below capacity keeps its epoch, while resize, shrink/clear, or capacity
+  ambiguity returns `HistoryChanged`/`HistoryGap` instead of splicing rows.
+- DECSET/DECRST 1007 is captured at the existing safe callback boundary as
+  `TerminalModes::alternate_scroll` and round-trips through state, snapshot,
+  delta, and checkpoint just like the other authoritative input modes.
 - The Unix raw-terminal controller validates both physical TTYs before attach,
   saves exact termios, and owns one outer alternate screen. It strips the one
   expected model screen selector, rejects every nested or inconsistent main /
@@ -126,6 +138,9 @@ or icon-name event retains at most `MAX_TITLE_BYTES = 256` source bytes.
 | Delta ANSI length is at least the snapshot ANSI length | Return one full `Resync` snapshot |
 | Snapshot ANSI exceeds the wire budget because of history | Remove oldest complete history lines only; preserve the full screen |
 | Current screen alone exceeds the requested snapshot budget | Preserve the screen, clear history, return `false`; frame encoding rejects if still oversized |
+| History page bound is zero or exceeds 80 | `TerminalError::InvalidHistoryPageSize`; model state remains unchanged |
+| History cursor epoch or retained range is stale | Return `HistoryChanged` or `HistoryGap`; never return mixed rows |
+| Alternate screen is active | History request returns `HistoryChanged`; no alternate-screen transcript is invented |
 | More than 32 side events occur in one update | Retain 31 events plus one `EventsDropped { count }` summary |
 | Title or icon input exceeds 256 source bytes | Retain a bounded lossy string with `truncated: true` |
 | OSC 52 or an unknown control payload is received | Classify or drop it; never reproduce its decoded or encoded payload |
@@ -164,6 +179,11 @@ or icon-name event retains at most `MAX_TITLE_BYTES = 256` source bytes.
   visible capacity remains `rows * columns * 2`; compare main/alternate,
   style, Unicode, and resize semantics after applying delta/resync.
 - `cargo test -p zterm-core`: cover revision overflow without mutation.
+- `cargo test -p zterm-core terminal::tests::history`: cover ordered styled
+  rows, Unicode, non-mutating paging, compatible append, capacity eviction,
+  resize, alternate-screen eligibility, cursor bounds, and the fixed page cap.
+- `cargo test -p zterm-core terminal::tests::alternate_scroll`: cover 1007
+  enable/disable through snapshot, state, delta/resync, and checkpoint.
 - `cargo bench -p zterm-core --bench terminal_state` and
   `sh tests/foundation/resource-gate.sh`: retain the machine-readable candidate
   matrix, saturated RSS/CPU evidence, and accepted three/eight-session bounds.

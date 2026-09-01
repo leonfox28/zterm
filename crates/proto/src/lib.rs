@@ -7,8 +7,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use prost::Message;
 use zeroize::{Zeroize, Zeroizing};
 use zterm_core::terminal::{
-    ActiveScreen, TerminalDelta, TerminalModes, TerminalMouseEncoding, TerminalMouseMode,
-    TerminalSize, TerminalSnapshot,
+    ActiveScreen, TerminalDelta, TerminalHistoryCursor, TerminalHistoryPage, TerminalHistoryResult,
+    TerminalModes, TerminalMouseEncoding, TerminalMouseMode, TerminalSize, TerminalSnapshot,
 };
 use zterm_core::{
     AttachmentId, AuthGeneration, AuthorizationStatus, Capabilities, ConnectionAttemptId,
@@ -36,6 +36,21 @@ impl fmt::Debug for v1::WireFrame {
             .field("payload_len", &self.payload.len())
             .field("request_id", &self.request_id)
             .field("deadline_ms", &self.deadline_ms)
+            .finish()
+    }
+}
+
+impl fmt::Debug for v1::TerminalHistoryPage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalHistoryPage")
+            .field("attachment_id_present", &self.attachment_id.is_some())
+            .field("outcome", &self.outcome)
+            .field("cursor", &self.cursor)
+            .field("row_count", &self.rows.len())
+            .field("ansi_bytes", &self.rows.iter().map(Vec::len).sum::<usize>())
+            .field("current_epoch", &self.current_epoch)
+            .field("current_revision", &self.current_revision)
             .finish()
     }
 }
@@ -406,13 +421,22 @@ pub enum WireKind {
     TerminalSessionEnded = 310,
     /// Latest daemon-owned remote attachment transport state for one local view.
     TerminalTransportStateEvent = 311,
+    /// Requests one bounded daemon-authored history page.
+    TerminalHistoryRequest = 312,
+    /// Returns one correlated daemon-authored history page or stale outcome.
+    TerminalHistoryPage = 313,
+    /// Same-UID-only selected connection path and RTT projection.
+    TerminalConnectionStatusEvent = 314,
 }
 
 impl WireKind {
     /// Returns whether the kind uses the stricter control-payload limit.
     #[must_use]
     pub const fn is_control(self) -> bool {
-        !matches!(self, Self::TerminalSnapshot | Self::TerminalDelta)
+        !matches!(
+            self,
+            Self::TerminalSnapshot | Self::TerminalDelta | Self::TerminalHistoryPage
+        )
     }
 
     /// Returns whether the kind is a short pair/hello transport frame.
@@ -496,6 +520,9 @@ impl TryFrom<u32> for WireKind {
             309 => Self::TerminalLeaseLost,
             310 => Self::TerminalSessionEnded,
             311 => Self::TerminalTransportStateEvent,
+            312 => Self::TerminalHistoryRequest,
+            313 => Self::TerminalHistoryPage,
+            314 => Self::TerminalConnectionStatusEvent,
             unknown => return Err(ProtocolError::UnknownKind(unknown)),
         };
         Ok(kind)
@@ -1003,7 +1030,57 @@ impl From<TerminalModes> for v1::TerminalModes {
                 TerminalMouseEncoding::Utf8 => 1,
                 TerminalMouseEncoding::Sgr => 2,
             },
+            alternate_scroll: value.alternate_scroll,
         }
+    }
+}
+
+impl From<TerminalHistoryCursor> for v1::TerminalHistoryCursor {
+    fn from(value: TerminalHistoryCursor) -> Self {
+        Self {
+            epoch: value.epoch.get(),
+            revision: value.revision.get(),
+            start_row: value.start_row,
+            row_count: value.row_count,
+            oldest_row: value.oldest_row,
+            newest_row: value.newest_row,
+        }
+    }
+}
+
+/// Projects one bounded history result into a content-redacted wire message.
+#[must_use]
+pub fn terminal_history_page_message(
+    attachment_id: AttachmentId,
+    result: TerminalHistoryResult,
+) -> v1::TerminalHistoryPage {
+    match result {
+        TerminalHistoryResult::Page(TerminalHistoryPage { cursor, rows }) => {
+            v1::TerminalHistoryPage {
+                attachment_id: Some(attachment_id.into()),
+                outcome: v1::TerminalHistoryOutcome::Ok as i32,
+                cursor: Some(cursor.into()),
+                rows,
+                current_epoch: cursor.epoch.get(),
+                current_revision: cursor.revision.get(),
+            }
+        }
+        TerminalHistoryResult::HistoryChanged { epoch, revision } => v1::TerminalHistoryPage {
+            attachment_id: Some(attachment_id.into()),
+            outcome: v1::TerminalHistoryOutcome::Changed as i32,
+            cursor: None,
+            rows: Vec::new(),
+            current_epoch: epoch.get(),
+            current_revision: revision.get(),
+        },
+        TerminalHistoryResult::HistoryGap { epoch, revision } => v1::TerminalHistoryPage {
+            attachment_id: Some(attachment_id.into()),
+            outcome: v1::TerminalHistoryOutcome::Gap as i32,
+            cursor: None,
+            rows: Vec::new(),
+            current_epoch: epoch.get(),
+            current_revision: revision.get(),
+        },
     }
 }
 
@@ -2088,6 +2165,18 @@ mod tests {
                 WireKind::TerminalTransportStateEvent,
                 v1::MessageKind::TerminalTransportStateEvent as u32,
             ),
+            (
+                WireKind::TerminalHistoryRequest,
+                v1::MessageKind::TerminalHistoryRequest as u32,
+            ),
+            (
+                WireKind::TerminalHistoryPage,
+                v1::MessageKind::TerminalHistoryPage as u32,
+            ),
+            (
+                WireKind::TerminalConnectionStatusEvent,
+                v1::MessageKind::TerminalConnectionStatusEvent as u32,
+            ),
         ];
 
         for (kind, proto_number) in kinds {
@@ -2186,7 +2275,7 @@ mod tests {
         assert_message_round_trip(
             WireKind::TerminalSyncRequired,
             v1::TerminalSyncRequired {
-                attachment_id,
+                attachment_id: attachment_id.clone(),
                 latest_revision: 17,
             },
         );
@@ -2214,6 +2303,42 @@ mod tests {
                 state: v1::TerminalTransportState::Reconnecting as i32,
             },
         );
+        let history_cursor = v1::TerminalHistoryCursor {
+            epoch: 3,
+            revision: 17,
+            start_row: 4,
+            row_count: 2,
+            oldest_row: 0,
+            newest_row: 9,
+        };
+        assert_message_round_trip(
+            WireKind::TerminalHistoryRequest,
+            v1::TerminalHistoryRequest {
+                attachment_id: attachment_id.clone(),
+                direction: v1::TerminalHistoryDirection::Older as i32,
+                cursor: Some(history_cursor),
+                maximum_rows: 64,
+            },
+        );
+        assert_message_round_trip(
+            WireKind::TerminalHistoryPage,
+            v1::TerminalHistoryPage {
+                attachment_id: attachment_id.clone(),
+                outcome: v1::TerminalHistoryOutcome::Ok as i32,
+                cursor: Some(history_cursor),
+                rows: vec![b"older".to_vec(), b"newer".to_vec()],
+                current_epoch: 3,
+                current_revision: 17,
+            },
+        );
+        assert_message_round_trip(
+            WireKind::TerminalConnectionStatusEvent,
+            v1::TerminalConnectionStatusEvent {
+                attachment_id,
+                path: v1::TerminalConnectionPath::Direct as i32,
+                rtt_ms: Some(42),
+            },
+        );
         assert_eq!(
             ResumeViewId::try_from(v1::ResumeViewId { value: vec![6; 16] })
                 .expect("fixed-width resume view ID"),
@@ -2238,5 +2363,65 @@ mod tests {
             }),
             Err(ProtocolError::InvalidTerminalSize { .. })
         ));
+    }
+
+    #[test]
+    fn history_frames_keep_content_and_control_limits_and_reject_malformed_payloads() {
+        assert!(WireKind::TerminalHistoryRequest.is_control());
+        assert!(!WireKind::TerminalHistoryPage.is_control());
+        assert!(WireKind::TerminalConnectionStatusEvent.is_control());
+
+        let content = vec![0_u8; MAX_CONTROL_PAYLOAD_BYTES + 1];
+        let encoded = encode_payload(WireKind::TerminalHistoryPage, 7, 0, content)
+            .expect("history content may use the ordinary frame ceiling");
+        assert_eq!(
+            FrameDecoder::new()
+                .feed(&encoded)
+                .expect("bounded history content frame")
+                .len(),
+            1
+        );
+        assert!(matches!(
+            encode_payload(
+                WireKind::TerminalHistoryRequest,
+                7,
+                0,
+                vec![0_u8; MAX_CONTROL_PAYLOAD_BYTES + 1]
+            ),
+            Err(ProtocolError::ControlPayloadTooLarge(_))
+        ));
+
+        let malformed = encode_payload(WireKind::TerminalHistoryPage, 8, 0, vec![0x80])
+            .expect("malformed concrete protobuf still has a valid outer frame");
+        let frame = FrameDecoder::new()
+            .feed(&malformed)
+            .expect("outer frame decodes")
+            .pop()
+            .expect("one malformed concrete payload");
+        assert!(matches!(
+            frame.decode_message::<v1::TerminalHistoryPage>(WireKind::TerminalHistoryPage),
+            Err(ProtocolError::MalformedProtobuf(_))
+        ));
+
+        const SENTINEL: &[u8] = b"HISTORY-ROW-CONTENT-SENTINEL";
+        let page = v1::TerminalHistoryPage {
+            attachment_id: Some(AttachmentId::from_array([0x45; 16]).into()),
+            outcome: v1::TerminalHistoryOutcome::Ok as i32,
+            cursor: Some(v1::TerminalHistoryCursor {
+                epoch: 1,
+                revision: 2,
+                start_row: 0,
+                row_count: 1,
+                oldest_row: 0,
+                newest_row: 1,
+            }),
+            rows: vec![SENTINEL.to_vec()],
+            current_epoch: 1,
+            current_revision: 2,
+        };
+        let debug = format!("{page:?}");
+        assert!(!debug.contains(std::str::from_utf8(SENTINEL).expect("ASCII sentinel")));
+        assert!(debug.contains("row_count: 1"));
+        assert!(debug.contains(&format!("ansi_bytes: {}", SENTINEL.len())));
     }
 }

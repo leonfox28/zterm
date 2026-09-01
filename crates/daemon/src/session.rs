@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 use iroh::SecretKey;
 use tokio::sync::watch;
 use zterm_core::terminal::{
-    TerminalDelta, TerminalDeltaResult, TerminalModel, TerminalResourceProjection, TerminalSize,
+    TerminalDelta, TerminalDeltaResult, TerminalHistoryCursor, TerminalHistoryDirection,
+    TerminalHistoryResult, TerminalModel, TerminalResourceProjection, TerminalSize,
     TerminalSnapshot,
 };
 use zterm_core::{
@@ -272,6 +273,26 @@ impl SessionAttachment {
                 meta,
                 attachment_id: self.attachment_id,
                 known_revision,
+                reply,
+            })
+    }
+
+    /// Returns one bounded page from the daemon-authoritative main-screen
+    /// history without changing the attachment's live-render checkpoint.
+    pub(crate) fn history_page_until(
+        &self,
+        direction: TerminalHistoryDirection,
+        cursor: Option<TerminalHistoryCursor>,
+        maximum_rows: usize,
+        deadline: Instant,
+    ) -> Result<TerminalHistoryResult, DaemonError> {
+        self.actor
+            .request(deadline, |meta, reply| SessionCommand::HistoryPage {
+                meta,
+                attachment_id: self.attachment_id,
+                direction,
+                cursor,
+                maximum_rows,
                 reply,
             })
     }
@@ -2548,6 +2569,14 @@ enum SessionCommand {
         known_revision: Revision,
         reply: SyncSender<Result<TerminalSnapshot, DaemonError>>,
     },
+    HistoryPage {
+        meta: CommandMeta,
+        attachment_id: AttachmentId,
+        direction: TerminalHistoryDirection,
+        cursor: Option<TerminalHistoryCursor>,
+        maximum_rows: usize,
+        reply: SyncSender<Result<TerminalHistoryResult, DaemonError>>,
+    },
     WriteInput {
         meta: CommandMeta,
         attachment_id: AttachmentId,
@@ -3174,6 +3203,16 @@ fn dispatch_command(
         } => respond(actor, meta, reply, || {
             sync_latest(runtime, attachment_id, known_revision)
         }),
+        SessionCommand::HistoryPage {
+            meta,
+            attachment_id,
+            direction,
+            cursor,
+            maximum_rows,
+            reply,
+        } => respond(actor, meta, reply, || {
+            history_page(runtime, attachment_id, direction, cursor, maximum_rows)
+        }),
         SessionCommand::WriteInput {
             meta,
             attachment_id,
@@ -3605,6 +3644,23 @@ fn sync_latest(
     Ok(snapshot)
 }
 
+fn history_page(
+    runtime: &SessionRuntime,
+    attachment_id: AttachmentId,
+    direction: TerminalHistoryDirection,
+    cursor: Option<TerminalHistoryCursor>,
+    maximum_rows: usize,
+) -> Result<TerminalHistoryResult, DaemonError> {
+    require_controller(runtime, attachment_id)?;
+    runtime
+        .attachments
+        .get(&attachment_id)
+        .ok_or_else(lease_lost)?
+        .terminal
+        .history_page(direction, cursor, maximum_rows)
+        .map_err(map_driver_error)
+}
+
 fn write_input(
     runtime: &SessionRuntime,
     attachment_id: AttachmentId,
@@ -3843,7 +3899,7 @@ fn require_controller(
         .ok_or_else(lease_lost)?;
     let AttachmentSync::Active { generation } = attachment.sync else {
         return Err(not_synchronized(
-            "snapshot must be applied before input or resize",
+            "snapshot must be applied before controller operations",
         ));
     };
     match runtime.controller {

@@ -9,7 +9,7 @@ use std::future::pending;
 use std::pin::Pin;
 #[cfg(unix)]
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -112,7 +112,8 @@ impl ConnectionIdentity {
             Capabilities::from_bits_retain(
                 Capabilities::LOCAL_LIFECYCLE
                     | Capabilities::SESSION_SERVICE
-                    | Capabilities::TERMINAL_SERVICE,
+                    | Capabilities::TERMINAL_SERVICE
+                    | Capabilities::HISTORY_PAGING,
             ),
         )
     }
@@ -452,6 +453,7 @@ struct Candidate {
     cancel: watch::Sender<bool>,
     actor_started: AtomicBool,
     primary: AtomicBool,
+    remote_capabilities: AtomicU64,
     admission: CandidateAdmission,
     metrics: Arc<BrokerMetrics>,
     _connection_permit: OwnedSemaphorePermit,
@@ -494,6 +496,46 @@ pub struct ConnectionDemand {
     slot: Arc<PeerSlot>,
     transient_routes: Vec<RelayHint>,
     released: bool,
+}
+
+/// Address-free selected-path status for one currently promoted connection.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SelectedPathObservation {
+    pub(crate) path: PathKind,
+    pub(crate) rtt_ms: Option<u32>,
+}
+
+/// Address-free observations bound to the exact candidate that opened a
+/// service stream. Keeping this handle with the stream prevents a later
+/// primary replacement from changing the capabilities or path reported for an
+/// already-open epoch.
+#[derive(Clone)]
+pub(crate) struct SelectedCandidateObserver {
+    candidate: Arc<Candidate>,
+}
+
+impl SelectedCandidateObserver {
+    /// Observes only the selected path class and its current RTT estimate.
+    /// Remote addresses and relay URLs never cross this boundary.
+    pub(crate) fn selected_path_observation(&self) -> SelectedPathObservation {
+        self.candidate
+            .connection
+            .paths()
+            .iter()
+            .find(|path| path.is_selected())
+            .map_or_else(SelectedPathObservation::default, |path| {
+                let (kind, _) = classify_transport_addr(path.remote_addr());
+                SelectedPathObservation {
+                    path: kind,
+                    rtt_ms: Some(round_rtt_millis(path.rtt())),
+                }
+            })
+    }
+
+    /// Returns whether this exact candidate advertised an optional capability.
+    pub(crate) fn supports(&self, capability: u64) -> bool {
+        self.candidate.supports(capability)
+    }
 }
 
 /// Normal-ALPN proof that the remote receiver currently authorizes this host.
@@ -671,6 +713,7 @@ pub struct AuthenticatedBiStream {
     remote: DeviceId,
     remote_generation: AuthGeneration,
     candidate: ConnectionCandidateKey,
+    candidate_observer: SelectedCandidateObserver,
     purpose: StreamPurpose,
     _stream_permit: OwnedSemaphorePermit,
     _metric: StreamMetricGuard,
@@ -705,6 +748,11 @@ impl AuthenticatedBiStream {
     #[must_use]
     pub const fn candidate(&self) -> ConnectionCandidateKey {
         self.candidate
+    }
+
+    /// Cloneable observations tied to the candidate that opened this stream.
+    pub(crate) fn candidate_observer(&self) -> SelectedCandidateObserver {
+        self.candidate_observer.clone()
     }
 }
 
@@ -1633,6 +1681,9 @@ impl ConnectionDemand {
                         remote: self.slot.remote,
                         remote_generation: generation,
                         candidate: candidate.key,
+                        candidate_observer: SelectedCandidateObserver {
+                            candidate: Arc::clone(&candidate),
+                        },
                         purpose,
                         _stream_permit: stream_permit,
                         _metric: metric,
@@ -1968,6 +2019,7 @@ impl ConnectionBroker {
                     "remote selected an incompatible wire major",
                 ));
             }
+            candidate.set_remote_capabilities(welcome.capabilities());
             {
                 let mut state = slot.state.lock().await;
                 state.remote_acceptance = Some(welcome.accepted_authorization_generation());
@@ -2042,6 +2094,7 @@ impl ConnectionBroker {
             Arc::clone(&self.inner.metrics),
             self.inner.limits,
         )?;
+        candidate.set_remote_capabilities(hello.capabilities());
         let slot = self.peer_slot(remote);
         self.register_candidate(&slot, Arc::clone(&candidate))
             .await?;
@@ -2496,6 +2549,7 @@ impl Candidate {
             cancel,
             actor_started: AtomicBool::new(false),
             primary: AtomicBool::new(false),
+            remote_capabilities: AtomicU64::new(0),
             admission: CandidateAdmission::new(limits),
             metrics,
             _connection_permit: connection_permit,
@@ -2519,6 +2573,16 @@ impl Candidate {
             self.metrics.remove_path(self.remote);
         }
         self.metrics.publish();
+    }
+
+    fn set_remote_capabilities(&self, capabilities: Capabilities) {
+        self.remote_capabilities
+            .store(capabilities.bits(), Ordering::Release);
+    }
+
+    fn supports(&self, capability: u64) -> bool {
+        Capabilities::from_bits_retain(self.remote_capabilities.load(Ordering::Acquire))
+            .contains(capability)
     }
 
     fn cancel(&self, reason: ConnectionCloseReason) {
@@ -2779,6 +2843,7 @@ fn is_remote_service_kind(kind: WireKind) -> bool {
             | WireKind::TerminalDetach
             | WireKind::TerminalSnapshotApplied
             | WireKind::TerminalSyncRequest
+            | WireKind::TerminalHistoryRequest
     )
 }
 
@@ -3311,6 +3376,11 @@ fn bounded_u32(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
 
+fn round_rtt_millis(rtt: Duration) -> u32 {
+    let rounded = rtt.as_nanos().saturating_add(500_000) / 1_000_000;
+    u32::try_from(rounded).unwrap_or(u32::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use std::future::{Future, poll_fn};
@@ -3354,6 +3424,15 @@ mod tests {
 
     fn relay(url: &str) -> RelayHint {
         RelayHint::new(url).expect("test relay is valid")
+    }
+
+    #[test]
+    fn selected_path_rtt_rounds_to_nearest_millisecond_and_clamps() {
+        assert_eq!(round_rtt_millis(Duration::from_micros(499)), 0);
+        assert_eq!(round_rtt_millis(Duration::from_micros(500)), 1);
+        assert_eq!(round_rtt_millis(Duration::from_micros(1_499)), 1);
+        assert_eq!(round_rtt_millis(Duration::from_micros(1_500)), 2);
+        assert_eq!(round_rtt_millis(Duration::MAX), u32::MAX);
     }
 
     fn authorization(

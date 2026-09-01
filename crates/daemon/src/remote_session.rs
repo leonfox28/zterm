@@ -749,7 +749,8 @@ mod tests {
     use crate::authorization::AuthorizationRegistry;
     #[cfg(unix)]
     use crate::remote_attachment::{
-        BoxAttachmentStream, RemoteAttachmentDemand, RemoteAttachmentTransport,
+        BoxAttachmentStream, OpenedAttachmentEpoch, RemoteAttachmentDemand,
+        RemoteAttachmentTransport,
     };
     use crate::session::SessionService;
     use crate::session_wire::{SessionRequestContext, SessionWireLimits, SessionWireServer};
@@ -922,7 +923,7 @@ mod tests {
         fn open<'a>(
             &'a mut self,
             _deadline: Instant,
-        ) -> BoxFuture<'a, Result<BoxAttachmentStream, DaemonError>> {
+        ) -> BoxFuture<'a, Result<OpenedAttachmentEpoch, DaemonError>> {
             let stream = {
                 let mut state = self
                     .state
@@ -932,12 +933,14 @@ mod tests {
                 state.streams.pop_front()
             };
             Box::pin(async move {
-                stream.ok_or_else(|| {
-                    DaemonError::new(
-                        DomainErrorKind::ResourceExhausted,
-                        "task-private transport fixture exhausted its bounded attachment streams",
-                    )
-                })
+                stream
+                    .map(OpenedAttachmentEpoch::unobserved)
+                    .ok_or_else(|| {
+                        DaemonError::new(
+                            DomainErrorKind::ResourceExhausted,
+                            "task-private transport fixture exhausted its bounded attachment streams",
+                        )
+                    })
             })
         }
     }

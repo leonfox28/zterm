@@ -31,7 +31,8 @@ The mutation wire boundary is
 one request carrying `OperationId { lease_ordinal = 1, sequence = 2,
 daemon_incarnation = 3 }`. `WireKind` values are registered once in
 `crates/proto/src/lib.rs`; session lease kinds are 207/208 and the product ALPN
-is `zterm/1`.
+is `zterm/1`. Terminal history uses additive kinds 312/313 and the same-UID-only
+connection-status event is kind 314.
 
 ## 3. Contracts
 
@@ -47,6 +48,11 @@ is `zterm/1`.
   peer-credential gate succeeds.
 - Capability values retain unknown bits. Optional future capabilities never
   become prerequisites for ordinary terminal service.
+- `Capabilities::HISTORY_PAGING` is active only for the complete bounded
+  request/page path. A history request carries attachment identity, direction,
+  optional epoch/revision cursor, and a maximum row count; its correlated page
+  has an explicit `Ok`, `Changed`, or `Gap` outcome. Page Debug reports only
+  structural counts, never formatted terminal rows.
 - `DomainErrorKind::code` and `from_code` are the single stable error-category
   bridge used by wire and JSON projections; adapters do not invent aliases.
 - `OperationWindow` is fixed to one daemon-issued `OperationLease` and retains
@@ -91,8 +97,12 @@ is `zterm/1`.
   registry and one decoder own all message dispatch.
 - Frames are `varint length + WireFrame`, capped at 8 MiB before body
   allocation. Control payloads are capped at 1 MiB before concrete-message
-  decoding. Unknown protobuf fields are compatible; unknown kind and wire
-  major are explicit errors.
+  decoding. `TerminalHistoryRequest` is control; `TerminalHistoryPage` is a
+  bounded content frame under the ordinary 8 MiB limit. Unknown protobuf
+  fields are compatible; unknown kind and wire major are explicit errors.
+- `TerminalConnectionStatusEvent` carries only attachment ID, unknown/direct/
+  relay, and optional bounded integer RTT. It is never a normal-ALPN service
+  kind and contains no DeviceId, address, relay URL, candidate, or ticket.
 - The normal product ALPN is `zterm/1`; short-lived pairing uses
   `zterm-pair/1`. Core defines transport-neutral values and never binds an Iroh
   endpoint; daemon ownership and authorization sequencing follow the
@@ -109,6 +119,8 @@ is `zterm/1`.
 | same operation ID carries a different semantic payload | outcome unknown; do not replay or execute |
 | frame prefix is malformed/non-canonical or body is truncated | protocol error scoped to that connection |
 | frame exceeds 8 MiB or control payload exceeds 1 MiB | reject before allocating/decoding the concrete body |
+| history direction/outcome is unspecified, row bound is invalid, or page cursor/count disagrees | reject as malformed before projection; do not expose row content |
+| connection status arrives on remote normal ALPN | reject; status is same-UID local IPC only |
 | wire major or kind is unsupported | explicit protocol/service error; listener remains healthy |
 
 ## 5. Good / Base / Bad Cases
@@ -133,6 +145,9 @@ is `zterm/1`.
   panic-safe duplicate waiters, and outcome unknown below the retired floor.
 - Proto tests cover round trip, unknown fields, unknown kinds, major mismatch,
   non-canonical/malformed varints, truncated bodies, and both size limits.
+- Proto/daemon tests cover additive kinds 312–314, alternate-scroll field 7,
+  all history outcomes, page/frame bounds, redacted Debug, exact request
+  correlation, and rejection of status on the remote service classifier.
 - `local_ipc` proves malformed/unsupported requests terminate only their own
   unary connection and do not poison the listener. `terminal_recovery` owns
   the equivalent duplex attachment isolation evidence.

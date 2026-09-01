@@ -1193,7 +1193,8 @@ fn protocol_proto() -> v1::ProtocolVersion {
         state_schema: zterm_proto::STATE_SCHEMA_VERSION,
         capabilities: Capabilities::LOCAL_LIFECYCLE
             | Capabilities::SESSION_SERVICE
-            | Capabilities::TERMINAL_SERVICE,
+            | Capabilities::TERMINAL_SERVICE
+            | Capabilities::HISTORY_PAGING,
     }
 }
 

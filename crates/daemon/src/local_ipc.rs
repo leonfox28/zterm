@@ -25,6 +25,10 @@ use tokio::task::JoinSet;
 #[cfg(unix)]
 use zeroize::{Zeroize, Zeroizing};
 #[cfg(unix)]
+use zterm_core::terminal::{
+    MAX_HISTORY_PAGE_ROWS, TerminalHistoryCursor, TerminalHistoryDirection,
+};
+#[cfg(unix)]
 use zterm_core::{
     AttachmentId, DEFAULT_PAIR_TTL_SECONDS, EphemeralOperationId, OperationId, OperationLease,
     PairFingerprint, ResourceLimits, Revision, SessionSelector,
@@ -60,6 +64,8 @@ const PAIRING_DEADLINE: Duration = Duration::from_secs(15);
 const DRAIN_GRACE: Duration = Duration::from_secs(30);
 #[cfg(unix)]
 const MAX_MUTATION_TARGETS_PER_CLIENT: usize = 64;
+#[cfg(unix)]
+const ATTACHMENT_COMMAND_STREAM_CLOSED: &str = "local terminal attachment command stream closed";
 #[cfg(unix)]
 /// Fixed production limits with a reduced test constructor for deadline evidence.
 #[cfg(unix)]
@@ -505,10 +511,14 @@ fn terminal_attach_target(frame: &DecodedFrame) -> Result<Option<DeviceId>, Daem
 pub enum LocalAttachmentEvent {
     /// Latest daemon-owned connection state for a remote desired view.
     TransportState(v1::TerminalTransportStateEvent),
+    /// Address-free selected path and RTT for a remote desired view.
+    ConnectionStatus(v1::TerminalConnectionStatusEvent),
     /// A full host-authoritative replacement state.
     Snapshot(v1::TerminalSnapshot),
     /// A merged revision update from the acknowledged checkpoint.
     Delta(v1::TerminalDelta),
+    /// One correlated bounded page from daemon-authoritative history.
+    HistoryPage(v1::TerminalHistoryPage),
     /// The following snapshot must replace the client state atomically.
     SyncRequired(v1::TerminalSyncRequired),
     /// A prepared takeover committed successfully.
@@ -527,6 +537,11 @@ impl fmt::Debug for LocalAttachmentEvent {
                 .debug_struct("TransportState")
                 .field("state", &state.state)
                 .finish_non_exhaustive(),
+            Self::ConnectionStatus(status) => formatter
+                .debug_struct("ConnectionStatus")
+                .field("path", &status.path)
+                .field("rtt_ms", &status.rtt_ms)
+                .finish_non_exhaustive(),
             Self::Snapshot(snapshot) => formatter
                 .debug_struct("Snapshot")
                 .field("revision", &snapshot.revision)
@@ -541,6 +556,11 @@ impl fmt::Debug for LocalAttachmentEvent {
                 .field("from_revision", &delta.from_revision)
                 .field("to_revision", &delta.to_revision)
                 .field("ansi_len", &delta.ansi.len())
+                .finish_non_exhaustive(),
+            Self::HistoryPage(page) => formatter
+                .debug_struct("HistoryPage")
+                .field("outcome", &page.outcome)
+                .field("row_count", &page.rows.len())
                 .finish_non_exhaustive(),
             Self::SyncRequired(required) => formatter
                 .debug_struct("SyncRequired")
@@ -596,6 +616,7 @@ pub struct LocalAttachmentClient {
     operation_lease: Option<OperationLease>,
     next_operation_sequence: u64,
     pending_takeover_request_id: Option<u64>,
+    pending_history_request_id: Option<u64>,
 }
 
 #[cfg(unix)]
@@ -612,6 +633,10 @@ impl fmt::Debug for LocalAttachmentClient {
             .field(
                 "has_pending_takeover",
                 &self.pending_takeover_request_id.is_some(),
+            )
+            .field(
+                "has_pending_history",
+                &self.pending_history_request_id.is_some(),
             )
             .finish_non_exhaustive()
     }
@@ -817,6 +842,7 @@ impl LocalAttachmentClient {
                 operation_lease: None,
                 next_operation_sequence: 1,
                 pending_takeover_request_id: None,
+                pending_history_request_id: None,
             }))
         })
         .await;
@@ -889,6 +915,7 @@ impl LocalAttachmentClient {
                 operation_lease: None,
                 next_operation_sequence: 1,
                 pending_takeover_request_id: None,
+                pending_history_request_id: None,
             },
             peer,
         )
@@ -950,6 +977,46 @@ impl LocalAttachmentClient {
         )
         .await
         .map(|_| ())
+    }
+
+    /// Requests one bounded page from daemon-authoritative main-screen
+    /// history. Exactly one page request may be outstanding per view.
+    pub(crate) async fn request_history(
+        &mut self,
+        direction: TerminalHistoryDirection,
+        cursor: Option<TerminalHistoryCursor>,
+        maximum_rows: usize,
+    ) -> Result<(), DaemonError> {
+        if self.pending_history_request_id.is_some() {
+            return Err(resource_error(
+                "a terminal history page response is already pending",
+            ));
+        }
+        if maximum_rows == 0 || maximum_rows > MAX_HISTORY_PAGE_ROWS {
+            return Err(resource_error(
+                "terminal history page bound is outside the allowed range",
+            ));
+        }
+        let direction = match direction {
+            TerminalHistoryDirection::Newest => v1::TerminalHistoryDirection::Newest,
+            TerminalHistoryDirection::Older => v1::TerminalHistoryDirection::Older,
+            TerminalHistoryDirection::Newer => v1::TerminalHistoryDirection::Newer,
+        };
+        let request_id = self
+            .send(
+                WireKind::TerminalHistoryRequest,
+                &v1::TerminalHistoryRequest {
+                    attachment_id: Some(self.attachment_id.into()),
+                    direction: direction as i32,
+                    cursor: cursor.map(Into::into),
+                    maximum_rows: u32::try_from(maximum_rows).map_err(|_| {
+                        resource_error("terminal history page bound is not representable")
+                    })?,
+                },
+            )
+            .await?;
+        self.pending_history_request_id = Some(request_id);
+        Ok(())
     }
 
     /// Commits a previously prepared and acknowledged takeover attachment.
@@ -1029,6 +1096,9 @@ impl LocalAttachmentClient {
             if self.pending_takeover_request_id == Some(frame.request_id) {
                 self.pending_takeover_request_id = None;
             }
+            if self.pending_history_request_id == Some(frame.request_id) {
+                self.pending_history_request_id = None;
+            }
             if error.kind() == DomainErrorKind::OperationOutcomeUnknown {
                 self.operation_lease = None;
                 self.next_operation_sequence = 1;
@@ -1045,6 +1115,21 @@ impl LocalAttachmentClient {
                     .map_err(|_| malformed("unknown terminal transport state"))?;
                 Ok(LocalAttachmentEvent::TransportState(state))
             }
+            WireKind::TerminalConnectionStatusEvent => {
+                let status: v1::TerminalConnectionStatusEvent = frame
+                    .decode_message(WireKind::TerminalConnectionStatusEvent)
+                    .map_err(protocol_error)?;
+                self.require_attachment(status.attachment_id.clone())?;
+                match v1::TerminalConnectionPath::try_from(status.path) {
+                    Ok(v1::TerminalConnectionPath::Unknown)
+                    | Ok(v1::TerminalConnectionPath::Direct)
+                    | Ok(v1::TerminalConnectionPath::Relay) => {}
+                    Ok(v1::TerminalConnectionPath::Unspecified) | Err(_) => {
+                        return Err(malformed("unknown terminal connection path"));
+                    }
+                }
+                Ok(LocalAttachmentEvent::ConnectionStatus(status))
+            }
             WireKind::TerminalSnapshot => {
                 let snapshot: v1::TerminalSnapshot = frame
                     .decode_message(WireKind::TerminalSnapshot)
@@ -1059,6 +1144,18 @@ impl LocalAttachmentClient {
                     .map_err(protocol_error)?;
                 self.require_attachment(delta.attachment_id.clone())?;
                 Ok(LocalAttachmentEvent::Delta(delta))
+            }
+            WireKind::TerminalHistoryPage => {
+                if self.pending_history_request_id != Some(frame.request_id) {
+                    return Err(malformed("terminal history page correlation mismatch"));
+                }
+                let page: v1::TerminalHistoryPage = frame
+                    .decode_message(WireKind::TerminalHistoryPage)
+                    .map_err(protocol_error)?;
+                self.require_attachment(page.attachment_id.clone())?;
+                validate_history_page(&page)?;
+                self.pending_history_request_id = None;
+                Ok(LocalAttachmentEvent::HistoryPage(page))
             }
             WireKind::TerminalSyncRequired => {
                 let required: v1::TerminalSyncRequired = frame
@@ -1115,7 +1212,7 @@ impl LocalAttachmentClient {
         self.stream
             .shutdown()
             .await
-            .map_err(|error| daemon_io("finish local terminal detach", error))
+            .map_err(|error| local_attachment_io("finish local terminal detach", error))
     }
 
     async fn send<Message: prost::Message>(
@@ -1132,7 +1229,7 @@ impl LocalAttachmentClient {
         self.stream
             .write_all(&bytes)
             .await
-            .map_err(|error| daemon_io("write local terminal message", error))?;
+            .map_err(local_attachment_command_error)?;
         Ok(request_id)
     }
 
@@ -1153,7 +1250,7 @@ impl LocalAttachmentClient {
                 .stream
                 .read(&mut buffer)
                 .await
-                .map_err(|error| daemon_io("read local terminal event", error))?;
+                .map_err(|error| local_attachment_io("read local terminal event", error))?;
             if read == 0 {
                 std::mem::replace(&mut self.decoder, FrameDecoder::new())
                     .finish()
@@ -1248,6 +1345,47 @@ fn attachment_cancelled() -> DaemonError {
 }
 
 #[cfg(unix)]
+fn local_attachment_command_error(error: std::io::Error) -> DaemonError {
+    if is_attachment_closure_error(error.kind()) {
+        DaemonError::new(DomainErrorKind::Cancelled, ATTACHMENT_COMMAND_STREAM_CLOSED)
+    } else {
+        daemon_io("write local terminal message", error)
+    }
+}
+
+#[cfg(unix)]
+fn local_attachment_io(operation: &str, error: std::io::Error) -> DaemonError {
+    if is_attachment_closure_error(error.kind()) {
+        attachment_cancelled()
+    } else {
+        daemon_io(operation, error)
+    }
+}
+
+#[cfg(unix)]
+const fn is_attachment_closure_error(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::UnexpectedEof
+    )
+}
+
+#[cfg(unix)]
+pub(crate) fn is_attachment_command_stream_closed(error: &DaemonError) -> bool {
+    error.kind() == DomainErrorKind::Cancelled && error.detail() == ATTACHMENT_COMMAND_STREAM_CLOSED
+}
+
+#[cfg(unix)]
+pub(crate) fn is_attachment_stream_closed_without_event(error: &DaemonError) -> bool {
+    error.kind() == DomainErrorKind::Cancelled
+        && error.detail() == "local terminal attachment closed"
+}
+
+#[cfg(unix)]
 fn service_error(frame: &DecodedFrame) -> Result<DaemonError, DaemonError> {
     let service_error: v1::ServiceError = frame
         .decode_message(WireKind::ServiceErrorResponse)
@@ -1319,6 +1457,40 @@ fn validate_snapshot_viewport(snapshot: &v1::TerminalSnapshot) -> Result<(), Dae
     }
     .try_into()
     .map_err(protocol_error)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_history_page(page: &v1::TerminalHistoryPage) -> Result<(), DaemonError> {
+    let outcome = v1::TerminalHistoryOutcome::try_from(page.outcome)
+        .map_err(|_| malformed("terminal history outcome is invalid"))?;
+    if page.rows.len() > MAX_HISTORY_PAGE_ROWS {
+        return Err(malformed("terminal history page exceeded the row bound"));
+    }
+    match outcome {
+        v1::TerminalHistoryOutcome::Ok => {
+            let cursor = page
+                .cursor
+                .as_ref()
+                .ok_or_else(|| malformed("terminal history page omitted its cursor"))?;
+            if usize::try_from(cursor.row_count).ok() != Some(page.rows.len())
+                || cursor.epoch != page.current_epoch
+                || cursor.revision != page.current_revision
+            {
+                return Err(malformed("terminal history page cursor is inconsistent"));
+            }
+        }
+        v1::TerminalHistoryOutcome::Changed | v1::TerminalHistoryOutcome::Gap => {
+            if page.cursor.is_some() || !page.rows.is_empty() {
+                return Err(malformed(
+                    "terminal history reset outcome retained page content",
+                ));
+            }
+        }
+        v1::TerminalHistoryOutcome::Unspecified => {
+            return Err(malformed("terminal history outcome is invalid"));
+        }
+    }
     Ok(())
 }
 
