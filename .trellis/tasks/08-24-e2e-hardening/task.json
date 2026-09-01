@@ -18,7 +18,9 @@
   "commit": null,
   "pr_url": null,
   "subtasks": [],
-  "children": [],
+  "children": [
+    "08-31-remote-terminal-ux"
+  ],
   "parent": "08-20-cross-platform-relay-terminal-mvp",
   "relatedFiles": [],
   "notes": "2026-08-31 physical official-n0 Direct accepted on cellular macOS -> Debian behind RouterOS IPv4 NAT after removing OpenClash Fake-IP interception for iroh.link and bypassing endpoint UDP. Both peers reported direct=1, relay=0 with an active stream and terminal interaction. Initial attachment returned operation_outcome_unknown three times before succeeding; defer and reproduce/fix separately. The temporary RouterOS ein-dnat accept rule remained at zero packets after success, did not participate, and was removed.",
