@@ -52,7 +52,7 @@ mod unix {
         TerminalHistoryPage, TerminalHistoryResult, TerminalModes, TerminalMouseEncoding,
         TerminalMouseMode, TerminalSize,
     };
-    use zterm_core::{DomainErrorKind, RESERVED_DEVICE_ALIAS, Revision, SessionId};
+    use zterm_core::{DomainErrorKind, RESERVED_DEVICE_ALIAS, ResourceLimits, Revision, SessionId};
     use zterm_daemon::error::DaemonError;
     use zterm_daemon::operations::{
         LocalRuntime, PreparedTerminalView, TerminalViewConnectionPath,
@@ -1069,12 +1069,17 @@ mod unix {
         }
     }
 
-    const fn child_terminal_size(physical: TerminalSize, remote: bool) -> TerminalSize {
-        if remote && physical.rows > 1 {
-            TerminalSize::new(physical.rows - 1, physical.columns)
+    fn child_terminal_size(physical: TerminalSize, remote: bool) -> TerminalSize {
+        let limits = ResourceLimits::default();
+        let content_rows = if remote && physical.rows > 1 {
+            physical.rows - 1
         } else {
-            physical
-        }
+            physical.rows
+        };
+        TerminalSize::new(
+            content_rows.min(limits.max_viewport_rows),
+            physical.columns.min(limits.max_viewport_columns),
+        )
     }
 
     fn preserve_created_session<T>(
@@ -3251,6 +3256,23 @@ mod unix {
             assert_eq!(
                 child_terminal_size(TerminalSize::new(1, 37), true),
                 TerminalSize::new(1, 37)
+            );
+        }
+
+        #[test]
+        fn oversized_physical_geometry_projects_one_valid_initial_and_resize_viewport() {
+            let oversized = TerminalSize::new(100, 300);
+            let maximum = TerminalSize::new(80, 240);
+            assert_eq!(child_terminal_size(oversized, false), maximum);
+            assert_eq!(child_terminal_size(oversized, true), maximum);
+
+            let mut coalescer = ResizeCoalescer::new(None);
+            assert_eq!(
+                coalescer.observe(
+                    child_terminal_size(oversized, true),
+                    TerminalViewTransportState::Active,
+                ),
+                Some(maximum)
             );
         }
 

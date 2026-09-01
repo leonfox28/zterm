@@ -44,7 +44,21 @@ The CLI derives two sizes from every physical TTY size:
 - remote attachment with at least two physical rows: `content = rows - 1`, `status = 1`;
 - local attachment, or a one-row physical terminal: `content = rows`, `status = 0`.
 
-The initial attach request and every coalesced resize publish only `content` to the daemon/remote PTY. The CLI retains the physical size for chrome placement. Growing back from one row re-enables the status row and sends the newly reduced content size once.
+The sole physical-to-child projection then clamps both content dimensions to
+`ResourceLimits::default()`:
+
+```text
+child_rows = min(content_rows, max_viewport_rows)
+child_columns = min(physical_columns, max_viewport_columns)
+```
+
+The initial attach request, the post-prepare observation, and every active or
+inactive coalesced resize publish only this bounded child size to the
+daemon/remote PTY. The CLI retains the uncapped physical size for chrome
+placement. Growing back from one row re-enables the status row and sends the
+newly reduced, bounded child size once. Independently supplied oversized
+Session/wire requests remain invalid; the CLI projection does not weaken the
+strict service boundary.
 
 ### 3.2 Status projection
 
@@ -141,15 +155,30 @@ Routing is mode-derived:
 
 ## 6. Resize/closure race
 
-The observed error is a same-UID command-side write racing attachment closure. The fix stays at the existing local terminal driver boundary:
+There are two distinct closure races at the same local terminal-view boundary:
 
-- a normal command error remains immediate;
-- a command-side socket-closure error (`EPIPE`, reset, or equivalent mapped closure) enters one bounded correlation drain instead of terminating the driver immediately;
-- the driver prioritizes already-buffered `SessionEnded`, `LeaseLost`, remote typed service error, or transport lifecycle events from the event side;
-- if no typed event arrives within the bound, return one normalized daemon/attachment closure diagnostic without embedding the raw OS error;
-- no resize/input command is replayed, and no new reconnect loop is introduced.
+1. a command-side socket closure (`EPIPE`, reset, or equivalent mapped
+   closure) can race an event still buffered on the same local attachment;
+2. after the driver has successfully delivered its final typed event/error to
+   the CLI event queue and exited, a ready SIGWINCH can submit through the now
+   closed command sender or lose its oneshot response owner before the CLI
+   consumes that event.
 
-The CLI therefore cannot let a resize command win merely because its oneshot completed a few microseconds before the authoritative event. Real daemon stop, lease loss, Session end, and driver failure keep their existing categories.
+Both use the same bounded correlation duration. The lower socket path drains
+and queues the authoritative event. The upper driver/writer path shares one
+latest-only boolean latch which is set only after the final event/error is
+successfully sent into the existing bounded event queue. A command send or
+response-owner closure which observes that latch returns command success only
+to prevent its generic channel error from winning; the CLI then consumes the
+already queued `SessionEnded`, `LeaseLost`, remote typed service error, or
+transport lifecycle outcome normally. If no authoritative outcome is observed
+within the bound, the command returns one normalized content-free daemon/
+attachment closure.
+
+Normal command errors remain immediate. Resize/input is never replayed, the
+latch contains no payload or queue, and no new reconnect loop is introduced.
+Real daemon stop, lease loss, Session end, and driver failure therefore retain
+their existing categories even when SIGWINCH is simultaneously ready.
 
 ## 7. Compatibility, security, and bounds
 
@@ -175,10 +204,13 @@ The CLI therefore cannot let a resize command win merely because its oneshot com
 - local and remote history request correlation, authorization/attachment identity, interleaved live deltas, reconnect failure, pending-control capacity, and no replay;
 - selected relay/direct path plus RTT projection, path migration, reconnect clearing, frozen alias, and no address/ID leakage;
 - deterministic resize versus buffered SessionEnded/LeaseLost/EOF races proving typed outcome wins and raw `Broken pipe` is absent.
+- a legal-size resize submitted only after the driver queued `SessionEnded` and
+  closed its command owner, plus the equivalent oneshot-owner loss and a
+  no-event negative, proving the top-level fallback cannot mask the event.
 
 ### CLI/PTY
 
-- geometry is physical rows minus one only for remote views, including one-row fallback and repeated resize;
+- geometry is physical rows minus one only for remote views, followed by shared `ResourceLimits` row/column clamping for initial attach and every resize; tests include the one-row fallback and a `300×100` physical TTY projecting to a live `240×80` child viewport;
 - full-row reverse status rendering, Unicode/narrow columns, child SGR/cursor/clear isolation, and exact terminal restoration;
 - wheel/Page routing under main, alternate, mouse, alternate-scroll, tmux, and Herdr modes;
 - live/pinned/resume state, page prefetch, gap notice, full resync, and exact bounded key/paste forwarding.

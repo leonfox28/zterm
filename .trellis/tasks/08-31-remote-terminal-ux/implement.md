@@ -44,10 +44,14 @@
 - [x] Add one bounded terminal-driver correlation drain for EPIPE/reset-equivalent closure, prioritizing buffered typed lifecycle/service events.
 - [x] Normalize unmatched closure after the bound; do not include the raw OS `Broken pipe` text, retry resize/input, or create another reconnect owner.
 - [x] Add deterministic schedule tests for resize versus SessionEnded, LeaseLost, remote reconnect/resync, buffered typed error, and plain EOF/daemon stop.
+- [x] Correlate a top-level `TerminalViewCommandWriter` close with the already
+  queued terminal event before the CLI reports `terminal attachment driver
+  closed`; the lower local-stream correlation does not cover a ready SIGWINCH
+  winning after the driver task has delivered its final event and exited.
 
 ## Step 5: CLI geometry, viewport, and chrome
 
-- [x] Split physical versus child viewport sizing before initial prepare and on every resize; reserve one row only for remote views with the one-row fallback.
+- [x] Split physical versus child viewport sizing before initial prepare and on every resize; reserve one row only for remote views with the one-row fallback, and clamp the child projection to the shared Session viewport maximum while retaining uncapped physical geometry for status placement.
 - [x] Introduce one exhaustive live/history/resume-pending viewport controller and one-outstanding-page prefetch state.
 - [x] Add the bounded SGR mouse/Page gesture codec and mode-derived routing; forward unknown keyboard bytes unchanged and avoid program-name branches.
 - [x] While pinned, drain live events without applying their ANSI; on return request the existing full snapshot, restore/ack it, then forward bounded retained key/paste bytes exactly once after Active.
@@ -59,6 +63,10 @@
 
 - [x] Extend local IPC/remote bridge/operations fixtures for the new event and history commands without content-bearing diagnostics.
 - [x] Extend the production multiprocess PTY fixture for rapid resize, narrow/one-row geometry, Unicode alias, status SGR isolation, and restoration; keep scroll/Page/paste/mode semantics in deterministic owner tests where the local fixture cannot observe remote history without product seams.
+- [x] Add a failing-before pure regression for oversized initial/resize physical geometry; keep Session/wire rejection strict for independently supplied oversized viewports.
+- [x] Add the exact CLI scheduling regression where a legal-size SIGWINCH and a
+  ready authoritative terminal event race; assert the event's typed outcome
+  wins instead of the command-channel fallback.
 - [x] Run nested tmux 3.7c and Herdr 0.8.2 through the generic mode path; verify alternate screen and child mouse ownership receive their input.
 - [ ] Manually validate Ghostty: long shell output scrolls, rapid resize stays attached, status is visually distinct, direct/relay and RTT update, and Ctrl+] detach remains unchanged.
 
@@ -68,6 +76,88 @@
 - [x] Run the focused and broad validation commands below and `git diff --check`; inspect source/status output for terminal content, Device ID, IP, relay URL, ticket, and raw Broken pipe leakage.
 - [x] Dispatch one independent native Trellis checker with `check.jsonl`; fix concrete findings only.
 - [x] Re-run affected focused gates and one final broad gate, then present code/test results for commit approval.
+
+## Bug analysis: oversized physical TTY closed the attachment
+
+### 1. Root cause category
+
+- **B/D/E — cross-layer contract, coverage gap, implicit assumption**: the CLI
+  reserved the status row but assumed every physical TTY size was a valid
+  Session viewport. The strict Session boundary correctly rejected `300×100`
+  against its `240×80` limit.
+
+### 2. Why the earlier fix did not cover it
+
+- The first investigation followed the reported `Broken pipe` and fixed the
+  closure-result race. Its resize tests used only admitted sizes, so they could
+  not expose the separate oversized resize request. The resulting deterministic
+  `300×100` reproduction does not explain the user's intermittent legal-size
+  `140×40` closure; the shared fallback message is not a causal diagnosis.
+
+### 3. Prevention mechanisms
+
+| Priority | Mechanism | Action | Status |
+|---|---|---|---|
+| P0 | Architecture | Use one physical-to-child projection for initial and every resize path | done |
+| P0 | Regression | Prove `300×100` projects to `240×80` while direct Session requests remain strict | done |
+| P0 | Live evidence | Resize a real remote attachment to `300×100`, assert it stays live, and observe remote `stty size` | done |
+
+### 4. Systematic expansion
+
+- All four CLI producers—initial, post-prepare, active resize, and inactive
+  resize—already converge on the same helper; no second clamp or retry owner is
+  needed. Status rendering continues to consume the uncapped physical size.
+- Future resize investigations must reproduce the exact failing dimensions and
+  compare them with service admission limits before attributing a close to a
+  timing race.
+
+### 5. Knowledge capture
+
+- [x] Update the PRD/design acceptance contract.
+- [x] Update `backend/local-daemon-ipc.md` with the executable projection and
+  strict-boundary rule.
+- [x] No template sync is applicable because this repository has no
+  `src/templates/markdown/spec/` mirror.
+
+## Bug analysis: writer closure masked an already queued outcome
+
+### 1. Root cause category
+
+- **B/D — cross-layer contract and coverage gap**: lower same-UID socket
+  closure correlation was correct, but the later driver-to-CLI command/event
+  boundary could close its mpsc/oneshot owner after delivering the terminal
+  event. A simultaneous SIGWINCH then exposed the generic command fallback
+  before the CLI consumed that event.
+
+### 2. Why the earlier fix did not cover it
+
+- Tests stopped at `LocalAttachmentClient -> run_terminal_driver`; they did not
+  schedule `TerminalViewCommandWriter -> CLI event reader` after the driver had
+  sent its final event and exited. The shared error text hid that these were two
+  different closure boundaries.
+
+### 3. Prevention mechanisms
+
+| Priority | Mechanism | Action | Status |
+|---|---|---|---|
+| P0 | Architecture | Set one latest-only latch only after the final event enters the bounded event queue | done |
+| P0 | Regression | Submit legal `31×97` resize after command-owner close, then require original typed event | done |
+| P0 | Negative | Drop the event reader and require normalized failure rather than false success | done |
+
+### 4. Systematic expansion
+
+- Command-send and oneshot-response closure use the same bounded correlation;
+  resize, input, snapshot acknowledgement, sync, and history therefore cannot
+  drift into separate fixes. Commands are suppressed only when an existing
+  terminal outcome is already consumable; they are never replayed.
+
+### 5. Knowledge capture
+
+- [x] Update PRD/design with the two distinct race boundaries.
+- [x] Update `backend/local-daemon-ipc.md` with latch ordering, fallback, and
+  positive/negative test assertions.
+- [x] No template sync is applicable because this repository has no
+  `src/templates/markdown/spec/` mirror.
 
 ## Validation commands
 

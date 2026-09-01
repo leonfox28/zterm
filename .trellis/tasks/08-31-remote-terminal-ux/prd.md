@@ -10,6 +10,8 @@
   `daemon_stopped: write local terminal message: Broken pipe (os error 32)`，随后暂时无法复现。当前内容无关 daemon 日志中没有对应 attachment/resize 失败记录，因此不能把偶发错误直接归因为 Ghostty 或远端 PTY。
 - CLI 在 `crates/cli/src/terminal_ui.rs:64` 进入 zterm 自己的 alternate screen；Ghostty 的普通主屏 scrollback 因此不是远端历史的可靠浏览入口。
 - resize 在 `crates/cli/src/terminal_ui.rs:297` 与 attachment events 并发处理；写入已经关闭的 same-UID attachment stream 会在 `crates/daemon/src/local_ipc.rs:1132` 暴露原始 `Broken pipe`。这证明错误表面，不足以证明哪一侧先关闭。
+- v0.1.8 后续调查独立确定了一个可重现的 resize 终止原因：外层 TTY 放大到 `300×100` 时，CLI 把超过 Session `240×80` 上限的 viewport 原样发送，严格的 Session admission 因此返回 `resource_exhausted`，随后的 stream-close 竞态也可显示为 `terminal attachment driver closed`。物理终端尺寸必须先投影为有界 child viewport，不能放宽 Session/wire 校验。
+- 用户后来确认现场失败窗口约为 `140×40`，低于该上限；且同版本同尺寸后续无修改即可正常 resize。因此 `300×100` 是需要修复的独立确定性缺陷，不能用来解释原始的合法尺寸偶发关闭；`terminal attachment driver closed` 只表示 CLI 命令通道/回应所有者已终止，不是尺寸原因码。
 - daemon 已为每个 Session 保留至多 2,000 行标准 main-screen history，并在 snapshot 中携带受 frame 上限约束的近期历史；当前 CLI 只把它写入 outer alternate screen，没有历史浏览状态或 cursor（`crates/daemon/src/operations.rs:209`、`crates/cli/src/terminal_ui.rs:1502`）。
 - 既有第一阶段设计已把按需 `HISTORY_PAGING` 留作后续：cursor 必须绑定 history revision/epoch，淘汰或并发变化要返回明确的 `history_changed` / `history_gap`，不能读取不一致历史（`.trellis/tasks/08-20-cross-platform-relay-terminal-mvp/design.md:415`）。
 - connection broker 已按远端 Device 保存 redacted selected path kind，并可读取 selected Iroh path 的 RTT；当前 public status 只有聚合 direct/relay 计数，没有 attachment 所属 peer 的 RTT（`crates/daemon/src/connection_broker.rs:1132`、`:2428`）。
@@ -29,6 +31,7 @@
 - 连续或快速调整 Ghostty 窗口不得仅因 SIGWINCH/resize 消息而结束仍然存活的 local 或 remote attachment。
 - resize 与 daemon-side attachment 关闭、remote reconnect、snapshot synchronization 或 Session end 同时发生时，CLI 必须优先呈现已知的 typed lifecycle outcome；不得把可归类的关闭竞态降级成裸 `Broken pipe`。
 - 如果本地 daemon 确实停止、Session 确实结束或 attachment 确实失去 lease，仍返回现有精确错误，不通过无界重试掩盖故障。
+- initial attach 和每次 resize 都必须在唯一的 CLI physical-to-child 投影边界将行列限制到共享 `ResourceLimits`；绕过该边界的超限 Session/wire 请求仍严格拒绝。
 - 为暂时不可复现的原始报告增加确定性竞态测试和最小内容无关诊断；不因一次现场现象引入第二套 reconnect owner。
 
 ### Bounded history browsing
@@ -42,7 +45,7 @@
 
 ### Remote connection status bar
 
-- remote attachment 默认在物理终端底部保留一行 zterm 状态栏；远端 PTY 看到的 viewport 相应减少一行，resize 仍保持一致。
+- remote attachment 默认在物理终端底部保留一行 zterm 状态栏；远端 PTY 看到的 viewport 先相应减少一行，再限制到共享 Session 行列上限。状态栏定位仍使用未截断的物理尺寸，resize 保持同一投影顺序。
 - 状态栏只显示三个字段，固定从左到右为：所连 Device 的安全显示名/alias、当前连接模式、延迟；不增加独立 transport-state、历史位置或其他持久字段。
 - 连接模式显示 `direct`、`relay` 或尚不可判定时的 `--`；延迟显示当前 selected path 的有界整数 RTT 毫秒值或 `--`。
 - 整条物理行（包括字段后的空白单元格）必须有连续底色。已确认以 ANSI reverse video 交换终端主题的默认 foreground/background，不写死 RGB、不查询 host palette，也不依赖 Ghostty 私有协议；完整研究见 [`research/terminal-theme-status-colors.md`](research/terminal-theme-status-colors.md)。
@@ -60,7 +63,7 @@
 ## Acceptance Criteria
 
 - [ ] 在确定性测试中让 active resize 与 local-stream close、typed Session end、remote reconnect 和 resynchronization 分别竞争；仍存活的 attachment 不退出，已知终态显示 typed outcome，且不向用户暴露可归类的裸 `Broken pipe`。
-- [ ] Ghostty 中快速连续改变窗口大小，remote shell 与 alternate-screen TUI 都保持 attachment；物理终端至少两行时远端程序观察到的尺寸等于物理行数减一，只有一行时按已定义 fallback 获得该行。
+- [ ] Ghostty 中快速连续改变窗口大小，remote shell 与 alternate-screen TUI 都保持 attachment；在 Session 上限内，物理终端至少两行时远端行数等于物理行数减一，只有一行时按已定义 fallback 获得该行；超过上限的物理尺寸（包括 `300×100`）投影为最大 `240×80` child viewport 且不终止连接。
 - [ ] 产生超过一屏但不超过 2,000 行的标准输出后，wheel/trackpad 和 PageUp/PageDown 可直接浏览历史；滚回底部或正常输入后显示最新 authoritative state。
 - [ ] viewport pinned 时普通键盘输入与 paste 先恢复 live bottom，再精确转发一次；不得丢失、重复或因隐式 modal state 吞掉输入。
 - [ ] 普通 shell history gesture 由 zterm 消费；remote child 开启 mouse reporting、alternate-scroll 或 full-screen Page-key ownership 后相同输入正确转发，nested tmux/Herdr 与常见 TUI 不被外层 history 抢占。

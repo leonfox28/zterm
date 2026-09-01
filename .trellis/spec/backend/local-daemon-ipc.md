@@ -194,7 +194,11 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   it must not add renderer markers or test branches to the product loop.
 - The raw-terminal UI distinguishes physical size from child size: remote views
   reserve the physical bottom row when rows are at least two, local/one-row
-  views do not. The remote-only row is exactly
+  views do not. Before both initial attach and every resize, the sole child-size
+  projection clamps rows and columns to the shared `ResourceLimits` viewport
+  maximum; the daemon and wire boundary still reject an independently supplied
+  oversized viewport. Status placement continues to use the uncapped physical
+  bottom row. The remote-only row is exactly
   `<device> | <direct|relay|--> | <integer ms|-->`, uses theme-default reverse
   video across every cell, clips on display-cell boundaries, and saves/resets/
   restores child cursor and style. Wheel/Page routing depends only on
@@ -212,10 +216,16 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   is incomplete, the UI keeps consuming that paste under the old input epoch,
   then performs the authoritative reader join/flush/new-epoch fence before
   forwarding the complete retained unit exactly once.
-- Command-side EPIPE/reset-equivalent attachment closure enters one bounded
-  event-side correlation window. A buffered typed lease/session/service outcome
-  wins; otherwise one content-free normalized closure is returned. Raw OS error
-  text is never user-visible, and commands are not replayed.
+- Closure correlation has two ordered owners under the same bounded window.
+  First, command-side EPIPE/reset-equivalent local attachment closure drains a
+  buffered typed lease/session/service outcome. Second, the spawned terminal
+  driver sets one latest-only latch only after its final typed event/error has
+  successfully entered the existing event queue; if a command send or oneshot
+  response owner then closes, the writer suppresses its channel fallback and
+  lets that queued event remain the sole user-visible outcome. Without either
+  authoritative event, one content-free normalized closure is returned. Raw OS
+  or `terminal attachment driver closed` text is never user-visible, and no
+  command is replayed.
 - A bridge retains at most eight correlated lease/takeover controls. Epoch loss
   completes every sent lease request with its original typed transport failure
   and every sent takeover with `operation_outcome_unknown`; neither is replayed.
@@ -303,6 +313,7 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
 | remote attachment stream is lost with a pending history page | typed transport failure; remove the pending cell and never replay it |
 | history page is uncorrelated, oversized, or cursor-inconsistent | malformed frame scoped to the view; never render or retain its rows |
 | command write closure races a buffered typed lifecycle event | publish the typed event; suppress raw `Broken pipe`/OS text and do not retry the command |
+| terminal driver command sender/response owner closes after its final typed event/error entered the event queue | suppress the command-channel fallback and let the queued event win; if no event is confirmed within the same bounded window, return normalized `daemon_stopped` |
 | `create_main` request was written but no complete correlated initial result is validated | `operation_outcome_unknown`; do not claim the default Session was absent or retry under a new identity |
 | existing-session initial attach receives states but no snapshot before its total deadline | `deadline_exceeded`; close only that view |
 | post-active frozen-session attach receives `session_occupied` while the old host reader is half-open | close the rejected epoch, remain reconnecting, drain/drop input and coalesce viewport for 250 ms, then retry the same SessionId without `create_main` |
@@ -398,11 +409,15 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   separately proves routing and validated transport-state consumption over a
   real same-UID Unix duplex connection.
 - `terminal_ui` pure tests cover remote rows-minus-one/one-row geometry,
+  oversized physical-to-bounded child projection for initial attach and resize,
   complete reverse-video Unicode-safe status output, mode-derived wheel/Page
   routing, and exact-once input across Live/History/ResumePending. Operations
-  tests prove typed terminal end wins the command-closure race and plain EOF is
-  normalized without raw OS text. The tmux 3.7c and Herdr 0.8.2 black-box modes
-  must pass through the same generic path.
+  tests prove both local-stream closure and top-level command send/response-owner
+  closure defer to an already queued typed terminal outcome, while closure with
+  no event is normalized without raw OS text. The top-level schedule uses one
+  legal viewport and reads the original typed event after the resize command
+  completes. The tmux 3.7c and Herdr 0.8.2 black-box modes must pass through the
+  same generic path.
 - The CLI multiprocess PTY gate uses a task-private deterministic shell. The
   connect child proves ready -> eventual interactive echo -> default detach
   through the unmodified `run_terminal`; the bare child separately proves

@@ -645,6 +645,8 @@ impl TerminalViewEventReader {
 pub struct TerminalViewCommandWriter {
     #[cfg(unix)]
     sender: tokio::sync::mpsc::Sender<TerminalDriverCommand>,
+    #[cfg(unix)]
+    terminal_outcome_queued: tokio::sync::watch::Receiver<bool>,
 }
 
 impl fmt::Debug for TerminalViewCommandWriter {
@@ -761,11 +763,25 @@ impl TerminalViewCommandWriter {
         ) -> TerminalDriverCommand,
     ) -> Result<(), DaemonError> {
         let (response, receiver) = tokio::sync::oneshot::channel();
-        self.sender
-            .send(command(response))
-            .await
-            .map_err(|_| terminal_driver_closed())?;
-        receiver.await.map_err(|_| terminal_driver_closed())?
+        if self.sender.send(command(response)).await.is_err() {
+            return self.correlate_terminal_outcome().await;
+        }
+        match receiver.await {
+            Ok(result) => result,
+            Err(_) => self.correlate_terminal_outcome().await,
+        }
+    }
+
+    #[cfg(unix)]
+    async fn correlate_terminal_outcome(&self) -> Result<(), DaemonError> {
+        let mut queued = self.terminal_outcome_queued.clone();
+        if *queued.borrow_and_update() {
+            return Ok(());
+        }
+        match tokio::time::timeout(TERMINAL_CLOSURE_CORRELATION_WINDOW, queued.changed()).await {
+            Ok(Ok(())) if *queued.borrow_and_update() => Ok(()),
+            Ok(Ok(()) | Err(_)) | Err(_) => Err(terminal_command_outcome_unavailable()),
+        }
     }
 }
 
@@ -807,10 +823,12 @@ fn spawn_terminal_driver(
 ) -> TerminalViewIo {
     let (command_sender, command_receiver) = tokio::sync::mpsc::channel(TERMINAL_DRIVER_CAPACITY);
     let (event_sender, event_receiver) = tokio::sync::mpsc::channel(TERMINAL_DRIVER_CAPACITY);
+    let (terminal_outcome_sender, terminal_outcome_receiver) = tokio::sync::watch::channel(false);
     tokio::spawn(run_terminal_driver(
         client,
         command_receiver,
         event_sender,
+        terminal_outcome_sender,
         initial_state,
         remote_alias,
         takeover,
@@ -821,6 +839,7 @@ fn spawn_terminal_driver(
         },
         writer: TerminalViewCommandWriter {
             sender: command_sender,
+            terminal_outcome_queued: terminal_outcome_receiver,
         },
     }
 }
@@ -830,6 +849,7 @@ async fn run_terminal_driver(
     mut client: LocalAttachmentClient,
     mut commands: tokio::sync::mpsc::Receiver<TerminalDriverCommand>,
     events: tokio::sync::mpsc::Sender<Result<TerminalViewEvent, DaemonError>>,
+    terminal_outcome_queued: tokio::sync::watch::Sender<bool>,
     initial_state: TerminalViewTransportState,
     remote_alias: Option<String>,
     takeover: bool,
@@ -910,6 +930,7 @@ async fn run_terminal_driver(
                 let event = pending.pop_front().expect("pending event was checked above");
                 permit.send(event);
                 if pending.is_empty() && stop_after_pending {
+                    terminal_outcome_queued.send_replace(true);
                     return;
                 }
             }
@@ -1383,13 +1404,6 @@ fn terminal_protocol_error(detail: &'static str) -> DaemonError {
 }
 
 #[cfg(unix)]
-fn terminal_driver_closed() -> DaemonError {
-    DaemonError::new(
-        DomainErrorKind::Cancelled,
-        "terminal attachment driver closed",
-    )
-}
-
 /// Side-effect-free impact projection for an identity reset confirmation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IdentityResetPreflight {
@@ -3329,6 +3343,137 @@ mod tests {
         assert!(!error.detail().contains("Broken pipe"));
         assert!(!error.detail().contains("os error"));
         assert!(eof_pending.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legal_resize_after_terminal_event_was_queued_preserves_the_typed_outcome() {
+        let session_id = SessionId::from_array([0xc5; SessionId::LENGTH]);
+        let attachment_id = AttachmentId::from_array([0xc6; AttachmentId::LENGTH]);
+        let (client, mut peer) = LocalAttachmentClient::terminal_driver_test_pair(
+            ResolvedSessionTarget::local(),
+            session_id,
+            attachment_id,
+        );
+        let view = spawn_terminal_driver(client, TerminalViewTransportState::Active, None, false);
+        let (mut events, writer) = view.split();
+        assert!(matches!(
+            events.read_event().await.expect("initial terminal event"),
+            Some(TerminalViewEvent::TransportState(
+                TerminalViewTransportState::Active
+            ))
+        ));
+
+        peer.write_all(
+            &encode_message(
+                WireKind::TerminalSessionEnded,
+                0,
+                0,
+                &v1::TerminalSessionEnded {
+                    session_id: Some(session_id.into()),
+                    attachment_id: Some(attachment_id.into()),
+                    reason: v1::TerminalSessionEndReason::NaturalExit as i32,
+                    exit_code: 0,
+                    signal: String::new(),
+                },
+            )
+            .expect("encode queued terminal outcome"),
+        )
+        .await
+        .expect("queue terminal outcome");
+        peer.flush().await.expect("flush terminal outcome");
+        drop(peer);
+
+        tokio::time::timeout(Duration::from_secs(1), writer.sender.closed())
+            .await
+            .expect("terminal driver must close its command owner after queuing the outcome");
+        writer
+            .resize(TerminalSize::new(31, 97))
+            .await
+            .expect("a legal resize must defer to the already queued terminal outcome");
+        assert!(matches!(
+            events
+                .read_event()
+                .await
+                .expect("authoritative terminal event"),
+            Some(TerminalViewEvent::SessionEnded(TerminalViewEnded {
+                reason: TerminalViewEndReason::NaturalExit,
+                ..
+            }))
+        ));
+
+        let (command_sender, mut command_receiver) =
+            tokio::sync::mpsc::channel(TERMINAL_DRIVER_CAPACITY);
+        let (outcome_sender, outcome_receiver) = tokio::sync::watch::channel(false);
+        let (event_sender, mut event_receiver) = tokio::sync::mpsc::channel::<TerminalViewEvent>(1);
+        let response_owner = tokio::spawn(async move {
+            let command = command_receiver
+                .recv()
+                .await
+                .expect("receive the accepted resize command");
+            event_sender
+                .send(TerminalViewEvent::LeaseLost { generation: 41 })
+                .await
+                .expect("queue authoritative response-owner outcome");
+            outcome_sender.send_replace(true);
+            drop(command);
+        });
+        let response_closed_writer = TerminalViewCommandWriter {
+            sender: command_sender,
+            terminal_outcome_queued: outcome_receiver,
+        };
+        response_closed_writer
+            .resize(TerminalSize::new(31, 97))
+            .await
+            .expect("a closed response owner must use the same event-side correlation");
+        response_owner.await.expect("response-owner schedule");
+        assert!(matches!(
+            event_receiver.recv().await,
+            Some(TerminalViewEvent::LeaseLost { generation: 41 })
+        ));
+
+        let (closed_sender, closed_receiver) = tokio::sync::mpsc::channel(TERMINAL_DRIVER_CAPACITY);
+        drop(closed_receiver);
+        let (unavailable_sender, unavailable_receiver) = tokio::sync::watch::channel(false);
+        drop(unavailable_sender);
+        let unavailable_writer = TerminalViewCommandWriter {
+            sender: closed_sender,
+            terminal_outcome_queued: unavailable_receiver,
+        };
+        let error = unavailable_writer
+            .resize(TerminalSize::new(31, 97))
+            .await
+            .expect_err("closure without an authoritative event must stay a bounded error");
+        assert_eq!(error.kind(), DomainErrorKind::DaemonStopped);
+        assert!(!error.detail().contains("terminal attachment driver closed"));
+        assert!(!error.detail().contains("Broken pipe"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropped_terminal_event_reader_never_confirms_a_closed_command() {
+        let session_id = SessionId::from_array([0xc7; SessionId::LENGTH]);
+        let attachment_id = AttachmentId::from_array([0xc8; AttachmentId::LENGTH]);
+        let (client, peer) = LocalAttachmentClient::terminal_driver_test_pair(
+            ResolvedSessionTarget::local(),
+            session_id,
+            attachment_id,
+        );
+        let view = spawn_terminal_driver(client, TerminalViewTransportState::Active, None, false);
+        let (events, writer) = view.split();
+        drop(events);
+
+        tokio::time::timeout(Duration::from_secs(1), writer.sender.closed())
+            .await
+            .expect("dropping the event owner must stop the terminal driver");
+        let error = writer
+            .resize(TerminalSize::new(31, 97))
+            .await
+            .expect_err("no command may be confirmed after its event owner was dropped");
+        assert_eq!(error.kind(), DomainErrorKind::DaemonStopped);
+        assert!(!error.detail().contains("terminal attachment driver closed"));
+        assert!(!error.detail().contains("Broken pipe"));
+        drop(peer);
     }
 
     #[cfg(unix)]
