@@ -86,9 +86,11 @@ exercises are not part of normal release acceptance.
 
 ## Release mapping
 
-The root Cargo workspace version is the product version source. The publisher
-asks Cargo for the inherited `zterm-core` package version and requires a GitHub
-Release tag equal to `v${workspace_version}`. That tag is used unchanged as the
+The root Cargo workspace version is the product version source. After immutable
+native publication, `release.yml` explicitly calls the reusable relay publisher
+with the frozen commit, exact `v${workspace_version}` tag and prerelease flag.
+The publisher asks Cargo for the inherited `zterm-core` version and requires
+that exact tag before any image build. The tag is used unchanged as the
 versioned OCI tag.
 
 For workspace version `0.1.1`, a stable GitHub Release named `v0.1.1`
@@ -105,9 +107,12 @@ development package, use their valid OCI input tag unchanged, and cannot use
 the reserved `latest` alias. The production and development packages are
 separate so a manual build cannot replace the stable image.
 
-The workflow checks out the exact Release tag, pins every third-party Action by
-full commit SHA, has only `contents: read` and `packages: write`, verifies the
-official Iroh archive during the build, and pushes one dual-architecture image.
+The reusable workflow checks out and proves the exact frozen commit, pins every
+third-party Action by full commit SHA, has only `contents: read` and
+`packages: write`, verifies the official Iroh archive during the build, and
+pushes one dual-architecture image. Manual dispatch remains a development-only
+path. Formal publication does not rely on a `release: published` event because
+a Release created with `GITHUB_TOKEN` does not reliably start another workflow.
 
 Historical release `v0.1.0` and image tag `:0.1.0` remain unchanged. The direct
 `v...` image-tag convention starts with `v0.1.1`; old tags are not renamed or
@@ -227,3 +232,8 @@ If a newly published image is confirmed defective, an operator may temporarily
 replace `:latest` in the server Compose with the preceding version tag, then run
 `docker compose pull` and `docker compose up -d`. This is a manual escape hatch,
 not automatic rollback logic, a routine drill, or a release gate.
+
+Native GitHub Release and GHCR publication are separate, non-atomic service
+boundaries. If the immutable native Release succeeds but relay publication
+fails, retain the native Release and rerun only the explicit relay job for the
+same frozen commit/tag. Never replace native assets to retry the image.

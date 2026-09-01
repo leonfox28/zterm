@@ -151,7 +151,9 @@ workflow.
 
 ## Deliberate exclusions
 
-- No M9 installer, updater, uninstaller, or release artifact yet.
+- This M2–M3 document does not own installer, updater, uninstaller, or release
+  artifact contracts. See [Install, update, and uninstall](install.md) and
+  [Release operations](releasing.md) for their current owners.
 - No M10 two-physical-network, NAT/path-migration, or new public Relay gate.
 - No GUI, Android runtime, Windows daemon/ConPTY, or iOS client in this
   milestone.

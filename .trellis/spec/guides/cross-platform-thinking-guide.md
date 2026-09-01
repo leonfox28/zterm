@@ -23,6 +23,11 @@ the same bytes or command semantics.
   Trellis developer journals must continue to resolve `merge=union`.
 - Cross-platform CI must run `sh tests/source-policy.sh` immediately after
   checkout and before `rustfmt` or compilation in every OS matrix entry.
+- CI admission runs on pull requests, `main` pushes, and manual dispatch rather
+  than duplicating a PR branch through both push and pull-request events. The
+  five-entry Rust matrix still expands the source-policy step on every host;
+  pure version/format/docs owners may be centralized because they do not prove
+  checkout bytes on another OS.
 - A workflow step that requires POSIX shell behavior must name `shell: bash` on
   Windows instead of depending on the runner's default shell.
 
@@ -34,7 +39,10 @@ Before changing source attributes or cross-platform workflows:
       written in `.gitattributes`.
 - [ ] Check actual checked-out Rust sources for carriage returns.
 - [ ] Preserve deliberate path-specific attributes such as journal merge rules.
-- [ ] Run the source-policy regression and `cargo fmt --all -- --check` locally.
+- [ ] Use `just check-fast` for the local edit loop; it includes the local
+      source-policy and portable policy owners.
+- [ ] Run `just check` before push or delivery. It is the authoritative local
+      gate, while hosted runners retain evidence for their own checkout bytes.
 - [ ] Let the Linux, macOS, and Windows matrix execute the same policy probe.
 - [ ] Consider adjacent platform assumptions: executable bits, case-sensitive
       paths, path separators, symlinks, and default shells.

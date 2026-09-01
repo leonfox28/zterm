@@ -1,5 +1,10 @@
 # Foundation Gate final report
 
+> **Historical record — not a current runbook.** This report retains the
+> commands and evidence used for the Foundation decision. Use
+> [Development and CI](development.md) and [Release operations](releasing.md)
+> for the current workflow.
+
 Status: **GO with automatic address-discovery evidence deferred to parent M10**.
 The TerminalModel, PTY lifecycle, retained-drain, black-box compatibility,
 resource, platform, and aggregate quality Gates passed. In the nested

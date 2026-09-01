@@ -149,6 +149,10 @@ unknown file or bypass signature/hash verification merely to force a rollback.
 
 ## Release-operator checkpoint
 
+The executable release runbook is [Release operations](releasing.md). This
+section records the installer trust prerequisites rather than duplicating the
+operator commands.
+
 Before any formal tag is pushed, a repository administrator must have:
 
 1. enabled immutable Releases and confirmed it with
@@ -166,17 +170,12 @@ underprivileged API call and does not request a PAT. The environment reviewer
 must confirm that immutable Releases remain enabled before approving the sole
 seed-bearing signing job.
 
-CI never creates a tag. After the exact `main` push run succeeds, a human
-creates and pushes the canonical `v` + Cargo-version tag. That push starts the
-release workflow automatically. Its validate job uses the Actions API to
-require a successful `ci.yml` `push` run on `main` for the same commit before
-the signing Environment or any Release state is reached. Every downstream job
-uses the frozen commit, and draft creation rechecks the tag. The signing tool is
-built before the only seed-bearing step so Cargo/build scripts never inherit
-the secret. The GitHub-hosted workflow rebuilds four native assets, tests all
-four installers, creates and round-trips one draft, emits provenance
-attestations, publishes it automatically, and requires the published Release
-API response to report `immutable: true`.
+CI never creates a tag. `release-prepare` creates a reviewable version PR;
+`release-publish` creates the annotated tag only after the merged exact main
+commit has a successful CI run. The GitHub-hosted workflow rebuilds four native
+assets, tests all four signed installers, round-trips one late draft, emits
+provenance attestations, requires immutable publication, and then explicitly
+publishes the matching relay image.
 
 A normal key rotation first ships a binary that trusts the next reviewed key
 through a manifest signed by the current key. If the current private key may be

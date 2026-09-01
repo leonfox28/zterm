@@ -1,11 +1,15 @@
 # Phase Zero verification record
 
+> **Historical record — not a current runbook.** This page preserves the
+> commands and evidence used at the time. Use [Development and CI](development.md)
+> and [Release operations](releasing.md) for the current workflow.
+
 Date: 2026-08-21  
 Host: macOS 26.6.2 arm64, Colima 0.10.3 (`vz`, Docker runtime)  
 Scope: historical local bootstrap plus the first approved public reverse-proxy
 relay deployment.
 
-## Current contract after Phase Zero
+## Historical contract recorded after Phase Zero
 
 This document preserves what was actually tested and deployed during the
 initial `v0.1.0` bootstrap. References below to the old digest-only Compose,

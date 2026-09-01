@@ -72,17 +72,17 @@ the signed native Release path and its trust/recovery boundaries.
 ## Version policy
 
 zterm uses one lockstep SemVer for the product rather than independent
-component versions. The root `[workspace.package].version` is the source for
-all product crates and is currently `0.1.9`; future CLI, daemon, desktop/mobile
-apps, protocol artifacts, and the zterm Relay wrapper advance together.
+component versions. The root `[workspace.package].version` is the only source
+for all product crates; future CLI, daemon, desktop/mobile apps, protocol
+artifacts, and the zterm Relay wrapper advance together.
 
 A GitHub Release tag must equal `v` plus Cargo's resolved workspace version.
-The same tag is used unchanged for the versioned GHCR image, so release
-`v0.1.9` publishes `zterm-relay:v0.1.9` and the stable `latest` alias. GitHub
-prereleases and manual builds publish only to `zterm-relay-dev`; manual tags are
-used unchanged except that `latest` is reserved. Internal validation tools such
-as the isolated Relay handshake probe are not product deliverables and keep
-their own non-product version.
+The same tag is used unchanged for the versioned GHCR image, and a stable
+release also advances the `latest` alias. GitHub prereleases and manual builds
+publish only to `zterm-relay-dev`; manual tags are used unchanged except that
+`latest` is reserved. Internal validation tools such as the isolated Relay
+handshake probe are not product deliverables and keep their own non-product
+version.
 
 ## Repository boundaries
 
@@ -98,6 +98,8 @@ their own non-product version.
 - `.github/workflows/release.yml` — protected exact-tag native Release workflow
   for the four supported Unix targets.
 - `docs/development.md` — exact local toolchain baseline and repeatable commands.
+- `docs/releasing.md` — release PR, exact-green tag, approval, native/relay
+  publication, and failure recovery.
 - `docs/relay.md` — relay trust boundary, publication, and deployment.
 - `docs/phase-zero-verification.md` — evidence from the completed local gate.
 - `docs/core-local-daemon.md` — current M2–M3 behavior, state, CLI, and exclusions.
@@ -106,25 +108,17 @@ their own non-product version.
 - `docs/install.md` — signed installer, explicit update/uninstall, recovery,
   and release-operator checkpoints.
 
-## Local checks
+## Development and release entry points
 
 ```bash
-sh tests/source-policy.sh
-sh tests/workspace-version.sh
-sh tests/release/static.sh
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
-cargo doc --workspace --no-deps
-cargo deny check
-sh tests/core-local-daemon/cross-uid.sh
-sh tests/relay/publication-channels.sh
-sh tests/relay/static.sh
-sh tests/relay/verify-upstream.sh
-sh tests/relay/build-platforms.sh
-sh tests/relay/smoke.sh
-sh tests/secret-scan.sh
+just check
+just release-prepare <version>
+just release-publish <version>
 ```
+
+Run `just doctor` when setting up a machine. See [Development and CI](docs/development.md)
+for PR/hosted evidence and [Release operations](docs/releasing.md) for the
+two-phase release flow.
 
 Local readiness and status do not initiate or wait on Iroh, DNS, Relay, or
 Internet work; a running daemon owns its Endpoint separately. Never place SSH

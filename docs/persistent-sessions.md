@@ -155,4 +155,5 @@ cargo test -p zterm-daemon --test terminal_recovery
 
 The explicit Foundation black-box gate additionally exercises pinned tmux and
 Herdr builds in task-private sockets/directories. It is intentionally excluded
-from ordinary push CI because it downloads external pinned artifacts.
+from routine pull-request and `main` CI because it downloads external pinned
+artifacts.

@@ -11,8 +11,9 @@ contains the one supported deployment shape.
   explicitly disables unused metrics and UDP QAD.
 - `compose.yaml` publishes that listener only on host loopback, where a
   same-host TLS reverse proxy can reach it.
-- `resolve-publication.sh` maps GitHub Releases and manual development builds to
-  the production and development GHCR packages.
+- `resolve-publication.sh` maps the native-release workflow's trusted
+  `workflow_call` inputs to the production GHCR package and manual
+  `workflow_dispatch` inputs to the development package.
 
 The default server directory is
 `/opt/1panel/docker/compose/zterm-relay`. Update it manually:
