@@ -3689,7 +3689,7 @@ fn resize(
     size: TerminalSize,
 ) -> Result<Revision, DaemonError> {
     validate_viewport(actor.limits, size)?;
-    require_controller(runtime, attachment_id)?;
+    require_resize_controller(runtime, attachment_id)?;
     let projection = TerminalModel::project_resources(size, actor.limits.recent_history_rows)
         .map_err(map_terminal_error)?;
     let registry = actor.registry.upgrade().ok_or_else(session_not_found)?;
@@ -3908,6 +3908,44 @@ fn require_controller(
         return Err(not_synchronized(
             "snapshot must be applied before controller operations",
         ));
+    };
+    match runtime.controller {
+        Some(ControllerLease {
+            attachment_id: owner,
+            generation: current,
+        }) if owner == attachment_id && current == generation => Ok(generation),
+        _ => Err(lease_lost()),
+    }
+}
+
+fn require_resize_controller(
+    runtime: &SessionRuntime,
+    attachment_id: AttachmentId,
+) -> Result<u64, DaemonError> {
+    // Snapshot delivery and controller commands travel in opposite directions
+    // on one duplex stream. A client can submit its latest viewport after the
+    // last Active event while a newer snapshot is already in flight. Resize is
+    // replaceable controller state, so admit it across that visual-sync window;
+    // input and history keep the stricter Active-only fence.
+    let attachment = runtime
+        .attachments
+        .get(&attachment_id)
+        .ok_or_else(lease_lost)?;
+    let generation = match attachment.sync {
+        AttachmentSync::Active { generation }
+        | AttachmentSync::Awaiting {
+            target: SyncTarget::Active { generation },
+            ..
+        } => generation,
+        AttachmentSync::Awaiting {
+            target: SyncTarget::PreparedTakeover,
+            ..
+        }
+        | AttachmentSync::PreparedTakeover => {
+            return Err(not_synchronized(
+                "snapshot must be applied before controller operations",
+            ));
+        }
     };
     match runtime.controller {
         Some(ControllerLease {

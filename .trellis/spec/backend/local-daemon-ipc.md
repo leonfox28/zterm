@@ -187,9 +187,22 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
 - Each non-`Active` terminal transition advances the input epoch and clears the
   prefix. Returning to `Active` first joins the old stdin reader, flushes queued
   kernel input, advances the epoch, installs the replacement reader, and only
-  then accepts input. `SIGWINCH` may initiate another sync, so viewport
-  publication or a resize acknowledgement alone is not an input fence. Pure UI
-  tests own the exact reader-replacement ordering. The multiprocess PTY fixture
+  then accepts input. `SIGWINCH` has one CLI owner: after successfully
+  submitting a changed size it immediately treats the view as
+  `Synchronizing`, coalesces only the latest observation, and sends no further
+  resize until an authoritative `Active` event. If that event finds a different
+  pending size, the owner submits it and remains `Synchronizing`; only an
+  `Active` event with no changed pending size reopens input. The owner tracks
+  the last submitted size and suppresses identical repeated signals because a
+  semantic no-op need not produce another replacement snapshot or completion
+  barrier. Because server output can begin another snapshot after the client
+  observed `Active`, Session admits replaceable resize only from the exact
+  current controller while its sync target remains `Active`; input, history,
+  prepared takeover, and stale/non-controller attachments retain the strict
+  `Active`/lease checks. The CLI never retries or replays resize. Viewport
+  publication or a local socket-write acknowledgement alone is not an input
+  fence. Pure UI and Session tests own the exact reader-replacement,
+  resize-state, and in-flight-snapshot ordering. The multiprocess PTY fixture
   uses the production `run_terminal` entry and bounded idempotent shell probes;
   it must not add renderer markers or test branches to the product loop.
 - The raw-terminal UI distinguishes physical size from child size: remote views

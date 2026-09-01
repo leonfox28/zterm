@@ -299,6 +299,44 @@ Create detailed flow docs when:
 
 ---
 
+## Asynchronous Command / Authoritative-State Boundary
+
+Writing a command into a queue or socket is not the same as the service having
+accepted and completed it. If a client enables its next command from a local or
+optimistic state event, map the full sequence before changing either side:
+
+```
+observe -> enqueue/write -> service validates -> state changes -> authoritative event
+```
+
+### Checklist
+
+- [ ] Name which step is acknowledged by each future, response, and event.
+- [ ] After submitting a state-changing command, locally fence incompatible
+      commands until the authoritative completion state arrives.
+- [ ] Coalesce replaceable observations while fenced; do not retry or replay
+      mutations to compensate for missing state ownership.
+- [ ] Decide whether a replaceable control value (for example, a viewport) is
+      safe across a visual synchronization window; do not automatically give
+      byte-bearing input the same admission rule.
+- [ ] Suppress semantic no-ops before entering the fence. A repeated value may
+      produce no service-side state transition and therefore no completion
+      event capable of reopening the client.
+- [ ] Keep strict service validation. Fix stale client state at the client
+      owner instead of accepting out-of-order commands at the boundary.
+- [ ] Pair a deterministic state-owner test with one scheduled process or
+      integration regression that exercises the real queue/socket ordering.
+
+**Real-world example**: A terminal resize future acknowledged only the local
+socket write. Rapid `SIGWINCH` delivery could submit a second resize while the
+Session was awaiting a replacement snapshot. Client fencing and identical-size
+suppression reduced the window but could not prove server state on a full-duplex
+stream. The complete fix kept input Active-only while allowing the exact
+current controller's replaceable viewport across an Active-target snapshot
+window, without retry or replay.
+
+---
+
 ## Event Log / Projection Boundary
 
 Append-only logs are cross-layer contracts. A single event travels through:

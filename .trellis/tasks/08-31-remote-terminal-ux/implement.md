@@ -159,6 +159,65 @@
 - [x] No template sync is applicable because this repository has no
   `src/templates/markdown/spec/` mirror.
 
+## Bug analysis: rapid resize crossed the snapshot barrier
+
+### 1. Root cause category
+
+- **B/D/E — cross-layer contract, coverage gap, implicit assumption**: a
+  successful `TerminalViewCommandWriter::resize` future proves that the frame
+  entered the local duplex stream, not that Session has completed the resulting
+  snapshot cycle. The CLI could still consider the view `Active` and submit a
+  later `SIGWINCH` while Session correctly rejected controller operations in
+  `Awaiting` state.
+
+### 2. Why earlier fixes did not cover it
+
+1. Closure correlation preserved typed terminal outcomes but did not serialize
+   ordinary successful resize commands against snapshot synchronization.
+2. Physical viewport clamping fixed deterministic oversized rejection but the
+   reported legal `140x40` case remained a scheduling race.
+3. The first local fence prevented the second changed resize, but an identical
+   coalesced signal could submit a semantic no-op, enter `Synchronizing`, and
+   wait forever because no size change meant no replacement snapshot/`Active`
+   barrier.
+4. Even after no-op suppression, a newly received `Active` could become stale
+   before the next client frame arrived: terminal output and client commands
+   travel independently on the duplex stream, so Session could already be
+   awaiting a newer snapshot.
+
+### 3. Prevention mechanisms
+
+| Priority | Mechanism | Action | Status |
+|---|---|---|---|
+| P0 | Architecture | Immediately fence after a changed resize and coalesce at the sole CLI owner | done |
+| P0 | Session boundary | Admit replaceable resize only for the exact current controller during an Active-target snapshot; keep input/history/takeover strict | done |
+| P0 | No-op rule | Track the last submitted viewport and suppress identical active or pending observations | done |
+| P0 | Regression | Deterministically prove pending/deduplicated state transitions and repeatedly exercise rapid real PTY `SIGWINCH` delivery | done |
+| P1 | Documentation | Record queue-write versus authoritative-state semantics in the reusable cross-layer guide and owning IPC spec | done |
+
+### 4. Systematic expansion
+
+- **Similar issues**: every byte-bearing one-way terminal command must be gated
+  by the authoritative transport state, not by completion of its local write
+  future. Replaceable state needs an explicit, separately reviewed admission
+  rule when visual synchronization and commands are full-duplex.
+- **Design improvement**: effective state plus pending resize are decided by
+  one coalescer transition; callers cannot independently reopen input while a
+  changed viewport is waiting.
+- **Process improvement**: when a state-changing command can be a no-op, tests
+  must cover both changed and identical values; changed-value tests alone can
+  falsely imply that a completion event is guaranteed.
+
+### 5. Knowledge capture
+
+- [x] Update `backend/local-daemon-ipc.md` with the fence, coalescing, no-op,
+  and resize-specific admission rules.
+- [x] Update `guides/cross-layer-thinking-guide.md` with the reusable
+  queue-write versus authoritative-state checklist.
+- [x] Keep the pure owner test plus production multiprocess PTY regression.
+- [x] No template sync is applicable because this repository has no
+  `src/templates/markdown/spec/` mirror.
+
 ## Validation commands
 
 Focused while implementing:

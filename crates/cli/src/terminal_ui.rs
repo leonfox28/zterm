@@ -212,7 +212,7 @@ mod unix {
         let mut stdin_pump = StdinPump::start(stdin, input_epoch.clone())?;
         let mut prefix = PrefixParser::new(escape.0);
         let mut transport_state = TerminalViewTransportState::Synchronizing;
-        let mut resize_coalescer = ResizeCoalescer::new(None);
+        let mut resize_coalescer = ResizeCoalescer::new(initial_size);
         let prepared = match await_while_inactive(
             prepare(request, runtime, initial_size),
             InactiveWaitContext {
@@ -364,10 +364,26 @@ mod unix {
                     if let Err(error) = render_status_stdout(&mut status_renderer, transport_state) {
                         break Err(error);
                     }
-                    if let Some(size) = resize_coalescer.observe(latest, transport_state)
-                        && let Err(error) = writer.resize(size).await
-                    {
-                        break Err(error.into());
+                    if let Some(size) = resize_coalescer.observe(latest, transport_state) {
+                        if let Err(error) = writer.resize(size).await {
+                            break Err(error.into());
+                        }
+                        match apply_transport_state_transition(
+                            stdin,
+                            &input_epoch,
+                            &mut current_input_epoch,
+                            &mut stdin_pump,
+                            &mut prefix,
+                            transport_state,
+                            TerminalViewTransportState::Synchronizing,
+                            &mut viewport,
+                            &mut status_renderer,
+                            &mut resize_coalescer,
+                            &writer,
+                        ).await {
+                            Ok(state) => transport_state = state,
+                            Err(error) => break 'terminal Err(error),
+                        }
                     }
                 }
                 // The explicit expired-deadline check above makes this local
@@ -413,7 +429,7 @@ mod unix {
                                 continue;
                             }
                             deferred_active = false;
-                            if let Err(error) = apply_transport_state_transition(
+                            match apply_transport_state_transition(
                                 stdin,
                                 &input_epoch,
                                 &mut current_input_epoch,
@@ -426,9 +442,9 @@ mod unix {
                                 &mut resize_coalescer,
                                 &writer,
                             ).await {
-                                break 'terminal Err(error);
+                                Ok(applied) => transport_state = applied,
+                                Err(error) => break 'terminal Err(error),
                             }
-                            transport_state = state;
                         }
                         TerminalViewEvent::ConnectionStatus(status) => {
                             status_renderer.observe(status)?;
@@ -731,7 +747,7 @@ mod unix {
                                 break Ok(TerminalCompletion::Detached);
                             }
                             if deferred_active && !input_codec.paste_in_progress() {
-                                if let Err(error) = apply_transport_state_transition(
+                                match apply_transport_state_transition(
                                     stdin,
                                     &input_epoch,
                                     &mut current_input_epoch,
@@ -744,9 +760,9 @@ mod unix {
                                     &mut resize_coalescer,
                                     &writer,
                                 ).await {
-                                    break 'terminal Err(error);
+                                    Ok(applied) => transport_state = applied,
+                                    Err(error) => break 'terminal Err(error),
                                 }
-                                transport_state = TerminalViewTransportState::Active;
                                 deferred_active = false;
                             }
                         }
@@ -963,7 +979,8 @@ mod unix {
         status_renderer: &mut StatusRenderer,
         resize_coalescer: &mut ResizeCoalescer,
         writer: &zterm_daemon::operations::TerminalViewCommandWriter,
-    ) -> Result<(), CliError> {
+    ) -> Result<TerminalViewTransportState, CliError> {
+        let (next, pending_resize) = resize_coalescer.enter_transport_state(next);
         let resume_input = transition_transport_input_state(
             stdin,
             input_epoch,
@@ -978,7 +995,7 @@ mod unix {
             render_transport_state_stdout(next)?;
         }
         render_status_stdout(status_renderer, next)?;
-        if let Some(size) = resize_coalescer.transport_state(next) {
+        if let Some(size) = pending_resize {
             writer.resize(size).await?;
         }
         if let Some(bytes) = resume_input
@@ -986,7 +1003,7 @@ mod unix {
         {
             writer.write_input(bytes).await?;
         }
-        Ok(())
+        Ok(next)
     }
 
     const fn input_epoch_is_current(observed: u64, current: u64) -> bool {
@@ -1833,11 +1850,15 @@ mod unix {
 
     struct ResizeCoalescer {
         pending: Option<TerminalSize>,
+        last_submitted: TerminalSize,
     }
 
     impl ResizeCoalescer {
-        const fn new(pending: Option<TerminalSize>) -> Self {
-            Self { pending }
+        const fn new(initial_size: TerminalSize) -> Self {
+            Self {
+                pending: None,
+                last_submitted: initial_size,
+            }
         }
 
         fn observe(
@@ -1847,17 +1868,35 @@ mod unix {
         ) -> Option<TerminalSize> {
             if state == TerminalViewTransportState::Active {
                 self.pending = None;
-                Some(size)
+                self.submit_if_changed(size)
             } else {
                 self.pending = Some(size);
                 None
             }
         }
 
-        fn transport_state(&mut self, state: TerminalViewTransportState) -> Option<TerminalSize> {
-            (state == TerminalViewTransportState::Active)
+        fn enter_transport_state(
+            &mut self,
+            state: TerminalViewTransportState,
+        ) -> (TerminalViewTransportState, Option<TerminalSize>) {
+            let pending = (state == TerminalViewTransportState::Active)
                 .then(|| self.pending.take())
                 .flatten()
+                .and_then(|size| self.submit_if_changed(size));
+            let effective = if pending.is_some() {
+                TerminalViewTransportState::Synchronizing
+            } else {
+                state
+            };
+            (effective, pending)
+        }
+
+        fn submit_if_changed(&mut self, size: TerminalSize) -> Option<TerminalSize> {
+            if size == self.last_submitted {
+                return None;
+            }
+            self.last_submitted = size;
+            Some(size)
         }
     }
 
@@ -3215,10 +3254,11 @@ mod unix {
 
         #[test]
         fn resize_coalescer_retains_only_the_latest_non_active_viewport() {
+            let initial = TerminalSize::new(24, 80);
             let first = TerminalSize::new(20, 60);
             let latest = TerminalSize::new(40, 120);
             let active = TerminalSize::new(50, 140);
-            let mut coalescer = ResizeCoalescer::new(None);
+            let mut coalescer = ResizeCoalescer::new(initial);
             assert_eq!(
                 coalescer.observe(first, TerminalViewTransportState::Synchronizing),
                 None
@@ -3228,12 +3268,16 @@ mod unix {
                 None
             );
             assert_eq!(
-                coalescer.transport_state(TerminalViewTransportState::Active),
-                Some(latest)
+                coalescer.enter_transport_state(TerminalViewTransportState::Active),
+                (TerminalViewTransportState::Synchronizing, Some(latest))
             );
             assert_eq!(
-                coalescer.transport_state(TerminalViewTransportState::Active),
+                coalescer.observe(latest, TerminalViewTransportState::Synchronizing),
                 None
+            );
+            assert_eq!(
+                coalescer.enter_transport_state(TerminalViewTransportState::Active),
+                (TerminalViewTransportState::Active, None)
             );
             assert_eq!(
                 coalescer.observe(active, TerminalViewTransportState::Active),
@@ -3266,7 +3310,7 @@ mod unix {
             assert_eq!(child_terminal_size(oversized, false), maximum);
             assert_eq!(child_terminal_size(oversized, true), maximum);
 
-            let mut coalescer = ResizeCoalescer::new(None);
+            let mut coalescer = ResizeCoalescer::new(TerminalSize::new(24, 80));
             assert_eq!(
                 coalescer.observe(
                     child_terminal_size(oversized, true),

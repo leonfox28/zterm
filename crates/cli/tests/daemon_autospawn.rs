@@ -794,7 +794,7 @@ async fn wait_for_active_viewport(runtime: &LocalRuntime, rows: u16, columns: u1
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "terminal UI did not publish its active viewport"
+            "terminal UI did not publish its active {rows}x{columns} viewport"
         );
         tokio::task::yield_now().await;
     }

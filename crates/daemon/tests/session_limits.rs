@@ -98,3 +98,63 @@ fn session_viewport_and_projection_limits_fail_without_mutation() -> Result<(), 
     fixture.service.shutdown().map_err(support::display)?;
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn current_controller_resize_survives_an_in_flight_snapshot() -> Result<(), String> {
+    use zterm_core::terminal::TerminalSize;
+    use zterm_core::{ResourceLimits, SessionSelector};
+    use zterm_daemon::session::AttachmentUpdate;
+
+    let fixture = support::Fixture::new(ResourceLimits::default())?;
+    let session = fixture.create(1, "resize-sync").map_err(support::display)?;
+    let attached = fixture
+        .service
+        .prepare_attach(
+            fixture.principal,
+            Some(SessionSelector::Id(session.session_id)),
+            false,
+            false,
+            None,
+        )
+        .map_err(support::display)?;
+    support::activate(&attached)?;
+
+    let in_flight = attached
+        .attachment
+        .sync_latest(attached.snapshot.revision)
+        .map_err(support::display)?;
+    let resized = TerminalSize::new(31, 97);
+    attached
+        .attachment
+        .resize(resized)
+        .map_err(support::display)?;
+    assert_eq!(
+        fixture.service.list().map_err(support::display)?[0].viewport,
+        resized
+    );
+    assert!(
+        attached
+            .attachment
+            .snapshot_applied(in_flight.revision)
+            .map_err(support::display)?
+            .is_none()
+    );
+    let Some(AttachmentUpdate::Snapshot(replacement)) = attached
+        .attachment
+        .next_update()
+        .map_err(support::display)?
+    else {
+        return Err("resize during synchronization did not require one latest snapshot".into());
+    };
+    assert_eq!(replacement.size, resized);
+    assert!(
+        attached
+            .attachment
+            .snapshot_applied(replacement.revision)
+            .map_err(support::display)?
+            .is_none()
+    );
+    fixture.service.shutdown().map_err(support::display)?;
+    Ok(())
+}
