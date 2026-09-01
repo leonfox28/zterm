@@ -176,3 +176,31 @@ Recorded hosted CI evidence without overclaiming remote Session behavior, archiv
 ### Status
 
 [OK] **Completed**
+
+
+## Session 8: Remote terminal UX v0.1.9
+<!-- trellis-session: v=2 fp=17753c03a16dc25d -->
+
+**Date**: 2026-09-01
+**Task**: Remote terminal UX v0.1.9
+**Branch**: `main`
+
+### Summary
+
+Delivered bounded remote scrollback and a theme-aware device/path/RTT status row; fixed oversized and legal-size rapid-resize lifecycle races; published signed v0.1.9 after full cross-platform CI and install verification; user accepted the final build in macOS Ghostty.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `fff36b9` | feat: improve remote terminal UX |
+| `3080d1f` | fix: pass cross-platform release gates |
+| `f2b9b11` | chore: prepare v0.1.8 release |
+| `8976c31` | fix: preserve terminal outcomes during resize races |
+| `a104a1c` | fix: restore shared reset preflight type |
+| `158364e` | chore: prepare v0.1.9 release |
+| `fceb075` | fix: serialize terminal resize synchronization |
+
+### Status
+
+[OK] **Completed**
