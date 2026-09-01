@@ -204,3 +204,33 @@ Delivered bounded remote scrollback and a theme-aware device/path/RTT status row
 ### Status
 
 [OK] **Completed**
+
+
+## Session 9: Update Trellis to 0.6.16
+<!-- trellis-session: v=2 fp=4d96c395b9773db6 -->
+
+**Date**: 2026-09-01
+**Task**: Update Trellis to 0.6.16
+**Branch**: `main`
+
+### Summary
+
+Updated the project Trellis runtime and platform integrations to 0.6.16, validated the generated templates and runtime syntax, and pushed the work commit.
+
+### Main Changes
+
+- Updated Trellis runtime, workflow, hooks, and platform adapters to 0.6.16.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `b91b942` | chore: update trellis to 0.6.16 |
+
+### Testing
+
+- [OK] trellis update --dry-run reported Already up to date; Python, JavaScript, TypeScript parsing, task JSON, and template hashes passed.
+
+### Status
+
+[OK] **Completed**
