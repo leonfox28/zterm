@@ -68,7 +68,8 @@
   ready authoritative terminal event race; assert the event's typed outcome
   wins instead of the command-channel fallback.
 - [x] Run nested tmux 3.7c and Herdr 0.8.2 through the generic mode path; verify alternate screen and child mouse ownership receive their input.
-- [ ] Manually validate Ghostty: long shell output scrolls, rapid resize stays attached, status is visually distinct, direct/relay and RTT update, and Ctrl+] detach remains unchanged.
+- [x] Manually validate Ghostty: long shell output scrolls, rapid resize stays attached, status is visually distinct, direct/relay and RTT update, and Ctrl+] detach remains unchanged.
+  - 2026-09-01: the user accepted the published v0.1.9 build in macOS Ghostty after the final rapid-resize regression retest and reported no remaining issue.
 
 ## Step 7: Specs, review, and completion
 
