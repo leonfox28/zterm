@@ -43,7 +43,7 @@ output_file=${GITHUB_OUTPUT:-/dev/stdout}
 
 publish_latest=false
 case "$event_name" in
-    release)
+    workflow_call)
         if ! workspace_version=$(read_workspace_version "$workspace_manifest"); then
             fail "could not resolve the workspace product version with Cargo"
         fi
@@ -60,7 +60,7 @@ case "$event_name" in
             true)
                 image_suffix=-dev
                 ;;
-            *) fail "RELEASE_PRERELEASE must be true or false for a release" ;;
+            *) fail "RELEASE_PRERELEASE must be true or false for a formal release call" ;;
         esac
         ;;
     workflow_dispatch)

@@ -1,100 +1,157 @@
 name: ci
 
 on:
+  pull_request:
   push:
     branches:
-      - "**"
-  pull_request:
+      - main
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  JUST_VERSION: 1.42.4
 
 jobs:
-  release-policy:
-    name: Native release policy
+  policy:
+    name: Policy and portable checks
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Check manual release and installer policy
-        run: sh tests/release/static.sh
-      - name: Check maintained shell fixtures
-        run: shellcheck -s sh install/install.sh tests/release/*.sh
-      - name: Check local HTTPS fixture syntax
-        run: python3 -m py_compile tests/release/https_fixture.py
+      - name: Install exact Rust toolchain
+        run: >-
+          rustup toolchain install 1.98.0 --profile minimal
+          --component rustfmt
+      - name: Restore portable-tool and Cargo caches
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/just
+            ~/go/bin/actionlint
+          key: ci-policy-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-just-1.42.4-actionlint-1.7.12-${{ hashFiles('Cargo.lock') }}
+      - name: Install exact local command owners
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v just >/dev/null 2>&1 \
+            || cargo +1.98.0 install just --version "$JUST_VERSION" --locked
+          test "$(just --version)" = "just $JUST_VERSION"
+          if [ ! -x "$HOME/go/bin/actionlint" ]; then
+            go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          fi
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+          "$HOME/go/bin/actionlint" -version
+      - name: Run the canonical portable policy profile
+        run: just ci-policy
+      - name: Explain reproduction on failure
+        if: failure()
+        run: echo "Reproduce with just ci-policy after just doctor." >> "$GITHUB_STEP_SUMMARY"
 
   rust:
-    name: Rust (${{ matrix.os }})
+    name: Rust / ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - macos-latest
-          - macos-15-intel
-          - ubuntu-24.04
-          - ubuntu-24.04-arm
-          - windows-latest
+        include:
+          - label: macOS arm64
+            os: macos-latest
+            profile: unix
+            docs: false
+            smoke: true
+          - label: macOS Intel
+            os: macos-15-intel
+            profile: unix
+            docs: false
+            smoke: false
+          - label: Linux x64
+            os: ubuntu-24.04
+            profile: unix
+            docs: true
+            smoke: true
+          - label: Linux arm64
+            os: ubuntu-24.04-arm
+            profile: unix
+            docs: false
+            smoke: false
+          - label: Windows shared boundary
+            os: windows-latest
+            profile: windows
+            docs: false
+            smoke: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Check source checkout policy
         shell: bash
         run: sh tests/source-policy.sh
       - name: Install exact Rust toolchain
         run: >-
           rustup toolchain install 1.98.0 --profile minimal
-          --component clippy --component rust-src --component rustfmt
-      - name: Check lockstep product version
+          --component clippy --component rust-src
+      - name: Restore Rust cache
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/just
+            ~/.cargo/bin/just.exe
+            target
+          key: ci-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-${{ matrix.profile }}-${{ hashFiles('Cargo.lock') }}-just-1.42.4
+          restore-keys: |
+            ci-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-${{ matrix.profile }}-
+      - name: Install exact just command owner
         shell: bash
-        run: sh tests/workspace-version.sh
-      - name: Check formatting
-        run: cargo +1.98.0 fmt --all -- --check
-      - name: Run Clippy
-        if: runner.os != 'Windows'
-        run: cargo +1.98.0 clippy --workspace --all-targets --all-features -- -D warnings
-      - name: Compile Windows shared and unsupported boundaries
-        if: runner.os == 'Windows'
-        run: cargo +1.98.0 clippy --workspace --lib --bins --all-features -- -D warnings
-      - name: Run tests (Unix includes PTY lifecycle)
-        if: runner.os != 'Windows'
-        run: cargo +1.98.0 test --workspace --all-features
-      - name: Run Windows shared-contract tests
-        if: runner.os == 'Windows'
-        run: >-
-          cargo +1.98.0 test
-          -p zterm-core -p zterm-proto -p zterm-platform -p zterm-daemon
-          --lib --all-features
-      - name: Build documentation
-        run: cargo +1.98.0 doc --workspace --no-deps
-      - name: Run no-argument milestone help
-        if: runner.os != 'Windows'
-        run: cargo +1.98.0 run --quiet --package zterm-cli
+        run: |
+          set -euo pipefail
+          command -v just >/dev/null 2>&1 \
+            || cargo +1.98.0 install just --version "$JUST_VERSION" --locked
+          test "$(just --version)" = "just $JUST_VERSION"
+      - name: Run full Unix platform evidence
+        if: matrix.profile == 'unix'
+        shell: bash
+        run: just ci-unix "${{ matrix.docs }}" "${{ matrix.smoke }}"
+      - name: Run Windows shared-boundary evidence
+        if: matrix.profile == 'windows'
+        shell: bash
+        run: just ci-windows
+      - name: Explain reproduction on failure
+        if: failure()
+        shell: bash
+        run: |
+          if [ "${{ matrix.profile }}" = windows ]; then
+            echo "Reproduce on Windows with just ci-windows." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Reproduce on the matching Unix host with just ci-unix ${{ matrix.docs }} ${{ matrix.smoke }}." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
-  release-mode-macos:
-    name: Release-mode build (${{ matrix.target }})
+  release-readiness-macos:
+    name: Release readiness / ${{ matrix.target }}
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
           - runner: macos-latest
             target: aarch64-apple-darwin
-            architecture: arm64
           - runner: macos-15-intel
             target: x86_64-apple-darwin
-            architecture: x86_64
-    env:
-      MACOSX_DEPLOYMENT_TARGET: "13.0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -103,23 +160,27 @@ jobs:
         run: sh tests/source-policy.sh
       - name: Install exact Rust toolchain
         run: rustup toolchain install 1.98.0 --profile minimal
-      - name: Build and inspect the release-mode boundary
-        shell: bash
+      - name: Restore release-readiness cache
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ci-readiness-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+      - name: Build and inspect the shipped binary boundary
         env:
           RELEASE_TARGET: ${{ matrix.target }}
-          RELEASE_ARCHITECTURE: ${{ matrix.architecture }}
-        run: |
-          set -euo pipefail
-          test "$(rustc +1.98.0 -vV | sed -n 's/^host: //p')" = "$RELEASE_TARGET"
-          cargo +1.98.0 build --locked --release \
-            --package zterm-cli --package zterm-release-tool
-          file target/release/zterm | grep -F "$RELEASE_ARCHITECTURE"
-          test "$(otool -l target/release/zterm | awk '$1 == "minos" {print $2}' | sort -u)" = "13.0"
+        run: sh tools/release/build-native.sh readiness
+      - name: Explain reproduction on failure
+        if: failure()
+        run: echo "Reproduce on the exact native host with RELEASE_TARGET=${{ matrix.target }} sh tools/release/build-native.sh readiness." >> "$GITHUB_STEP_SUMMARY"
 
-  release-mode-linux:
-    name: Release-mode build (${{ matrix.target }}, glibc 2.28)
+  release-readiness-linux:
+    name: Release readiness / ${{ matrix.target }} / glibc 2.28
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
     container:
       image: debian:10-slim@sha256:bb3dc79fddbca7e8903248ab916bb775c96ec61014b3d02b4f06043b604726dc
     strategy:
@@ -131,7 +192,7 @@ jobs:
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
     steps:
-      - name: Select the frozen Debian 10 package snapshot
+      - name: Bootstrap Git for the pinned container checkout
         shell: bash
         run: |
           set -euo pipefail
@@ -141,78 +202,151 @@ jobs:
             /etc/apt/sources.list
           apt-get -o Acquire::Check-Valid-Until=false update
           DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
-            binutils build-essential ca-certificates curl git pkg-config
+            ca-certificates git
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Trust only the checked-out workspace
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Check source checkout policy
-        run: sh tests/source-policy.sh
-      - name: Install exact Rust toolchain
-        shell: bash
         run: |
-          set -euo pipefail
-          curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
-            https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.98.0
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - name: Build and inspect the release-mode boundary
-        shell: bash
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          sh tests/source-policy.sh
+      - name: Prepare the pinned glibc builder
+        run: sh tools/release/setup-glibc-builder.sh
+      - name: Restore release-readiness cache
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ci-readiness-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+      - name: Build and inspect the shipped binary boundary
         env:
           RELEASE_TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          test "$(rustc -vV | sed -n 's/^host: //p')" = "$RELEASE_TARGET"
-          test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.28"
-          cargo build --locked --release \
-            --package zterm-cli --package zterm-release-tool
-          maximum_glibc=$(readelf --version-info target/release/zterm \
-            | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)
-          test -n "$maximum_glibc"
-          test "$(printf '%s\n%s\n' "$maximum_glibc" GLIBC_2.28 | sort -V | tail -1)" = GLIBC_2.28
+        run: sh tools/release/build-native.sh readiness
+      - name: Explain reproduction on failure
+        if: failure()
+        run: echo "Reproduce in the pinned Debian container with RELEASE_TARGET=${{ matrix.target }} sh tools/release/build-native.sh readiness." >> "$GITHUB_STEP_SUMMARY"
 
   dependencies:
     name: Dependency policy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install exact Rust toolchain
         run: rustup toolchain install 1.98.0 --profile minimal
-      - name: Install cargo-deny 0.20.2
-        run: cargo +1.98.0 install cargo-deny --version 0.20.2 --locked
-      - name: Check dependencies
+      - name: Restore dependency-tool cache
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/just
+            ~/.cargo/bin/cargo-deny
+          key: ci-dependencies-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-just-1.42.4-deny-0.20.2-${{ hashFiles('Cargo.lock', 'tests/relay/handshake-probe/Cargo.lock') }}
+      - name: Install exact command owners
+        shell: bash
         run: |
-          cargo +1.98.0 deny check
-          cargo +1.98.0 deny --manifest-path tests/relay/handshake-probe/Cargo.toml --config tests/relay/handshake-probe/deny.toml check
+          set -euo pipefail
+          command -v just >/dev/null 2>&1 \
+            || cargo +1.98.0 install just --version "$JUST_VERSION" --locked
+          command -v cargo-deny >/dev/null 2>&1 \
+            || cargo +1.98.0 install cargo-deny --version 0.20.2 --locked
+          test "$(just --version)" = "just $JUST_VERSION"
+          cargo deny --version | grep -F '0.20.2'
+      - name: Run both dependency-policy owners
+        run: just ci-dependencies
+      - name: Explain reproduction on failure
+        if: failure()
+        run: echo "Reproduce with just ci-dependencies." >> "$GITHUB_STEP_SUMMARY"
 
   relay:
     name: Official relay bundle
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install exact Rust toolchain
         run: >-
           rustup toolchain install 1.98.0 --profile minimal
           --component clippy --component rustfmt
-      - name: Check authenticated relay handshake probe
+      - name: Restore relay cache
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/just
+            tests/relay/handshake-probe/target
+          key: ci-relay-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-just-1.42.4-${{ hashFiles('tests/relay/handshake-probe/Cargo.lock', 'deploy/relay/Dockerfile') }}
+      - name: Install exact just command owner
+        shell: bash
         run: |
-          cargo +1.98.0 fmt --manifest-path tests/relay/handshake-probe/Cargo.toml -- --check
-          cargo +1.98.0 clippy --locked --manifest-path tests/relay/handshake-probe/Cargo.toml -- -D warnings
-      - name: Check POSIX shell syntax
-        run: sh -n deploy/relay/*.sh tests/relay/*.sh
+          set -euo pipefail
+          command -v just >/dev/null 2>&1 \
+            || cargo +1.98.0 install just --version "$JUST_VERSION" --locked
+          test "$(just --version)" = "just $JUST_VERSION"
       - name: Register cross-architecture emulation
         uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
       - name: Create a BuildKit builder
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
-      - name: Validate metadata and Compose exposure
-        run: sh tests/relay/static.sh
-      - name: Validate publication channels
-        run: sh tests/relay/publication-channels.sh
-      - name: Verify official release checksums
-        run: sh tests/relay/verify-upstream.sh
-      - name: Build and execute both Linux architectures
-        run: sh tests/relay/build-platforms.sh
-      - name: Run relay runtime health smoke test
-        run: sh tests/relay/smoke.sh
-      - name: Scan deployment material for secrets
-        run: sh tests/relay/secret-scan.sh
+      - name: Run the complete relay evidence profile
+        run: just ci-relay
+      - name: Explain reproduction on failure
+        if: failure()
+        run: echo "Reproduce on Docker-capable Linux with just ci-relay." >> "$GITHUB_STEP_SUMMARY"
+
+  gate:
+    name: CI gate
+    if: always()
+    needs:
+      - policy
+      - rust
+      - release-readiness-macos
+      - release-readiness-linux
+      - dependencies
+      - relay
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every event-owned evidence result
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref }}
+          POLICY_RESULT: ${{ needs.policy.result }}
+          RUST_RESULT: ${{ needs.rust.result }}
+          MACOS_READINESS_RESULT: ${{ needs.release-readiness-macos.result }}
+          LINUX_READINESS_RESULT: ${{ needs.release-readiness-linux.result }}
+          DEPENDENCY_RESULT: ${{ needs.dependencies.result }}
+          RELAY_RESULT: ${{ needs.relay.result }}
+        run: |
+          set -euo pipefail
+          failed=false
+          for result in "$POLICY_RESULT" "$RUST_RESULT" "$DEPENDENCY_RESULT" "$RELAY_RESULT"; do
+            if [ "$result" != success ]; then failed=true; fi
+          done
+          if [ "$EVENT_NAME" = push ] && [ "$REF_NAME" = refs/heads/main ]; then
+            for result in "$MACOS_READINESS_RESULT" "$LINUX_READINESS_RESULT"; do
+              if [ "$result" != success ]; then failed=true; fi
+            done
+          else
+            for result in "$MACOS_READINESS_RESULT" "$LINUX_READINESS_RESULT"; do
+              if [ "$result" != skipped ]; then failed=true; fi
+            done
+          fi
+          {
+            echo '## CI ownership summary'
+            echo "- policy: $POLICY_RESULT (just ci-policy)"
+            echo "- Rust matrix: $RUST_RESULT (just ci-unix / just ci-windows)"
+            echo "- dependencies: $DEPENDENCY_RESULT (just ci-dependencies)"
+            echo "- relay: $RELAY_RESULT (just ci-relay)"
+            echo "- macOS readiness: $MACOS_READINESS_RESULT"
+            echo "- Linux readiness: $LINUX_READINESS_RESULT"
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ "$failed" = false ] || exit 1

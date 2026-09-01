@@ -140,7 +140,12 @@ before adding another infrastructure profile or validation layer.
 
 - A GitHub Release tag must equal the literal `v` prefix plus the Cargo-resolved
   workspace product version. The same Release tag is used unchanged as the OCI
-  image tag.
+  image tag. Formal versions containing SemVer build metadata are rejected
+  before native publication because `+` is not an OCI tag character.
+- The immutable native Release explicitly calls `relay-image.yml` as a reusable
+  workflow with the frozen commit, exact tag, and prerelease classification.
+  Formal publication must not depend on a `release: published` event produced
+  by `GITHUB_TOKEN`. Manual dispatch remains development-only.
 - Stable releases publish only to `zterm-relay` and also update `latest`.
   GitHub prereleases and manual runs publish only to `zterm-relay-dev` and never
   update `latest`.
@@ -192,6 +197,7 @@ before adding another infrastructure profile or validation layer.
 | Release tag differs from `v${workspace_version}` | Stop publication before image build |
 | Stable release resolves outside `zterm-relay` or does not own `latest` | Stop publication |
 | Prerelease/manual run resolves outside `zterm-relay-dev` or updates `latest` | Stop publication |
+| Native Release succeeds but the explicit GHCR call fails | Keep the immutable native Release, leave the overall run red, and retry only relay publication for the same frozen commit/tag |
 | Official artifact checksum differs | Stop image build |
 | Self-hosted Compose publishes anything except host-loopback TCP 38451 | Reject the deployment model |
 | Post-update health or authenticated Iroh handshake fails | Deployment is not accepted; report the observed failure |
@@ -266,7 +272,9 @@ before adding another infrastructure profile or validation layer.
   to make QAD and peer UDP truly direct; public addresses and endpoint IDs are
   excluded from the durable evidence.
 - Repository secret scan and ordinary Rust/dependency/cross-platform CI remain
-  required.
+  required. The scan covers shipped source and deployment inputs, excludes the
+  non-shipped `.trellis` planning/runtime tree, and keeps fixture evidence for
+  private-key, GitHub-token, and AWS access-key patterns.
 
 ### 7. Wrong vs Correct
 

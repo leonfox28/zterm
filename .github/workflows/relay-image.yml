@@ -1,9 +1,20 @@
 name: publish relay image
 
 on:
-  release:
-    types:
-      - published
+  workflow_call:
+    inputs:
+      commit:
+        description: Frozen native-release commit
+        required: true
+        type: string
+      tag:
+        description: Exact v-prefixed native Release tag
+        required: true
+        type: string
+      prerelease:
+        description: Whether the native Release is a prerelease
+        required: true
+        type: boolean
   workflow_dispatch:
     inputs:
       version:
@@ -16,19 +27,26 @@ permissions:
   packages: write
 
 concurrency:
-  group: relay-image-${{ github.ref }}-${{ inputs.version || github.event.release.tag_name }}
+  group: relay-image-${{ inputs.commit || github.sha }}-${{ inputs.tag || inputs.version }}
   cancel-in-progress: false
 
 jobs:
   publish:
     name: Build and publish multi-platform relay image
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
-      - name: Check out the original Git release tag source
+      - name: Check out the frozen publication source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event_name == 'release' && format('refs/tags/{0}', github.event.release.tag_name) || github.sha }}
+          ref: ${{ inputs.commit || github.sha }}
           persist-credentials: false
+
+      - name: Prove the formal checkout commit
+        if: inputs.commit != ''
+        env:
+          EXPECTED_COMMIT: ${{ inputs.commit }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT"
 
       - name: Install exact Rust toolchain
         run: rustup toolchain install 1.98.0 --profile minimal
@@ -37,11 +55,11 @@ jobs:
         id: publish
         shell: bash
         env:
-          EVENT_NAME: ${{ github.event_name }}
+          EVENT_NAME: ${{ inputs.commit != '' && 'workflow_call' || 'workflow_dispatch' }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
           MANUAL_VERSION: ${{ inputs.version }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_PRERELEASE: ${{ inputs.prerelease }}
         run: sh deploy/relay/resolve-publication.sh
 
       - name: Register cross-architecture emulation
@@ -69,7 +87,7 @@ jobs:
             type=raw,value=latest,enable=${{ steps.publish.outputs.publish_latest }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ inputs.commit || github.sha }}
             org.opencontainers.image.version=${{ steps.publish.outputs.version }}
 
       - name: Build and publish one multi-platform manifest
