@@ -29,7 +29,7 @@ upgrade is an explicit repository change and must rerun every quality gate.
 ## Product version
 
 The root `[workspace.package].version` is the single lockstep product version,
-currently `0.1.7`. All five zterm product crates inherit it with
+currently `0.1.8`. All five zterm product crates inherit it with
 `version.workspace = true`; do not assign a component-specific version to a
 crate. A release changes this one value, refreshes `Cargo.lock`, and advances
 the CLI, daemon, protocol, platform libraries, apps, and Relay wrapper as one
