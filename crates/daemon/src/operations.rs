@@ -2821,13 +2821,30 @@ async fn validate_running_setup(
 async fn wait_until_stopped(paths: &UserPaths) -> Result<(), DaemonError> {
     let started = Instant::now();
     loop {
-        if probe_readiness(paths).await?.is_none() {
+        #[cfg(unix)]
+        let ownership_released = match ensure_daemon_ownership_released(paths) {
+            Ok(()) => true,
+            Err(error) if error.kind() == DomainErrorKind::Cancelled => false,
+            Err(error) => return Err(error),
+        };
+        #[cfg(not(unix))]
+        let ownership_released = true;
+        // Do not open a new readiness connection while the retiring daemon
+        // still owns its lock or socket: listener shutdown may accept and
+        // close that probe without a response. Once ownership is absent, the
+        // normal readiness owner can prove the stopped observation.
+        let readiness_released = if ownership_released {
+            probe_readiness(paths).await?.is_none()
+        } else {
+            false
+        };
+        if readiness_released && ownership_released {
             return Ok(());
         }
         if started.elapsed() >= std::time::Duration::from_secs(5) {
             return Err(DaemonError::new(
                 DomainErrorKind::DaemonStartTimeout,
-                "daemon did not stop within 5 seconds",
+                "daemon readiness, socket, and ownership were not released within 5 seconds",
             ));
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
