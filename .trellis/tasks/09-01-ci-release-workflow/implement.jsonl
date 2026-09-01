@@ -1,0 +1,11 @@
+{"file":".trellis/spec/backend/distribution-lifecycle.md","reason":"Binding exact-main CI, four-target build/floor, signing, installer, draft, attestation and immutable publication contract."}
+{"file":".trellis/spec/backend/relay-deployment.md","reason":"Binding stable/prerelease/manual OCI channel, multi-architecture image and minimal permission contract."}
+{"file":".trellis/spec/backend/local-daemon-ipc.md","reason":"Owns stop/restart, daemon lock/socket lifecycle and detached multi-process regression affected by the observed macOS failure."}
+{"file":".trellis/spec/guides/cross-platform-thinking-guide.md","reason":"Requires source-policy on every OS checkout and distinguishes compile-only from native runtime evidence."}
+{"file":".trellis/spec/guides/evidence-driven-simplicity.md","reason":"Requires one invariant owner, causal flaky-test fixes, bounded validation and no unused release machinery."}
+{"file":".trellis/tasks/09-01-ci-release-workflow/prd.md","reason":"Final user-approved scope, decisions, acceptance criteria and explicit exclusions for the CI/release optimization."}
+{"file":".trellis/tasks/09-01-ci-release-workflow/design.md","reason":"Target command surface, job graph, release state machine, shared scripts, relay call and rollback design."}
+{"file":".trellis/tasks/09-01-ci-release-workflow/research/current-state.md","reason":"Actual workflow graph, run counts/timing, failed logs and relay orchestration gap evidence."}
+{"file":".trellis/tasks/09-01-ci-release-workflow/research/redundancy-analysis.md","reason":"Per-check repetition, unique platform evidence and safe first-pass removal analysis."}
+{"file":".trellis/tasks/09-01-ci-release-workflow/research/open-source-comparison.md","reason":"Pinned Herdr comparison and approved synthesis of borrowed versus intentionally stronger zterm behavior."}
+{"file":".trellis/tasks/08-24-distribution-release/research/release-workflow-comparison.md","reason":"Parent research for ripgrep, uv, just and release security/atomicity patterns that constrain this child task."}

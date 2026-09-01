@@ -1,0 +1,10 @@
+{"file":".trellis/spec/backend/distribution-lifecycle.md","reason":"Audit that deduplication does not weaken exact-SHA, target floors, protected signing, installer, inventory or immutable release ordering."}
+{"file":".trellis/spec/backend/relay-deployment.md","reason":"Verify explicit reusable publication preserves stable/prerelease/manual repository and tag rules."}
+{"file":".trellis/spec/backend/local-daemon-ipc.md","reason":"Verify the restart race is fixed at daemon ownership release rather than hidden with sleep, retry or test removal."}
+{"file":".trellis/spec/guides/cross-platform-thinking-guide.md","reason":"Verify every OS checkout retains source-policy and native/compile evidence is described precisely."}
+{"file":".trellis/spec/guides/evidence-driven-simplicity.md","reason":"Review each remaining/repeated gate for a unique owner and enforce bounded checks and stop conditions."}
+{"file":".trellis/tasks/09-01-ci-release-workflow/prd.md","reason":"Map the final diff and validation evidence to all AC1–AC15 requirements and out-of-scope boundaries."}
+{"file":".trellis/tasks/09-01-ci-release-workflow/design.md","reason":"Check command/job/release/relay data flow, permissions, failure states and rollback against the approved architecture."}
+{"file":".trellis/tasks/09-01-ci-release-workflow/research/current-state.md","reason":"Compare target job ownership, failure diagnostics and timings against the recorded baseline rather than generic assumptions."}
+{"file":".trellis/tasks/09-01-ci-release-workflow/research/redundancy-analysis.md","reason":"Ensure only pure duplication was removed and all distinct trust/platform evidence retains an owner."}
+{"file":".trellis/tasks/09-01-ci-release-workflow/research/open-source-comparison.md","reason":"Reject accidental copying of Herdr's direct-main or weaker release publication boundaries while preserving its command/cache benefits."}

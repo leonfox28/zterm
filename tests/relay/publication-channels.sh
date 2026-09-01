@@ -61,22 +61,27 @@ write_workspace_fixture() {
         --manifest-path "$fixture_dir/Cargo.toml"
 }
 
+workspace_package=$(cargo +1.98.0 pkgid --locked --manifest-path "$repo_root/Cargo.toml" \
+    --package zterm-core)
+workspace_version=${workspace_package##*@}
+stable_tag="v$workspace_version"
+
 stable_output="$test_dir/stable"
-EVENT_NAME=release \
+EVENT_NAME=workflow_call \
 GITHUB_REPOSITORY_OWNER=LeonFox28 \
-RELEASE_TAG=v0.1.9 \
+RELEASE_TAG="$stable_tag" \
 RELEASE_PRERELEASE=false \
 GITHUB_OUTPUT="$stable_output" \
     sh "$resolver"
 assert_output "$stable_output" 'image=ghcr.io/leonfox28/zterm-relay'
-assert_output "$stable_output" 'version=v0.1.9'
+assert_output "$stable_output" "version=$stable_tag"
 assert_output "$stable_output" 'publish_latest=true'
 assert_output_count "$stable_output" 3
 
 prerelease_dir="$test_dir/prerelease-workspace"
 write_workspace_fixture "$prerelease_dir" '0.2.0-rc.1'
 prerelease_output="$test_dir/prerelease"
-EVENT_NAME=release \
+EVENT_NAME=workflow_call \
 GITHUB_REPOSITORY_OWNER=leonfox28 \
 RELEASE_TAG=v0.2.0-rc.1 \
 RELEASE_PRERELEASE=true \
@@ -99,10 +104,11 @@ assert_output "$manual_output" 'version=phase-zero'
 assert_output "$manual_output" 'publish_latest=false'
 assert_output_count "$manual_output" 3
 
+mismatching_tag="$stable_tag.mismatch"
 assert_rejected version-mismatch \
-    'release tag v0.1.10 does not match workspace tag v0.1.9' \
-    EVENT_NAME=release GITHUB_REPOSITORY_OWNER=leonfox28 \
-    RELEASE_TAG=v0.1.10 RELEASE_PRERELEASE=false
+    "release tag $mismatching_tag does not match workspace tag $stable_tag" \
+    EVENT_NAME=workflow_call GITHUB_REPOSITORY_OWNER=leonfox28 \
+    RELEASE_TAG="$mismatching_tag" RELEASE_PRERELEASE=false
 
 assert_rejected invalid-manual-tag \
     'version is not a valid OCI image tag' \

@@ -14,9 +14,11 @@ use zterm_daemon::bootstrap::{bootstrap, validate_committed_setup};
 #[cfg(unix)]
 use zterm_daemon::config::{ValidatedInfrastructure, validate_setup_input};
 #[cfg(unix)]
-use zterm_daemon::lifecycle::ensure_daemon_with;
+use zterm_daemon::lifecycle::DaemonLauncher;
 #[cfg(unix)]
 use zterm_daemon::local_ipc::LocalClient;
+#[cfg(unix)]
+use zterm_daemon::operations::LocalRuntime;
 
 #[cfg(unix)]
 use state_fixture::TestState;
@@ -47,20 +49,22 @@ async fn detached_lifecycle() {
     let identity_bytes = std::fs::read(state.paths.identity()).expect("identity snapshot");
     let executable = std::env::current_exe().expect("harness executable");
     let argument = daemon_harness::child_argument(&state.paths);
+    let local_runtime = LocalRuntime::for_test(
+        state.paths.clone(),
+        DaemonLauncher::for_test(executable.clone(), argument.clone()),
+    );
 
-    ensure_daemon_with(&state.paths, &executable, &argument)
+    local_runtime
+        .ensure_configured_daemon()
         .await
         .expect("detached readiness");
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let client = LocalClient::new(state.paths.socket());
     assert_eq!(
         client.status().await.expect("survives launcher").device_id,
         setup.device_id
     );
-    client.stop(false).await.expect("explicit stop");
-    wait_for_socket_state(&state.paths, false).await;
-
-    ensure_daemon_with(&state.paths, &executable, &argument)
+    local_runtime
+        .restart(false)
         .await
         .expect("restart readiness");
     assert_eq!(
@@ -100,7 +104,8 @@ async fn detached_lifecycle() {
         DomainErrorKind::DaemonStopped
     );
 
-    ensure_daemon_with(&state.paths, &executable, &argument)
+    local_runtime
+        .ensure_configured_daemon()
         .await
         .expect("on-demand crash recovery");
     let recovered = LocalClient::new(state.paths.socket())

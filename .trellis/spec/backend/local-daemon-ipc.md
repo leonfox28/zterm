@@ -280,7 +280,10 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
 - `setup` and `daemon restart` may spawn. Status, doctor, logs, daemon status,
   and daemon stop never spawn a daemon. A successful stop responds after
   session shutdown and removes only its own socket during the normal daemon
-  lifecycle handoff.
+  lifecycle handoff. Restart then waits within the existing bounded deadline
+  for readiness to disappear, the socket to be absent, and `daemon.lock` to be
+  missing or unlocked before launching the replacement; socket disappearance
+  alone is not daemon ownership release.
 - Daemon stop/restart with active Sessions requires explicit `--force`; the
   public surface has no implicit interactive bypass. Close, revoke, and
   identity reset instead use exact preflight plus interactive `yes` or
@@ -395,7 +398,9 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   inventory, retryable partial deletion, and no implicit setup.
 - `single_instance` and `detached_lifecycle` are harness-free multi-process
   executables using only task-private `UserPaths`; production argv has no state
-  override.
+  override. `detached_lifecycle` constructs `LocalRuntime::for_test` with its
+  explicit launcher and exercises the public `restart` owner so a retiring
+  process cannot race the replacement through a still-held `daemon.lock`.
 - `local_session_ipc` proves session mutations, detach/reconnect, and daemon-stop
   events; it also drops a create response and retries the same operation ID on
   a new socket, blocks a real session-A PTY writer while status/session B

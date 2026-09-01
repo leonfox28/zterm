@@ -22,6 +22,8 @@ verified on 2026-08-21 with:
 | pkg-config / pkgconf | 3.0.5 |
 | jq | 1.7.1 |
 | cargo-deny | 0.20.2 |
+| just | 1.42.4 in CI; compatible local release |
+| actionlint | 1.7.12 |
 
 Rust 1.95.0 is user-owned and must not be removed. A future Rust or cargo-deny
 upgrade is an explicit repository change and must rerun every quality gate.
@@ -29,11 +31,10 @@ upgrade is an explicit repository change and must rerun every quality gate.
 ## Product version
 
 The root `[workspace.package].version` is the single lockstep product version,
-currently `0.1.9`. All five zterm product crates inherit it with
-`version.workspace = true`; do not assign a component-specific version to a
-crate. A release changes this one value, refreshes `Cargo.lock`, and advances
-the CLI, daemon, protocol, platform libraries, apps, and Relay wrapper as one
-product.
+and all five zterm product crates inherit it with `version.workspace = true`;
+do not assign a component-specific version to a crate. A release preparation
+changes this one value, refreshes `Cargo.lock`, and advances the CLI, daemon,
+protocol, platform libraries, apps, and Relay wrapper as one product.
 
 `tests/relay/handshake-probe` is deliberately outside the root workspace. It is
 an internal acceptance tool rather than a shipped zterm component, so its
@@ -48,6 +49,7 @@ startup services are not required.
 ```bash
 brew install docker docker-compose docker-buildx colima pkg-config jq
 cargo install cargo-deny --version 0.20.2 --locked
+brew install just shellcheck actionlint gh
 ```
 
 Homebrew's Compose plugin directory must be visible to the Docker CLI. Preserve
@@ -116,20 +118,73 @@ into core, give the CLI an Endpoint or identity key, or move OS/Session
 ownership into adapters. Hosted Linux remote-runtime evidence remains a
 separate acceptance gate; see [Remote sessions and the public CLI](remote-cli.md).
 
-## Quality gate
+## Local command owner
 
 ```bash
-sh tests/source-policy.sh
-sh tests/workspace-version.sh
-sh tests/release/static.sh
-cargo +1.98.0 fmt --all -- --check
-cargo +1.98.0 clippy --workspace --all-targets --all-features -- -D warnings
-cargo +1.98.0 test --workspace --all-features
-cargo +1.98.0 doc --workspace --no-deps
-cargo deny check
-sh tests/core-local-daemon/cross-uid.sh
-sh tests/secret-scan.sh
+just doctor
+just check-fast
+just check
 ```
+
+`just check` is the authoritative pre-push gate on the current host. It
+includes portable policy, native Clippy/tests/docs, dependency policy and the
+locally reproducible relay contracts. `just check-fast` is the shorter edit
+loop. Neither command claims evidence from a different OS/CPU, the pinned
+glibc builder, Docker/QEMU execution, a protected signing secret, final signed
+installers, GitHub attestation, or immutable publication; GitHub Actions owns
+those boundaries and the recipes print that distinction.
+
+CI uses the same repository profiles:
+
+| Hosted owner | Reproduction entry |
+| --- | --- |
+| Policy and portable checks | `just ci-policy` |
+| Four Unix hosts | `just ci-unix <docs> <smoke>` on the matching host |
+| Windows shared boundary | `just ci-windows` on Windows |
+| Dependency policy | `just ci-dependencies` |
+| Docker/QEMU relay bundle | `just ci-relay` on Docker-capable Linux |
+| Four main release-readiness targets | `tools/release/build-native.sh readiness` on the exact native/pinned builder |
+
+Workspace version and format each run once, docs run on Linux x64, and the
+no-argument CLI smoke runs once per shipped OS family. Source checkout policy
+still runs before compilation in every OS matrix entry, and the first pass
+keeps all existing Unix runtime and Windows shared-boundary tests.
+
+## Branch and pull-request flow
+
+Normal substantive work and release preparation use a branch and pull request:
+
+```bash
+git switch -c <topic>
+just check
+git push --set-upstream origin <topic>
+gh pr create
+```
+
+CI runs for the pull request, not a duplicate branch-push workflow. Updating
+the branch cancels the older PR-head run. Merge only after the stable `CI gate`
+is green; the resulting `main` push runs the full integration graph plus all
+four exact-SHA release-readiness builds.
+
+After this workflow change is merged, a repository administrator must apply
+the following one-time `main` protection checklist. The repository code does
+not mutate these settings:
+
+1. require changes through a pull request, with zero mandatory outside
+   approvals for the solo-maintainer repository;
+2. require the exact status check `CI gate` before merge;
+3. apply the rules to administrators/no bypass so direct pushes are not the
+   normal path;
+4. disable force pushes and branch deletion.
+
+Apply protection only after `CI gate` exists on the default branch. After
+20–30 PR/main runs, review critical path, cache hit rate, flaky failures and
+unique platform catches before considering nextest, path classification, or
+compile-only secondary targets.
+
+For a failed job, use the matching recipe printed in its step summary. Runner
+queue delay is separate from job execution time; job timeouts prevent hangs
+but do not eliminate GitHub-hosted queueing.
 
 `cargo run --quiet --package zterm-cli -- --help` and `--version` are
 side-effect free. Never use real `~/.zterm` for mutation tests; inject

@@ -67,6 +67,16 @@ stdin:  64 lowercase hexadecimal seed bytes, with at most one trailing LF
 stdout: 64 lowercase hexadecimal Ed25519 public-key bytes plus LF
 ```
 
+Release preparation validates the proposed Cargo version through the same
+non-product Rust/SemVer owner:
+
+```text
+zterm-release-tool validate-next-version <SEMVER>
+```
+
+The text must be canonical SemVer and strictly newer than the compiled
+workspace version.
+
 ### 3. Contracts
 
 - `zterm-release.json` authenticates schema/product/version/tag/classification,
@@ -121,7 +131,11 @@ stdout: 64 lowercase hexadecimal Ed25519 public-key bytes plus LF
   last. It never sends `RevokeSelf` or performs setup.
 - A successful `ci.yml` push run on `main` owns release-mode compilation on all
   four native distribution platforms while retaining Windows shared-boundary
-  validation. A human may push the exact `v` + Cargo-version tag only afterward.
+  validation. The stable aggregate owner is named `CI gate`; normal substantive
+  work and the release-version commit reach protected `main` through a PR. A
+  human may push the exact annotated `v` + Cargo-version tag only afterward.
+  Formal versions must not contain SemVer build metadata because the same text
+  is also an OCI tag and `+` is not legal there.
 - Containerized native jobs must add only the exact quoted `$GITHUB_WORKSPACE`
   as Git `safe.directory` after checkout and before Git-backed source-policy
   checks. A wildcard or broader trusted path is forbidden. Tool paths must be
@@ -130,6 +144,12 @@ stdout: 64 lowercase hexadecimal Ed25519 public-key bytes plus LF
 - `.github/workflows/release.yml` is tag-triggered, GitHub-hosted, and
   action/image digest-pinned. It rejects a tag without a successful `ci.yml`
   `push` run on `main` for that exact commit before signing or Release state.
+  Each of the four native jobs builds, self-checks and uploads only its shipped
+  raw `zterm` binary plus identity. The Ubuntu assembly job builds
+  `zterm-release-tool` once for deterministic archive/manifest/SBOM assembly;
+  target jobs never compile or upload that private tool. Separate pre-secret
+  signing and pre-publication verification boundaries still rebuild the
+  reviewed tool from the frozen source.
   The Ubuntu assembly owner must require ShellCheck exactly once over the
   generated formal installer before protected signing. The four-platform
   installer matrix must not assume ShellCheck is installed; every entry still
@@ -208,13 +228,15 @@ stdout: 64 lowercase hexadecimal Ed25519 public-key bytes plus LF
   failure, and incompatible daemon rejection at their authoritative owners.
   The signed hosted candidate owns positive pre-setup/configured uninstall and
   reinstall identity-rotation evidence.
-- `sh tests/release/static.sh` asserts exact-tag triggering, exact green-main-CI
-  gating, four main-push release-mode builds, pinned release dependencies, one
+- `sh tests/release/static.sh` asserts exact-tag triggering, an annotated tag
+  without build metadata, exact green-main-CI gating, stable PR `CI gate`, four
+  main-push release-mode builds, pinned release dependencies/caches/timeouts, one
   Environment/secret reference, runtime-HOME Cargo path, exact non-wildcard
   container `safe.directory`, one fail-closed Ubuntu generated-installer
   ShellCheck owner before signing, no ShellCheck assumption in the installer
-  matrix, direct numeric-loopback fixture binding with no FQDN path, verified
-  draft publication, and installer no-side-effect tokens.
+  matrix, centralized raw-candidate archiving, absence of ordinary CI commands
+  after the tag, direct numeric-loopback fixture binding with no FQDN path,
+  verified draft publication, and installer no-side-effect tokens.
   Exact-main CI ShellChecks maintained shell sources. Hosted four-target jobs
   own POSIX syntax, a local HTTPS happy path through an existing default
   `0775` directory created under `umask 0002` without `chmod`,

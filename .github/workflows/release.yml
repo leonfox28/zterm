@@ -21,9 +21,11 @@ jobs:
   validate:
     name: Validate exact immutable release source
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     outputs:
       commit: ${{ steps.source.outputs.commit }}
       ci_run_id: ${{ steps.source.outputs.ci_run_id }}
+      ci_run_url: ${{ steps.source.outputs.ci_run_url }}
       source_epoch: ${{ steps.source.outputs.source_epoch }}
       released_at: ${{ steps.source.outputs.released_at }}
       prerelease: ${{ steps.source.outputs.prerelease }}
@@ -49,24 +51,36 @@ jobs:
           test "$GITHUB_REF" = "refs/tags/$RELEASE_TAG"
           version=$(cargo +1.98.0 metadata --locked --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name == "zterm-cli") | .version')
+          case "$version" in
+            *+*) echo "formal release versions must not contain SemVer build metadata" >&2; exit 1 ;;
+          esac
           test "$RELEASE_TAG" = "v$version"
           test "$(git tag --points-at HEAD --list "$RELEASE_TAG")" = "$RELEASE_TAG"
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            echo "the tag already has a Release; assets are never replaced" >&2
-            exit 1
-          fi
-          commit=$(git rev-parse HEAD)
-          ci_run_id=$(gh api --method GET \
+          test "$(git cat-file -t "refs/tags/$RELEASE_TAG")" = tag
+          set +e
+          release_lookup=$(gh api --include \
             -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2026-03-10' \
-            "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
-            -f branch=main -f event=push -f status=success \
-            -f head_sha="$commit" -f per_page=1 \
-            --jq '.workflow_runs[] | select(.event == "push" and .head_branch == "main" and .status == "completed" and .conclusion == "success") | .id')
-          if [ -z "$ci_run_id" ]; then
-            echo "the tagged commit has no successful ci push run on main" >&2
-            exit 1
-          fi
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" 2>&1)
+          release_status=$?
+          set -e
+          case "$release_status" in
+            0)
+              echo "the tag already has a Release; assets are never replaced" >&2
+              exit 1
+              ;;
+            *)
+              printf '%s\n' "$release_lookup" | grep -Eq 'HTTP[/][^ ]+ 404|HTTP 404' \
+                || { echo "could not prove Release vacancy" >&2; exit 1; }
+              ;;
+          esac
+          commit=$(git rev-parse HEAD)
+          green_ci=$(sh tools/release/find-green-main-ci.sh "$commit")
+          ci_run_id=${green_ci%% *}
+          ci_run_url=${green_ci#* }
+          test "$ci_run_id" != "$green_ci"
+          test -n "$ci_run_id" && test -n "$ci_run_url"
+          case "$ci_run_url" in *' '*) exit 1 ;; esac
           source_epoch=$(git show -s --format=%ct HEAD)
           released_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
           case "$version" in
@@ -76,6 +90,7 @@ jobs:
           {
             echo "commit=$commit"
             echo "ci_run_id=$ci_run_id"
+            echo "ci_run_url=$ci_run_url"
             echo "source_epoch=$source_epoch"
             echo "released_at=$released_at"
             echo "prerelease=$prerelease"
@@ -85,18 +100,16 @@ jobs:
     name: Build ${{ matrix.target }}
     needs: validate
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
         include:
           - runner: macos-latest
             target: aarch64-apple-darwin
-            architecture: arm64
           - runner: macos-15-intel
             target: x86_64-apple-darwin
-            architecture: x86_64
     env:
-      MACOSX_DEPLOYMENT_TARGET: "13.0"
       SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.source_epoch }}
       ZTERM_SOURCE_COMMIT: ${{ needs.validate.outputs.commit }}
     steps:
@@ -109,24 +122,18 @@ jobs:
       - name: Install exact Rust toolchain
         run: rustup toolchain install 1.98.0 --profile minimal
 
+      - name: Restore dependency downloads only
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: release-downloads-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+
       - name: Build and inspect the native candidate
-        shell: bash
         env:
           RELEASE_TARGET: ${{ matrix.target }}
-          RELEASE_ARCHITECTURE: ${{ matrix.architecture }}
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$ZTERM_SOURCE_COMMIT"
-          test "$(rustc +1.98.0 -vV | sed -n 's/^host: //p')" = "$RELEASE_TARGET"
-          cargo +1.98.0 build --locked --release \
-            --package zterm-cli --package zterm-release-tool
-          file target/release/zterm | grep -F "$RELEASE_ARCHITECTURE"
-          test "$(otool -l target/release/zterm | awk '$1 == "minos" {print $2}' | sort -u)" = "13.0"
-          mkdir release-input
-          target/release/zterm --internal-release-self-check \
-            > "release-input/zterm-$RELEASE_TARGET.identity.json"
-          target/release/zterm-release-tool archive target/release/zterm \
-            "release-input/zterm-$RELEASE_TARGET.tar.gz"
+        run: sh tools/release/build-native.sh formal release-input
 
       - name: Upload the native candidate and identity
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -140,6 +147,7 @@ jobs:
     name: Build ${{ matrix.target }} at glibc 2.28
     needs: validate
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     container:
       image: debian:10-slim@sha256:bb3dc79fddbca7e8903248ab916bb775c96ec61014b3d02b4f06043b604726dc
     strategy:
@@ -154,7 +162,7 @@ jobs:
       SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.source_epoch }}
       ZTERM_SOURCE_COMMIT: ${{ needs.validate.outputs.commit }}
     steps:
-      - name: Select the frozen Debian 10 package snapshot
+      - name: Bootstrap Git for the pinned container checkout
         shell: bash
         run: |
           set -euo pipefail
@@ -164,7 +172,7 @@ jobs:
             /etc/apt/sources.list
           apt-get -o Acquire::Check-Valid-Until=false update
           DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
-            binutils build-essential ca-certificates curl git pkg-config
+            ca-certificates git
 
       - name: Check out the exact existing tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -172,37 +180,26 @@ jobs:
           ref: ${{ needs.validate.outputs.commit }}
           persist-credentials: false
 
-      - name: Trust only the checked-out workspace
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: Install exact Rust toolchain
-        shell: bash
+      - name: Check source checkout policy
         run: |
-          set -euo pipefail
-          curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
-            https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.98.0
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          sh tests/source-policy.sh
+
+      - name: Prepare the pinned glibc builder
+        run: sh tools/release/setup-glibc-builder.sh
+
+      - name: Restore dependency downloads only
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: release-downloads-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Build and inspect the native candidate
-        shell: bash
         env:
           RELEASE_TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$ZTERM_SOURCE_COMMIT"
-          test "$(rustc -vV | sed -n 's/^host: //p')" = "$RELEASE_TARGET"
-          test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.28"
-          cargo build --locked --release \
-            --package zterm-cli --package zterm-release-tool
-          maximum_glibc=$(readelf --version-info target/release/zterm \
-            | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)
-          test -n "$maximum_glibc"
-          test "$(printf '%s\n%s\n' "$maximum_glibc" GLIBC_2.28 | sort -V | tail -1)" = GLIBC_2.28
-          mkdir release-input
-          target/release/zterm --internal-release-self-check \
-            > "release-input/zterm-$RELEASE_TARGET.identity.json"
-          target/release/zterm-release-tool archive target/release/zterm \
-            "release-input/zterm-$RELEASE_TARGET.tar.gz"
+        run: sh tools/release/build-native.sh formal release-input
 
       - name: Upload the native candidate and identity
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -219,6 +216,7 @@ jobs:
       - macos-artifacts
       - linux-artifacts
     runs-on: ubuntu-24.04
+    timeout-minutes: 25
     steps:
       - name: Check out the exact existing tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -229,6 +227,14 @@ jobs:
       - name: Install exact Rust toolchain
         run: rustup toolchain install 1.98.0 --profile minimal
 
+      - name: Restore dependency downloads only
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: release-assembly-downloads-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+
       - name: Download all four native candidates
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -236,16 +242,33 @@ jobs:
           path: release-input
           merge-multiple: true
 
+      - name: Build the single archive and manifest owner
+        run: cargo +1.98.0 build --locked --release --package zterm-release-tool
+
+      - name: Archive the four raw native candidates once
+        env:
+          SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.source_epoch }}
+        run: |
+          set -eu
+          for target in \
+            aarch64-apple-darwin \
+            x86_64-apple-darwin \
+            aarch64-unknown-linux-gnu \
+            x86_64-unknown-linux-gnu; do
+            chmod 700 "release-input/zterm-$target"
+            target/release/zterm-release-tool archive \
+              "release-input/zterm-$target" \
+              "release-input/zterm-$target.tar.gz"
+          done
+
       - name: Assemble and verify the exact unsigned inventory
         env:
           SOURCE_COMMIT: ${{ needs.validate.outputs.commit }}
           RELEASED_AT: ${{ needs.validate.outputs.released_at }}
         run: |
-          cargo +1.98.0 run --locked --release --package zterm-release-tool -- \
+          target/release/zterm-release-tool \
             prepare release-input release-output "$RELEASE_TAG" "$SOURCE_COMMIT" "$RELEASED_AT"
-          cargo +1.98.0 run --locked --release --package zterm-release-tool -- \
-            verify-unsigned release-output
-          sh tests/release/static.sh
+          target/release/zterm-release-tool verify-unsigned release-output
 
       - name: Check the generated installer with ShellCheck
         run: |
@@ -266,6 +289,7 @@ jobs:
       - validate
       - assemble
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     environment: release
     steps:
       - name: Check out the exact existing tag
@@ -320,6 +344,7 @@ jobs:
       - validate
       - sign
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -351,11 +376,10 @@ jobs:
           name: installer-fixture-${{ github.ref_name }}
           path: fixture
 
-      - name: Check installer POSIX syntax and fixture prerequisites
+      - name: Check installer POSIX syntax
         run: |
           sh -n install/install.sh tests/release/installer-fixture.sh \
             fixture/zterm-install-test.sh
-          python3 -m py_compile tests/release/https_fixture.py
 
       - name: Exercise authenticated install and smallest preflight negatives
         run: >-
@@ -368,6 +392,9 @@ jobs:
       - validate
       - installer
     runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    outputs:
+      release_url: ${{ steps.publication.outputs.release_url }}
     permissions:
       contents: write
       id-token: write
@@ -381,6 +408,14 @@ jobs:
 
       - name: Install exact Rust toolchain
         run: rustup toolchain install 1.98.0 --profile minimal
+
+      - name: Restore dependency downloads only
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: release-publish-downloads-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Download and verify the signed inventory
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -401,13 +436,26 @@ jobs:
           PRERELEASE: ${{ needs.validate.outputs.prerelease }}
         run: |
           set -euo pipefail
-          git fetch --force --no-tags origin \
+          git fetch --no-tags origin \
             "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
           test "$(git rev-list -n 1 "$RELEASE_TAG")" = "$SOURCE_COMMIT"
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            echo "the tag already has a Release; assets are never replaced" >&2
-            exit 1
-          fi
+          set +e
+          release_lookup=$(gh api --include \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" 2>&1)
+          release_status=$?
+          set -e
+          case "$release_status" in
+            0)
+              echo "the tag already has a Release; assets are never replaced" >&2
+              exit 1
+              ;;
+            *)
+              printf '%s\n' "$release_lookup" | grep -Eq 'HTTP[/][^ ]+ 404|HTTP 404' \
+                || { echo "could not prove Release vacancy" >&2; exit 1; }
+              ;;
+          esac
           flags=(--draft --verify-tag --target "$SOURCE_COMMIT" \
             --title "zterm $RELEASE_TAG" --generate-notes)
           if [ "$PRERELEASE" = true ]; then
@@ -441,16 +489,70 @@ jobs:
           subject-path: roundtrip/*
 
       - name: Publish and verify the immutable formal Release
+        id: publication
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           gh release edit "$RELEASE_TAG" --draft=false
-          gh api \
+          release_json=$(gh api \
             -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2026-03-10' \
-            "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG")
+          printf '%s\n' "$release_json" \
             | jq -e --arg tag "$RELEASE_TAG" \
               '.tag_name == $tag and .draft == false and .immutable == true' \
               >/dev/null
+          release_url=$(printf '%s\n' "$release_json" | jq -r .html_url)
+          test -n "$release_url"
+          echo "release_url=$release_url" >> "$GITHUB_OUTPUT"
+
+  relay:
+    name: Publish companion relay image
+    needs:
+      - validate
+      - publish
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/relay-image.yml
+    with:
+      commit: ${{ needs.validate.outputs.commit }}
+      tag: ${{ github.ref_name }}
+      prerelease: ${{ needs.validate.outputs.prerelease == 'true' }}
+
+  complete:
+    name: Release completion summary
+    if: always()
+    needs:
+      - validate
+      - publish
+      - relay
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Report native and relay outcomes
+        env:
+          CI_RUN_URL: ${{ needs.validate.outputs.ci_run_url }}
+          NATIVE_RESULT: ${{ needs.publish.result }}
+          NATIVE_URL: ${{ needs.publish.outputs.release_url }}
+          PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+          RELAY_RESULT: ${{ needs.relay.result }}
+        run: |
+          relay_owner=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          {
+            echo '## Formal release summary'
+            echo "- exact green main CI: $CI_RUN_URL"
+            echo "- immutable native Release: $NATIVE_RESULT $NATIVE_URL"
+            echo "- explicit relay image publication: $RELAY_RESULT"
+            if [ "$PRERELEASE" = true ]; then
+              echo "- relay target: ghcr.io/$relay_owner/zterm-relay-dev:$RELEASE_TAG"
+            elif [ "$PRERELEASE" = false ]; then
+              echo "- relay targets: ghcr.io/$relay_owner/zterm-relay:$RELEASE_TAG and :latest"
+            fi
+            if [ "$NATIVE_RESULT" = success ] && [ "$RELAY_RESULT" != success ]; then
+              echo '- recovery: keep the immutable native Release and rerun only the failed relay job for this frozen tag; never replace native assets.'
+              echo "- recovery command: gh run rerun $GITHUB_RUN_ID --failed --repo $GITHUB_REPOSITORY"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

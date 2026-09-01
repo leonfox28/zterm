@@ -8,6 +8,7 @@ dockerignore="$repo_root/deploy/relay/.dockerignore"
 compose_file="$repo_root/deploy/relay/compose.yaml"
 relay_config="$repo_root/deploy/relay/relay.toml"
 publish_workflow="$repo_root/.github/workflows/relay-image.yml"
+native_release_workflow="$repo_root/.github/workflows/release.yml"
 publication_resolver="$repo_root/deploy/relay/resolve-publication.sh"
 relay_doc="$repo_root/docs/relay.md"
 handshake_manifest="$repo_root/tests/relay/handshake-probe/Cargo.toml"
@@ -96,12 +97,24 @@ if printf '%s\n' "$workflow_actions" \
     | grep -Ev '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}([[:space:]]+#.*)?$'; then
     fail "publication workflow action is not pinned by full commit SHA"
 fi
-grep -Fq 'release:' "$publish_workflow" \
-    || fail "stable and prerelease publication trigger is missing"
+grep -Fq '  workflow_call:' "$publish_workflow" \
+    || fail "formal relay publication must be a reusable workflow"
+if grep -Eq '^[[:space:]]{2}release:' "$publish_workflow"; then
+    fail "formal relay publication must not rely on the implicit release event"
+fi
 grep -Fq 'workflow_dispatch:' "$publish_workflow" \
     || fail "manual development publication trigger is missing"
-grep -Fq "ref: \${{ github.event_name == 'release' && format('refs/tags/{0}', github.event.release.tag_name) || github.sha }}" \
-    "$publish_workflow" || fail "publication does not check out the selected release tag"
+grep -Fq 'ref: ${{ inputs.commit || github.sha }}' \
+    "$publish_workflow" || fail "formal publication does not check out the frozen commit"
+grep -Fq "if: inputs.commit != ''" "$publish_workflow" \
+    || fail "formal publication does not distinguish the required frozen input"
+grep -Fq "EVENT_NAME: \${{ inputs.commit != '' && 'workflow_call' || 'workflow_dispatch' }}" \
+    "$publish_workflow" || fail "publication resolver mode is not derived from trusted inputs"
+if grep -Fq "github.event_name == 'workflow_call'" "$publish_workflow"; then
+    fail "called workflow must not expect the caller event name to become workflow_call"
+fi
+grep -Fq 'test "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT"' "$publish_workflow" \
+    || fail "formal publication does not prove the frozen checkout"
 grep -Fq 'persist-credentials: false' "$publish_workflow" \
     || fail "publication checkout retains unnecessary Git credentials"
 grep -Fq 'run: sh deploy/relay/resolve-publication.sh' "$publish_workflow" \
@@ -110,9 +123,9 @@ grep -Fq 'GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}' "$publish_wor
     || fail "GHCR owner is not derived from the repository"
 grep -Fq 'MANUAL_VERSION: ${{ inputs.version }}' "$publish_workflow" \
     || fail "manual tag is not passed to the publication resolver"
-grep -Fq 'RELEASE_TAG: ${{ github.event.release.tag_name }}' "$publish_workflow" \
+grep -Fq 'RELEASE_TAG: ${{ inputs.tag }}' "$publish_workflow" \
     || fail "release tag is not passed to the publication resolver"
-grep -Fq 'RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}' "$publish_workflow" \
+grep -Fq 'RELEASE_PRERELEASE: ${{ inputs.prerelease }}' "$publish_workflow" \
     || fail "release channel flag is not passed to the publication resolver"
 grep -Fq 'registry: ghcr.io' "$publish_workflow" \
     || fail "publication does not authenticate to GHCR"
@@ -136,6 +149,24 @@ if grep -Eq 'sbom:|provenance:[[:space:]]+mode=|validate-image-reference|steps[.
 fi
 [ "$(grep -Fc 'uses: docker/build-push-action@' "$publish_workflow")" -eq 1 ] \
     || fail "publication must build exactly one multi-platform image"
+
+grep -Fq 'uses: ./.github/workflows/relay-image.yml' "$native_release_workflow" \
+    || fail "native release does not explicitly call relay publication"
+grep -Fq 'commit: ${{ needs.validate.outputs.commit }}' "$native_release_workflow" \
+    || fail "native release does not pass the frozen commit to relay publication"
+grep -Fq 'tag: ${{ github.ref_name }}' "$native_release_workflow" \
+    || fail "native release does not pass the exact tag to relay publication"
+relay_call=$(sed -n '/^  relay:/,/^  complete:/p' "$native_release_workflow")
+printf '%s\n' "$relay_call" | grep -Fq 'contents: read' \
+    || fail "relay caller lacks minimal contents permission"
+printf '%s\n' "$relay_call" | grep -Fq 'packages: write' \
+    || fail "relay caller lacks package publication permission"
+grep -Fq 'ghcr.io/$relay_owner/zterm-relay-dev:$RELEASE_TAG' "$native_release_workflow" \
+    || fail "release summary does not identify the prerelease relay target"
+grep -Fq 'ghcr.io/$relay_owner/zterm-relay:$RELEASE_TAG and :latest' \
+    "$native_release_workflow" || fail "release summary does not identify stable relay targets"
+grep -Fq 'gh run rerun $GITHUB_RUN_ID --failed --repo $GITHUB_REPOSITORY' \
+    "$native_release_workflow" || fail "release summary lacks a precise relay retry command"
 
 if grep -Eq 'release_tag#v|is_canonical_semver|sha256' "$publication_resolver"; then
     fail "obsolete tag conversion, SemVer parser, or digest logic remains"

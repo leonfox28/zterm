@@ -437,9 +437,11 @@ outbound-known and inbound-authorization directions explicit.
 - Linux workspace CI must execute the harness-false `cross_uid` target with
   `CI=true`. The optional self-hosted Relay's direct post-update probe belongs
   to its deployment runbook and is not an M5-M6 transport-auth gate.
-- Every change runs workspace fmt, check, Clippy with `-D warnings`, tests,
-  docs, dependency/source/version/secret policy, task validation, and
-  `git diff --check`.
+- Every change runs `just check` as the authoritative local pre-push/delivery
+  gate. That recipe owns workspace format, Clippy with `-D warnings`, tests,
+  docs, and dependency/source/version/secret policy; do not expand it back into
+  a competing command list here. Task validation and `git diff --check` remain
+  explicit Trellis/final-diff checks.
 
 ## 7. Wrong vs Correct
 

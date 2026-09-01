@@ -5,7 +5,8 @@ mod assets;
 use std::env;
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail, ensure};
+use semver::Version;
 
 fn main() {
     if let Err(error) = run() {
@@ -21,6 +22,11 @@ fn run() -> Result<()> {
         return usage();
     };
     match command.to_str() {
+        Some("validate-next-version") => {
+            let version = required_text(&mut arguments, "next version")?;
+            require_end(arguments)?;
+            validate_next_version(&version, env!("CARGO_PKG_VERSION"))
+        }
         Some("archive") => {
             let binary = required_path(&mut arguments, "binary")?;
             let output = required_path(&mut arguments, "output archive")?;
@@ -87,8 +93,55 @@ fn require_end(mut arguments: env::ArgsOs) -> Result<()> {
     Ok(())
 }
 
+fn validate_next_version(candidate: &str, current: &str) -> Result<()> {
+    let candidate_version = Version::parse(candidate).context("next version is not SemVer")?;
+    ensure!(
+        candidate == candidate_version.to_string(),
+        "next version must use canonical SemVer text"
+    );
+    ensure!(
+        candidate_version.build.is_empty(),
+        "release versions must not contain SemVer build metadata because '+' is not an OCI tag character"
+    );
+    let current_version = Version::parse(current).context("workspace version is not SemVer")?;
+    ensure!(
+        candidate_version > current_version,
+        "next version {candidate} must be newer than workspace version {current}"
+    );
+    println!("next release version {candidate} is valid");
+    Ok(())
+}
+
 fn usage<T>() -> Result<T> {
     bail!(
-        "usage: zterm-release-tool <archive|prepare|sign|derive-public-key|verify|verify-unsigned|render-test-installer> ..."
+        "usage: zterm-release-tool <validate-next-version|archive|prepare|sign|derive-public-key|verify|verify-unsigned|render-test-installer> ..."
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_next_version;
+
+    #[test]
+    fn next_version_accepts_newer_stable_and_prerelease_versions() {
+        validate_next_version("0.1.10", "0.1.9").expect("newer patch release");
+        validate_next_version("0.2.0-rc.1", "0.1.9").expect("newer prerelease");
+    }
+
+    #[test]
+    fn next_version_rejects_same_downgrade_malformed_and_noncanonical_text() {
+        for candidate in [
+            "0.1.9",
+            "0.1.8",
+            "not-semver",
+            "v0.2.0",
+            "01.2.3",
+            "0.2.0+build.1",
+        ] {
+            assert!(
+                validate_next_version(candidate, "0.1.9").is_err(),
+                "candidate must be rejected: {candidate}"
+            );
+        }
+    }
 }

@@ -1,5 +1,10 @@
 # Research: release workflow comparison
 
+> Historical comparison baseline captured on 2026-08-25, before the two-phase
+> zterm release operator and narrowed CI triggers were implemented. Preserve
+> the evidence below as research; use `docs/development.md` and
+> `docs/releasing.md` for current repository operation.
+
 - Query: 用户提出“push/merge 到主干后运行一次全方位 CI；测试和构建全部通过后再打 tag 并发布”，并希望对照 `herdr` 及 2–3 个成熟 Rust CLI 项目的真实发布流程。需要比较 PR/main CI 触发、main 是否构建 release-mode、tag 由谁创建、tag/release 触发、正式产物是重建还是复用、签名/来源证明、人工审批、draft/直接发布以及失败重试边界。
 - Scope: mixed（本仓库 + 仅限上游仓库/官方文档的外部只读研究）
 - Date: 2026-08-25
