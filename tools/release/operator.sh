@@ -169,9 +169,10 @@ parse_run_info() {
     run_info=$1
     parsed_run_id=${run_info%% *}
     parsed_run_url=${run_info#* }
-    [ "$parsed_run_id" != "$run_info" ] \
-        && [ -n "$parsed_run_id" ] && [ -n "$parsed_run_url" ] \
-        || fail "GitHub returned an ambiguous run result"
+    if [ "$parsed_run_id" = "$run_info" ] \
+        || [ -z "$parsed_run_id" ] || [ -z "$parsed_run_url" ]; then
+        fail "GitHub returned an ambiguous run result"
+    fi
     case "$parsed_run_url" in
         *' '*) fail "GitHub returned an ambiguous run result" ;;
     esac

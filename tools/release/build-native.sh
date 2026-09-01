@@ -87,8 +87,9 @@ if [ "$mode" = formal ]; then
     mkdir -p "$output_dir"
     candidate="$output_dir/zterm-$target"
     identity="$output_dir/zterm-$target.identity.json"
-    [ ! -e "$candidate" ] && [ ! -e "$identity" ] \
-        || fail "formal candidate output already exists for $target"
+    if [ -e "$candidate" ] || [ -e "$identity" ]; then
+        fail "formal candidate output already exists for $target"
+    fi
     "$binary" --internal-release-self-check >"$identity"
     cp "$binary" "$candidate"
     chmod 700 "$candidate"

@@ -32,7 +32,8 @@ run=$(gh api --method GET \
 
 run_id=${run%% *}
 run_url=${run#* }
-[ "$run_id" != "$run" ] && [ -n "$run_id" ] && [ -n "$run_url" ] \
-    || fail "GitHub returned an ambiguous CI result"
+if [ "$run_id" = "$run" ] || [ -z "$run_id" ] || [ -z "$run_url" ]; then
+    fail "GitHub returned an ambiguous CI result"
+fi
 case "$run_url" in *' '*) fail "GitHub returned an ambiguous CI result" ;; esac
 printf '%s %s\n' "$run_id" "$run_url"

@@ -194,8 +194,10 @@ rust_first_steps=$(printf '%s\n' "$rust_job" \
 checkout_line=$(printf '%s\n' "$rust_job" | grep -n 'uses: actions/checkout@' | sed -n '1s/:.*//p')
 source_line=$(printf '%s\n' "$rust_job" | grep -n 'run: sh tests/source-policy.sh' | sed -n '1s/:.*//p')
 toolchain_line=$(printf '%s\n' "$rust_job" | grep -n 'name: Install exact Rust toolchain' | sed -n '1s/:.*//p')
-[ "$checkout_line" -lt "$source_line" ] && [ "$source_line" -lt "$toolchain_line" ] \
-    || fail "source-policy must run after checkout and before Rust tooling/compilation"
+if ! [ "$checkout_line" -lt "$source_line" ] \
+    || ! [ "$source_line" -lt "$toolchain_line" ]; then
+    fail "source-policy must run after checkout and before Rust tooling/compilation"
+fi
 linux_readiness_job=$(sed -n \
     '/^  release-readiness-linux:/,/^  dependencies:/p' "$ci_workflow")
 for linux_policy_job in "$linux_readiness_job" "$linux_build_job"; do
