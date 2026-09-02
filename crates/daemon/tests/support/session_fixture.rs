@@ -6,7 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
-use zterm_core::terminal::{TerminalModel, TerminalSize, TerminalSnapshot};
+use zterm_core::terminal::{TerminalSize, TerminalSnapshot};
 use zterm_core::{
     AttachmentId, AttachmentPrincipal, DeviceId, DomainErrorKind, OperationId, OperationLease,
     ResourceLimits, Revision, SessionName,
@@ -14,6 +14,7 @@ use zterm_core::{
 use zterm_daemon::error::DaemonError;
 use zterm_daemon::session::{PreparedAttachment, SessionAttachment, SessionService};
 use zterm_platform::pty::{ExplicitPtyCommand, PtyHost, PtySize};
+use zterm_terminal::TerminalModel;
 
 pub const DEADLINE: Duration = Duration::from_secs(10);
 

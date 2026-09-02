@@ -48,6 +48,9 @@ low-level fixture/integration primitive, not a first-stage user command API.
   `$SHELL`, `$HOME`, or cwd.
 - The builder explicitly sets `HOME`, `SHELL`, and cwd, then uses
   `CommandBuilder::new_default_prog()` so portable-pty supplies login argv0.
+  It also unconditionally sets the hosted capability profile
+  `TERM=xterm-256color` and `COLORTERM=truecolor`; a parent Ghostty, kitty,
+  tmux, or unset environment never leaks its terminal identity to the child.
 - The output reader transfers exactly once. The session retains the PTY master,
   input writer, and root-child handle.
 - The daemon may consume an already-spawned `PtySession` into zterm-owned
@@ -61,6 +64,9 @@ low-level fixture/integration primitive, not a first-stage user command API.
 - Only the session owner may call `close_explicitly()`. Attachments and
   transports may observe terminal state but must not own `PtySession`, a PTY
   handle, or a child-kill capability.
+- One product Session owns exactly one root child, one portable-pty instance,
+  and one authoritative `zterm-terminal` model. The Alacritty dependency owns
+  parser/grid/state only and never opens or nests another PTY.
 - Dropping an attachment, connection, or revision subscriber does not call PTY
   close. Root-child natural exit and explicit session close are the only
   Foundation termination triggers.
@@ -112,7 +118,8 @@ All path and size validation must finish before any PTY is opened.
 ### 6. Tests Required
 
 - Unit: reject zero dimensions and invalid program/shell/home/cwd before PTY
-  creation; assert the login builder uses effective-account values.
+  creation; assert the login builder uses effective-account values and exact
+  hosted TERM/COLORTERM values independent of the parent environment.
 - Unix integration: real PTY input/output, child-observed resize, natural exit
   status, reader single transfer, and explicit close with a bounded deadline.
 - Daemon integration: a HUP-resistant root child makes a short shutdown fail

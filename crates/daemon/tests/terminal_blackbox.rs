@@ -10,11 +10,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
-use zterm_core::terminal::{ActiveScreen, TerminalDeltaResult, TerminalModel, TerminalSize};
+use zterm_core::terminal::{ActiveScreen, TerminalDeltaResult, TerminalSize};
 #[cfg(unix)]
 use zterm_daemon::terminal_driver::{TerminalDriver, TerminalDriverConfig};
 #[cfg(unix)]
 use zterm_platform::pty::{ExplicitPtyCommand, PtyChildState, PtyHost, PtySize};
+use zterm_terminal::TerminalModel;
 
 #[cfg(unix)]
 const DEADLINE: Duration = Duration::from_secs(20);

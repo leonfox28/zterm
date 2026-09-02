@@ -1,0 +1,11 @@
+{"file": ".trellis/spec/backend/terminal-model.md", "reason": "迁移必须保留当前revision、state、snapshot/delta、history、effects和PTY-input安全caps；本任务明确删除旧aggregate/RSS/benchmark要求。"}
+{"file": ".trellis/spec/backend/terminal-driver.md", "reason": "保留 ordered model ownership、持续无损 PTY drain、latest-only attachment、reply ordering、resize 与 finalize 语义。"}
+{"file": ".trellis/spec/backend/pty-lifecycle.md", "reason": "确保 parser 迁移不替换 portable-pty，也不改变 child、reader、resize、wait、interrupt 与 close 所有权。"}
+{"file": ".trellis/spec/backend/session-service.md", "reason": "维持one-session-one-PTY、8-session数量/尺寸边界、controller/pending takeover、attachment与owner释放，同时删除aggregate memory admission。"}
+{"file": ".trellis/spec/backend/core-wire-domain.md", "reason": "指导 core 保持 Zterm-owned 纯 Rust DTO/wire 边界，防止 Alacritty 类型或 host engine dependency 泄漏。"}
+{"file": ".trellis/spec/backend/distribution-lifecycle.md", "reason": "保留 hosted CI、四个 native release artifacts、平台 floor、SBOM、license 与动态依赖检查。"}
+{"file": ".trellis/spec/guides/cross-platform-thinking-guide.md", "reason": "要求 macOS/Linux/Windows 各自由正确环境提供证据，并把 mobile 限定为 dependency isolation。"}
+{"file": ".trellis/spec/guides/evidence-driven-simplicity.md", "reason": "约束迁移不引入双 parser、runtime fallback、新 actor 或尚无消费者的 semantic/rendering surface。"}
+{"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/alacritty-terminal-integration.md", "reason": "提供官方0.26.0 API/source证据、行为差异、ingress policy、projection、安全caps、crate boundary、取消aggregate admission和无性能测试决策。"}
+{"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/herdr-reference-architecture.md", "reason": "只借鉴 Herdr 的 authoritative state、per-client projection、backpressure 与 TERM 隔离原则，不复制其 unsafe/FFI 实现。"}
+{"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/rust-vt-and-c-language-evaluation.md", "reason": "保留选择官方 Rust terminal core、拒绝社区 Ghostty wrapper与 C rewrite的决策背景，避免实现时恢复已否决路线。"}

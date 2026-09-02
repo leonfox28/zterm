@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use zterm_core::terminal::{TerminalModel, TerminalSize};
+use zterm_core::terminal::TerminalSize;
 use zterm_daemon::terminal_driver::{TerminalDriver, TerminalDriverConfig};
 use zterm_platform::pty::{ExplicitPtyCommand, PtyChildState, PtyHost, PtySize};
+use zterm_terminal::TerminalModel;
 
 pub const DEADLINE: Duration = Duration::from_secs(15);
 pub const SCROLLBACK_ROWS: usize = 10_000;

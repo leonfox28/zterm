@@ -1681,7 +1681,15 @@ where
             let mut delta: v1::TerminalDelta = decode(&frame)?;
             validate_delta(&delta)?;
             require_remote_attachment(delta.attachment_id.clone(), remote_attachment_id)?;
-            if !matches!(phase, EpochPhase::Active) {
+            let prepared_takeover = matches!(
+                phase,
+                EpochPhase::Synchronizing {
+                    acknowledged: true,
+                    needs_takeover: true,
+                    ..
+                }
+            );
+            if !matches!(phase, EpochPhase::Active) && !prepared_takeover {
                 return Err(malformed(
                     "remote terminal delta arrived before initial synchronization",
                 ));
@@ -1703,7 +1711,7 @@ where
                 *phase = EpochPhase::Synchronizing {
                     expected: known,
                     acknowledged: true,
-                    needs_takeover: false,
+                    needs_takeover: prepared_takeover,
                 };
                 enter_synchronizing(
                     local_writer,
@@ -1725,6 +1733,9 @@ where
             .map_err(protocol_error)?;
             write_local(local_writer, &bytes, Instant::now() + operation_timeout).await?;
             state.known_revision = Some(to_revision);
+            if let EpochPhase::Synchronizing { expected, .. } = phase {
+                *expected = to_revision;
+            }
             Ok(None)
         }
         WireKind::TerminalSyncRequired => {

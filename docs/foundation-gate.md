@@ -5,6 +5,23 @@
 > [Development and CI](development.md) and [Release operations](releasing.md)
 > for the current workflow.
 
+## Terminal-engine supersession — 2026-09-02
+
+The terminal portions of this historical report were superseded by the direct
+cutover to official crates.io `alacritty_terminal 0.26.0` in the host-only
+`zterm-terminal` crate. Current code no longer contains `vt100`, the fixed-cell
+projection API, aggregate 128 MiB terminal-memory admission, or the 256 MiB RSS
+qualification gate. The historical `terminal_state` benchmark and
+`tests/foundation/resource-gate.sh` were deleted and are not current commands.
+
+The retained current limits are eight Sessions, 240x80 viewport, 2,000 history
+rows, and the explicit PTY-input sequence/string/title/reply/event/combining
+bounds documented in [Persistent sessions](persistent-sessions.md). No
+performance or RSS benchmark was run for the migration, and no post-migration
+performance claim is made. The older measurements below remain provenance for
+the Foundation decision only; they must not be used as current admission or CI
+requirements.
+
 Status: **GO with automatic address-discovery evidence deferred to parent M10**.
 The TerminalModel, PTY lifecycle, retained-drain, black-box compatibility,
 resource, platform, and aggregate quality Gates passed. In the nested
@@ -70,9 +87,9 @@ Exact resolved dependencies used by the implemented scope:
 | `tokio` | 1.53.1; `macros`, `rt`, `sync`, `time` requested by zterm |
 | `anyhow` | 1.0.104; test-only |
 | `futures-util` | 0.3.34; test-only |
-| `vt100` | 0.16.2; private implementation of `zterm-core::terminal` |
-| `vte` | 0.15.0 (resolved transitively by `vt100`) |
-| `unicode-width` | 0.2.2 (resolved transitively by `vt100`) |
+| `vt100` | 0.16.2; historical Foundation implementation, removed by the 2026-09-02 migration |
+| `vte` | 0.15.0; historical Foundation transitive dependency; current `vte` is only through pinned Alacritty |
+| `unicode-width` | 0.2.2; retained directly by the current terminal adapter |
 | `portable-pty` | 0.9.0; default feature set (empty), private behind `zterm-platform::pty` |
 | `nix` | 0.28.0; direct Unix `fs`, `user` features for effective-account lookup and pre-spawn access checks |
 
@@ -166,7 +183,7 @@ profile, candidate construction, and path observation code are unchanged.
 
 ## Step 2 TerminalModel result
 
-The retained `zterm-core::terminal` boundary uses exactly `vt100 0.16.2`
+At the time of this historical Gate, `zterm-core::terminal` used exactly `vt100 0.16.2`
 behind private fields. Public snapshots, deltas, checkpoints, states, modes,
 cells, side events, resource projections, and errors are all zterm-owned types;
 no parser type or wire format crosses the boundary. At the time of this
@@ -325,7 +342,7 @@ Herdr socket and tmux server were absent, then explicit cleanup removed the
 temporary homes, archives, and binaries before reporting
 `BLACKBOX_CLEANUP=PASS`.
 
-## Step 6 resource result
+## Step 6 resource result (historical and superseded)
 
 The stable harness-free `terminal_state` benchmark used the release/bench
 profile and emitted one machine-readable record per case. Every model received
@@ -367,7 +384,7 @@ is 590.6 MiB. Conversely, the required three-session case remained bounded
 even with 10,000 saturated rows, and eight saturated sessions at the retained
 upper viewport/history recommendation remained at 154.7 MiB peak RSS.
 
-The Foundation recommendation for the later session registry is therefore:
+The Foundation recommendation at that time was therefore:
 
 - default standard scrollback: 2,000 rows per session;
 - fallback initial viewport when no controller size is available: 120x40;
@@ -376,18 +393,21 @@ The Foundation recommendation for the later session registry is therefore:
 - checked fixed-cell admission ceiling: 128 MiB, with a 256 MiB terminal
   process-RSS target.
 
-All five conditions must be enforced together before allocating or resizing a
-model. The 128 MiB structural ceiling is only 1.4 MiB above the measured
+Those five conditions were used by the original Foundation implementation.
+The 2026-09-02 terminal migration explicitly removed the aggregate/RSS
+conditions; they are not enforced before current model allocation or resize.
+Historically, the 128 MiB structural ceiling was only 1.4 MiB above the measured
 126.6 MiB eight-session fixed-cell reservation; parser, snapshot, and transient
 allocations are not charged to that structural limit. The saturated benchmark
 process measured those exercised overheads at 154.7 MiB against the separate
 256 MiB RSS target, leaving roughly 101 MiB of observed headroom. This is not a
 guarantee for an unimplemented full daemon/session registry, which must enforce
-the admission bounds and recheck whole-process RSS when it is built. The
-current `resource_projection()` provides the checked per-model input.
+the admission bounds and recheck whole-process RSS when it is built. At that
+time, `resource_projection()` provided the checked per-model input; that API
+has since been removed.
 Arbitrary 512x256/10,000 allocations are not supported by this recommendation.
 
-`tests/foundation/resource-gate.sh` builds the benchmark once, exercises all
+The now-removed `tests/foundation/resource-gate.sh` built the benchmark once, exercised all
 ten cases, checks the accepted saturated three/eight-session configurations
 against the 128 MiB fixed-cell and measured 256 MiB limits, checks both
 structural and observed-RSS rejection evidence, and rejects a saturated sample
@@ -404,8 +424,8 @@ checkout policy immediately after checkout and before formatting or compiling,
 then executes the same format, Clippy, workspace-test, documentation, and
 side-effect-free CLI sequence. The harness-free PTY/drain tests execute their
 real behavior on Unix and return explicit non-Unix skips on Windows. The
-network, downloadable black-box, and resource Gates remain explicit commands
-instead of being repeated on every push.
+network and downloadable black-box Gates remain explicit commands instead of
+being repeated on every push. The historical resource Gate has been removed.
 
 The workflow passed `actionlint 1.7.12`. The Foundation commit's hosted matrix
 passed on both macOS architectures, both Linux architectures, and Windows
@@ -502,10 +522,10 @@ sh tests/foundation/terminal-blackbox.sh
   OpenCode 1.18.20: checksum and isolated alternate-screen smoke passed; no prompt
   TERMINAL_BLACKBOX_GATE=PASS; BLACKBOX_CLEANUP=PASS
 
-cargo bench -p zterm-core --bench terminal_state
+historical only (removed): cargo bench -p zterm-core --bench terminal_state
   stable 1/3/16 x 120x40/512x256 candidate matrix emitted six records
 
-sh tests/foundation/resource-gate.sh
+historical only (removed): sh tests/foundation/resource-gate.sh
   ten shallow/saturated cases measured with /usr/bin/time
   saturated cases retained exactly 10,000 or 2,000 configured history rows
   recommended 3/8-session configurations passed structural and RSS limits
@@ -532,7 +552,7 @@ actionlint 1.7.12 .github/workflows/ci.yml
 | Zero-attachment drain and detach/reattach ownership | Passed locally on macOS arm64, in Linux arm64, and across the hosted Unix matrix |
 | VT parser/corpus and compatibility gaps | Step 2 passed with the active/inactive-screen boundary documented above |
 | Snapshot/checkpoint/delta protocol | Step 2 passed for latest active-screen semantics |
-| Resource measurements and recommended defaults | Step 6 passed; 2,000 rows, 240x80 ceiling, eight sessions, 128 MiB fixed-cell admission ceiling recommended |
+| Resource measurements and recommended defaults | Historical Step 6 passed; current code retains 2,000 rows, 240x80, and eight Sessions but has no aggregate-memory/RSS admission gate |
 | tmux/Herdr/Codex/OpenCode black-box checks | Step 5 passed; Codex isolated onboarding truthfully recorded as main screen |
 | Real two-network automatic discovery | deferred to parent M10; not treated as passed |
 | M2 entry decision | allowed; Foundation has no remaining hard stop |

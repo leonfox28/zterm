@@ -2,29 +2,31 @@
 
 ## 1. Scope / Trigger
 
-Apply this contract when changing `zterm-core::terminal`, its VT parser,
-terminal query replies, side events, reconnect snapshots/checkpoints/deltas,
-or the structural resource projection. The daemon owns the authoritative
-model; controllers consume zterm-owned state and ANSI payloads and never own a
-second parser contract.
+Apply this contract when changing terminal DTOs in `zterm-core`, the
+Alacritty-backed model in `zterm-terminal`, terminal query replies, side
+events, snapshots/checkpoints/deltas, history, or PTY-output safety bounds.
 
-The current implementation uses exactly `vt100 0.16.2`. Its types remain
-private so the implementation can be replaced behind the same corpus and
-public behavior if a later Gate proves it unsuitable.
+`zterm-terminal` owns the only terminal parser/grid/state engine. The daemon
+owns one model per Session; controllers consume Zterm-owned values and
+allowlisted ANSI and never own an upstream terminal type.
 
-## 2. Signatures
+## 2. Ownership and Signatures
 
-The retained public boundary is:
+`zterm-core::terminal` owns only transport-neutral values:
+
+- size, screen, cell/style/cursor, modes, events, and updates;
+- snapshot, delta/resync, and history values;
+- screen-selection metadata and the final snapshot byte limiter.
+
+`zterm-terminal` owns the host-only engine boundary:
 
 ```rust
 TerminalModel::new(size: TerminalSize, scrollback_rows: usize)
     -> Result<TerminalModel, TerminalError>
-TerminalModel::project_resources(size: TerminalSize, scrollback_rows: usize)
-    -> Result<TerminalResourceProjection, TerminalError>
 TerminalModel::ingest(&mut self, bytes: &[u8])
     -> Result<TerminalUpdate, TerminalError>
 TerminalModel::preflight_resize(&self, size: TerminalSize)
-    -> Result<(Revision, TerminalResourceProjection), TerminalError>
+    -> Result<Revision, TerminalError>
 TerminalModel::resize(&mut self, size: TerminalSize)
     -> Result<TerminalUpdate, TerminalError>
 TerminalModel::checkpoint(&self) -> TerminalCheckpoint
@@ -32,194 +34,215 @@ TerminalModel::snapshot(&self) -> TerminalSnapshot
 TerminalModel::delta_or_resync(&self, checkpoint: &TerminalCheckpoint)
     -> TerminalDeltaResult
 TerminalModel::state(&self) -> TerminalState
-TerminalModel::resource_projection(&self) -> TerminalResourceProjection
 TerminalModel::history_page(direction, cursor, maximum_rows)
     -> Result<TerminalHistoryResult, TerminalError>
 TerminalSnapshot::limit_ansi_payload(&mut self, maximum_bytes: usize) -> bool
 ```
 
-`Revision` is the zterm-owned checked newtype shared by core, protocol
-conversions, and the daemon driver. `TerminalSnapshot` carries `revision`, `size`, `active_screen`,
-`screen_ansi`, `recent_history_ansi`, and `modes`. `TerminalDelta` carries
-`from_revision`, `to_revision`, `size`, `active_screen`, `ansi`, and `modes`.
-`TerminalCheckpoint` is opaque. No public field or signature may expose a
-`vt100` type.
+`TerminalCheckpoint` is opaque and content-redacted. No public signature or
+Debug implementation exposes an `alacritty_terminal` or `vte` type.
 
-One history page retains at most `MAX_HISTORY_PAGE_ROWS = 80` daemon-formatted
-rows. One update retains at most `MAX_SIDE_EVENTS_PER_UPDATE = 32` events. A title
-or icon-name event retains at most `MAX_TITLE_BYTES = 256` source bytes.
+## 3. Dependency and Engine Boundary
 
-## 3. Contracts
+- The workspace pins the official crates.io
+  `alacritty_terminal = "=0.26.0"` with default features disabled.
+- `zterm-terminal` is the only direct engine owner. `zterm-core` and
+  `zterm-proto` have no `zterm-terminal`, Alacritty, or `vte` dependency. The
+  CLI has no direct engine dependency; it includes the engine only transitively
+  because the host binary also contains the daemon.
+- `Term<BoundedEventSink>` and the re-exported `vte::ansi::Processor` are the
+  sole terminal state engine. The Zterm ingress policy frames controls and
+  applies product policy but never stores a grid or history.
+- Engine configuration uses the requested bounded scrollback, disables OSC 52
+  and Kitty keyboard mode, and normalizes initial alternate-scroll to off.
+- Zterm never calls Alacritty tty, event-loop, renderer, process-spawn, or
+  selection APIs. `portable-pty` remains the sole PTY/process owner.
+- All Zterm-owned crates inherit `unsafe_code = "forbid"`. No wrapper, FFI,
+  raw pointer, custom `Send`/`Sync`, dual parser, or runtime fallback is allowed.
 
-- Non-empty PTY chunks are ingested in order and advance one checked `Revision`
-  revision. Empty input is a no-op. A successful resize also advances exactly
-  one revision, including a same-size resize.
-- `TerminalState` is the semantic comparison boundary: current screen, size,
-  visible cells and styles, cursor and active style, and supported input modes.
-- A reconnect client applies `recent_history_ansi` before `screen_ansi`.
-  Snapshot replay into a fresh model must reproduce the latest semantic state.
-- `TerminalModel` is the only history/VT owner. History paging clones only its
-  screen view, never changes the authoritative scrollback offset, returns rows
-  oldest-to-newest, and exposes only zterm-owned cursor/page/result types. A
-  cursor binds an epoch, observed revision, and retained bounds; monotonic append
-  below capacity keeps its epoch, while resize, shrink/clear, or capacity
-  ambiguity returns `HistoryChanged`/`HistoryGap` instead of splicing rows.
-- DECSET/DECRST 1007 is captured at the existing safe callback boundary as
-  `TerminalModes::alternate_scroll` and round-trips through state, snapshot,
-  delta, and checkpoint just like the other authoritative input modes.
-- The Unix raw-terminal controller validates both physical TTYs before attach,
-  saves exact termios, and owns one outer alternate screen. It strips the one
-  expected model screen selector, rejects every nested or inconsistent main /
-  alternate selector, writes and flushes the complete snapshot before its
-  exact acknowledgement, and requests a full sync on any revision gap.
-- Input is read through one fixed-capacity channel. While preparing,
-  synchronizing, or reconnecting, ordinary bytes are drained and discarded;
-  only the local detach prefix remains actionable. Before publishing each
-  transition to `Active`, the controller closes the old receiver, wakes and
-  synchronously joins its reader, flushes queued terminal input while no reader
-  exists, advances the input epoch and clears prefix state, then starts the
-  replacement reader. No byte observed before that fence may be replayed into
-  the Session.
-- Normal completion, typed failure, task cancellation, unwind, and captured
-  SIGINT/SIGTERM/SIGHUP all attempt the same idempotent display and exact
-  termios restoration before a content-free normal-mode diagnostic. Termios
-  calls retry `EINTR`; a failed explicit restoration remains retryable by
-  `Drop` and is not hidden by the terminal operation's earlier error.
-- Snapshot frame bounding preserves the current `screen_ansi`. If a wire
-  envelope would exceed 8 MiB, the one snapshot limiter drops only oldest
-  complete `CRLF`-terminated history lines, prepends an ANSI reset at the new
-  boundary, and never mutates host scrollback. Proto conversion reserves fixed
-  envelope headroom and the frame encoder remains the final exact size gate.
-- A checkpoint builds a fresh zero-scrollback parser from only the latest
-  visible-screen ANSI and privately retains its main and alternate visible
-  grids. It never clones host scrollback and retains exactly
-  `rows * columns * 2` cell slots independent of the model's history capacity.
-  A delta is one merged latest-state update, not a queue of intermediate
-  revisions. Size mismatch, a future checkpoint, or a delta whose ANSI payload
-  is no smaller than the full snapshot returns `Resync`.
-- `vt100` formats only the active visible grid. When the alternate screen is
-  active, Foundation snapshots do not serialize the inactive main grid or its
-  history. This is the approved latest-active-screen reconnect boundary, not a
-  promise of concurrent inactive-screen preview.
-- The supported query replies are primary DA `CSI ?1;2c`, DSR status OK
-  `CSI 0n`, standard CPR, and private `CSI ?6n` CPR. Other private markers such
-  as `CSI >6n` are unsupported and produce no reply.
-- OSC 52 clipboard reads/writes are rejected. Unknown OSC/DCS/APC payloads are
-  never copied into replies, rendered state, snapshots, or deltas. Side events
-  retain only bounded classifications or allowed bounded title/icon text.
-- The resource projection is checked arithmetic over vt100 0.16.2's fixed
-  inline cell slots. It excludes parser state, row/container overhead,
-  snapshots, transient workload allocations, RSS, and throughput; those
-  remain Foundation resource measurements and the projection must not be
-  presented as an RSS limit by itself.
-- Attachment checkpoints are deliberately outside the authoritative model
-  projection but are visible-only and fixed. M4 permits one controller plus at
-  most one pending takeover per session, bounding retained checkpoint state to
-  four visible grids per session without retaining history.
-- Registry admission and resize call the public non-allocating
-  `project_resources`/`preflight_resize` owners; they do not reproduce the cell
-  arithmetic or mutate a model to discover whether a request is valid.
-- The Foundation-measured admission baseline for the later session registry is
-  2,000 scrollback rows, at most 240x80 cells, at most eight live sessions, and
-  at most 128 MiB summed fixed-cell projection under a 256 MiB process-RSS
-  target. Check all four bounds before construction and resize. The fallback
-  viewport when no controller size exists is 120x40.
+## 4. Ordered Ingest and Revisions
 
-## 4. Validation & Error Matrix
+- Non-empty PTY chunks are ingested in order and advance exactly one checked
+  `Revision`, including chunks ending in a partial control. Empty input is a
+  no-op. A successful same-size or changed-size resize also advances exactly
+  one revision.
+- Revision and allocation preflight complete before terminal mutation. Reply
+  overflow is terminal-fatal to the driver; it must not continue with an
+  unknown child-reply stream.
+- Whole-input, one-byte, fixed-size, and deterministic-random chunking must
+  produce identical semantic state, replies, and allowed side events.
+- Query replies are exactly primary DA `CSI ?1;2c`, DSR status `CSI 0n`,
+  standard CPR, and private `CSI ?row;columnR`. Secondary DA, window/color/mode
+  queries, and other private markers receive no reply.
+
+## 5. Ingress and Side-Effect Policy
+
+`TerminalIngressPolicy` is a streaming, chunk-invariant trust boundary with
+these hard caps:
+
+| Input-controlled value | Cap |
+| --- | ---: |
+| ESC/CSI bytes | 256 |
+| OSC/DCS/APC/PM/SOS bytes | 1,024 |
+| canonical reply bytes per update | 64 KiB |
+| side events per update | 32 |
+| title/icon source bytes | 256 |
+
+- The policy recognizes 7-bit and C1 introducers, BEL/C1-ST/split-ESC-ST
+  termination, and CAN/SUB cancellation. Overflow discards through the current
+  terminator and emits one content-free bounded classification; payload bytes
+  never become printable fallback text.
+- Inside a partial ESC/CSI sequence, ESC is an ECMA-48 anywhere transition that
+  discards the old syntax and restarts framing, including across input chunks.
+  C1 introducers likewise restart in their policy-owned state. Embedded C0/DEL
+  bytes execute or are ignored without joining the buffered syntax, so they
+  cannot obscure a filtered sequence such as synchronized-update 2026.
+- BEL maps to audible bell, `ESC g` to visual bell,
+  `CSI 8;rows;columns t` to a validated resize request, OSC 0/2 to title, and
+  OSC 1 to icon-name. Title/icon values retain no more than 256 source bytes.
+- OSC 52 maps to a payload-free clipboard rejection. OSC 8, other OSC,
+  DCS/APC/PM/SOS, synchronized-update 2026, Kitty keyboard controls, REP, and
+  underline-color controls are consumed or rejected before the engine.
+- Underline-color filtering follows top-level SGR parameter boundaries: numeric
+  aliases such as leading-zero `058` are contained, while `58`/`59` used as an
+  indexed or RGB foreground/background color component remain ordinary color.
+- Engine callbacks are themselves bounded before model collection. They never
+  forward upstream `PtyWrite`, clipboard/title/color payloads, closures,
+  lifecycle events, or Debug output.
+- More than 32 events retain 31 events plus one saturating
+  `EventsDropped { count }` summary. No rejected secret may appear in state,
+  replies, snapshots, deltas, history, Debug, or logs.
+
+## 6. Cell Extras and Persistent-State Bounds
+
+- `MAX_CELL_TEXT_BYTES = 22`. Projection stores valid UTF-8 in fixed inline
+  storage and adds only complete scalars. A visually blank default cell is
+  normalized to empty; a styled blank remains one space.
+- Before feeding any zero-width scalar, the engine checks the target cell. The
+  base scalar plus combining scalars may not exceed 22 UTF-8 bytes.
+- Combining usage is tracked separately for the main and alternate grids and
+  bounded across the Session at 4,096 retained cells and 64 KiB retained
+  combining bytes. The alternate grid is reconciled on screen switches; the
+  active grid/history is reconciled on resize and when a conservative counter
+  reaches a limit, so overwritten or evicted extras release quota.
+- A scalar crossing the cell, cell-count, or byte cap is discarded before
+  Alacritty can grow `CellExtra` and produces a bounded
+  `UnsupportedSequence(Character)` classification.
+- OSC 8 and underline-color inputs never reach the engine, so hyperlinks and
+  unsupported underline-color extras cannot create unmetered cell heap state.
+- Eight live Sessions, a maximum 240x80 viewport, 2,000 history rows, and wire
+  frame bounds remain separate service limits.
+
+These are hostile-input safety limits, not estimated model memory admission.
+There is no aggregate terminal-memory projection, 128 MiB admission gate, or
+256 MiB RSS gate. Alacritty allocation/capacity is allocator-owned and is
+released when the Session model is dropped.
+
+## 7. Projection, Snapshot, Delta, and Checkpoint
+
+- Projection reads the active grid at display offset zero and maps only the
+  current Zterm subset: indexed/RGB/default colors, bold/dim/italic/underline/
+  inverse, wide head/spacer, cursor, and supported input modes. Hyperlinks,
+  strike, hidden, underline color/style detail, palette state, Kitty keyboard,
+  and graphics are not advertised.
+- Only the Zterm allowlisted encoder creates client ANSI. Its vocabulary is
+  printable UTF-8, reviewed SGR, CUP, ED2, EL2, home, cursor visibility,
+  supported input modes, and the two top-level Zterm screen selectors. It emits
+  no OSC/DCS/APC/PM/SOS or arbitrary upstream bytes.
+- A full snapshot contains recent main history first and the complete latest
+  active screen second. The core 8 MiB limiter removes only oldest complete
+  history lines and never truncates the active screen.
+- A checkpoint retains format, revision, size, active-screen identity, and one
+  fixed projected active viewport. It retains neither Alacritty state, inactive
+  screen, nor history; capacity is exactly `rows * columns` cells.
+- Delta compares owned rows, redraws only changed rows, and restores
+  cursor/modes. Future revision, format/size/screen mismatch, every-row change,
+  or delta ANSI not smaller than full ANSI returns `Resync`. A newer revision
+  whose complete projected state is identical returns a revision-only delta
+  with empty ANSI.
+
+## 8. History Contract
+
+- Main history is read oldest-to-newest through Alacritty negative-line
+  indexing without changing display offset, revision, checkpoint, or viewport.
+- A page retains at most `MAX_HISTORY_PAGE_ROWS = 80` formatted rows.
+- Monotonic append below capacity preserves epoch. Resize, clear/decrease,
+  capacity eviction, or identity ambiguity advances epoch and returns Changed
+  or Gap instead of splicing unverifiable rows.
+- History while the alternate screen is active returns Changed; alternate
+  history is never invented.
+
+## 9. Validation and Error Matrix
 
 | Condition | Required result |
 | --- | --- |
-| Zero rows or columns at construction or resize | `TerminalError::InvalidSize`; existing state remains unchanged |
-| Revision would exceed `u64::MAX` | `TerminalError::RevisionOverflow`; parser state and size remain unchanged |
-| Cell-capacity arithmetic overflows `usize` | `TerminalError::ResourceProjectionOverflow` |
-| A requested model or resize exceeds a Foundation admission bound | The future session registry rejects it before mutating or allocating the authoritative model |
-| Checkpoint revision is newer than the model | Return one full `Resync` snapshot |
-| Checkpoint size differs from current size | Return one full `Resync` snapshot |
-| Delta ANSI length is at least the snapshot ANSI length | Return one full `Resync` snapshot |
-| Snapshot ANSI exceeds the wire budget because of history | Remove oldest complete history lines only; preserve the full screen |
-| Current screen alone exceeds the requested snapshot budget | Preserve the screen, clear history, return `false`; frame encoding rejects if still oversized |
-| History page bound is zero or exceeds 80 | `TerminalError::InvalidHistoryPageSize`; model state remains unchanged |
-| History cursor epoch or retained range is stale | Return `HistoryChanged` or `HistoryGap`; never return mixed rows |
-| Alternate screen is active | History request returns `HistoryChanged`; no alternate-screen transcript is invented |
-| More than 32 side events occur in one update | Retain 31 events plus one `EventsDropped { count }` summary |
-| Title or icon input exceeds 256 source bytes | Retain a bounded lossy string with `truncated: true` |
-| OSC 52 or an unknown control payload is received | Classify or drop it; never reproduce its decoded or encoded payload |
-| Unsupported CPR private marker is received | No PTY reply; emit bounded `UnsupportedSequence(Csi)` |
+| zero row/column | `TerminalError::InvalidSize`; no mutation |
+| checked `rows * columns`/history arithmetic overflow | `TerminalError::AllocationOverflow`; no allocation |
+| revision would exceed `u64::MAX` | `TerminalError::RevisionOverflow`; no mutation |
+| canonical replies exceed 64 KiB/update | `TerminalError::ReplyOverflow`; driver fails closed |
+| history row request is zero or over 80 | `InvalidHistoryPageSize`; no mutation |
+| stale/invalid history cursor | Changed or Gap; never mixed rows |
+| alternate screen history request | Changed |
+| event/title/control/combining cap reached | bounded summary/classification; no payload leak |
+| future/incompatible/inefficient checkpoint | one full `Resync` |
+| active screen alone exceeds requested frame budget | preserve screen, clear history, return `false` |
+| CI forces colored Cargo output | dependency-tree policy overrides color to `never` before byte comparison |
 
-## 5. Good / Base / Bad Cases
+## 10. Required Evidence
 
-- **Good:** ingest an ANSI prefix, snapshot and checkpoint it, ingest a suffix,
-  replay snapshot plus merged delta into a fresh model, then compare semantic
-  state across whole, one-byte, fixed, and deterministic pseudo-random chunks.
-- **Base:** a resize or future checkpoint returns `Resync`; the controller
-  discards its old projection and applies the latest full snapshot once.
-- **Good safety case:** DA/DSR/CPR generate only the documented constant or
-  cursor-derived replies; OSC 52 produces an effect-rejected event without any
-  clipboard payload.
-- **Good resource case:** sum checked projections before accepting a new model
-  or resize, then separately retain the session-count, viewport, and scrollback
-  ceilings validated by the resource Gate.
-- **Bad:** expose `vt100::Screen`, compare only generated ANSI bytes, retain an
-  unbounded delta/event queue, forward unknown OSC bytes, describe the
-  structural resource projection as measured RSS, or admit a model based only
-  on the current lazily allocated RSS.
+- `cargo test -p zterm-terminal --all-features` covers the semantic corpus,
+  exact query replies, chunk strategies, projection, history, snapshot/delta,
+  resync, allocation/revision overflow, and active-screen normalization.
+- `security_policy` covers control-string and secret containment, title/event/
+  reply bounds, per-cell combining flood, both-screen/session combining cell
+  and byte limits, synchronized updates, OSC 8/52, and malformed input.
+- Lifecycle tests prove dropping the model releases the engine while an opaque
+  checkpoint remains usable and engine/history-free.
+- Daemon driver/session and real-PTY tests remain required for drain, reply
+  ordering, resize, detach/reconnect, and lifecycle ownership.
+- Format, Clippy with warnings denied, workspace tests, docs, cargo-deny,
+  source policy, and dependency-tree isolation are required.
+- The executable dependency-tree policy owns `CARGO_TERM_COLOR=never` and must
+  produce the same canonical ASCII tree when its caller sets
+  `CARGO_TERM_COLOR=always`; terminal presentation escapes are never graph data.
 
-## 6. Tests Required
+Do not run or recreate terminal throughput, latency, CPU, RSS, or candidate
+comparison benchmarks for this contract.
 
-- `cargo test -p zterm-core --test terminal_corpus`: assert main/alternate,
-  clear/scroll/cursor, indexed/RGB color, wide and combining Unicode, modes,
-  resize, exact supported replies, unsupported CPR containment, bounded side
-  events, and absence of both decoded and encoded unsafe payloads under every
-  chunk strategy.
-- `cargo test -p zterm-core --test terminal_snapshot_delta`: replay snapshots
-  into a fresh model, apply a merged delta, and compare semantic state rather
-  than bytes. Cover alternate/main transitions, bounded history, resize/future/
-  large-delta resync, invalid size, and resource overflow. Feed more than the
-  configured history capacity and assert checkpoint scrollback is zero and
-  visible capacity remains `rows * columns * 2`; compare main/alternate,
-  style, Unicode, and resize semantics after applying delta/resync.
-- `cargo test -p zterm-core`: cover revision overflow without mutation.
-- `cargo test -p zterm-core terminal::tests::history`: cover ordered styled
-  rows, Unicode, non-mutating paging, compatible append, capacity eviction,
-  resize, alternate-screen eligibility, cursor bounds, and the fixed page cap.
-- `cargo test -p zterm-core terminal::tests::alternate_scroll`: cover 1007
-  enable/disable through snapshot, state, delta/resync, and checkpoint.
-- `cargo bench -p zterm-core --bench terminal_state` and
-  `sh tests/foundation/resource-gate.sh`: retain the machine-readable candidate
-  matrix, saturated RSS/CPU evidence, and accepted three/eight-session bounds.
-- Ordinary workspace format, Clippy with warnings denied, tests, docs, and
-  dependency policy remain required on every change.
-- Task-private PTY tests deterministically stop the stdin reader between
-  readable `poll` and blocking `read`, require repeated Active fences to join
-  before flushing, and prove only post-fence bytes are delivered. Isolated
-  child-process tests cover success, error, cancellation, panic, SIGINT,
-  SIGTERM, and SIGHUP restoration ordering without terminal-content logging.
+## 11. Wrong vs Correct
 
-## 7. Wrong vs Correct
-
-### Wrong
+Wrong:
 
 ```rust
 pub struct TerminalCheckpoint {
-    pub screen: vt100::Screen,
+    pub term: alacritty_terminal::Term<MyListener>,
 }
 
-attachment_queue.push(every_intermediate_delta);
-controller.write_to_local_terminal(unknown_osc_payload);
+client.write(upstream_event_payload);
+session_registry.reserve(estimated_alacritty_bytes);
 ```
 
-This leaks the chosen parser, creates unbounded attachment state, and permits
-remote terminal output to trigger uncontrolled local behavior.
-
-### Correct
+Correct:
 
 ```rust
-let checkpoint = model.checkpoint(); // opaque parser baseline
+let checkpoint = model.checkpoint();
 match model.delta_or_resync(&checkpoint) {
     TerminalDeltaResult::Delta(delta) => apply(delta.ansi),
     TerminalDeltaResult::Resync(snapshot) => replace_with(snapshot),
 }
 ```
 
-Keep one host-authoritative model, expose only zterm-owned contracts, and use a
-single latest-state delta or full resynchronization.
+Keep one host-authoritative model, expose only Zterm-owned contracts, bound
+input-controlled state before the engine, and recover clients from latest
+state rather than an output log.
+
+For byte-exact dependency evidence, inheriting presentation settings is also
+wrong:
+
+```sh
+# Wrong: CI can inject ANSI escapes into the captured bytes.
+tree=$(cargo tree --charset ascii)
+
+# Correct: the comparison owner fixes its own presentation contract.
+tree=$(CARGO_TERM_COLOR=never cargo tree --charset ascii)
+```

@@ -5,7 +5,7 @@
 ### 1. Scope / Trigger
 
 This contract applies when `zterm-daemon` combines a `PtySession` with the
-host-authoritative `TerminalModel`. It exists to make terminal process lifetime
+`zterm-terminal` host-authoritative `TerminalModel`. It exists to make terminal process lifetime
 and PTY backpressure independent of Iroh connections, CLI processes, GUI tabs,
 and mobile app lifecycle.
 
@@ -82,8 +82,13 @@ blocking PtyReader
   remains.
 - Resize holds the model owner only long enough to preflight, resize the native
   PTY, mutate the model, and publish one revision. The checked model preflight
-  is the sole validation owner, so native/model dimensions cannot diverge on a
-  predictable validation failure.
+  owns size/allocation/revision validation, while the Session service owns its
+  independent viewport ceiling. Native/model dimensions therefore cannot
+  diverge on a predictable validation failure. There is no terminal-memory
+  estimate, reservation, or rollback step.
+- The driver imports model/checkpoint/error from `zterm-terminal` and terminal
+  DTOs from `zterm-core`. It never exposes an Alacritty type or calls its tty,
+  event-loop, or process APIs.
 - Finalization consumes the driver. Natural exit waits without killing;
   explicit close uses the sole child-kill authority. Both then join the PTY
   reader and model threads after EOF/queue drain, without holding the PTY or
@@ -108,6 +113,7 @@ No environment variable or network object participates in this data path.
 | read chunk size is zero | `InvalidConfig` before reader transfer |
 | PTY reader/input/resize/wait/close fails | typed `Pty` error |
 | terminal ingest/resize fails | typed `Terminal` error and queue abort |
+| canonical reply bytes exceed the per-update bound | typed terminal failure and queue abort; never write a partial trusted reply stream |
 | PTY read fails | `Read` recorded for attachments/waiters |
 | Unix PTY slave closes and the master reports `EIO` | platform reader normalizes it to EOF |
 | mutex/condvar is poisoned | `Synchronization` |

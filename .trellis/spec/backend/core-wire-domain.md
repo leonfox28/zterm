@@ -2,8 +2,8 @@
 
 ## 1. Scope / Trigger
 
-Apply this contract when changing shared identifiers, terminal revisions,
-capabilities, resource defaults, operation replay, protobuf messages, wire
+Apply this contract when changing shared identifiers, terminal revisions and
+DTOs, capabilities, resource defaults, operation replay, protobuf messages, wire
 kinds, or frame encoding. `zterm-core` owns product domain values and
 `zterm-proto` owns their wire representation and validation.
 
@@ -39,6 +39,11 @@ connection-status event is kind 314.
 - `DeviceId` is 32 bytes; `SessionId` and `AttachmentId` are 16 bytes.
 - `Revision` is the only public terminal revision type. It is monotonic and
   checked before mutation.
+- `zterm-core::terminal` owns transport-neutral terminal size, screen, cell,
+  style, cursor, mode, event, update, snapshot/delta, and history values.
+  `zterm-proto` encodes those values. Neither crate depends on
+  `zterm-terminal`, `alacritty_terminal`, or `vte`, and no upstream terminal
+  type crosses a public or wire boundary.
 - `SessionName` is the only validator for exact case-sensitive session names;
   `SessionSelector` resolves either a validated name or a 16-byte ID, and
   `SessionEndReason` distinguishes natural exit, explicit close, daemon stop,
@@ -182,6 +187,7 @@ the client preserves the exact retry identity and payload.
 - Prost, SQLite, Iroh, or OS dependencies in `zterm-core`.
 - Raw `u64` revisions in public terminal APIs.
 - A second frame parser in the CLI or daemon.
+- A host terminal engine dependency or upstream terminal type in core/proto.
 - Re-executing an operation whose result has fallen below the replay low-water
   mark.
 - Generating or accepting a client-invented lease ordinal/incarnation, wrapping

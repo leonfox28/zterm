@@ -16,10 +16,7 @@ use std::time::{Duration, Instant};
 
 use iroh::SecretKey;
 use tokio::sync::watch;
-use zterm_core::terminal::{
-    TerminalDelta, TerminalDeltaResult, TerminalModel, TerminalResourceProjection, TerminalSize,
-    TerminalSnapshot,
-};
+use zterm_core::terminal::{TerminalDelta, TerminalDeltaResult, TerminalSize, TerminalSnapshot};
 #[cfg(unix)]
 use zterm_core::terminal::{
     TerminalHistoryCursor, TerminalHistoryDirection, TerminalHistoryResult,
@@ -31,6 +28,7 @@ use zterm_core::{
 };
 use zterm_platform::account::EffectiveAccount;
 use zterm_platform::pty::{PtyChildState, PtyError, PtyHost, PtyPathKind, PtySession, PtySize};
+use zterm_terminal::{TerminalError, TerminalModel};
 
 use crate::error::DaemonError;
 use crate::terminal_driver::{
@@ -892,7 +890,7 @@ impl SessionService {
             }
             // Retain every actor observed during this shutdown. Its registry
             // finalizer may compare-remove the entry immediately before its OS
-            // thread returns; dropping that projection must not let a
+            // thread returns; dropping that summary must not let a
             // successful stop skip the corresponding JoinHandle.
             for entry in observed.values() {
                 let actor_identity = Arc::as_ptr(&entry.actor);
@@ -1039,11 +1037,9 @@ impl SessionService {
             )
         });
         validate_viewport(self.limits, size)?;
-        let projection = TerminalModel::project_resources(size, self.limits.recent_history_rows)
-            .map_err(map_terminal_error)?;
-        let session_id =
-            self.inner
-                .reserve_creation_session(&name, creation, projection, self.limits)?;
+        let session_id = self
+            .inner
+            .reserve_creation_session(&name, creation, self.limits)?;
         owner.set_session_id(session_id);
 
         let model = TerminalModel::new(size, self.limits.recent_history_rows)
@@ -1063,7 +1059,6 @@ impl SessionService {
         let actor = SessionActor::start(
             session_id,
             size,
-            projection,
             driver,
             Arc::downgrade(&self.inner),
             self.limits,
@@ -1299,8 +1294,8 @@ impl SessionEntry {
 }
 
 /// Unforgeable in-process ownership identity shared by a creation name slot,
-/// its resource reservation, and the eventual provisional/live actor entry.
-/// Cleanup always compares this identity before removing any projection.
+/// its session-count reservation, and the eventual provisional/live actor entry.
+/// Cleanup always compares this identity before removing any reservation.
 #[derive(Clone)]
 struct OwnershipToken(Arc<()>);
 
@@ -1317,7 +1312,7 @@ impl OwnershipToken {
 #[derive(Default)]
 struct RegistryInner {
     state: Mutex<RegistryState>,
-    resources: Mutex<ResourceState>,
+    reservations: Mutex<ReservationState>,
     #[cfg(test)]
     candidate_ids: Mutex<VecDeque<SessionId>>,
     #[cfg(test)]
@@ -1477,14 +1472,14 @@ impl RegistryInner {
                 } if *current_id == session_id && creation.ownership.ptr_eq(&entry.ownership)
             )
         });
-        let resources = cleanup_lock(&self.resources);
-        let owns_resource = resources
-            .projections
+        let reservations = cleanup_lock(&self.reservations);
+        let owns_reservation = reservations
+            .reservations
             .get(&session_id)
-            .is_some_and(|reservation| reservation.ownership.ptr_eq(&entry.ownership));
-        drop(resources);
+            .is_some_and(|ownership| ownership.ptr_eq(&entry.ownership));
+        drop(reservations);
         if owns_name
-            && owns_resource
+            && owns_reservation
             && !state.by_id.contains_key(&session_id)
             && !state.provisional.contains_key(&session_id)
         {
@@ -1582,11 +1577,10 @@ impl RegistryInner {
         &self,
         name: &SessionName,
         creation: &Arc<CreationCell>,
-        projection: TerminalResourceProjection,
         limits: ResourceLimits,
     ) -> Result<SessionId, DaemonError> {
-        // State-before-resources is also used by completion. Holding the state
-        // lock makes shutdown cancellation and identity/resource reservation
+        // State-before-reservations is also used by completion. Holding the state
+        // lock makes shutdown cancellation and identity/session-count reservation
         // one atomic ownership boundary. No path may acquire these locks in
         // the opposite order.
         let mut state = lock(&self.state, "session registry")?;
@@ -1607,20 +1601,10 @@ impl RegistryInner {
                 "session creation reservation was cancelled",
             ));
         }
-        let mut resources = lock(&self.resources, "session resources")?;
-        if resources.projections.len() >= limits.max_live_sessions {
+        let mut reservations = lock(&self.reservations, "session reservations")?;
+        if reservations.reservations.len() >= limits.max_live_sessions {
             return Err(resource_error("live session limit reached"));
         }
-        let next = resources
-            .used_bytes
-            .checked_add(projection.estimated_cell_storage_bytes)
-            .ok_or_else(|| resource_error("aggregate projection overflow"))?;
-        if next > limits.aggregate_cell_projection_bytes {
-            return Err(resource_error(
-                "aggregate terminal projection limit reached",
-            ));
-        }
-
         let session_id = (0..16)
             .map(|_| self.next_session_id_candidate())
             .find(|candidate| {
@@ -1630,17 +1614,12 @@ impl RegistryInner {
                         .cleanup_only
                         .iter()
                         .any(|entry| entry.actor.id == *candidate)
-                    && !resources.projections.contains_key(candidate)
+                    && !reservations.reservations.contains_key(candidate)
             })
             .ok_or_else(|| resource_error("unable to allocate a unique session identity"))?;
-        resources.used_bytes = next;
-        let replaced = resources.projections.insert(
-            session_id,
-            ResourceReservation {
-                bytes: projection.estimated_cell_storage_bytes,
-                ownership: creation.ownership.clone(),
-            },
-        );
+        let replaced = reservations
+            .reservations
+            .insert(session_id, creation.ownership.clone());
         debug_assert!(
             replaced.is_none(),
             "atomic identity reservation replaced an owner"
@@ -1676,45 +1655,8 @@ impl RegistryInner {
             .store(true, Ordering::Release);
     }
 
-    fn update_projection(
-        &self,
-        session_id: SessionId,
-        old: usize,
-        new: usize,
-        limit: usize,
-    ) -> Result<(), DaemonError> {
-        let mut resources = lock(&self.resources, "session resources")?;
-        let Some(current) = resources
-            .projections
-            .get(&session_id)
-            .map(|reservation| reservation.bytes)
-        else {
-            return Err(session_not_found());
-        };
-        if current != old {
-            return Err(session_not_found());
-        }
-        let next = resources
-            .used_bytes
-            .checked_sub(old)
-            .and_then(|value| value.checked_add(new))
-            .ok_or_else(|| resource_error("aggregate projection overflow"))?;
-        if next > limit {
-            return Err(resource_error(
-                "aggregate terminal projection limit reached",
-            ));
-        }
-        resources.used_bytes = next;
-        resources
-            .projections
-            .get_mut(&session_id)
-            .expect("verified reservation remains locked")
-            .bytes = new;
-        Ok(())
-    }
-
     /// Releases a creation which never acquired a registry-visible actor.
-    /// Both the name and projection are retained unless this exact creation
+    /// Both the name and session-count reservation are retained unless this exact creation
     /// token still owns them.
     fn release_creation(
         &self,
@@ -1733,13 +1675,13 @@ impl RegistryInner {
             )
         });
         if let Some(session_id) = session_id {
-            let mut resources = cleanup_lock(&self.resources);
-            let owns_resource = resources
-                .projections
+            let mut reservations = cleanup_lock(&self.reservations);
+            let owns_reservation = reservations
+                .reservations
                 .get(&session_id)
-                .is_some_and(|reservation| reservation.ownership.ptr_eq(&creation.ownership));
-            if owns_resource && let Some(reservation) = resources.projections.remove(&session_id) {
-                resources.used_bytes = resources.used_bytes.saturating_sub(reservation.bytes);
+                .is_some_and(|ownership| ownership.ptr_eq(&creation.ownership));
+            if owns_reservation {
+                reservations.reservations.remove(&session_id);
             }
         }
         if owns_name {
@@ -1748,7 +1690,7 @@ impl RegistryInner {
     }
 
     fn reservation_count(&self) -> Result<usize, DaemonError> {
-        Ok(cleanup_lock(&self.resources).projections.len())
+        Ok(cleanup_lock(&self.reservations).reservations.len())
     }
 
     fn complete(&self, session_id: SessionId, actor: &Arc<SessionActor>) {
@@ -1791,11 +1733,11 @@ impl RegistryInner {
                     session_id: None, ..
                 } => false,
             });
-        let mut resources = cleanup_lock(&self.resources);
-        let owns_resource = resources
-            .projections
+        let mut reservations = cleanup_lock(&self.reservations);
+        let owns_reservation = reservations
+            .reservations
             .get(&session_id)
-            .is_some_and(|reservation| reservation.ownership.ptr_eq(&entry.ownership));
+            .is_some_and(|ownership| ownership.ptr_eq(&entry.ownership));
         if live_matches {
             state.by_id.remove(&session_id);
         } else if provisional_matches {
@@ -1806,8 +1748,8 @@ impl RegistryInner {
         if owns_name {
             state.by_name.remove(&entry.name);
         }
-        if owns_resource && let Some(reservation) = resources.projections.remove(&session_id) {
-            resources.used_bytes = resources.used_bytes.saturating_sub(reservation.bytes);
+        if owns_reservation {
+            reservations.reservations.remove(&session_id);
         }
     }
 
@@ -2056,14 +1998,8 @@ impl Drop for SpawnedPtyOwner {
 }
 
 #[derive(Default)]
-struct ResourceState {
-    projections: BTreeMap<SessionId, ResourceReservation>,
-    used_bytes: usize,
-}
-
-struct ResourceReservation {
-    bytes: usize,
-    ownership: OwnershipToken,
+struct ReservationState {
+    reservations: BTreeMap<SessionId, OwnershipToken>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -2441,7 +2377,6 @@ struct SessionRuntime {
     controller: Option<ControllerLease>,
     controller_operation: Option<ReplayOperationKey>,
     next_generation: u64,
-    projection: TerminalResourceProjection,
     viewport: TerminalSize,
     last_revision: Revision,
 }
@@ -2632,7 +2567,6 @@ impl SessionActor {
     fn start(
         id: SessionId,
         viewport: TerminalSize,
-        projection: TerminalResourceProjection,
         driver: TerminalDriver,
         registry: Weak<RegistryInner>,
         limits: ResourceLimits,
@@ -2684,7 +2618,6 @@ impl SessionActor {
                     controller: None,
                     controller_operation: None,
                     next_generation: 0,
-                    projection,
                     viewport,
                     last_revision: Revision::ZERO,
                 };
@@ -3690,41 +3623,16 @@ fn resize(
 ) -> Result<Revision, DaemonError> {
     validate_viewport(actor.limits, size)?;
     require_resize_controller(runtime, attachment_id)?;
-    let projection = TerminalModel::project_resources(size, actor.limits.recent_history_rows)
-        .map_err(map_terminal_error)?;
-    let registry = actor.registry.upgrade().ok_or_else(session_not_found)?;
-    let old = runtime.projection.estimated_cell_storage_bytes;
-    let new = projection.estimated_cell_storage_bytes;
-    registry.update_projection(
-        actor.id,
-        old,
-        new,
-        actor.limits.aggregate_cell_projection_bytes,
-    )?;
-    let resized = runtime
+    let revision = runtime
         .driver
         .as_ref()
         .ok_or_else(session_not_found)?
         .resize(size)
-        .map_err(map_driver_error);
-    match resized {
-        Ok(revision) => {
-            runtime.projection = projection;
-            runtime.viewport = size;
-            runtime.last_revision = revision;
-            actor.update_cached(runtime, false);
-            Ok(revision)
-        }
-        Err(error) => {
-            let _ = registry.update_projection(
-                actor.id,
-                new,
-                old,
-                actor.limits.aggregate_cell_projection_bytes,
-            );
-            Err(error)
-        }
-    }
+        .map_err(map_driver_error)?;
+    runtime.viewport = size;
+    runtime.last_revision = revision;
+    actor.update_cached(runtime, false);
+    Ok(revision)
 }
 
 fn takeover(
@@ -4029,7 +3937,7 @@ fn map_pty_error(error: PtyError) -> DaemonError {
     }
 }
 
-fn map_terminal_error(error: zterm_core::terminal::TerminalError) -> DaemonError {
+fn map_terminal_error(error: TerminalError) -> DaemonError {
     DaemonError::new(DomainErrorKind::ResourceExhausted, error.to_string())
 }
 
@@ -5799,7 +5707,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn session_id_collision_never_overwrites_an_existing_owner_projection() {
+    fn session_id_collision_never_overwrites_an_existing_owner_reservation() {
         let temporary = tempfile::tempdir().expect("temporary ID-collision fixture");
         let service = unix_fixture_service(
             DeviceId::from_array([70; 32]),
@@ -5890,9 +5798,6 @@ mod tests {
         // poisoned/corrupt registration collision: it has its own actor/token
         // but the externally supplied ID conflicts with a live owner.
         let size = TerminalSize::new(24, 80);
-        let projection =
-            TerminalModel::project_resources(size, ResourceLimits::default().recent_history_rows)
-                .expect("cleanup-owner projection");
         let model = TerminalModel::new(size, ResourceLimits::default().recent_history_rows)
             .expect("cleanup-owner model");
         let shell = [Path::new("/bin/sh"), Path::new("/usr/bin/sh")]
@@ -5912,7 +5817,6 @@ mod tests {
         let cleanup_actor = SessionActor::start(
             first.session_id,
             size,
-            projection,
             driver,
             Arc::downgrade(&service.inner),
             ResourceLimits::default(),
@@ -6150,8 +6054,8 @@ mod tests {
         let registry = Arc::clone(&service.inner);
         assert!(
             thread::spawn(move || {
-                let _resources = registry.resources.lock().expect("resource lock");
-                panic!("inject resource ownership poison");
+                let _reservations = registry.reservations.lock().expect("reservation lock");
+                panic!("inject reservation ownership poison");
             })
             .join()
             .is_err()

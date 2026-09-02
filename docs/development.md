@@ -31,7 +31,7 @@ upgrade is an explicit repository change and must rerun every quality gate.
 ## Product version
 
 The root `[workspace.package].version` is the single lockstep product version,
-and all five zterm product crates inherit it with `version.workspace = true`;
+and all six zterm product crates inherit it with `version.workspace = true`;
 do not assign a component-specific version to a crate. A release preparation
 changes this one value, refreshes `Cargo.lock`, and advances the CLI, daemon,
 protocol, platform libraries, apps, and Relay wrapper as one product.
@@ -97,26 +97,26 @@ directly to `prost-build`.
 ## Workspace dependency direction
 
 ```text
-zterm-core
-   ^       ^
-   |       |
- proto  platform
-   ^       ^
-    \     /
-     daemon
-        ^
-        |
-       cli
+                         zterm-core
+                    /        |        \
+             zterm-proto  zterm-platform  zterm-terminal
+                    \        |        /
+                         zterm-daemon
+                              |
+                          zterm-cli
 ```
 
-The dependency direction is executable: core owns domain/terminal values,
-proto owns the wire codec, platform owns OS boundaries, daemon owns state,
-pairing, network transport, and services (including the one live Session
-registry), and CLI owns parsing plus the raw-terminal renderer. The CLI reaches
-local and remote Sessions only through the daemon; do not move transport state
-into core, give the CLI an Endpoint or identity key, or move OS/Session
-ownership into adapters. Hosted Linux remote-runtime evidence remains a
-separate acceptance gate; see [Remote sessions and the public CLI](remote-cli.md).
+Arrows run from a consumer to its dependency. Core owns domain and
+transport-neutral terminal values; proto owns the wire codec; platform owns OS
+and PTY boundaries; the host-only terminal crate owns the pinned Alacritty
+parser/grid/state adapter. Daemon combines those owners and retains the live
+Session registry; CLI owns command parsing and the outer raw-terminal renderer.
+Core/proto never depend on the host terminal engine, and CLI has no direct
+engine dependency. The CLI reaches local and remote Sessions only through the
+daemon; do not move transport state into core, give the CLI an Endpoint or
+identity key, or move OS/Session ownership into adapters. Hosted Linux
+remote-runtime evidence remains a separate acceptance gate; see
+[Remote sessions and the public CLI](remote-cli.md).
 
 ## Local command owner
 
