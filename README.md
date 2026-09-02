@@ -86,7 +86,7 @@ version.
 
 ## Repository boundaries
 
-- `crates/` — five Rust crates owning core, protocol, platform, daemon, and CLI boundaries.
+- `crates/` — six Rust crates owning core, protocol, platform, terminal-engine, daemon, and CLI boundaries.
 - `proto/zterm/v1/` — the product wire schema compiled with vendored `protoc` binaries.
 - `deploy/relay/` — official relay artifact verification and Compose deployment.
 - `.github/workflows/relay-image.yml` — multi-platform publisher for the

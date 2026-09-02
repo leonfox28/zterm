@@ -26,8 +26,9 @@ fn run() -> Result<(), String> {
     use std::ffi::OsString;
 
     use support::{DEADLINE, INITIAL_SIZE, SCROLLBACK_ROWS, TempMarker};
-    use zterm_core::terminal::{TerminalDeltaResult, TerminalModel};
+    use zterm_core::terminal::TerminalDeltaResult;
     use zterm_daemon::terminal_driver::TerminalDriverConfig;
+    use zterm_terminal::TerminalModel;
 
     let marker = TempMarker::new("slow-attachment")?;
     let config = TerminalDriverConfig {

@@ -1,8 +1,7 @@
 //! Snapshot, checkpoint, delta, and resource-boundary regression tests.
 
-use zterm_core::terminal::{
-    ActiveScreen, TerminalDeltaResult, TerminalError, TerminalModel, TerminalSize,
-};
+use zterm_core::terminal::{ActiveScreen, TerminalDeltaResult, TerminalSize};
+use zterm_terminal::{TerminalError, TerminalModel};
 
 fn apply_snapshot(snapshot: &zterm_core::terminal::TerminalSnapshot) -> TerminalModel {
     let mut client = TerminalModel::new(snapshot.size, 64).expect("snapshot size is valid");
@@ -129,7 +128,7 @@ fn checkpoint_retains_only_visible_grids_across_history_styles_and_screen_transi
     let main_checkpoint = source.checkpoint();
     assert_eq!(
         main_checkpoint.retained_cell_capacity(),
-        usize::from(size.rows) * usize::from(size.columns) * 2
+        usize::from(size.rows) * usize::from(size.columns)
     );
     assert_eq!(main_checkpoint.retained_scrollback_rows(), 0);
     let mut client = apply_snapshot(&main_snapshot);
@@ -214,7 +213,7 @@ fn incompatible_or_larger_delta_chooses_full_resync() {
 }
 
 #[test]
-fn history_resources_and_revision_rules_are_bounded_and_typed() {
+fn history_and_revision_rules_are_bounded_and_typed() {
     let size = TerminalSize::new(3, 12);
     let mut model = TerminalModel::new(size, 4).expect("bounded model is valid");
     assert_eq!(model.revision().get(), 0);
@@ -237,17 +236,26 @@ fn history_resources_and_revision_rules_are_bounded_and_typed() {
             .expect("test revision has room")
     );
 
+    let unchanged_checkpoint = model.checkpoint();
+    let revision_before_second_resize = model.revision();
+    model
+        .resize(size)
+        .expect("a second same-size resize is still ordered");
+    let TerminalDeltaResult::Delta(unchanged) = model.delta_or_resync(&unchanged_checkpoint) else {
+        panic!("same-size resize with identical projected state remains a revision-only delta");
+    };
+    assert_eq!(unchanged.from_revision, revision_before_second_resize);
+    assert_eq!(unchanged.to_revision, model.revision());
+    assert!(
+        unchanged.ansi.is_empty(),
+        "revision-only updates must not manufacture visible ANSI"
+    );
+
     let snapshot = model.snapshot();
     assert!(!snapshot.recent_history_ansi.is_empty());
     assert!(snapshot.recent_history_ansi.len() <= 4 * usize::from(size.columns) + 64);
     let client = apply_snapshot(&snapshot);
     assert_eq!(client.state(), model.state());
-
-    let projection = model.resource_projection();
-    assert_eq!(projection.visible_cells_per_screen, 36);
-    assert_eq!(projection.scrollback_capacity_cells, 48);
-    assert_eq!(projection.total_cell_capacity, 120);
-    assert!(projection.estimated_cell_storage_bytes >= projection.total_cell_capacity);
 
     assert_eq!(
         TerminalModel::new(TerminalSize::new(0, 12), 4).err(),
@@ -259,7 +267,7 @@ fn history_resources_and_revision_rules_are_bounded_and_typed() {
     );
     assert_eq!(
         TerminalModel::new(TerminalSize::new(1, 2), usize::MAX).err(),
-        Some(TerminalError::ResourceProjectionOverflow {
+        Some(TerminalError::AllocationOverflow {
             size: TerminalSize::new(1, 2),
             scrollback_rows: usize::MAX,
         })

@@ -11,12 +11,13 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use zterm_core::Revision;
 use zterm_core::terminal::{
-    TerminalCheckpoint, TerminalDeltaResult, TerminalError, TerminalHistoryCursor,
-    TerminalHistoryDirection, TerminalHistoryResult, TerminalModel, TerminalSize, TerminalSnapshot,
+    TerminalDeltaResult, TerminalHistoryCursor, TerminalHistoryDirection, TerminalHistoryResult,
+    TerminalSize, TerminalSnapshot,
 };
 use zterm_platform::pty::{
     PtyChild, PtyChildInterrupt, PtyChildState, PtyError, PtyExitStatus, PtyIo, PtySession, PtySize,
 };
+use zterm_terminal::{TerminalCheckpoint, TerminalError, TerminalModel};
 
 /// Fixed resource limits for one retained terminal driver.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

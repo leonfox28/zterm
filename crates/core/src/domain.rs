@@ -540,8 +540,6 @@ pub struct ResourceLimits {
     pub max_viewport_rows: u16,
     /// Maximum accepted viewport columns.
     pub max_viewport_columns: u16,
-    /// Admission ceiling for summed fixed-cell projections.
-    pub aggregate_cell_projection_bytes: usize,
     /// Maximum simultaneous local unary or attachment IPC connections.
     pub max_local_connections: usize,
     /// Maximum accepted relative local request deadline.
@@ -557,15 +555,11 @@ impl Default for ResourceLimits {
             no_controller_columns: 120,
             max_viewport_rows: 80,
             max_viewport_columns: 240,
-            aggregate_cell_projection_bytes: 128 * 1024 * 1024,
             max_local_connections: 32,
             max_local_deadline_seconds: 30,
         }
     }
 }
-
-/// Whole-process memory target measured by integration gates, not admission.
-pub const DAEMON_RSS_MEASUREMENT_TARGET_BYTES: usize = 256 * 1024 * 1024;
 
 /// Daemon-issued bounded replay lease for one authenticated principal.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -751,7 +745,7 @@ pub enum DomainErrorKind {
     NotSynchronized,
     /// An attachment no longer owns the controller lease.
     LeaseLost,
-    /// A fixed session, viewport, or projection bound would be exceeded.
+    /// A fixed session-count or viewport bound would be exceeded.
     ResourceExhausted,
     /// A defined future service is not implemented in this milestone.
     ServiceNotImplemented,
@@ -939,8 +933,6 @@ mod tests {
         let limits = ResourceLimits::default();
         assert_eq!(limits.max_live_sessions, 8);
         assert_eq!(limits.recent_history_rows, 2_000);
-        assert_eq!(limits.aggregate_cell_projection_bytes, 128 * 1024 * 1024);
-        assert_eq!(DAEMON_RSS_MEASUREMENT_TARGET_BYTES, 256 * 1024 * 1024);
         assert_eq!(
             DomainErrorKind::from_code(DomainErrorKind::DaemonStopped.code()),
             Some(DomainErrorKind::DaemonStopped)

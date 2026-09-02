@@ -691,8 +691,26 @@ impl SessionWireServer {
                 flatten_attachment_task(result)
             }
             result = &mut writer_task => {
-                reader_task.abort();
-                flatten_attachment_task(result)
+                let writer_result = flatten_attachment_task(result);
+                if writer_result.as_ref().is_err_and(|error| {
+                    error.kind() == DomainErrorKind::DaemonStopped
+                }) {
+                    // A peer can send an explicit detach and close its read
+                    // half while a revision-only terminal update is already
+                    // writable. Give the reader its bounded opportunity to
+                    // classify the queued detach/EOF before treating the write
+                    // failure as authoritative transport loss.
+                    match tokio::time::timeout(limits.operation_timeout, &mut reader_task).await {
+                        Ok(result) => flatten_attachment_task(result),
+                        Err(_) => {
+                            reader_task.abort();
+                            writer_result
+                        }
+                    }
+                } else {
+                    reader_task.abort();
+                    writer_result
+                }
             }
         };
         let transport_loss = should_move_remote_resume_checkpoint(context.is_remote(), &result);
@@ -2332,7 +2350,7 @@ mod tests {
         own: DeviceId,
         attachment_id: AttachmentId,
         revision: Revision,
-    ) -> OperationLease {
+    ) -> Revision {
         peer.send(
             WireKind::TerminalSnapshotApplied,
             2,
@@ -2350,17 +2368,37 @@ mod tests {
             },
         )
         .await;
-        let barrier = peer.next().await;
-        assert_eq!(barrier.kind, WireKind::SessionOperationLeaseResponse);
-        assert_eq!(barrier.request_id, 3);
-        let barrier: v1::SessionOperationLeaseResponse = barrier
-            .decode_message(WireKind::SessionOperationLeaseResponse)
-            .expect("decode remote activation barrier");
-        barrier
-            .lease
-            .expect("activation barrier returns a daemon-issued lease")
-            .try_into()
-            .expect("valid activation-barrier lease")
+        let mut latest_revision = revision;
+        loop {
+            let barrier = peer.next().await;
+            if barrier.kind == WireKind::TerminalDelta {
+                assert_eq!(barrier.request_id, 0);
+                let delta: v1::TerminalDelta = barrier
+                    .decode_message(WireKind::TerminalDelta)
+                    .expect("decode live delta preceding the activation barrier");
+                let delta_attachment: AttachmentId = delta
+                    .attachment_id
+                    .expect("live activation delta carries an attachment ID")
+                    .try_into()
+                    .expect("live activation delta attachment ID is valid");
+                assert_eq!(delta_attachment, attachment_id);
+                assert_eq!(delta.from_revision, latest_revision.get());
+                assert!(delta.to_revision >= delta.from_revision);
+                latest_revision = Revision::new(delta.to_revision);
+                continue;
+            }
+            assert_eq!(barrier.kind, WireKind::SessionOperationLeaseResponse);
+            assert_eq!(barrier.request_id, 3);
+            let barrier: v1::SessionOperationLeaseResponse = barrier
+                .decode_message(WireKind::SessionOperationLeaseResponse)
+                .expect("decode remote activation barrier");
+            let _: OperationLease = barrier
+                .lease
+                .expect("activation barrier returns a daemon-issued lease")
+                .try_into()
+                .expect("valid activation-barrier lease");
+            return latest_revision;
+        }
     }
 
     fn unix_wire_service(own: DeviceId, working_directory: PathBuf) -> SessionService {
@@ -3558,8 +3596,13 @@ mod tests {
             .expect("initial attachment ID")
             .try_into()
             .expect("fixed-width initial attachment ID");
-        let baseline = Revision::new(first_snapshot.revision);
-        acknowledge_and_barrier(&mut first, own, first_attachment, baseline).await;
+        let baseline = acknowledge_and_barrier(
+            &mut first,
+            own,
+            first_attachment,
+            Revision::new(first_snapshot.revision),
+        )
+        .await;
         first
             .stream
             .shutdown()
@@ -3594,8 +3637,13 @@ mod tests {
             .expect("fixed-width resumed attachment ID");
         assert_ne!(resumed_attachment, first_attachment);
         assert_eq!(resumed_delta.from_revision, baseline.get());
-        let resumed_revision = Revision::new(resumed_delta.to_revision);
-        acknowledge_and_barrier(&mut resumed, own, resumed_attachment, resumed_revision).await;
+        let resumed_revision = acknowledge_and_barrier(
+            &mut resumed,
+            own,
+            resumed_attachment,
+            Revision::new(resumed_delta.to_revision),
+        )
+        .await;
         resumed
             .send(
                 WireKind::TerminalInput,
@@ -3645,12 +3693,11 @@ mod tests {
             .expect("post-protocol attachment ID")
             .try_into()
             .expect("fixed-width post-protocol attachment ID");
-        let after_protocol_revision = Revision::new(after_protocol_snapshot.revision);
-        acknowledge_and_barrier(
+        let after_protocol_revision = acknowledge_and_barrier(
             &mut after_protocol,
             own,
             after_protocol_attachment,
-            after_protocol_revision,
+            Revision::new(after_protocol_snapshot.revision),
         )
         .await;
         after_protocol

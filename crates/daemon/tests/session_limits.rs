@@ -1,4 +1,4 @@
-//! Session-count, viewport, projection, and resize rollback integration tests.
+//! Session-count, viewport, and resize rollback integration tests.
 
 #[cfg(unix)]
 #[path = "support/session_fixture.rs"]
@@ -6,8 +6,8 @@ mod support;
 
 #[cfg(unix)]
 #[test]
-fn session_viewport_and_projection_limits_fail_without_mutation() -> Result<(), String> {
-    use zterm_core::terminal::{TerminalModel, TerminalSize};
+fn session_count_and_viewport_limits_fail_without_mutation() -> Result<(), String> {
+    use zterm_core::terminal::TerminalSize;
     use zterm_core::{DomainErrorKind, ResourceLimits, SessionName, SessionSelector};
 
     let fixture = support::Fixture::new(ResourceLimits::default())?;
@@ -27,14 +27,8 @@ fn session_viewport_and_projection_limits_fail_without_mutation() -> Result<(), 
     assert_eq!(fixture.service.list().map_err(support::display)?.len(), 8);
     fixture.service.shutdown().map_err(support::display)?;
 
-    let mut tight = ResourceLimits::default();
+    let tight = ResourceLimits::default();
     let initial = TerminalSize::new(tight.no_controller_rows, tight.no_controller_columns);
-    tight.aggregate_cell_projection_bytes = TerminalModel::project_resources(
-        TerminalSize::new(tight.max_viewport_rows, tight.max_viewport_columns),
-        tight.recent_history_rows,
-    )
-    .map_err(support::display)?
-    .estimated_cell_storage_bytes;
     let fixture = support::Fixture::new(tight)?;
     let session = fixture
         .service
@@ -61,28 +55,40 @@ fn session_viewport_and_projection_limits_fail_without_mutation() -> Result<(), 
         .attachment
         .resize(TerminalSize::new(80, 240))
         .map_err(support::display)?;
-    let aggregate = fixture
+    let second = fixture
         .service
         .create(
             fixture.principal,
             fixture.op(2),
-            SessionName::new("aggregate-overflow").expect("fixture name"),
+            SessionName::new("second-session").expect("fixture name"),
             None,
             Some(initial),
         )
-        .expect_err("aggregate projection must reject a second session");
-    assert_eq!(aggregate.kind(), DomainErrorKind::ResourceExhausted);
-    assert_eq!(fixture.service.list().map_err(support::display)?.len(), 1);
-    let before = fixture.service.list().map_err(support::display)?[0].clone();
+        .map_err(support::display)?;
+    assert_ne!(second.session_id, session.session_id);
+    assert_eq!(fixture.service.list().map_err(support::display)?.len(), 2);
+    let before = fixture
+        .service
+        .list()
+        .map_err(support::display)?
+        .into_iter()
+        .find(|summary| summary.session_id == session.session_id)
+        .ok_or_else(|| "resized session disappeared".to_owned())?;
     let oversized = attached
         .attachment
         .resize(TerminalSize::new(81, 240))
         .expect_err("oversized viewport");
     assert_eq!(oversized.kind(), DomainErrorKind::ResourceExhausted);
-    let after = fixture.service.list().map_err(support::display)?[0].clone();
+    let after = fixture
+        .service
+        .list()
+        .map_err(support::display)?
+        .into_iter()
+        .find(|summary| summary.session_id == session.session_id)
+        .ok_or_else(|| "resized session disappeared".to_owned())?;
     assert_eq!(
         before, after,
-        "failed resize must retain state and reservation"
+        "failed resize must retain terminal and viewport state"
     );
     let oversized_attach = match fixture.service.prepare_attach(
         fixture.principal,

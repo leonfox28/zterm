@@ -8,6 +8,9 @@ use std::sync::{Arc, Mutex, TryLockError};
 
 use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty};
 
+const HOSTED_TERM: &str = "xterm-256color";
+const HOSTED_COLORTERM: &str = "truecolor";
+
 #[cfg(all(unix, not(any(target_os = "android", target_os = "redox"))))]
 use crate::account::{AccountError, EffectiveAccount};
 
@@ -724,6 +727,8 @@ fn login_shell_builder(
     let mut builder = CommandBuilder::new_default_prog();
     builder.env("HOME", account.home());
     builder.env("SHELL", account.shell());
+    builder.env("TERM", HOSTED_TERM);
+    builder.env("COLORTERM", HOSTED_COLORTERM);
     builder.cwd(cwd);
     Ok(builder)
 }
@@ -766,6 +771,14 @@ mod tests {
         assert!(builder.is_default_prog());
         assert_eq!(builder.get_env("HOME"), Some(account.home().as_os_str()));
         assert_eq!(builder.get_env("SHELL"), Some(account.shell().as_os_str()));
+        assert_eq!(
+            builder.get_env("TERM"),
+            Some(std::ffi::OsStr::new(HOSTED_TERM))
+        );
+        assert_eq!(
+            builder.get_env("COLORTERM"),
+            Some(std::ffi::OsStr::new(HOSTED_COLORTERM))
+        );
         assert_eq!(
             builder.get_cwd().map(OsString::as_os_str),
             Some(account.home().as_os_str())

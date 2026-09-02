@@ -31,6 +31,19 @@ fn main() {
     #[cfg(unix)]
     {
         let args = std::env::args_os().collect::<Vec<_>>();
+        if args
+            .get(1)
+            .is_some_and(|arg| arg == "--hosted-profile-probe")
+        {
+            let code = match hosted_profile_probe() {
+                Ok(()) => 0,
+                Err(error) => {
+                    eprintln!("hosted profile probe failed: {error}");
+                    2
+                }
+            };
+            std::process::exit(code);
+        }
         if args.get(1).is_some_and(|arg| arg == "--fixture-child") {
             let code = match fixture_child(&args[2..]) {
                 Ok(code) => code,
@@ -55,9 +68,91 @@ fn main() {
 
 #[cfg(unix)]
 fn run_unix_gate() -> Result<(), String> {
+    hosted_profile_is_independent_of_parent_terminal()?;
     interactive_lifecycle()?;
     high_output_lifecycle()?;
     explicit_close_lifecycle()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn hosted_profile_is_independent_of_parent_terminal() -> Result<(), String> {
+    for (label, term, colorterm) in [
+        ("ghostty", Some("xterm-ghostty"), Some("truecolor")),
+        ("kitty", Some("xterm-kitty"), Some("24bit")),
+        ("tmux", Some("screen-256color"), None),
+        ("unset", None, None),
+    ] {
+        let executable = current_executable()?;
+        let mut command = Command::new(executable);
+        command
+            .arg("--hosted-profile-probe")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        match term {
+            Some(term) => {
+                command.env("TERM", term);
+            }
+            None => {
+                command.env_remove("TERM");
+            }
+        }
+        match colorterm {
+            Some(colorterm) => {
+                command.env("COLORTERM", colorterm);
+            }
+            None => {
+                command.env_remove("COLORTERM");
+            }
+        }
+        let mut child = command.spawn().map_err(display_error)?;
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            if let Some(status) = child.try_wait().map_err(display_error)? {
+                let output = child.wait_with_output().map_err(display_error)?;
+                if !status.success() {
+                    return Err(format!(
+                        "{label} parent profile probe failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+                require_contains(&output.stdout, b"HOSTED_PROFILE:xterm-256color:truecolor")?;
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "{label} parent profile probe exceeded its deadline"
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    println!("PTY_CASE=hosted_profile,parent_variants=4,term=xterm-256color");
+    Ok(())
+}
+
+#[cfg(unix)]
+fn hosted_profile_probe() -> Result<(), String> {
+    let mut session = PtyHost::new()
+        .spawn_current_account_login_shell(PtySize::default(), None)
+        .map_err(display_error)?;
+    let reader = session.take_reader().map_err(display_error)?;
+    let output = OutputDrain::start(reader);
+    session
+        .write_input(b"printf 'HOSTED_PROFILE:%s:%s\\n' \"$TERM\" \"$COLORTERM\"; exit\n")
+        .map_err(display_error)?;
+    output.wait_for(b"HOSTED_PROFILE:xterm-256color:truecolor", DEADLINE)?;
+    let status = wait_for_exit(&mut session, DEADLINE)?;
+    if !status.success() {
+        return Err(format!(
+            "hosted login shell did not exit successfully: {status:?}"
+        ));
+    }
+    let bytes = output.finish(DEADLINE)?;
+    require_contains(&bytes, b"HOSTED_PROFILE:xterm-256color:truecolor")?;
+    println!("HOSTED_PROFILE:xterm-256color:truecolor");
     Ok(())
 }
 

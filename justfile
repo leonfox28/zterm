@@ -32,11 +32,12 @@ check:
 # Canonical portable CI owner: version, format, workflow/release policy, shell, and Python syntax.
 ci-policy:
     sh tests/workspace-version.sh
+    sh tests/terminal-dependency-policy.sh
     cargo +1.98.0 fmt --all -- --check
     actionlint
     sh tests/release/static.sh
     sh tests/release/operator-fixture.sh
-    shellcheck -s sh install/install.sh tests/release/*.sh tests/secret-scan*.sh $(find tools/ci tools/release -type f -name '*.sh' -print)
+    shellcheck -s sh install/install.sh tests/release/*.sh tests/secret-scan*.sh tests/terminal-dependency-policy.sh $(find tools/ci tools/release -type f -name '*.sh' -print)
     sh tools/ci/check-python-syntax.sh tests/release/https_fixture.py tests/release/https_fixture_bind_test.py
 
 # Full Unix runtime evidence; CI assigns docs/smoke to their canonical hosts.
@@ -51,7 +52,7 @@ ci-unix docs='false' smoke='false':
 # Hosted Windows shared/unsupported-platform boundary.
 ci-windows:
     cargo +1.98.0 clippy --workspace --lib --bins --all-features -- -D warnings
-    cargo +1.98.0 test -p zterm-core -p zterm-proto -p zterm-platform -p zterm-daemon --lib --all-features
+    cargo +1.98.0 test -p zterm-core -p zterm-proto -p zterm-platform -p zterm-terminal -p zterm-daemon --lib --all-features
 
 # Workspace and isolated relay-probe dependency policy.
 ci-dependencies:

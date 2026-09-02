@@ -45,20 +45,22 @@ children. Production code contains no program-specific session branch.
 
 ## Synchronization and bounds
 
-The daemon's `TerminalModel` is the only terminal truth. Each attachment first
+The daemon's Alacritty-backed `TerminalModel` is the only terminal truth.
+`alacritty_terminal` parses PTY bytes and stores grid/history/modes; it is not a
+pixel renderer and does not replace `portable-pty`. Each attachment first
 receives a full snapshot and must acknowledge that exact revision before input
 or resize is accepted. A stale/future acknowledgement, viewport mismatch, or
 inefficient delta causes `SyncRequired` followed by a replacement snapshot.
 There is no unbounded output log or per-revision queue: slow clients converge
 to the latest merged delta or resynchronize once.
 
-An attachment checkpoint contains only reconstructed main/alternate visible
-grids in a zero-scrollback parser. It retains `rows × columns × 2` cells no
-matter how much of the bounded host history is populated; history remains owned
-once by the authoritative model. Main/alternate transitions, styles, Unicode,
-and resize resynchronization preserve the same latest-visible semantics.
+An attachment checkpoint contains one fixed Zterm-owned projection of the
+latest active viewport. It retains `rows × columns` cells and no engine,
+inactive screen, or history. Main/alternate transitions resynchronize, while
+styles, Unicode, and resize resynchronization preserve the same latest-visible
+semantics.
 
-Current resource admission is fixed:
+Current independent service and hostile-input bounds are fixed:
 
 | Resource | M4 limit |
 | --- | ---: |
@@ -66,16 +68,27 @@ Current resource admission is fixed:
 | Recent history per session | 2,000 rows |
 | Default viewport | 120 columns × 40 rows |
 | Maximum viewport | 240 columns × 80 rows |
-| Aggregate fixed-cell projection | 128 MiB |
-| Process RSS measurement target | 256 MiB |
+| Combining text per cell | 22 UTF-8 bytes including the base scalar |
+| Combining-extra cells per session | 4,096 across main and alternate |
+| Combining bytes per session | 64 KiB across main and alternate |
+| Side events / canonical replies per update | 32 / 64 KiB |
 | Same-UID socket connections | 32 |
 | Wire frame | 8 MiB |
 | Control payload | 1 MiB |
 
-The fixed-cell projection is checked admission arithmetic, not a claim that
-RSS is exactly predictable. Snapshot encoding always preserves the current
-screen; when necessary it removes only the oldest complete history lines at an
-ANSI reset/line boundary to remain within the frame ceiling.
+There is no aggregate terminal-memory estimate or RSS admission gate. Alacritty
+owns its internal allocation/capacity; dropping the Session drops the model.
+Zterm still caps every PTY-controlled string, reply, event, and combining extra
+before it can become unbounded persistent state. Snapshot encoding always
+preserves the current screen; when necessary it removes only the oldest
+complete history lines at an ANSI reset/line boundary to remain within the
+frame ceiling.
+
+The login PTY always receives `TERM=xterm-256color` and
+`COLORTERM=truecolor`. If the user runs Zterm inside Ghostty, kitty,
+Alacritty, tmux, or another terminal, that outer application only interprets
+Zterm's allowlisted ANSI. It does not contain, share, or nest the daemon's
+Alacritty model object or its PTY.
 
 ## Trust and architecture boundary
 
@@ -114,8 +127,8 @@ operation may allocate one. Leases and replay results are in memory only; there
 is no automatic fresh-process recovery or generic persisted retry token.
 
 Names use one atomic provisional/live registry slot, so create cannot race a
-rename into publishing a duplicate. Session ID collision checking and resource
-insertion occur in that same ordered ownership boundary, and name/resource/
+rename into publishing a duplicate. Session ID collision checking and count
+reservation occur in that same ordered ownership boundary, and name/reservation/
 actor entries carry one compare-only token. If shutdown cancels publication
 after a PTY was spawned, cancellation blocks publication but keeps the original
 name unavailable while the daemon closes, reaps, drains, and joins it. Until
@@ -125,7 +138,7 @@ only for exact-token removal; unrelated sessions cannot be released.
 
 Stop requests interrupt all session children concurrently. A successful stop
 is acknowledged only after every child, driver thread, actor, and provisional
-resource is released. If the absolute cleanup deadline expires, the daemon
+reservation is released. If the absolute cleanup deadline expires, the daemon
 returns a typed error and keeps its listener/socket available for status and a
 later retry; it does not claim to have stopped while ownership remains.
 Driver and actor Drop paths never join on a socket/runtime caller. They first

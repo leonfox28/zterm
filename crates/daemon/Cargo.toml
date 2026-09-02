@@ -27,6 +27,7 @@ zeroize.workspace = true
 zterm-core.workspace = true
 zterm-platform.workspace = true
 zterm-proto.workspace = true
+zterm-terminal.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
