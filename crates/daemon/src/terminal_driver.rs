@@ -12,7 +12,8 @@ use tokio::sync::watch;
 use zterm_core::Revision;
 use zterm_core::terminal::{
     TerminalDeltaResult, TerminalHistoryCursor, TerminalHistoryDirection, TerminalHistoryResult,
-    TerminalSize, TerminalSnapshot,
+    TerminalScrollAction, TerminalScrollMetrics, TerminalSize, TerminalSnapshot,
+    TerminalViewportResult,
 };
 use zterm_platform::pty::{
     PtyChild, PtyChildInterrupt, PtyChildState, PtyError, PtyExitStatus, PtyIo, PtySession, PtySize,
@@ -589,6 +590,16 @@ impl TerminalAttachment {
         lock(&self.shared.model, "terminal model")?
             .history_page(direction, cursor, maximum_rows)
             .map_err(Into::into)
+    }
+
+    /// Projects one complete semantic viewport without advancing the live checkpoint.
+    pub fn scroll_viewport(
+        &self,
+        previous: Option<TerminalScrollMetrics>,
+        action: TerminalScrollAction,
+    ) -> Result<TerminalViewportResult, TerminalDriverError> {
+        self.shared.check_failure()?;
+        Ok(lock(&self.shared.model, "terminal model")?.scroll_viewport(previous, action))
     }
 }
 

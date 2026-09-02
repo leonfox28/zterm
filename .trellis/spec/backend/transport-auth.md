@@ -164,7 +164,8 @@ outbound-known and inbound-authorization directions explicit.
   then retries with `create_main = false`. First-ever occupancy and every other
   typed initial attach error remain terminal.
 - Every opened attachment epoch owns an address-free observer for the exact
-  candidate that opened its service stream. Its `HISTORY_PAGING` gate and
+  candidate that opened its service stream. Its `HISTORY_PAGING` and
+  `TERMINAL_VIEWPORT` gates and
   selected Iroh path sample must use only that observer; a later deterministic
   primary replacement cannot change an already-open epoch, and only a fresh
   reconnect epoch may observe the replacement candidate. RTT is rounded to the
@@ -177,6 +178,20 @@ outbound-known and inbound-authorization directions explicit.
   bounded pending-control cell, is correlated to one page, and is resolved—not
   replayed—when its stream epoch ends. Connection-status events are never valid
   normal-ALPN service kinds.
+- Continuous scrolling is ordinary authenticated attachment control guarded by
+  negotiated `TERMINAL_VIEWPORT`. One semantic request occupies one bounded
+  pending cell and is correlated to one validated complete frame. Relative
+  requests saturating-coalesce and the latest absolute drag target wins; no
+  request is replayed into a later epoch. A peer without the bit receives no
+  kind 315/316 and continues through `HISTORY_PAGING` unchanged.
+- `controller_was_active` is scoped to one remote stream epoch. A host-initiated
+  `TerminalSyncRequired -> Snapshot` inside that epoch preserves it, allowing
+  only the same previously-active controller's input/history/viewport to cross
+  the replacement sync window. A new transport epoch, initial attach, or
+  takeover initializes it false. Epoch loss completes pending history and
+  viewport requests once as correlated content-free Gap(0/0), then emits
+  `Reconnecting`; mutation/lease/takeover errors retain their existing typed or
+  outcome-unknown semantics.
 - Apply normal QUIC limits immediately after connect/accept and before
   Hello/Welcome: advertise `max_bi_streams_per_connection` and zero
   unidirectional streams. Pair connections advertise one bidirectional and zero
@@ -328,7 +343,9 @@ outbound-known and inbound-authorization directions explicit.
 | malformed, trailing, oversized, stalled, or panicking remote service stream | close/fail only that stream; retain primary connection, Session, PTY, and other streams |
 | reconnect delta baseline is inconsistent | consume and validate `TerminalSyncRequired`, then require a same-attachment snapshot at its declared revision |
 | selected path changes direct/relay or disappears | emit a redacted changed local observation no faster than 1 Hz; reconnect displays unknown |
-| history request loses its remote stream | resolve once with typed transport failure; do not retry on another stream epoch |
+| history or viewport request loses its remote stream | resolve once with a correlated content-free Gap(0/0), then reconnect; do not retry on another stream epoch |
+| viewport request/frame is used without capability, correlation, valid metrics, or exact current row count | reject/send no unknown kind; never retain unverified rows or baseline |
+| input/history/viewport arrives during replacement sync | forward only if `controller_was_active` is true for this exact stream epoch and controller; initial/new-epoch/takeover stays fenced |
 | active epoch changes to a full snapshot | emit one local `Synchronizing` event before snapshot bytes; suppress duplicates until the view becomes active again |
 | remote write/control peer stops reading | operation deadline releases the stream epoch and eventually the desired-view demand |
 | continuously ready accept branch with completed handler tasks | reap completed `JoinSet` entries before the next accept; retained task ownership stays bounded |
@@ -362,6 +379,9 @@ outbound-known and inbound-authorization directions explicit.
   occurs after the permit is released.
 - **Good:** retain a correlated peer error's kind/request ID, zeroize its
   message, and re-encode one stable local detail.
+- **Good:** capability-gate semantic viewport per opened epoch, preserve a
+  previously-active controller across only an in-epoch replacement snapshot,
+  and resolve read-only pending controls as Gap before reconnecting.
 - **Bad:** cap the combined route list at four, accept unidirectional QUIC
   streams that no actor consumes, persist a direct address, roll back an
   outcome-unknown authorization, detach a PTY because one device was revoked,
@@ -393,10 +413,12 @@ outbound-known and inbound-authorization directions explicit.
   quiesce-before-Endpoint ordering without creating an Endpoint.
 - `remote_attachment` pure fake-stream tests cover one demand across fresh
   stream/attachment epochs, stable local identity, state ordering, input drop,
-  latest viewport coalescing, marker-plus-snapshot fallback, bounded stalled
-  writes, pending lease/takeover completion, post-active half-open occupancy
-  retry under paused time, first-ever occupancy termination, and other terminal
-  classifications. The authenticated `session_wire` PTY regression proves
+  latest geometry and semantic-scroll coalescing, capability-less legacy
+  fallback, marker-plus-snapshot preservation, same-epoch visual-sync fences,
+  correlated Gap on epoch loss, bounded stalled writes, pending lease/takeover
+  completion, post-active half-open occupancy retry under paused time,
+  first-ever occupancy termination, and other terminal classifications. The
+  authenticated `session_wire` PTY regression proves
   EOF-only checkpoint move versus explicit/protocol discard without opening an
   Endpoint.
 - Unix IPC: `local_pair_ipc`, `local_device_ipc`, `local_ipc`, and
@@ -470,6 +492,22 @@ for source in [fresh, cache, ticket] {
 
 Each independently validated source stays bounded, deduplication preserves the
 fallback order, and later sources remain reachable after earlier dial failures.
+
+Viewport negotiation and sync identity follow the same epoch ownership rule:
+
+```rust
+// Wrong: an old peer receives an unknown kind and a reconnect inherits trust.
+send(TerminalViewportRequest(action)).await?;
+next_epoch.controller_was_active = previous_epoch.controller_was_active;
+
+// Correct: capability and prior-active state belong to this opened epoch.
+if epoch.capabilities.contains(Capabilities::TERMINAL_VIEWPORT) {
+    epoch.send_viewport(action).await?;
+} else {
+    epoch.request_legacy_history().await?;
+}
+next_epoch.controller_was_active = false;
+```
 
 For shared modules, leaving Unix-backed private state or commands compiled on
 Windows is also wrong:

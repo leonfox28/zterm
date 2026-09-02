@@ -31,6 +31,8 @@ SessionAttachment::write_input(bytes) -> Result<(), DaemonError>
 SessionAttachment::resize(size) -> Result<Revision, DaemonError>
 SessionAttachment::history_page(direction, cursor, maximum_rows)
     -> Result<TerminalHistoryResult, DaemonError>
+SessionAttachment::scroll_viewport(action: TerminalScrollAction)
+    -> Result<TerminalViewportResult, DaemonError>
 ```
 
 Adapters may call the deadline-bearing `*_until(..., Instant)` variants, but
@@ -108,18 +110,34 @@ they must not duplicate registry, replay, session-reservation, or controller log
   takeover exists per session, so 1.0 retains at most the active controller
   checkpoint and one replacement checkpoint. Attachments never receive PTY
   close authority.
-- Every full snapshot must be acknowledged at its exact revision before input
-  or resize. A mismatch discards the checkpoint and returns a latest snapshot;
-  input is not queued while synchronization is pending. Once that exact
-  acknowledgement is accepted, contiguous live deltas may arrive before an
-  activation barrier or takeover response. Adapters advance the acknowledged
-  revision through that chain while preserving pending-takeover state; a gap
+- A fresh attach or pending takeover must acknowledge its first full snapshot
+  at the exact revision before input, history, or semantic viewport operations.
+  A mismatch discards the checkpoint and returns a latest snapshot; input is
+  not queued by the Session. Resize is replaceable controller state and retains
+  its existing broader allowance while an Active-target snapshot is in flight.
+  Once the attachment has been Active, the same current controller/generation
+  may also issue input, legacy history, and semantic viewport operations across
+  a later replacement-snapshot `Awaiting -> Active` window. This narrow
+  `ever_active` fence handles the duplex ordering race without admitting a
+  fresh attachment, pending takeover, stale generation, or different
+  controller. Contiguous live deltas may arrive before an activation barrier;
+  adapters advance the acknowledged revision through that chain, while a gap
   requests a fresh authoritative sync and never silently activates it.
-- History is a controller-only, active/main-screen read. The Session actor
-  validates attachment/controller ownership, synchronization state, direction,
-  cursor epoch/range, and the fixed row bound once, then asks the retained
-  driver/model for one page. Paging never mutates the lease, checkpoint, PTY,
-  lifecycle watermark, or live revision stream.
+- History is a controller-only main-screen read. The Session actor validates
+  attachment/current-controller ownership, the initial-versus-replacement sync
+  fence, direction, cursor epoch/range, and the fixed row bound once, then asks
+  the retained driver/model for one page. Paging never mutates the lease,
+  checkpoint, PTY, lifecycle watermark, or live revision stream.
+- Semantic scroll position is optional `TerminalScrollMetrics` stored only on
+  `ActorAttachment`. Each action passes that attachment-owned baseline into the
+  retained driver and replaces or clears it from the typed result. It is never
+  stored on `TerminalModel`, in `RemoteResumeCheckpoint`, on disk, or in the
+  controller lease, so two attachments cannot move one another's viewport.
+  Explicit `sync_latest`, detach, a genuinely new/reconnecting attachment, and
+  controller takeover reset it. An automatic `next_update -> Snapshot` for an
+  already-active controller preserves it so relative scrolling remains pinned
+  through background resize/resync; epoch/height reconciliation is delegated
+  to the model and reported as `Rebased`/Changed/Gap.
 - Revision and lifecycle notification use Tokio `watch` watermarks. There is
   no per-revision backlog. A slow view receives one merged delta or a full
   replacement snapshot. An adapter must inspect the current lifecycle value
@@ -206,8 +224,9 @@ they must not duplicate registry, replay, session-reservation, or controller log
 | ninth session or invalid viewport | `resource_exhausted`; no PTY/model mutation |
 | normal second controller | `session_occupied` |
 | overlapping first attach after one request owns/pends the controller | `session_occupied`; the registry still contains exactly one `main` |
-| input/resize before exact snapshot acknowledgement | `not_synchronized` |
-| history request is non-controller, non-active, alternate-screen, stale, or out of bounds | typed lease/sync/changed/gap/malformed result; no PTY or checkpoint mutation |
+| fresh/takeover input, history, or viewport request before exact first snapshot acknowledgement | `not_synchronized`; no PTY/model/checkpoint mutation |
+| previously-active current controller issues input/history/viewport during a later replacement snapshot | admit exactly once against the same generation; do not activate or acknowledge the snapshot implicitly |
+| history/viewport request is non-controller, alternate-screen, stale, invalid, or out of bounds | typed lease/sync/changed/gap/malformed result; no PTY or checkpoint mutation |
 | stale/replaced attachment | `lease_lost`, no PTY write |
 | missing session selector | `session_not_found` |
 | retained operation retry | exact prior success or typed error |
@@ -225,9 +244,13 @@ they must not duplicate registry, replay, session-reservation, or controller log
   daemon-lifetime session available for a later snapshot/resync.
 - **Good retry case:** a response-lost takeover reconnects with the same opaque
   operation and may replace only the controller established by that operation.
+- **Good visual-sync case:** preserve one attachment's pinned baseline across
+  its automatic replacement snapshot and allow only that already-active current
+  controller to continue navigation/input during the duplex window.
 - **Bad:** hold a registry or replay lock across spawn/PTTY I/O, run a blocking
   session effect on the current-thread Tokio runtime, remove a `Starting` name
-  before cleanup succeeds, or join worker threads from `Drop`.
+  before cleanup succeeds, persist a scroll baseline in the model/resume cell,
+  or join worker threads from `Drop`.
 
 ## 6. Tests Required
 
@@ -246,6 +269,11 @@ they must not duplicate registry, replay, session-reservation, or controller log
 - Session/unit wire tests cover bounded local and authenticated-remote history
   routing, exact attachment/controller authorization, malformed row bounds,
   and read-only behavior alongside interleaved live revisions.
+- Session/unit wire tests also cover per-attachment semantic baselines,
+  same-epoch anchoring, automatic-resync preservation, explicit-sync reset,
+  first-attach/takeover rejection, and the exact already-active controller
+  allowance across an `Awaiting` replacement window. Input in that allowed
+  window must reach the PTY exactly once.
 - `principal_detach`, `local_device_ipc`, and the `session_wire` revoke matrix
   cover matching-only detach across Sessions, stale-effect rejection,
   idempotence, preservation of local/other-remote attachments, durable restart
@@ -295,6 +323,8 @@ they must not duplicate registry, replay, session-reservation, or controller log
 let mut registry = registry.lock()?;
 let result = actor.write_all(input); // may block while every session waits
 registry.remove(&session_id);
+
+runtime.model.scroll_metrics = Some(metrics); // shared across controllers
 result
 ```
 
@@ -304,6 +334,8 @@ result
 let actor = registry.lookup(session_id)?; // short lock only
 let command = Command::input(input, absolute_deadline);
 actor.try_submit(command)?;               // bounded per-session mailbox
+
+attachment.scroll_metrics = Some(frame.metrics); // private to this attachment
 ```
 
 Creation and cleanup additionally compare one ownership token across the name,
@@ -327,6 +359,9 @@ inject_publication_failure(child);
 - A registry in an adapter, CLI, GUI, or future Iroh transport.
 - Closing a PTY because a stream, socket, tab, or attachment disappeared.
 - Per-program branches for tmux, Herdr, Codex, OpenCode, or other hosted tools.
+- A shared/model-persistent scroll offset, a scroll baseline inside the remote
+  resume cell, or allowing a fresh/takeover attachment to borrow an old
+  controller's `ever_active` synchronization privilege.
 - Per-revision queues, transcript persistence, arbitrary launch commands, or
   Agent-specific state branches in the 1.0 terminal service.
 - Holding a global replay mutex while running a side effect, retiring an

@@ -54,6 +54,10 @@ portable-pty reader ── fixed no-drop queue ── TerminalDriver model threa
 | Rollback | Source revert; no runtime fallback or dual parser |
 | Performance | No benchmark, comparison, SLO, RSS requalification or performance claim |
 | Memory admission | Remove the aggregate 128 MiB terminal-memory gate; retain count/dimension and untrusted-input caps |
+| Scroll owner | Per attachment; never Alacritty's shared `display_offset` |
+| CLI scroll amount | Three lines per complete host-owned SGR wheel report; one event on child-owned paths |
+| Scrollbar | Stable one-column main-screen gutter above width four; alternate screen reclaims it |
+| Mobile seam | Core/proto metrics + line/offset actions; no CLI glyph/pixel policy in wire |
 
 ## 3. Crate and Dependency Layout
 
@@ -500,3 +504,271 @@ Explicitly excluded evidence:
 The old `terminal_state` measurement target and `tests/foundation/resource-gate.sh` are removed with
 the obsolete 128/256 MiB policy rather than retargeted. Future profiling, if requested, starts as a
 separate task with an explicit question and workload.
+
+## 18. Scroll Follow-up Architecture
+
+The post-release scroll change adds a presentation projection beside the existing live
+snapshot/delta path. It does not add another terminal engine and does not mutate Alacritty's global
+display offset.
+
+```text
+physical Ghostty / kitty / other terminal
+        │ SGR mouse, keys, paste, SIGWINCH
+        ▼
+CLI HostInputCodec + ChromeLayout
+        │
+        ├─ child-owned event ───────────────► existing PTY input command
+        │
+        └─ Zterm-owned ScrollAction
+                    │ local IPC / optional remote bridge
+                    ▼
+           Session ActorAttachment.scroll
+                    │ offset/action under model lock
+                    ▼
+       TerminalModel::viewport_frame(offset)
+                    │ canonical history + live rows, metrics
+                    ▼
+            TerminalViewportFrame
+                    │
+                    ▼
+       CLI history renderer + scrollbar renderer
+```
+
+There are deliberately three different owners:
+
+- Alacritty `Term` owns canonical main/alternate grids, retained rows and child-requested modes.
+- one `ActorAttachment` owns only its scroll action baseline; it is reset on detach and is never
+  copied into the Session/model or remote-resume checkpoint;
+- the CLI owns physical terminal capture, its last returned frame/metrics, drag state and gutter
+  presentation. A later Android client owns equivalent local presentation without the CLI glyphs.
+
+The existing history-page API remains intact for explicit legacy fallback. New peers use the
+viewport path because a page containing history alone cannot represent an offset of three rows from
+live without also carrying the remaining visible screen rows.
+
+## 19. Scroll Domain and Projection Math
+
+Core adds transport-neutral values equivalent to:
+
+```rust
+struct TerminalScrollMetrics {
+    epoch: Revision,
+    revision: Revision,
+    offset_from_bottom: u64,
+    max_offset_from_bottom: u64,
+    viewport_rows: u16,
+}
+
+enum TerminalScrollAction {
+    ByLines(i32),       // positive = older/up; negative = newer/down
+    ToOffset(u64),
+}
+
+enum TerminalViewportResult {
+    Frame { disposition: ExactOrRebased, metrics, rows },
+    Live { metrics },
+    Changed { epoch, revision },
+    Gap { epoch, revision },
+}
+```
+
+Names may be adjusted to existing Rust conventions during implementation, but meanings and bounds
+are fixed. `offset_from_bottom == 0` is live. `max_offset_from_bottom` is the retained main-history
+row count for the represented epoch. `viewport_rows` must equal the validated current model height;
+the client cannot request an arbitrary render allocation.
+
+For model height `R`, retained history `H`, clamped offset `O = min(requested, H)`, row `i` in a
+history frame is read directly from:
+
+```text
+Alacritty Line(i - O), for i in 0 .. R
+```
+
+Thus `O=3` yields `Line(-3), Line(-2), Line(-1), Line(0) ... Line(R-4)`. `O=H` starts at the oldest
+retained row; all frames still contain exactly `R` rows by continuing into the current main screen.
+Projection uses `project_row` and `encode_history_row`-equivalent allowlisted output under one model
+lock. It never invokes `Grid::scroll_display`, never changes `display_offset`, and never advances the
+model revision or any live checkpoint.
+
+`ActorAttachment.scroll` stores the last accepted epoch, max offset and current offset. Before a
+relative action:
+
+1. obtain the current extent from the same locked model;
+2. if the epoch matches, add `current_max - previous_max` before the user's delta so output appended
+   below capacity keeps the same logical content pinned;
+3. if identity changed because of resize, clear or eviction, clamp the old offset into the current
+   extent and mark the replacement `Rebased`;
+4. apply the signed delta with checked/saturating bounds, then create one frame from that exact
+   epoch/revision.
+
+An absolute `ToOffset` maps directly into the current extent and is suitable for track click/drag.
+If the final offset is zero, the response is `Live`; the CLI uses the existing full-sync handshake
+instead of trying to reconstruct live cursor/modes from history rows. If main history is unavailable
+or the authoritative screen is alternate, the typed `Changed/Gap` path is used—never a partially
+mixed frame.
+
+While a history frame is visible, incoming live deltas update the renderer's authoritative
+revision/modes without overwriting the frozen frame. A subsequent action performs the adjustment
+above. If exact row identity no longer exists, `Rebased` replaces the entire frame at the closest
+valid retained offset. This is bounded and deterministic even though an evicted row cannot be
+recovered.
+
+## 20. Proto, Wire, and Version Skew
+
+Proto v1 receives additive messages for scroll metrics/action, a viewport request and a viewport
+frame. Exact field numbers and enum values are allocated after the current terminal history fields;
+existing numbers are never reused. `TerminalSnapshot` and `TerminalDelta` receive an optional live
+metrics field with offset zero. The field is absent when a legacy peer authored the message or when
+no valid main-screen extent can be asserted.
+
+The new request/frame use the next unused terminal wire kinds after 314. Existing bit 18 is
+`AGENT_EVENTS`, so `Capabilities::TERMINAL_VIEWPORT` uses the next free bit 19 and gates use across
+remote peers:
+
+- request is a control frame and stays below the existing 1 MiB control bound;
+- response is content, contains at most the validated viewport height of canonical rows, and stays
+  below the existing 8 MiB content bound;
+- attachment ID, request ID, deadline, one-response correlation and redacted `Debug` follow the
+  current history request/page rules;
+- one semantic viewport request may be outstanding per view. Relative wheel deltas are accumulated
+  within a fixed signed bound while pending; an absolute drag target replaces the older queued
+  target. No physical-event-sized queue is introduced.
+
+New client/new server uses the semantic viewport. A new client connected through an old remote
+daemon sees no capability, never sends the unknown kind, keeps the stable main gutter blank until
+legacy history bounds are known, and uses the current bounded page browser without claiming exact
+continuous scrolling or drag. An old client ignores the optional snapshot/delta fields and retains
+its old behavior. Local same-version IPC always uses the new messages, while validation still treats
+missing/unknown enum values and mismatched attachment IDs as malformed input.
+
+The wire carries metrics, actions, outcomes and canonical row bytes only. It does not carry Unicode
+track/thumb characters, color, gutter width, pixel coordinates, touch velocity or platform UI
+policy. Android can reuse the state/action vocabulary, but its renderer and gesture-to-line adapter
+remain a separate task.
+
+## 21. Input Ownership and Resume State Machine
+
+Physical capture is an outer-terminal implementation detail, separate from child modes. The CLI
+keeps `DECSET 1003 + 1006` active so it can observe candidate mouse events; daemon-authored
+`TerminalModes` decide the semantic owner.
+
+```text
+history visible?
+  yes -> Zterm owns wheel/page navigation
+  no  -> event targets visible scrollbar gutter?
+           yes -> Zterm chrome owns it
+           no  -> child mouse reporting active?
+                    yes -> encode exactly one allowed mouse report
+                    no  -> alternate screen + alternate-scroll?
+                             yes -> encode exactly one cursor key
+                             no  -> main screen Zterm history owns wheel
+```
+
+The gutter is outside the child PTY rectangle, so a click at its physical column is never clamped
+into or forged as the child's final column. Child-rectangle routing has no application-name or TERM
+heuristic. Herdr/Pi-style SGR mouse declarations naturally select the one-report branch.
+
+CLI constants are:
+
+- one host-owned SGR wheel report: three lines;
+- PageUp/PageDown: `max(viewport_rows - 1, 1)` lines;
+- one child-owned wheel report: one encoded report with no multiplier;
+- alternate-scroll: one normal/application cursor sequence with no multiplier.
+
+Any ordinary key, paste or prefix input in history enters `ResumePending`. Input remains in the
+existing fixed byte bound while the CLI requests a current live snapshot. If authoritative screen
+state changes gutter geometry, the resize coalescer submits that one geometry and keeps input fenced
+through the resulting sync. Only after the replacement is flushed and transport is Active is the
+retained input written exactly once. PageDown or a scrollbar jump reaching offset zero uses the same
+resume path without child input.
+
+Every renderer transaction that can contain daemon-authored ANSI writes in this order:
+
+```text
+child snapshot/delta OR viewport rows
+    -> status/chrome repair needed for that transaction
+    -> HOST_INPUT_CAPTURE
+    -> one flush
+```
+
+This unconditional final reassertion fixes the current reset bug. Cleanup remains centralized in
+`TerminalGuard`; error and signal paths cannot bypass its raw-mode/mouse restoration.
+
+## 22. CLI Chrome Layout and Scrollbar
+
+`ChromeLayout` is derived from physical size, remote status-row presence, product viewport limits
+and the effective presentation screen:
+
+```text
+usable_rows = min(physical_rows - status_rows, max_viewport_rows)
+usable_cols = min(physical_columns, max_viewport_columns)
+
+main and usable_cols > 4:
+    child = usable_rows x (usable_cols - 1)
+    gutter_column = usable_cols
+alternate or usable_cols <= 4:
+    child = usable_rows x usable_cols
+    gutter = none
+```
+
+Before the initial snapshot identifies the screen, preparation conservatively uses main geometry;
+normal new shell sessions therefore never change width when history first appears. Attaching to an
+already-alternate application may require one correction to full width after its first snapshot.
+
+The scrollbar spans only `usable_rows`; a remote status row and unsupported physical overflow are
+outside its hit-test rectangle. With track height `T`, visible rows `V`, maximum offset `M`:
+
+```text
+thumb_len = M == 0 ? 0 : max(1, floor(T * V / (V + M)))
+travel    = T - thumb_len
+thumb_top = M == 0 ? travel : round((M - offset) * travel / M)
+```
+
+All products use checked `u128` intermediates and clamp to the track. The CLI plans to render `▕`
+for track and `▐` for thumb, with explicit save/restore cursor and SGR reset. No history means the
+reserved cell column is cleared but no track is drawn. Track click maps the pointer to an absolute
+offset centered on the thumb. Drag stores a bounded grab-row within the thumb, updates the latest
+absolute target on motion, and ends on release/capture loss.
+
+In live main, the gutter stays reserved even if a child has mouse reporting. Deliberate input in the
+visible gutter is host chrome; input in the `N-1` child columns follows child modes. In alternate,
+the gutter is cleared before the full `N` columns are handed to the child and no scrollbar hit target
+exists.
+
+The effective presentation screen remains Main while a Zterm history frame is pinned, even if a
+background child delta declares Alternate. This prevents a hidden child state transition from
+stealing gestures or resizing underneath frozen history. On live resume, the latest authoritative
+screen is reconciled once.
+
+`ResizeCoalescer::last_submitted` remains the loop breaker. A live Main→Alternate transition changes
+`N-1` to `N` at most once; the resize-produced replacement still says Alternate and therefore is a
+no-op. Alternate→Main is symmetric. The child may draw once before Zterm observes the mode and once
+after SIGWINCH; this accepted two-phase redraw is tested for eventual geometry, no input loss and no
+oscillation rather than described as impossible.
+
+## 23. Failure, Reconnect, and Rollback
+
+- A malformed/out-of-order viewport frame is a protocol error under the existing terminal driver
+  correlation rules; it is never rendered.
+- A `Changed/Gap` response leaves a bounded notice and uses the existing live-resume path on ordinary
+  input. `Rebased` is a complete replacement, so no old/new epoch rows coexist.
+- Transport reconnect and controller takeover discard the attachment-local scroll state and return
+  to live synchronization. Presentation offset is not part of remote resume identity.
+- A capability-less peer uses the existing history-page fallback. Capability negotiation, not an
+  intentionally failing unknown message, selects the path.
+- The implementation can be rolled back as source changes. Additive proto fields/kinds have no
+  persistent data migration; old peers ignore fields and never receive kinds they did not negotiate.
+
+## 24. Scroll Verification Design
+
+The narrow unit layer proves projection formulas, signed/absolute action clamps, epoch rebase,
+scrollbar integer geometry and input ownership. Protocol tests prove enum/field stability, size
+bounds, one-outstanding correlation, old-peer fallback and Debug redaction. CLI pseudo-terminal
+tests record exact output order so `HOST_INPUT_CAPTURE` follows snapshots, ordinary deltas, resyncs
+and history frames, and cleanup removes it.
+
+Integration fixtures exercise main shell, Herdr/Pi-style `1049/1000/1002/1003/1006`, alternate-scroll,
+background mode changes while pinned, width 4/5, remote status rows, drag bursts and main/alternate
+resize synchronization. Release evidence requires real macOS and Linux local/direct/relay smoke
+before beginning Android work. These are functional checks; no throughput, latency, CPU or RSS
+benchmark is added or run.

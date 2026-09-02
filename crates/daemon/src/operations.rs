@@ -8,10 +8,14 @@ use std::time::{Duration, Instant};
 
 use zterm_core::terminal::{
     ActiveScreen, TerminalHistoryCursor, TerminalHistoryDirection, TerminalHistoryResult,
-    TerminalModes, TerminalSize,
+    TerminalModes, TerminalScrollAction, TerminalScrollMetrics, TerminalSize,
+    TerminalViewportResult,
 };
 #[cfg(unix)]
-use zterm_core::terminal::{TerminalHistoryPage, TerminalMouseEncoding, TerminalMouseMode};
+use zterm_core::terminal::{
+    TerminalHistoryPage, TerminalMouseEncoding, TerminalMouseMode, TerminalViewportDisposition,
+    TerminalViewportFrame,
+};
 use zterm_core::{
     AttachmentId, AuthGeneration, AuthorizationStatus, DeviceAlias, DeviceId, DeviceSummary,
     DomainErrorKind, Revision, SessionId, SessionName, SessionSelector,
@@ -225,6 +229,7 @@ pub struct TerminalViewSnapshot {
     modes: TerminalModes,
     recent_history_ansi: Vec<u8>,
     screen_ansi: Vec<u8>,
+    scroll_metrics: Option<TerminalScrollMetrics>,
 }
 
 impl fmt::Debug for TerminalViewSnapshot {
@@ -237,6 +242,7 @@ impl fmt::Debug for TerminalViewSnapshot {
             .field("modes", &self.modes)
             .field("recent_history_ansi_len", &self.recent_history_ansi.len())
             .field("screen_ansi_len", &self.screen_ansi.len())
+            .field("scroll_metrics", &self.scroll_metrics)
             .finish()
     }
 }
@@ -277,6 +283,12 @@ impl TerminalViewSnapshot {
     pub fn screen_ansi(&self) -> &[u8] {
         &self.screen_ansi
     }
+
+    /// Live main-screen scroll extent, absent for alternate or legacy peers.
+    #[must_use]
+    pub const fn scroll_metrics(&self) -> Option<TerminalScrollMetrics> {
+        self.scroll_metrics
+    }
 }
 
 /// Daemon-authored merged update from one exact acknowledged revision.
@@ -288,6 +300,7 @@ pub struct TerminalViewDelta {
     active_screen: ActiveScreen,
     modes: TerminalModes,
     ansi: Vec<u8>,
+    scroll_metrics: Option<TerminalScrollMetrics>,
 }
 
 impl fmt::Debug for TerminalViewDelta {
@@ -300,6 +313,7 @@ impl fmt::Debug for TerminalViewDelta {
             .field("active_screen", &self.active_screen)
             .field("modes", &self.modes)
             .field("ansi_len", &self.ansi.len())
+            .field("scroll_metrics", &self.scroll_metrics)
             .finish()
     }
 }
@@ -339,6 +353,12 @@ impl TerminalViewDelta {
     #[must_use]
     pub fn ansi(&self) -> &[u8] {
         &self.ansi
+    }
+
+    /// Live main-screen scroll extent, absent for alternate or legacy peers.
+    #[must_use]
+    pub const fn scroll_metrics(&self) -> Option<TerminalScrollMetrics> {
+        self.scroll_metrics
     }
 }
 
@@ -454,7 +474,9 @@ pub enum TerminalViewEvent {
     Delta(TerminalViewDelta),
     /// One correlated bounded page from daemon-authoritative history.
     History(TerminalHistoryResult),
-    /// Discard the current baseline and request a replacement snapshot.
+    /// One correlated complete attachment-local semantic viewport outcome.
+    Viewport(TerminalViewportResult),
+    /// The following snapshot replaces the current live rendering baseline.
     SyncRequired {
         /// Latest host revision declared by the synchronization marker.
         latest_revision: Revision,
@@ -482,6 +504,7 @@ impl fmt::Debug for TerminalViewEvent {
             Self::Snapshot(snapshot) => formatter.debug_tuple("Snapshot").field(snapshot).finish(),
             Self::Delta(delta) => formatter.debug_tuple("Delta").field(delta).finish(),
             Self::History(history) => formatter.debug_tuple("History").field(history).finish(),
+            Self::Viewport(viewport) => formatter.debug_tuple("Viewport").field(viewport).finish(),
             Self::SyncRequired { latest_revision } => formatter
                 .debug_struct("SyncRequired")
                 .field("latest_revision", latest_revision)
@@ -742,6 +765,20 @@ impl TerminalViewCommandWriter {
         }
     }
 
+    /// Requests one attachment-local semantic viewport action.
+    pub async fn request_viewport(&self, action: TerminalScrollAction) -> Result<(), DaemonError> {
+        #[cfg(unix)]
+        {
+            self.submit(|response| TerminalDriverCommand::RequestViewport { action, response })
+                .await
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = action;
+            Err(unsupported_command_platform())
+        }
+    }
+
     /// Detaches this view while leaving the Session and PTY running.
     pub async fn detach(&self) -> Result<(), DaemonError> {
         #[cfg(unix)]
@@ -807,6 +844,10 @@ enum TerminalDriverCommand {
         direction: TerminalHistoryDirection,
         cursor: Option<TerminalHistoryCursor>,
         maximum_rows: usize,
+        response: tokio::sync::oneshot::Sender<Result<(), DaemonError>>,
+    },
+    RequestViewport {
+        action: TerminalScrollAction,
         response: tokio::sync::oneshot::Sender<Result<(), DaemonError>>,
     },
     Detach {
@@ -1125,6 +1166,11 @@ async fn handle_terminal_driver_command(
             response,
             TerminalDriverCommandResult::Continue,
         ),
+        TerminalDriverCommand::RequestViewport { action, response } => (
+            client.request_viewport(action).await,
+            response,
+            TerminalDriverCommandResult::Continue,
+        ),
         TerminalDriverCommand::Detach { response } => (
             client.detach().await,
             response,
@@ -1183,6 +1229,9 @@ fn terminal_event_from_local(
             .map(Some),
         LocalAttachmentEvent::HistoryPage(page) => terminal_history_from_wire(page)
             .map(TerminalViewEvent::History)
+            .map(Some),
+        LocalAttachmentEvent::ViewportFrame(frame) => terminal_viewport_from_wire(frame)
+            .map(TerminalViewEvent::Viewport)
             .map(Some),
         LocalAttachmentEvent::ConnectionStatus(status) => {
             let device = remote_alias.ok_or_else(|| {
@@ -1261,6 +1310,7 @@ fn terminal_snapshot_from_wire(
         modes: terminal_modes_from_wire(snapshot.modes)?,
         recent_history_ansi: snapshot.recent_history_ansi,
         screen_ansi: snapshot.screen_ansi,
+        scroll_metrics: terminal_scroll_metrics_from_wire(snapshot.scroll_metrics)?,
     })
 }
 
@@ -1275,6 +1325,7 @@ fn terminal_delta_from_wire(
         active_screen: terminal_active_screen_from_wire(delta.active_screen)?,
         modes: terminal_modes_from_wire(delta.modes)?,
         ansi: delta.ansi,
+        scroll_metrics: terminal_scroll_metrics_from_wire(delta.scroll_metrics)?,
     })
 }
 
@@ -1313,6 +1364,84 @@ fn terminal_history_from_wire(
         }),
         zterm_proto::v1::TerminalHistoryOutcome::Unspecified => Err(terminal_protocol_error(
             "terminal history outcome was unspecified",
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn terminal_scroll_metrics_from_wire(
+    metrics: Option<zterm_proto::v1::TerminalScrollMetrics>,
+) -> Result<Option<TerminalScrollMetrics>, DaemonError> {
+    metrics
+        .map(|metrics| {
+            let viewport_rows = u16::try_from(metrics.viewport_rows).map_err(|_| {
+                terminal_protocol_error("terminal viewport rows are outside the supported range")
+            })?;
+            let metrics = TerminalScrollMetrics {
+                epoch: Revision::new(metrics.epoch),
+                revision: Revision::new(metrics.revision),
+                offset_from_bottom: metrics.offset_from_bottom,
+                max_offset_from_bottom: metrics.max_offset_from_bottom,
+                viewport_rows,
+            };
+            metrics
+                .is_valid()
+                .then_some(metrics)
+                .ok_or_else(|| terminal_protocol_error("terminal scroll metrics are invalid"))
+        })
+        .transpose()
+}
+
+#[cfg(unix)]
+fn terminal_viewport_from_wire(
+    frame: zterm_proto::v1::TerminalViewportFrame,
+) -> Result<TerminalViewportResult, DaemonError> {
+    let outcome = zterm_proto::v1::TerminalViewportOutcome::try_from(frame.outcome)
+        .map_err(|_| terminal_protocol_error("unknown terminal viewport outcome"))?;
+    match outcome {
+        zterm_proto::v1::TerminalViewportOutcome::Frame => {
+            let metrics = terminal_scroll_metrics_from_wire(frame.metrics)?.ok_or_else(|| {
+                terminal_protocol_error("terminal viewport frame omitted metrics")
+            })?;
+            let disposition =
+                match zterm_proto::v1::TerminalViewportDisposition::try_from(frame.disposition)
+                    .map_err(|_| terminal_protocol_error("unknown terminal viewport disposition"))?
+                {
+                    zterm_proto::v1::TerminalViewportDisposition::Exact => {
+                        TerminalViewportDisposition::Exact
+                    }
+                    zterm_proto::v1::TerminalViewportDisposition::Rebased => {
+                        TerminalViewportDisposition::Rebased
+                    }
+                    zterm_proto::v1::TerminalViewportDisposition::Unspecified => {
+                        return Err(terminal_protocol_error(
+                            "terminal viewport disposition was unspecified",
+                        ));
+                    }
+                };
+            Ok(TerminalViewportResult::Frame(TerminalViewportFrame {
+                disposition,
+                metrics,
+                rows: frame.rows,
+            }))
+        }
+        zterm_proto::v1::TerminalViewportOutcome::Live => {
+            let metrics = terminal_scroll_metrics_from_wire(frame.metrics)?
+                .ok_or_else(|| terminal_protocol_error("terminal live viewport omitted metrics"))?;
+            Ok(TerminalViewportResult::Live(metrics))
+        }
+        zterm_proto::v1::TerminalViewportOutcome::Changed => {
+            Ok(TerminalViewportResult::HistoryChanged {
+                epoch: Revision::new(frame.current_epoch),
+                revision: Revision::new(frame.current_revision),
+            })
+        }
+        zterm_proto::v1::TerminalViewportOutcome::Gap => Ok(TerminalViewportResult::HistoryGap {
+            epoch: Revision::new(frame.current_epoch),
+            revision: Revision::new(frame.current_revision),
+        }),
+        zterm_proto::v1::TerminalViewportOutcome::Unspecified => Err(terminal_protocol_error(
+            "terminal viewport outcome was unspecified",
         )),
     }
 }

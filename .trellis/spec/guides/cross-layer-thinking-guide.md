@@ -331,9 +331,36 @@ observe -> enqueue/write -> service validates -> state changes -> authoritative 
 socket write. Rapid `SIGWINCH` delivery could submit a second resize while the
 Session was awaiting a replacement snapshot. Client fencing and identical-size
 suppression reduced the window but could not prove server state on a full-duplex
-stream. The complete fix kept input Active-only while allowing the exact
-current controller's replaceable viewport across an Active-target snapshot
-window, without retry or replay.
+stream. The complete fix kept new client input Active-gated, while the server
+accepted a command already sent by the exact previously-active controller if it
+arrived after an in-epoch replacement snapshot began. Fresh attachment,
+takeover, reconnect epoch, and stale generation remain fenced; no command is
+retried or replayed.
+
+### Terminal Presentation / Synchronization Checklist
+
+Treat these as separate state machines even though one event may affect all of
+them: physical outer-terminal capture, child-declared input modes,
+attachment-local presentation, and transport/controller synchronization.
+
+- [ ] Map one repaint as bytes -> Zterm chrome -> host capture -> one flush;
+      never assume child mode output preserves the physical capture state.
+- [ ] Route each wheel report from authoritative screen/modes and hit geometry,
+      not process names or screen contents; assert exactly one owner.
+- [ ] Store scroll position at the attachment boundary and pass it as a typed
+      baseline into a read-only model projection; never mutate a shared engine
+      display offset for one client.
+- [ ] Distinguish an in-epoch replacement snapshot from a true reconnect. State
+      which presentation values survive each transition and which are reset.
+- [ ] For full-duplex races, record both current synchronization state and
+      whether this exact controller was previously Active. Never carry that
+      fact into a new stream epoch or takeover.
+- [ ] Complete pending read-only controls once with a correlated typed outcome
+      before publishing reconnect; do not convert expected epoch loss into a
+      fatal uncorrelated UI error.
+- [ ] Test the composition at model, Session, wire, bridge, CLI byte stream, and
+      real outer-PTY boundaries. A green unit test at only one layer is not
+      evidence that capture, correlation, and redraw ordering compose.
 
 ---
 

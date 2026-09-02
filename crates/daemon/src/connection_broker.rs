@@ -115,7 +115,8 @@ impl ConnectionIdentity {
                 Capabilities::LOCAL_LIFECYCLE
                     | Capabilities::SESSION_SERVICE
                     | Capabilities::TERMINAL_SERVICE
-                    | Capabilities::HISTORY_PAGING,
+                    | Capabilities::HISTORY_PAGING
+                    | Capabilities::TERMINAL_VIEWPORT,
             ),
         )
     }

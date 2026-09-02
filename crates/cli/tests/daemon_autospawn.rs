@@ -17,6 +17,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 #[cfg(unix)]
 use std::sync::mpsc;
+#[cfg(unix)]
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 #[cfg(unix)]
 use clap::Parser;
@@ -48,6 +53,10 @@ const TERMINAL_CONNECT_MARKER: &[u8] = b"\xe7\x95\x8c";
 const TERMINAL_BARE_MARKER: &[u8] = b"\xe9\x9b\xaa";
 #[cfg(unix)]
 const TERMINAL_SHELL_READY_MARKER: &[u8] = b"ZTERM_LOCAL_UI_SHELL_READY";
+#[cfg(unix)]
+const TERMINAL_SCROLL_TARGET: &[u8] = b"ZTERM_SCROLL_TARGET";
+#[cfg(unix)]
+const TERMINAL_SCROLL_BOTTOM: &[u8] = b"ZTERM_SCROLL_BOTTOM";
 #[cfg(unix)]
 const TERMINAL_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -101,7 +110,7 @@ fn run_terminal_child_if_requested() -> bool {
         DaemonLauncher::for_test("/does/not/exist".into(), "--must-not-run".to_owned()),
     );
     let arguments = match mode {
-        "connect" => vec!["zterm", "connect", "local"],
+        "connect" | "scroll" => vec!["zterm", "connect", "local"],
         "bare-signal" => vec!["zterm"],
         "non-tty-connect" => vec!["zterm", "connect", "local"],
         _ => panic!("unknown terminal child mode"),
@@ -353,6 +362,11 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
         .expect("list local UI Session");
     assert_eq!(ui_sessions.len(), 1);
     let ui_main_id = ui_sessions[0].session_id;
+    wait_for_detach(&runtime, "local", &ui_main_id.to_string()).await;
+
+    let scroll_output = run_local_terminal_child(&runtime, &state.paths, "scroll").await;
+    assert!(contains_bytes(&scroll_output, TERMINAL_SCROLL_TARGET));
+    assert!(contains_bytes(&scroll_output, TERMINAL_RESTORE_BYTES));
     wait_for_detach(&runtime, "local", &ui_main_id.to_string()).await;
 
     let bare_output = run_local_terminal_child(&runtime, &state.paths, "bare-signal").await;
@@ -649,6 +663,7 @@ async fn run_local_terminal_child(
 
     let output_marker = match mode {
         "connect" => TERMINAL_CONNECT_MARKER,
+        "scroll" => TERMINAL_SCROLL_BOTTOM,
         "bare-signal" => TERMINAL_BARE_MARKER,
         _ => panic!("unsupported terminal PTY fixture mode"),
     };
@@ -656,6 +671,8 @@ async fn run_local_terminal_child(
     let (entered_sender, entered_receiver) = mpsc::channel();
     let (ready_sender, ready_receiver) = mpsc::channel();
     let (output_sender, output_receiver) = mpsc::channel();
+    let scroll_target_count = Arc::new(AtomicUsize::new(0));
+    let reader_scroll_target_count = Arc::clone(&scroll_target_count);
     let reader = std::thread::spawn(move || {
         let mut master = master;
         let mut bytes = Vec::new();
@@ -668,6 +685,13 @@ async fn run_local_terminal_child(
                 Ok(0) => break,
                 Ok(read) => {
                     bytes.extend_from_slice(&buffer[..read]);
+                    reader_scroll_target_count.store(
+                        bytes
+                            .windows(TERMINAL_SCROLL_TARGET.len())
+                            .filter(|window| *window == TERMINAL_SCROLL_TARGET)
+                            .count(),
+                        Ordering::Release,
+                    );
                     if !entered && contains_bytes(&bytes, TERMINAL_ENTER_BYTES) {
                         entered = true;
                         let _ = entered_sender.send(());
@@ -711,24 +735,53 @@ async fn run_local_terminal_child(
             &format!("local terminal {mode} fixture did not become ready"),
         );
     }
-    let active_revision = wait_for_active_viewport(runtime, 24, 80).await;
+    let active_revision = wait_for_active_viewport(runtime, 24, 79).await;
     // Session state can become Active just before the renderer consumes the
     // matching event. Use an idempotent fixture-only probe until the real PTY
     // echoes it; product input is still sent only through `run_terminal`.
     let probe_deadline = std::time::Instant::now() + TERMINAL_TEST_TIMEOUT;
-    let output_seen = loop {
-        master_writer
-            .write_all(output_marker)
-            .and_then(|()| master_writer.write_all(b"\r"))
-            .expect("write deterministic interactive probe");
-        if output_receiver
-            .recv_timeout(std::time::Duration::from_millis(50))
-            .is_ok()
+    let output_seen = if mode == "scroll" {
+        while scroll_target_count.load(Ordering::Acquire) < 2
+            && std::time::Instant::now() < probe_deadline
         {
-            break true;
+            master_writer
+                .write_all(TERMINAL_SCROLL_TARGET)
+                .and_then(|()| master_writer.write_all(b"\r"))
+                .expect("write retained scroll target probe");
+            std::thread::sleep(std::time::Duration::from_millis(25));
         }
-        if std::time::Instant::now() >= probe_deadline {
-            break false;
+        if scroll_target_count.load(Ordering::Acquire) < 2 {
+            false
+        } else {
+            // The fixture PTY echoes each command once and its shell prints it
+            // twice. Seven fillers plus the bottom-marker command therefore
+            // leave exactly 24 rows after the last target occurrence: one
+            // three-line wheel action must bring that target back into view.
+            for index in 0..7 {
+                write!(master_writer, "ZTERM_SCROLL_FILL_{index:02}\r")
+                    .expect("write retained scroll filler");
+            }
+            master_writer
+                .write_all(TERMINAL_SCROLL_BOTTOM)
+                .and_then(|()| master_writer.write_all(b"\r"))
+                .expect("write live scroll bottom marker");
+            output_receiver.recv_timeout(TERMINAL_TEST_TIMEOUT).is_ok()
+        }
+    } else {
+        loop {
+            master_writer
+                .write_all(output_marker)
+                .and_then(|()| master_writer.write_all(b"\r"))
+                .expect("write deterministic interactive probe");
+            if output_receiver
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_ok()
+            {
+                break true;
+            }
+            if std::time::Instant::now() >= probe_deadline {
+                break false;
+            }
         }
     };
     if !output_seen {
@@ -760,11 +813,28 @@ async fn run_local_terminal_child(
             active_revision.get(),
         );
     }
+    if mode == "scroll" {
+        let baseline = scroll_target_count.load(Ordering::Acquire);
+        assert!(baseline > 0, "the retained target must first render live");
+        master_writer
+            .write_all(b"\x1b[<64;10;10M")
+            .expect("write one host wheel-up event");
+        let scroll_deadline = std::time::Instant::now() + TERMINAL_TEST_TIMEOUT;
+        while scroll_target_count.load(Ordering::Acquire) <= baseline
+            && std::time::Instant::now() < scroll_deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            scroll_target_count.load(Ordering::Acquire) > baseline,
+            "semantic wheel scrolling must repaint an older row from the real PTY history"
+        );
+    }
     if mode == "bare-signal" {
         set_terminal_child_size(&master_writer, 1, 5);
         kill(Pid::from_raw(child.id() as i32), Signal::SIGWINCH)
             .expect("notify narrow one-row viewport change");
-        let narrow_revision = wait_for_active_viewport(runtime, 1, 5).await;
+        let narrow_revision = wait_for_active_viewport(runtime, 1, 4).await;
         assert!(
             narrow_revision.get() > active_revision.get(),
             "one-row SIGWINCH must advance the authoritative terminal revision"
@@ -775,7 +845,7 @@ async fn run_local_terminal_child(
             kill(Pid::from_raw(child.id() as i32), Signal::SIGWINCH)
                 .expect("notify rapid viewport change");
         }
-        let resized_revision = wait_for_active_viewport(runtime, 26, 82).await;
+        let resized_revision = wait_for_active_viewport(runtime, 26, 81).await;
         assert!(
             resized_revision.get() > narrow_revision.get(),
             "rapid SIGWINCH coalescing must publish the final authoritative viewport"
@@ -916,6 +986,20 @@ fn terminal_child_error_kind(bytes: &[u8]) -> &'static str {
         ),
         (b"error_kind: Cancelled".as_slice(), "cancelled"),
         (b"error_kind: LeaseLost".as_slice(), "lease_lost"),
+        (b"error_kind: MalformedFrame".as_slice(), "malformed_frame"),
+        (
+            b"error_kind: NotSynchronized".as_slice(),
+            "not_synchronized",
+        ),
+        (
+            b"error_kind: ResourceExhausted".as_slice(),
+            "resource_exhausted",
+        ),
+        (
+            b"error_kind: SessionOccupied".as_slice(),
+            "session_occupied",
+        ),
+        (b"error_kind: DaemonStopped".as_slice(), "daemon_stopped"),
         (b"error_kind:".as_slice(), "other_daemon"),
         (b"TerminalDriverFailure".as_slice(), "terminal_driver"),
         (b"Io {".as_slice(), "io"),

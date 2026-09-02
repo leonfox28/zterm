@@ -268,6 +268,154 @@ Rollback point: daemon cutover可整体source-revert；不加入runtime feature 
 Implementation self-review and independent `trellis-check` are complete. The
 hosted matrix/release-readiness runs remain external acceptance evidence.
 
+## Phase 6 — Continuous Scroll Viewport and CLI Scrollbar Follow-up
+
+> Phase 0–5 record the already implemented and released engine migration. Every item below is new,
+> remains unchecked during brainstorm, and requires the fresh post-summary user approval recorded at
+> the end of this document before product-code work starts.
+
+### Step 6.0 — Freeze the regressions and compatibility baseline
+
+- [x] Record the follow-up start commit/dirty files and preserve all unrelated user/task changes.
+- [x] Add a byte-level failing fixture proving an initial snapshot and an ordinary delta currently
+  leave outer `1003/1006` disabled; cover resync, child mouse enable/disable and guard cleanup before
+  changing renderer behavior.
+- [x] Add a controller fixture proving the first live wheel-up currently ignores its three-line
+  amount and cannot render `3 history + rows-3 live`; preserve existing PageUp, resume-input bound,
+  history Changed/Gap and mixed-version page behavior as baseline evidence.
+- [x] Freeze current wire kind/field/capability values through 314 / `HISTORY_PAGING` before adding
+  anything. Do not reuse or renumber an existing value.
+
+Rollback point: tests/research only; released runtime path is unchanged.
+
+### Step 6.1 — Add renderer-neutral scroll domain and model projection
+
+- [x] In `zterm-core::terminal`, add bounded/redacted `TerminalScrollMetrics`, signed
+  `ScrollByLines`, absolute `ScrollToOffset`, viewport disposition/result/frame types and validation
+  helpers. Define zero as live, positive signed delta as older/up and negative as newer/down.
+- [x] Add live main-screen metrics to `TerminalSnapshot`/`TerminalDelta`; absent/invalid-on-alternate
+  remains explicit rather than inventing a history extent.
+- [x] In `zterm-terminal`, expose a non-mutating extent and full-height viewport projection. For
+  offset `N`, read `Line(-N)..Line(rows-N-1)` under one model lock through the existing bounded row
+  projector/encoder; never call `scroll_display` or modify `display_offset`.
+- [x] Unit-test offsets 0/1/3/max/over-max, history shorter/longer than viewport, exact
+  `3 history + live` composition, wide/styled/Unicode rows, alternate screen, resize/clear/eviction,
+  unchanged revision/checkpoint/state and isolation between two callers.
+- [x] Add per-attachment scroll baseline to `ActorAttachment`, not `TerminalModel` or
+  `RemoteResumeCheckpoint`. Implement same-epoch output pinning, checked signed/absolute clamps,
+  explicit `Rebased`, Live at offset zero and reset-on-detach/reconnect semantics.
+
+Rollback point: new domain/model APIs remain unconnected to CLI input and do not affect live render.
+
+### Step 6.2 — Carry semantic viewport through local and remote transport
+
+- [x] Add proto v1 metrics/action/outcome/request/frame messages, optional live metrics on snapshot/
+  delta, next unused terminal kinds after 314 and `Capabilities::TERMINAL_VIEWPORT` at the next free
+  bit 19 (`AGENT_EVENTS` already owns bit 18).
+  Preserve every existing field/kind/capability number.
+- [x] Classify request as control and frame as content; validate attachment ID, action oneof,
+  signed range, metrics invariants, row count/height, 1 MiB/8 MiB frame limits and content-redacted
+  Debug output.
+- [x] Thread the request/result through proto conversion, local IPC, typed operations driver,
+  Session actor/driver, session wire, remote attachment bridge and connection broker advertisement.
+  Keep at most one outstanding viewport request per attachment.
+- [x] Coalesce pending wheel deltas into one bounded signed amount and pending drag into the latest
+  absolute target. Live/resume supersedes queued scrolling; terminal outcome ordering still wins
+  command-stream closure races.
+- [x] Preserve `TerminalHistoryRequest/Page` unchanged as the fallback. A capability-less old peer
+  must never receive a viewport kind; new↔old tests prove optional fields are ignored, legacy paging
+  remains usable and no unsupported feature is falsely advertised.
+
+Rollback point: new wire is capability-gated; old history paging and snapshot/delta remain valid.
+
+### Step 6.3 — Fix capture and replace the CLI page jump with semantic actions
+
+- [x] Refactor `TerminalRenderer` transactions so snapshot, applied delta, resync replacement and
+  viewport-frame rendering finish with `HOST_INPUT_CAPTURE` followed by one flush. Remove the narrow
+  `child_transition_disables_host_capture` dependency without altering authoritative child modes.
+- [x] Replace the continuous-path `HistoryViewport` page/offset navigation with the returned semantic
+  metrics/frame and new request actions. Retain a small explicit legacy pager only for peers lacking
+  `TERMINAL_VIEWPORT`.
+- [x] Implement ownership order: pinned Zterm history; visible Zterm gutter; live child mouse mode;
+  live alternate+alternate-scroll; otherwise host main history. Never inspect process names, TERM,
+  tmux state or screen text.
+- [x] Keep one report on child mouse branches and change alternate-scroll from three cursor sequences
+  to one. Keep the host CLI wheel constant at three lines and PageUp/PageDown at rows minus one.
+- [x] Preserve `ResumePending`: ordinary input is bounded, latest live replacement and any geometry
+  sync are flushed first, and the retained bytes are then sent exactly once. Background child mode
+  changes cannot steal a pinned viewport.
+- [x] Extend pseudo-terminal tests for Ghostty/kitty-compatible SGR reports, Default/UTF-8/SGR child
+  encoding, Herdr/Pi-style modes, child mode exit, burst coalescing, delta gaps, cleanup, signals and
+  panic restoration.
+
+Rollback point: capture hotfix and semantic routing can be source-reverted without wire persistence.
+
+### Step 6.4 — Implement stable gutter, scrollbar, and mode-driven geometry
+
+- [x] Introduce a pure `ChromeLayout` from physical size, product limits, remote status-row presence
+  and effective presentation screen. Use main assumption before initial snapshot, reserve one column
+  only when usable width is greater than four, and expose exact child/gutter hit rectangles.
+- [x] Make initial/physical/mode-driven resize use the same layout. Main history appearance must never
+  resize; live Main→Alternate changes `N-1→N` once and Alternate→Main changes `N→N-1` once.
+  `ResizeCoalescer::last_submitted` must suppress the resize-produced same-screen replacement.
+- [x] Add pure overflow-safe scrollbar geometry: proportional min-one-row thumb, oldest/top and
+  live/bottom mapping, track-click absolute target, drag grab offset and clamped pointer mapping.
+- [x] Render a cleared reserved gutter with no history; render `▕` track and `▐` thumb only with valid
+  metrics. Save/restore cursor/style, exclude the remote status row, clear stale chrome before
+  alternate reclaim and repaint chrome after every relevant live/history/status transaction.
+- [x] Intercept gutter wheel/press/drag/release without clamping it into child coordinates. Ignore
+  events beyond usable layout, end drag on release/capture loss and ensure main-screen child mouse
+  still receives events from all `N-1` child columns exactly once.
+- [x] Unit/integration-test widths 1/4/5/max/over-max, heights with/without remote status, zero/one/max
+  history, all thumb positions, clicks above/below/on thumb, drag bursts, initial alternate attach,
+  pinned-background alternate, no geometry loop and eventual child redraw at the advertised width.
+
+Rollback point: disabling/removing CLI chrome restores full-width main geometry; semantic viewport
+wire remains independently valid for Android or a later UI.
+
+### Step 6.5 — Close platform, compatibility, and knowledge gates
+
+- [x] Run targeted core/terminal/proto/daemon/CLI tests, then fmt, Clippy, workspace tests, docs,
+  cargo-deny, source policy and `just check`; do not run or add performance/RSS benchmarks.
+- [ ] Add real PTY smoke scripts/fixtures for shell scroll, Herdr/Pi-style fullscreen enter/exit,
+  mouse ownership, resize, detach/reconnect and local/direct/relay flows without requiring a named
+  outer terminal for correctness.
+- [ ] Execute and record macOS local/direct/relay smoke on macOS and Linux local/direct/relay smoke on
+  Linux. Hosted Linux evidence must come from its CI/runner; local macOS cannot stand in for it.
+- [x] Update terminal-model, terminal-driver, session-service, local-daemon-IPC, core-wire-domain,
+  CLI/UI and cross-platform specs with executable scroll ownership, capability and geometry contracts.
+- [ ] Run `trellis-check`; verify only intended task/product files changed, all follow-up acceptance
+  items have direct evidence, and the report states that no throughput/latency/CPU/RSS benchmark was
+  run and Android is still the next task.
+
+Follow-up rollback is a source revert. Proto additions are additive and no viewport state is
+persisted, so there is no schema/data migration to undo.
+
+### Phase 6 verification evidence
+
+- Follow-up baseline: released `main` commit
+  `bce1d57d8bd91b5c0e58bcdf422d899cedcd7fac`; every dirty path was inventoried before product
+  edits and the task-owned prior changes were preserved.
+- Independent `trellis-check` reviewed the complete core -> terminal model -> Session -> proto ->
+  local/remote bridge -> CLI path and fixed validation, old-peer, gutter-drag, background-resync,
+  duplex input/history/viewport race, and epoch-loss correlation findings.
+- Final `just check` passed after the additional caller-isolation and resize/eviction/clear model
+  regressions. It includes source/version/dependency policy, format, workspace all-target Clippy with
+  warnings denied, secret scans, all workspace tests/docs, cargo-deny, and relay static/upstream
+  checks. The affected full suites include daemon `198/198`, CLI library `47 passed / 3 isolated
+  helpers ignored`, and terminal model `19/19`.
+- The real macOS local outer-PTY + daemon + production CLI scroll fixture passed five consecutive
+  runs: a single SGR wheel report repainted the target exactly three rows above a 24-row live
+  viewport, then detach and termios restoration completed. The automatic-resync pinned-baseline PTY
+  regression also passed five consecutive runs.
+- Pure/local/remote protocol tests cover Herdr/Pi-style terminal modes, one-report ownership,
+  alternate entry/exit, capability-less fallback, one-outstanding/coalescing, background sync,
+  reconnect, resize, redaction, and frame limits. The broader real-binary/direct/relay smoke item
+  remains unchecked: actual Herdr/Pi fullscreen runs, macOS direct/relay, and all Linux
+  local/direct/relay runtime paths are still external acceptance work.
+- No throughput, latency, CPU, RSS, or candidate-comparison benchmark was run. Android remains the
+  next task only after the outstanding native transport matrix is recorded.
+
 ## Validation Matrix
 
 实现时先跑针对性门，再跑workspace门；命令按实际test target补充，但不得用不存在的target
@@ -280,6 +428,7 @@ cargo +1.98.0 fmt --all -- --check
 cargo +1.98.0 clippy --workspace --all-targets --all-features -- -D warnings
 cargo +1.98.0 test -p zterm-terminal --all-features
 cargo +1.98.0 test -p zterm-core --all-features
+cargo +1.98.0 test -p zterm-proto --all-features
 cargo +1.98.0 test -p zterm-daemon --lib --all-features
 cargo +1.98.0 test -p zterm-daemon --test terminal_blackbox
 cargo +1.98.0 test -p zterm-daemon --test terminal_drain
@@ -334,6 +483,17 @@ The user-owned modification to the parent task's `task.json` remains present
 and was not edited by this implementation or the independent check. The
 unchecked items are exactly the hosted-only evidence boundaries above.
 
+## Scroll Follow-up Completion Gate
+
+- [x] Host capture survives initial/full/delta/resync/history render and is removed on every exit.
+- [x] Exact continuous viewport, signed/absolute actions, epoch rebase and per-attachment isolation
+  pass model/session/local/remote tests.
+- [x] One-report ownership and Herdr/Pi-style nested paths pass without application-specific logic.
+- [x] Stable main gutter, interactive scrollbar and main/alternate single-resize behavior pass.
+- [x] New capability and mixed-version legacy fallback pass bounds/correlation/redaction tests.
+- [ ] Real macOS and Linux local/direct/relay smoke evidence is recorded before Android work starts.
+- [x] Relevant specs/task evidence are current; `trellis-check` passes; no performance test was run.
+
 ## Pre-Start Approval
 
 - [x] 用户已明确批准本 PRD、design和implementation plan（2026-09-02）。
@@ -342,3 +502,8 @@ unchecked items are exactly the hosted-only evidence boundaries above.
 ```sh
 python3 .trellis/scripts/task.py start .trellis/tasks/09-02-migrate-alacritty-terminal
 ```
+
+### Scroll follow-up authorization
+
+- [x] 已向用户展示本次 scroll/gutter/wire 最终计划摘要。
+- [x] 用户在该最终摘要之后再次明确批准开始修改产品代码（2026-09-02）。

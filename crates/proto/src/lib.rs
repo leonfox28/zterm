@@ -8,7 +8,8 @@ use prost::Message;
 use zeroize::{Zeroize, Zeroizing};
 use zterm_core::terminal::{
     ActiveScreen, TerminalDelta, TerminalHistoryCursor, TerminalHistoryPage, TerminalHistoryResult,
-    TerminalModes, TerminalMouseEncoding, TerminalMouseMode, TerminalSize, TerminalSnapshot,
+    TerminalModes, TerminalMouseEncoding, TerminalMouseMode, TerminalScrollMetrics, TerminalSize,
+    TerminalSnapshot, TerminalViewportDisposition, TerminalViewportFrame, TerminalViewportResult,
 };
 use zterm_core::{
     AttachmentId, AuthGeneration, AuthorizationStatus, Capabilities, ConnectionAttemptId,
@@ -47,6 +48,22 @@ impl fmt::Debug for v1::TerminalHistoryPage {
             .field("attachment_id_present", &self.attachment_id.is_some())
             .field("outcome", &self.outcome)
             .field("cursor", &self.cursor)
+            .field("row_count", &self.rows.len())
+            .field("ansi_bytes", &self.rows.iter().map(Vec::len).sum::<usize>())
+            .field("current_epoch", &self.current_epoch)
+            .field("current_revision", &self.current_revision)
+            .finish()
+    }
+}
+
+impl fmt::Debug for v1::TerminalViewportFrame {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalViewportFrame")
+            .field("attachment_id_present", &self.attachment_id.is_some())
+            .field("outcome", &self.outcome)
+            .field("disposition", &self.disposition)
+            .field("metrics", &self.metrics)
             .field("row_count", &self.rows.len())
             .field("ansi_bytes", &self.rows.iter().map(Vec::len).sum::<usize>())
             .field("current_epoch", &self.current_epoch)
@@ -270,6 +287,7 @@ impl fmt::Debug for v1::TerminalSnapshot {
             .field("recent_history_ansi_len", &self.recent_history_ansi.len())
             .field("active_screen", &self.active_screen)
             .field("modes", &self.modes)
+            .field("scroll_metrics", &self.scroll_metrics)
             .finish()
     }
 }
@@ -287,6 +305,7 @@ impl fmt::Debug for v1::TerminalDelta {
             .field("active_screen", &self.active_screen)
             .field("modes", &self.modes)
             .field("attachment_id", &self.attachment_id)
+            .field("scroll_metrics", &self.scroll_metrics)
             .finish()
     }
 }
@@ -427,6 +446,10 @@ pub enum WireKind {
     TerminalHistoryPage = 313,
     /// Same-UID-only selected connection path and RTT projection.
     TerminalConnectionStatusEvent = 314,
+    /// Applies one attachment-local semantic viewport action.
+    TerminalViewportRequest = 315,
+    /// Returns one complete attachment-local viewport outcome.
+    TerminalViewportFrame = 316,
 }
 
 impl WireKind {
@@ -435,7 +458,10 @@ impl WireKind {
     pub const fn is_control(self) -> bool {
         !matches!(
             self,
-            Self::TerminalSnapshot | Self::TerminalDelta | Self::TerminalHistoryPage
+            Self::TerminalSnapshot
+                | Self::TerminalDelta
+                | Self::TerminalHistoryPage
+                | Self::TerminalViewportFrame
         )
     }
 
@@ -523,6 +549,8 @@ impl TryFrom<u32> for WireKind {
             312 => Self::TerminalHistoryRequest,
             313 => Self::TerminalHistoryPage,
             314 => Self::TerminalConnectionStatusEvent,
+            315 => Self::TerminalViewportRequest,
+            316 => Self::TerminalViewportFrame,
             unknown => return Err(ProtocolError::UnknownKind(unknown)),
         };
         Ok(kind)
@@ -1048,6 +1076,18 @@ impl From<TerminalHistoryCursor> for v1::TerminalHistoryCursor {
     }
 }
 
+impl From<TerminalScrollMetrics> for v1::TerminalScrollMetrics {
+    fn from(value: TerminalScrollMetrics) -> Self {
+        Self {
+            epoch: value.epoch.get(),
+            revision: value.revision.get(),
+            offset_from_bottom: value.offset_from_bottom,
+            max_offset_from_bottom: value.max_offset_from_bottom,
+            viewport_rows: u32::from(value.viewport_rows),
+        }
+    }
+}
+
 /// Projects one bounded history result into a content-redacted wire message.
 #[must_use]
 pub fn terminal_history_page_message(
@@ -1084,6 +1124,61 @@ pub fn terminal_history_page_message(
     }
 }
 
+/// Projects one attachment-local semantic viewport result into a wire message.
+#[must_use]
+pub fn terminal_viewport_frame_message(
+    attachment_id: AttachmentId,
+    result: TerminalViewportResult,
+) -> v1::TerminalViewportFrame {
+    match result {
+        TerminalViewportResult::Frame(TerminalViewportFrame {
+            disposition,
+            metrics,
+            rows,
+        }) => v1::TerminalViewportFrame {
+            attachment_id: Some(attachment_id.into()),
+            outcome: v1::TerminalViewportOutcome::Frame as i32,
+            disposition: match disposition {
+                TerminalViewportDisposition::Exact => v1::TerminalViewportDisposition::Exact as i32,
+                TerminalViewportDisposition::Rebased => {
+                    v1::TerminalViewportDisposition::Rebased as i32
+                }
+            },
+            metrics: Some(metrics.into()),
+            rows,
+            current_epoch: metrics.epoch.get(),
+            current_revision: metrics.revision.get(),
+        },
+        TerminalViewportResult::Live(metrics) => v1::TerminalViewportFrame {
+            attachment_id: Some(attachment_id.into()),
+            outcome: v1::TerminalViewportOutcome::Live as i32,
+            disposition: v1::TerminalViewportDisposition::Unspecified as i32,
+            metrics: Some(metrics.into()),
+            rows: Vec::new(),
+            current_epoch: metrics.epoch.get(),
+            current_revision: metrics.revision.get(),
+        },
+        TerminalViewportResult::HistoryChanged { epoch, revision } => v1::TerminalViewportFrame {
+            attachment_id: Some(attachment_id.into()),
+            outcome: v1::TerminalViewportOutcome::Changed as i32,
+            disposition: v1::TerminalViewportDisposition::Unspecified as i32,
+            metrics: None,
+            rows: Vec::new(),
+            current_epoch: epoch.get(),
+            current_revision: revision.get(),
+        },
+        TerminalViewportResult::HistoryGap { epoch, revision } => v1::TerminalViewportFrame {
+            attachment_id: Some(attachment_id.into()),
+            outcome: v1::TerminalViewportOutcome::Gap as i32,
+            disposition: v1::TerminalViewportDisposition::Unspecified as i32,
+            metrics: None,
+            rows: Vec::new(),
+            current_epoch: epoch.get(),
+            current_revision: revision.get(),
+        },
+    }
+}
+
 /// Projects one host snapshot into its wire message without reparsing ANSI.
 #[must_use]
 pub fn terminal_snapshot_message(
@@ -1102,6 +1197,7 @@ pub fn terminal_snapshot_message(
         recent_history_ansi: snapshot.recent_history_ansi,
         active_screen: v1::TerminalActiveScreen::from(snapshot.active_screen) as i32,
         modes: Some(snapshot.modes.into()),
+        scroll_metrics: snapshot.scroll_metrics.map(Into::into),
     }
 }
 
@@ -1120,6 +1216,7 @@ pub fn terminal_delta_message(
         active_screen: v1::TerminalActiveScreen::from(delta.active_screen) as i32,
         modes: Some(delta.modes.into()),
         attachment_id: Some(attachment_id.into()),
+        scroll_metrics: delta.scroll_metrics.map(Into::into),
     }
 }
 
@@ -1946,6 +2043,7 @@ mod tests {
                 screen_ansi: screen.clone(),
                 recent_history_ansi: history,
                 modes: TerminalModes::default(),
+                scroll_metrics: None,
             },
         );
         assert_eq!(message.screen_ansi, screen);
@@ -2177,6 +2275,14 @@ mod tests {
                 WireKind::TerminalConnectionStatusEvent,
                 v1::MessageKind::TerminalConnectionStatusEvent as u32,
             ),
+            (
+                WireKind::TerminalViewportRequest,
+                v1::MessageKind::TerminalViewportRequest as u32,
+            ),
+            (
+                WireKind::TerminalViewportFrame,
+                v1::MessageKind::TerminalViewportFrame as u32,
+            ),
         ];
 
         for (kind, proto_number) in kinds {
@@ -2270,6 +2376,7 @@ mod tests {
                 active_screen: v1::TerminalActiveScreen::Main as i32,
                 modes: Some(v1::TerminalModes::default()),
                 attachment_id: attachment_id.clone(),
+                scroll_metrics: None,
             },
         );
         assert_message_round_trip(
@@ -2334,9 +2441,36 @@ mod tests {
         assert_message_round_trip(
             WireKind::TerminalConnectionStatusEvent,
             v1::TerminalConnectionStatusEvent {
-                attachment_id,
+                attachment_id: attachment_id.clone(),
                 path: v1::TerminalConnectionPath::Direct as i32,
                 rtt_ms: Some(42),
+            },
+        );
+        assert_message_round_trip(
+            WireKind::TerminalViewportRequest,
+            v1::TerminalViewportRequest {
+                attachment_id: attachment_id.clone(),
+                action: Some(v1::TerminalViewportAction {
+                    action: Some(v1::terminal_viewport_action::Action::ScrollByLines(3)),
+                }),
+            },
+        );
+        assert_message_round_trip(
+            WireKind::TerminalViewportFrame,
+            v1::TerminalViewportFrame {
+                attachment_id,
+                outcome: v1::TerminalViewportOutcome::Frame as i32,
+                disposition: v1::TerminalViewportDisposition::Exact as i32,
+                metrics: Some(v1::TerminalScrollMetrics {
+                    epoch: 3,
+                    revision: 17,
+                    offset_from_bottom: 3,
+                    max_offset_from_bottom: 9,
+                    viewport_rows: 2,
+                }),
+                rows: vec![b"older".to_vec(), b"newer".to_vec()],
+                current_epoch: 3,
+                current_revision: 17,
             },
         );
         assert_eq!(
@@ -2369,6 +2503,8 @@ mod tests {
     fn history_frames_keep_content_and_control_limits_and_reject_malformed_payloads() {
         assert!(WireKind::TerminalHistoryRequest.is_control());
         assert!(!WireKind::TerminalHistoryPage.is_control());
+        assert!(WireKind::TerminalViewportRequest.is_control());
+        assert!(!WireKind::TerminalViewportFrame.is_control());
         assert!(WireKind::TerminalConnectionStatusEvent.is_control());
 
         let content = vec![0_u8; MAX_CONTROL_PAYLOAD_BYTES + 1];
@@ -2388,6 +2524,20 @@ mod tests {
                 0,
                 vec![0_u8; MAX_CONTROL_PAYLOAD_BYTES + 1]
             ),
+            Err(ProtocolError::ControlPayloadTooLarge(_))
+        ));
+        let viewport_content = vec![0_u8; MAX_CONTROL_PAYLOAD_BYTES + 1];
+        assert!(
+            encode_payload(
+                WireKind::TerminalViewportFrame,
+                9,
+                0,
+                viewport_content.clone(),
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            encode_payload(WireKind::TerminalViewportRequest, 9, 0, viewport_content),
             Err(ProtocolError::ControlPayloadTooLarge(_))
         ));
 
@@ -2423,5 +2573,22 @@ mod tests {
         assert!(!debug.contains(std::str::from_utf8(SENTINEL).expect("ASCII sentinel")));
         assert!(debug.contains("row_count: 1"));
         assert!(debug.contains(&format!("ansi_bytes: {}", SENTINEL.len())));
+
+        const VIEWPORT_SENTINEL: &[u8] = b"VIEWPORT_ROW_SENTINEL_5b2e";
+        let viewport = v1::TerminalViewportFrame {
+            attachment_id: Some(AttachmentId::from_array([0x46; 16]).into()),
+            outcome: v1::TerminalViewportOutcome::Frame as i32,
+            disposition: v1::TerminalViewportDisposition::Exact as i32,
+            metrics: None,
+            rows: vec![VIEWPORT_SENTINEL.to_vec()],
+            current_epoch: 1,
+            current_revision: 2,
+        };
+        let debug = format!("{viewport:?}");
+        assert!(
+            !debug
+                .contains(std::str::from_utf8(VIEWPORT_SENTINEL).expect("ASCII viewport sentinel"))
+        );
+        assert!(debug.contains("row_count: 1"));
     }
 }

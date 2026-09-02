@@ -41,6 +41,7 @@ message TerminalSnapshot {
   bytes recent_history_ansi = 7;
   TerminalActiveScreen active_screen = 8;
   TerminalModes modes = 9;
+  TerminalScrollMetrics scroll_metrics = 10;
 }
 
 message TerminalDelta {
@@ -52,6 +53,7 @@ message TerminalDelta {
   TerminalActiveScreen active_screen = 6;
   TerminalModes modes = 7;
   AttachmentId attachment_id = 8;
+  TerminalScrollMetrics scroll_metrics = 9;
 }
 
 message TerminalInput {
@@ -157,6 +159,50 @@ message TerminalHistoryPage {
   repeated bytes rows = 4;
   uint64 current_epoch = 5;
   uint64 current_revision = 6;
+}
+
+message TerminalScrollMetrics {
+  uint64 epoch = 1;
+  uint64 revision = 2;
+  uint64 offset_from_bottom = 3;
+  uint64 max_offset_from_bottom = 4;
+  uint32 viewport_rows = 5;
+}
+
+message TerminalViewportAction {
+  oneof action {
+    sint32 scroll_by_lines = 1;
+    uint64 scroll_to_offset = 2;
+  }
+}
+
+message TerminalViewportRequest {
+  AttachmentId attachment_id = 1;
+  TerminalViewportAction action = 2;
+}
+
+enum TerminalViewportOutcome {
+  TERMINAL_VIEWPORT_OUTCOME_UNSPECIFIED = 0;
+  TERMINAL_VIEWPORT_OUTCOME_FRAME = 1;
+  TERMINAL_VIEWPORT_OUTCOME_LIVE = 2;
+  TERMINAL_VIEWPORT_OUTCOME_CHANGED = 3;
+  TERMINAL_VIEWPORT_OUTCOME_GAP = 4;
+}
+
+enum TerminalViewportDisposition {
+  TERMINAL_VIEWPORT_DISPOSITION_UNSPECIFIED = 0;
+  TERMINAL_VIEWPORT_DISPOSITION_EXACT = 1;
+  TERMINAL_VIEWPORT_DISPOSITION_REBASED = 2;
+}
+
+message TerminalViewportFrame {
+  AttachmentId attachment_id = 1;
+  TerminalViewportOutcome outcome = 2;
+  TerminalViewportDisposition disposition = 3;
+  TerminalScrollMetrics metrics = 4;
+  repeated bytes rows = 5;
+  uint64 current_epoch = 6;
+  uint64 current_revision = 7;
 }
 
 enum TerminalConnectionPath {

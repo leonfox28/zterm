@@ -5,8 +5,9 @@ use alacritty_terminal::index::Line;
 use zterm_core::Revision;
 use zterm_core::terminal::{
     ActiveScreen, MAX_HISTORY_PAGE_ROWS, TerminalDelta, TerminalDeltaResult, TerminalHistoryCursor,
-    TerminalHistoryDirection, TerminalHistoryPage, TerminalHistoryResult, TerminalSize,
-    TerminalSnapshot, TerminalState, TerminalUpdate,
+    TerminalHistoryDirection, TerminalHistoryPage, TerminalHistoryResult, TerminalScrollAction,
+    TerminalScrollMetrics, TerminalSize, TerminalSnapshot, TerminalState, TerminalUpdate,
+    TerminalViewportDisposition, TerminalViewportFrame, TerminalViewportResult,
 };
 
 use crate::ansi::{encode_delta, encode_full, encode_history_row};
@@ -218,6 +219,7 @@ impl TerminalModel {
             screen_ansi: encode_full(&projection),
             recent_history_ansi: self.recent_history_ansi(),
             modes: projection.modes,
+            scroll_metrics: self.live_scroll_metrics(),
         }
     }
 
@@ -232,6 +234,7 @@ impl TerminalModel {
             screen_ansi: encode_full(&latest),
             recent_history_ansi: self.recent_history_ansi(),
             modes: latest.modes,
+            scroll_metrics: self.live_scroll_metrics(),
         };
         if checkpoint.revision > self.revision
             || checkpoint.projection.version != CHECKPOINT_FORMAT_VERSION
@@ -267,6 +270,7 @@ impl TerminalModel {
             active_screen: latest.active_screen,
             ansi,
             modes: latest.modes,
+            scroll_metrics: self.live_scroll_metrics(),
         };
         let full = snapshot();
         if delta.ansi_payload_len() >= full.ansi_payload_len() {
@@ -280,6 +284,95 @@ impl TerminalModel {
     #[must_use]
     pub fn state(&self) -> TerminalState {
         project(&self.engine).to_state()
+    }
+
+    /// Returns the live main-screen scroll extent without changing terminal state.
+    #[must_use]
+    pub fn live_scroll_metrics(&self) -> Option<TerminalScrollMetrics> {
+        (self.engine.active_screen() == ActiveScreen::Main).then_some(TerminalScrollMetrics {
+            epoch: self.history_epoch,
+            revision: self.revision,
+            offset_from_bottom: 0,
+            max_offset_from_bottom: u64::try_from(self.retained_history_rows).unwrap_or(u64::MAX),
+            viewport_rows: self.size().rows,
+        })
+    }
+
+    /// Applies one attachment-local scroll action and projects a complete viewport.
+    ///
+    /// The supplied metrics are an attachment-owned baseline. This method never
+    /// mutates Alacritty's shared display offset, model revision, or checkpoint.
+    #[must_use]
+    pub fn scroll_viewport(
+        &self,
+        previous: Option<TerminalScrollMetrics>,
+        action: TerminalScrollAction,
+    ) -> TerminalViewportResult {
+        let Some(mut metrics) = self.live_scroll_metrics() else {
+            return TerminalViewportResult::HistoryChanged {
+                epoch: self.history_epoch,
+                revision: self.revision,
+            };
+        };
+        if previous
+            .is_some_and(|previous| !previous.is_valid() || previous.revision > self.revision)
+        {
+            return TerminalViewportResult::HistoryGap {
+                epoch: metrics.epoch,
+                revision: metrics.revision,
+            };
+        }
+
+        let mut disposition = TerminalViewportDisposition::Exact;
+        let mut offset = 0_u64;
+        if let Some(previous) = previous {
+            if previous.epoch == metrics.epoch
+                && previous.viewport_rows == metrics.viewport_rows
+                && previous.max_offset_from_bottom <= metrics.max_offset_from_bottom
+            {
+                let appended = metrics
+                    .max_offset_from_bottom
+                    .saturating_sub(previous.max_offset_from_bottom);
+                offset = previous
+                    .offset_from_bottom
+                    .saturating_add(appended)
+                    .min(metrics.max_offset_from_bottom);
+            } else {
+                disposition = TerminalViewportDisposition::Rebased;
+                offset = previous
+                    .offset_from_bottom
+                    .min(metrics.max_offset_from_bottom);
+            }
+        }
+
+        offset = match action {
+            TerminalScrollAction::ScrollByLines(lines) if lines >= 0 => offset
+                .saturating_add(u64::from(lines.unsigned_abs()))
+                .min(metrics.max_offset_from_bottom),
+            TerminalScrollAction::ScrollByLines(lines) => {
+                offset.saturating_sub(u64::from(lines.unsigned_abs()))
+            }
+            TerminalScrollAction::ScrollToOffset(target) => {
+                target.min(metrics.max_offset_from_bottom)
+            }
+        };
+        metrics.offset_from_bottom = offset;
+        if offset == 0 {
+            return TerminalViewportResult::Live(metrics);
+        }
+
+        let offset = i32::try_from(offset).unwrap_or(i32::MAX);
+        let rows = (0..metrics.viewport_rows)
+            .map(|row| {
+                let line = i32::from(row).saturating_sub(offset);
+                encode_history_row(&project_row(&self.engine, Line(line)))
+            })
+            .collect();
+        TerminalViewportResult::Frame(TerminalViewportFrame {
+            disposition,
+            metrics,
+            rows,
+        })
     }
 
     /// Returns one bounded, revision-aware page from retained main history.
@@ -559,6 +652,224 @@ mod tests {
                 .history_page(TerminalHistoryDirection::Newest, None, 2)
                 .expect("typed alternate result"),
             TerminalHistoryResult::HistoryChanged { .. }
+        ));
+    }
+
+    #[test]
+    fn scroll_viewport_projects_full_rows_and_clamps_at_both_ends() {
+        let mut model =
+            TerminalModel::new(TerminalSize::new(4, 12), 8).expect("bounded history terminal");
+        model
+            .ingest(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven")
+            .expect("seed history and live rows");
+        let before = model.state();
+
+        let TerminalViewportResult::Frame(oldest) =
+            model.scroll_viewport(None, TerminalScrollAction::ScrollToOffset(u64::MAX))
+        else {
+            panic!("non-empty history must produce a frame");
+        };
+        assert_eq!(oldest.metrics.offset_from_bottom, 3);
+        assert_eq!(oldest.rows.len(), 4);
+        assert!(String::from_utf8_lossy(&oldest.rows[0]).contains("one"));
+        assert!(String::from_utf8_lossy(&oldest.rows[1]).contains("two"));
+        assert!(String::from_utf8_lossy(&oldest.rows[2]).contains("three"));
+        assert!(String::from_utf8_lossy(&oldest.rows[3]).contains("four"));
+        assert_eq!(
+            model.state(),
+            before,
+            "viewport projection must not mutate live state"
+        );
+
+        let TerminalViewportResult::Live(live) = model.scroll_viewport(
+            Some(oldest.metrics),
+            TerminalScrollAction::ScrollByLines(i32::MIN),
+        ) else {
+            panic!("large downward motion must clamp at the live bottom");
+        };
+        assert_eq!(live.offset_from_bottom, 0);
+    }
+
+    #[test]
+    fn scroll_viewport_anchors_same_epoch_growth_before_relative_motion() {
+        let mut model =
+            TerminalModel::new(TerminalSize::new(2, 12), 8).expect("bounded history terminal");
+        model
+            .ingest(b"one\r\ntwo\r\nthree")
+            .expect("seed one history row");
+        let TerminalViewportResult::Frame(pinned) =
+            model.scroll_viewport(None, TerminalScrollAction::ScrollByLines(1))
+        else {
+            panic!("history must produce a frame");
+        };
+        assert!(String::from_utf8_lossy(&pinned.rows[0]).contains("one"));
+
+        model.ingest(b"\r\nfour").expect("grow below capacity");
+        let TerminalViewportResult::Frame(anchored) =
+            model.scroll_viewport(Some(pinned.metrics), TerminalScrollAction::ScrollByLines(0))
+        else {
+            panic!("same-epoch growth keeps a pinned frame");
+        };
+        assert_eq!(anchored.disposition, TerminalViewportDisposition::Exact);
+        assert_eq!(anchored.metrics.offset_from_bottom, 2);
+        assert!(String::from_utf8_lossy(&anchored.rows[0]).contains("one"));
+    }
+
+    #[test]
+    fn scroll_viewport_baselines_are_caller_owned_and_independent() {
+        let mut model =
+            TerminalModel::new(TerminalSize::new(4, 12), 8).expect("bounded history terminal");
+        model
+            .ingest(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven")
+            .expect("seed history for two callers");
+        let before = model.state();
+
+        let TerminalViewportResult::Frame(first) =
+            model.scroll_viewport(None, TerminalScrollAction::ScrollByLines(1))
+        else {
+            panic!("the first caller must receive one row of history");
+        };
+        let TerminalViewportResult::Frame(second) =
+            model.scroll_viewport(None, TerminalScrollAction::ScrollByLines(3))
+        else {
+            panic!("the second caller must receive three rows of history");
+        };
+        assert_eq!(first.metrics.offset_from_bottom, 1);
+        assert_eq!(second.metrics.offset_from_bottom, 3);
+
+        let TerminalViewportResult::Frame(first_advanced) =
+            model.scroll_viewport(Some(first.metrics), TerminalScrollAction::ScrollByLines(1))
+        else {
+            panic!("the first caller advances from its own baseline");
+        };
+        let TerminalViewportResult::Frame(second_unchanged) =
+            model.scroll_viewport(Some(second.metrics), TerminalScrollAction::ScrollByLines(0))
+        else {
+            panic!("the second caller retains its independent baseline");
+        };
+        assert_eq!(first_advanced.metrics.offset_from_bottom, 2);
+        assert_eq!(second_unchanged.metrics.offset_from_bottom, 3);
+        assert_eq!(model.state(), before, "neither caller mutates live state");
+    }
+
+    #[test]
+    fn scroll_viewport_rebases_after_resize_eviction_and_history_clear() {
+        let mut model =
+            TerminalModel::new(TerminalSize::new(2, 12), 2).expect("small history terminal");
+        model
+            .ingest(b"one\r\ntwo\r\nthree\r\nfour")
+            .expect("fill retained history");
+        let TerminalViewportResult::Frame(before_eviction) =
+            model.scroll_viewport(None, TerminalScrollAction::ScrollByLines(1))
+        else {
+            panic!("history must be available before eviction");
+        };
+
+        model.ingest(b"\r\nfive").expect("evict one retained row");
+        let TerminalViewportResult::Frame(after_eviction) = model.scroll_viewport(
+            Some(before_eviction.metrics),
+            TerminalScrollAction::ScrollByLines(0),
+        ) else {
+            panic!("bounded retained history remains after eviction");
+        };
+        assert_eq!(
+            after_eviction.disposition,
+            TerminalViewportDisposition::Rebased
+        );
+
+        model
+            .resize(TerminalSize::new(3, 12))
+            .expect("resize changes viewport identity");
+        match model.scroll_viewport(
+            Some(after_eviction.metrics),
+            TerminalScrollAction::ScrollByLines(0),
+        ) {
+            TerminalViewportResult::Frame(frame) => {
+                assert_eq!(frame.disposition, TerminalViewportDisposition::Rebased);
+                assert_eq!(frame.rows.len(), 3);
+            }
+            TerminalViewportResult::Live(metrics) => {
+                assert_eq!(metrics.offset_from_bottom, 0);
+                assert_eq!(metrics.viewport_rows, 3);
+            }
+            other => panic!("resize must rebase to a current frame or live state: {other:?}"),
+        }
+
+        let previous = model.live_scroll_metrics().expect("main-screen metrics");
+        model.ingest(b"\x1b[3J").expect("clear saved history");
+        let TerminalViewportResult::Live(cleared) =
+            model.scroll_viewport(Some(previous), TerminalScrollAction::ScrollByLines(0))
+        else {
+            panic!("cleared history must clamp the viewport to live");
+        };
+        assert_eq!(cleared.offset_from_bottom, 0);
+        assert_eq!(cleared.max_offset_from_bottom, 0);
+    }
+
+    #[test]
+    fn scroll_viewport_preserves_styled_wide_unicode_rows_through_allowlisted_ansi() {
+        let mut model =
+            TerminalModel::new(TerminalSize::new(2, 12), 4).expect("Unicode history terminal");
+        model
+            .ingest("\x1b[31m界\x1b[0m\r\nplain\r\nlive".as_bytes())
+            .expect("seed styled wide history row");
+        let before = model.state();
+        let TerminalViewportResult::Frame(frame) =
+            model.scroll_viewport(None, TerminalScrollAction::ScrollToOffset(1))
+        else {
+            panic!("retained Unicode row must produce a frame");
+        };
+        assert_eq!(frame.rows.len(), 2);
+        assert!(
+            frame.rows[0]
+                .windows("界".len())
+                .any(|bytes| bytes == "界".as_bytes())
+        );
+        assert!(uses_only_allowlisted_ansi(&frame.rows[0], false));
+        assert_eq!(model.state(), before);
+    }
+
+    #[test]
+    fn scroll_viewport_rebases_stale_epoch_and_rejects_invalid_or_alternate_baselines() {
+        let mut model =
+            TerminalModel::new(TerminalSize::new(2, 12), 8).expect("bounded history terminal");
+        model.ingest(b"one\r\ntwo\r\nthree").expect("seed history");
+        let TerminalViewportResult::Frame(pinned) =
+            model.scroll_viewport(None, TerminalScrollAction::ScrollByLines(1))
+        else {
+            panic!("history must produce a frame");
+        };
+
+        let mut stale_epoch = pinned.metrics;
+        stale_epoch.epoch = Revision::new(stale_epoch.epoch.get().saturating_add(1));
+        let TerminalViewportResult::Frame(rebased) =
+            model.scroll_viewport(Some(stale_epoch), TerminalScrollAction::ScrollByLines(0))
+        else {
+            panic!("current history can replace a stale viewport");
+        };
+        assert_eq!(rebased.disposition, TerminalViewportDisposition::Rebased);
+        assert_eq!(rebased.rows.len(), 2);
+
+        let mut invalid = rebased.metrics;
+        invalid.offset_from_bottom = invalid.max_offset_from_bottom.saturating_add(1);
+        assert!(matches!(
+            model.scroll_viewport(Some(invalid), TerminalScrollAction::ScrollByLines(1)),
+            TerminalViewportResult::HistoryGap { .. }
+        ));
+
+        let mut future_epoch = rebased.metrics;
+        future_epoch.epoch = Revision::new(future_epoch.revision.get().saturating_add(1));
+        assert!(matches!(
+            model.scroll_viewport(Some(future_epoch), TerminalScrollAction::ScrollByLines(0)),
+            TerminalViewportResult::HistoryGap { .. }
+        ));
+
+        model
+            .ingest(b"\x1b[?1049h")
+            .expect("enter alternate screen");
+        assert!(matches!(
+            model.scroll_viewport(None, TerminalScrollAction::ScrollByLines(1)),
+            TerminalViewportResult::HistoryChanged { .. }
         ));
     }
 

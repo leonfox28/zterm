@@ -36,6 +36,11 @@ TerminalAttachment::discard_checkpoint(&mut self)
 TerminalAttachment::latest_snapshot(&self) -> Result<TerminalSnapshot, TerminalDriverError>
 TerminalAttachment::history_page(direction, cursor, maximum_rows)
     -> Result<TerminalHistoryResult, TerminalDriverError>
+TerminalAttachment::scroll_viewport(
+    &self,
+    previous: Option<TerminalScrollMetrics>,
+    action: TerminalScrollAction,
+) -> Result<TerminalViewportResult, TerminalDriverError>
 ```
 
 ### 3. Contracts
@@ -62,6 +67,11 @@ blocking PtyReader
 - History paging is a read-only attachment operation delegated to the one
   authoritative model. It neither advances the attachment checkpoint nor
   changes controller lease, PTY lifetime, revision delivery, or resize state.
+- Continuous viewport projection is likewise read-only. It checks terminal
+  health, acquires the authoritative model mutex once for the whole extent /
+  action / full-frame calculation, and leaves the attachment checkpoint and
+  Alacritty display offset unchanged. The caller supplies and owns the optional
+  attachment baseline; the driver stores no scroll position.
 - At startup the driver consumes `PtySession` into three owner-only parts: one
   reader, one `PtyIo` writer/master, and independent `PtyChild` control. A PTY
   write/flush or resize may hold only the I/O mutex; it cannot prevent the
@@ -119,6 +129,8 @@ No environment variable or network object participates in this data path.
 | mutex/condvar is poisoned | `Synchronization` |
 | revision/idle wait expires with no recorded failure | `Deadline` |
 | revision wait races a recorded failure | return the recorded failure, not `Deadline` |
+| viewport projection observes a recorded model/driver failure | return that typed failure before returning a frame |
+| viewport baseline is invalid, stale, or alternate-screen | return the model-authored Gap/Changed/Rebased result; never mutate or synthesize rows in the driver |
 
 ### 5. Good / Base / Bad Cases
 
@@ -143,6 +155,10 @@ No environment variable or network object participates in this data path.
 - History projection: request a bounded page through a retained attachment and
   prove its live checkpoint/revision delivery and controller ownership are
   unchanged.
+- Continuous viewport projection: apply independent baselines through two
+  retained attachments, verify a full frame is read under one model lock, and
+  prove neither live checkpoint/revision delivery nor the other attachment's
+  position changes.
 - Bounded queue: assert `maximum_pending_chunks <= capacity` while processed
   chunks exceed one complete queue window.
 - Query/wait regression: a raw-mode child sends DSR and exits only after
@@ -172,6 +188,8 @@ for bytes in pty_reader {
     attachment_sender.send(parse(bytes))?;
     revision_queue.push(latest_revision);
 }
+
+attachment.model.lock()?.scroll_display(delta);
 ```
 
 #### Correct
@@ -181,6 +199,9 @@ for bytes in pty_reader {
 byte_queue.push(bytes); // bounded, blocking, no-drop
 let update = terminal_model.ingest(bytes)?;
 latest_revision.publish(update.revision);
+
+let frame = attachment.scroll_viewport(previous, action)?;
+// `previous` remains owned by the Session attachment, never by the driver/model.
 ```
 
 For polling a child behind its owner-only mutex, first copy the nonblocking
