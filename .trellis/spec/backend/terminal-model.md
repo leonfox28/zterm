@@ -36,6 +36,12 @@ TerminalModel::delta_or_resync(&self, checkpoint: &TerminalCheckpoint)
 TerminalModel::state(&self) -> TerminalState
 TerminalModel::history_page(direction, cursor, maximum_rows)
     -> Result<TerminalHistoryResult, TerminalError>
+TerminalModel::live_scroll_metrics(&self) -> Option<TerminalScrollMetrics>
+TerminalModel::scroll_viewport(
+    &self,
+    previous: Option<TerminalScrollMetrics>,
+    action: TerminalScrollAction,
+) -> TerminalViewportResult
 TerminalSnapshot::limit_ansi_payload(&mut self, maximum_bytes: usize) -> bool
 ```
 
@@ -160,6 +166,24 @@ released when the Session model is dropped.
   or delta ANSI not smaller than full ANSI returns `Resync`. A newer revision
   whose complete projected state is identical returns a revision-only delta
   with empty ANSI.
+- A valid `TerminalScrollMetrics` has nonzero `viewport_rows`,
+  `epoch <= revision`, and `offset_from_bottom <= max_offset_from_bottom`.
+  Snapshot and delta expose live main-screen metrics with offset zero; the
+  field is absent on the alternate screen rather than inventing an extent.
+- `TerminalScrollAction::ScrollByLines` is signed: positive moves toward older
+  rows and negative moves toward the live bottom. `ScrollToOffset` is absolute.
+  Both saturate and clamp to `0..=max_offset_from_bottom`; offset zero returns
+  `Live`, and a positive offset returns one complete full-height frame.
+- For offset `N`, the frame is projected top-to-bottom from
+  `Line(-N)..Line(rows-N-1)` through the existing bounded row projector and
+  allowlisted encoder. Projection never calls Alacritty `scroll_display`, never
+  changes `display_offset`, and does not mutate revision, checkpoint, or state.
+- A previous baseline from the same epoch and height anchors content while new
+  rows append: first add the increase in `max_offset_from_bottom`, then apply
+  the requested action. A different epoch/height or decreased extent returns
+  the closest clamped frame as `Rebased`. Structurally invalid or future
+  metrics return `HistoryGap`; an alternate-screen request returns
+  `HistoryChanged`.
 
 ## 8. History Contract
 
@@ -183,6 +207,9 @@ released when the Session model is dropped.
 | history row request is zero or over 80 | `InvalidHistoryPageSize`; no mutation |
 | stale/invalid history cursor | Changed or Gap; never mixed rows |
 | alternate screen history request | Changed |
+| viewport metrics have zero rows, epoch after revision, offset past maximum, or a future revision | `HistoryGap`; no model mutation |
+| viewport baseline identity/height changed or retained extent decreased | closest bounded full frame with `Rebased`, or `Live` if clamped to zero |
+| viewport requested while alternate is active | `HistoryChanged`; no alternate history is invented |
 | event/title/control/combining cap reached | bounded summary/classification; no payload leak |
 | future/incompatible/inefficient checkpoint | one full `Resync` |
 | active screen alone exceeds requested frame budget | preserve screen, clear history, return `false` |
@@ -200,6 +227,9 @@ released when the Session model is dropped.
   checkpoint remains usable and engine/history-free.
 - Daemon driver/session and real-PTY tests remain required for drain, reply
   ordering, resize, detach/reconnect, and lifecycle ownership.
+- Viewport tests cover offsets 0/1/3/max/over-max, mixed history/live rows,
+  same-epoch anchoring, epoch/height rebase, future/invalid metrics, alternate
+  screen, wide/styled Unicode, and unchanged state/revision/checkpoint.
 - Format, Clippy with warnings denied, workspace tests, docs, cargo-deny,
   source policy, and dependency-tree isolation are required.
 - The executable dependency-tree policy owns `CARGO_TERM_COLOR=never` and must
@@ -220,6 +250,7 @@ pub struct TerminalCheckpoint {
 
 client.write(upstream_event_payload);
 session_registry.reserve(estimated_alacritty_bytes);
+model.scroll_display(Scroll::Delta(lines));
 ```
 
 Correct:
@@ -230,6 +261,9 @@ match model.delta_or_resync(&checkpoint) {
     TerminalDeltaResult::Delta(delta) => apply(delta.ansi),
     TerminalDeltaResult::Resync(snapshot) => replace_with(snapshot),
 }
+
+let result = model.scroll_viewport(previous_attachment_metrics, action);
+// Read-only projection; the attachment owns the returned baseline.
 ```
 
 Keep one host-authoritative model, expose only Zterm-owned contracts, bound

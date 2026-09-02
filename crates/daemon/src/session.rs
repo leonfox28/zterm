@@ -19,7 +19,8 @@ use tokio::sync::watch;
 use zterm_core::terminal::{TerminalDelta, TerminalDeltaResult, TerminalSize, TerminalSnapshot};
 #[cfg(unix)]
 use zterm_core::terminal::{
-    TerminalHistoryCursor, TerminalHistoryDirection, TerminalHistoryResult,
+    TerminalHistoryCursor, TerminalHistoryDirection, TerminalHistoryResult, TerminalScrollAction,
+    TerminalScrollMetrics, TerminalViewportResult,
 };
 use zterm_core::{
     AttachmentId, AttachmentPrincipal, ControllerLease, DaemonIncarnation, DeviceId,
@@ -295,6 +296,22 @@ impl SessionAttachment {
                 direction,
                 cursor,
                 maximum_rows,
+                reply,
+            })
+    }
+
+    /// Applies one semantic scroll action to this attachment's private viewport.
+    #[cfg(unix)]
+    pub(crate) fn scroll_viewport_until(
+        &self,
+        action: TerminalScrollAction,
+        deadline: Instant,
+    ) -> Result<TerminalViewportResult, DaemonError> {
+        self.actor
+            .request(deadline, |meta, reply| SessionCommand::ScrollViewport {
+                meta,
+                attachment_id: self.attachment_id,
+                action,
                 reply,
             })
     }
@@ -2386,6 +2403,9 @@ struct ActorAttachment {
     #[cfg(unix)]
     resume_view_id: Option<ResumeViewId>,
     terminal: TerminalAttachment,
+    #[cfg(unix)]
+    scroll_metrics: Option<TerminalScrollMetrics>,
+    ever_active: bool,
     sync: AttachmentSync,
     lifecycle: watch::Sender<AttachmentLifecycle>,
     detached: Arc<AtomicBool>,
@@ -2516,6 +2536,13 @@ enum SessionCommand {
         cursor: Option<TerminalHistoryCursor>,
         maximum_rows: usize,
         reply: SyncSender<Result<TerminalHistoryResult, DaemonError>>,
+    },
+    #[cfg(unix)]
+    ScrollViewport {
+        meta: CommandMeta,
+        attachment_id: AttachmentId,
+        action: TerminalScrollAction,
+        reply: SyncSender<Result<TerminalViewportResult, DaemonError>>,
     },
     WriteInput {
         meta: CommandMeta,
@@ -3152,6 +3179,15 @@ fn dispatch_command(
         } => respond(actor, meta, reply, || {
             history_page(runtime, attachment_id, direction, cursor, maximum_rows)
         }),
+        #[cfg(unix)]
+        SessionCommand::ScrollViewport {
+            meta,
+            attachment_id,
+            action,
+            reply,
+        } => respond(actor, meta, reply, || {
+            scroll_viewport(runtime, attachment_id, action)
+        }),
         SessionCommand::WriteInput {
             meta,
             attachment_id,
@@ -3257,6 +3293,7 @@ fn prepare_attach(
     #[cfg(unix)]
     let resume_view_id = resume.map(|request| request.view_id);
     let resumed_terminal = take_resume_terminal(actor, runtime, principal, resume);
+    let resumed_controller = resumed_terminal.is_some();
     if runtime.controller.is_some() && !takeover {
         return Err(DaemonError::new(
             DomainErrorKind::SessionOccupied,
@@ -3332,6 +3369,9 @@ fn prepare_attach(
             #[cfg(unix)]
             resume_view_id,
             terminal,
+            #[cfg(unix)]
+            scroll_metrics: None,
+            ever_active: resumed_controller,
             sync: AttachmentSync::Awaiting {
                 revision: initial_revision,
                 target,
@@ -3463,6 +3503,7 @@ fn snapshot_applied(
     }
     attachment.sync = match target {
         SyncTarget::Active { generation } => {
+            attachment.ever_active = true;
             attachment
                 .lifecycle
                 .send_replace(AttachmentLifecycle::Active { generation });
@@ -3570,6 +3611,10 @@ fn sync_latest(
         AttachmentSync::Awaiting { target, .. } => target,
     };
     attachment.terminal.discard_checkpoint();
+    #[cfg(unix)]
+    {
+        attachment.scroll_metrics = None;
+    }
     let snapshot = full_sync(&mut attachment.terminal)?;
     attachment.sync = AttachmentSync::Awaiting {
         revision: snapshot.revision,
@@ -3591,7 +3636,7 @@ fn history_page(
     cursor: Option<TerminalHistoryCursor>,
     maximum_rows: usize,
 ) -> Result<TerminalHistoryResult, DaemonError> {
-    require_controller(runtime, attachment_id)?;
+    require_existing_visual_sync_controller(runtime, attachment_id)?;
     runtime
         .attachments
         .get(&attachment_id)
@@ -3601,12 +3646,35 @@ fn history_page(
         .map_err(map_driver_error)
 }
 
+#[cfg(unix)]
+fn scroll_viewport(
+    runtime: &mut SessionRuntime,
+    attachment_id: AttachmentId,
+    action: TerminalScrollAction,
+) -> Result<TerminalViewportResult, DaemonError> {
+    require_existing_visual_sync_controller(runtime, attachment_id)?;
+    let attachment = runtime
+        .attachments
+        .get_mut(&attachment_id)
+        .ok_or_else(lease_lost)?;
+    let result = attachment
+        .terminal
+        .scroll_viewport(attachment.scroll_metrics, action)
+        .map_err(map_driver_error)?;
+    attachment.scroll_metrics = match &result {
+        TerminalViewportResult::Frame(frame) => Some(frame.metrics),
+        TerminalViewportResult::Live(_) | TerminalViewportResult::HistoryGap { .. } => None,
+        TerminalViewportResult::HistoryChanged { .. } => attachment.scroll_metrics,
+    };
+    Ok(result)
+}
+
 fn write_input(
     runtime: &SessionRuntime,
     attachment_id: AttachmentId,
     bytes: &[u8],
 ) -> Result<(), DaemonError> {
-    require_controller(runtime, attachment_id)?;
+    require_existing_visual_sync_controller(runtime, attachment_id)?;
     runtime
         .driver
         .as_ref()
@@ -3699,6 +3767,7 @@ fn takeover(
         .get_mut(&attachment_id)
         .ok_or_else(lease_lost)?;
     attachment.sync = AttachmentSync::Active { generation };
+    attachment.ever_active = true;
     attachment
         .lifecycle
         .send_replace(AttachmentLifecycle::Active { generation });
@@ -3831,17 +3900,18 @@ fn require_resize_controller(
     attachment_id: AttachmentId,
 ) -> Result<u64, DaemonError> {
     // Snapshot delivery and controller commands travel in opposite directions
-    // on one duplex stream. A client can submit its latest viewport after the
-    // last Active event while a newer snapshot is already in flight. Resize is
-    // replaceable controller state, so admit it across that visual-sync window;
-    // input and history keep the stricter Active-only fence.
+    // on one duplex stream. Resize is replaceable controller state and may be
+    // admitted while either the initial or a later Active snapshot is in
+    // flight. Input and read-only presentation requests reuse this controller
+    // check only after proving that the same attachment was active before its
+    // current visual-sync window. First attach and takeover remain fenced.
     let attachment = runtime
         .attachments
         .get(&attachment_id)
         .ok_or_else(lease_lost)?;
     let generation = match attachment.sync {
-        AttachmentSync::Active { generation }
-        | AttachmentSync::Awaiting {
+        AttachmentSync::Active { generation } => generation,
+        AttachmentSync::Awaiting {
             target: SyncTarget::Active { generation },
             ..
         } => generation,
@@ -3862,6 +3932,22 @@ fn require_resize_controller(
         }) if owner == attachment_id && current == generation => Ok(generation),
         _ => Err(lease_lost()),
     }
+}
+
+fn require_existing_visual_sync_controller(
+    runtime: &SessionRuntime,
+    attachment_id: AttachmentId,
+) -> Result<u64, DaemonError> {
+    let attachment = runtime
+        .attachments
+        .get(&attachment_id)
+        .ok_or_else(lease_lost)?;
+    if matches!(attachment.sync, AttachmentSync::Awaiting { .. }) && !attachment.ever_active {
+        return Err(not_synchronized(
+            "snapshot must be applied before controller operations",
+        ));
+    }
+    require_resize_controller(runtime, attachment_id)
 }
 
 fn full_sync(attachment: &mut TerminalAttachment) -> Result<TerminalSnapshot, DaemonError> {
@@ -4634,6 +4720,13 @@ mod tests {
                 .any(|bytes| bytes == b"LATER")
         );
         let resumed_revision = delta.to_revision;
+        resumed
+            .attachment
+            .scroll_viewport_until(
+                TerminalScrollAction::ScrollByLines(3),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .expect("a resumed controller may project before its replacement is acknowledged");
         assert!(
             resumed
                 .attachment
@@ -4657,6 +4750,14 @@ mod tests {
             .expect("a mismatched baseline falls back to an authoritative snapshot");
         assert!(mismatched.initial_delta.is_none());
         assert!(terminal_snapshot_contains(&mismatched.snapshot, b"LATER"));
+        let mismatched_error = mismatched
+            .attachment
+            .scroll_viewport_until(
+                TerminalScrollAction::ScrollByLines(3),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .expect_err("a mismatched resume is a fresh unacknowledged controller");
+        assert_eq!(mismatched_error.kind(), DomainErrorKind::NotSynchronized);
         assert!(
             mismatched
                 .attachment
@@ -4676,6 +4777,266 @@ mod tests {
         assert!(after_explicit_detach.initial_delta.is_none());
         after_explicit_detach.attachment.detach();
         service.shutdown().expect("resume fixture shuts down");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn controller_io_crosses_only_an_existing_controllers_visual_sync_window() {
+        let temporary = tempfile::tempdir().expect("temporary visual-sync fixture");
+        let service = unix_fixture_service(
+            DeviceId::from_array([0x91; 32]),
+            temporary.path().to_path_buf(),
+            "exec /bin/cat",
+        );
+        let controller = service.local_principal(AttachmentId::from_array([0x91; 16]));
+        let lease = service
+            .issue_operation_lease(controller)
+            .expect("fixture operation lease");
+        let summary = service
+            .create(
+                controller,
+                OperationId { lease, sequence: 1 },
+                SessionName::new("visual-sync-scroll").expect("fixture session name"),
+                None,
+                None,
+            )
+            .expect("fixture session creates");
+        let prepared = service
+            .prepare_attach(
+                controller,
+                Some(SessionSelector::Id(summary.session_id)),
+                false,
+                false,
+                None,
+            )
+            .expect("controller attachment prepares");
+
+        let initial_error = prepared
+            .attachment
+            .scroll_viewport_until(
+                TerminalScrollAction::ScrollByLines(3),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .expect_err("the first snapshot must be acknowledged before visual requests");
+        assert_eq!(initial_error.kind(), DomainErrorKind::NotSynchronized);
+        let initial_history_error = prepared
+            .attachment
+            .history_page_until(
+                TerminalHistoryDirection::Newest,
+                None,
+                10,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .expect_err("the first snapshot must be acknowledged before legacy history requests");
+        assert_eq!(
+            initial_history_error.kind(),
+            DomainErrorKind::NotSynchronized
+        );
+        let initial_input_error = prepared
+            .attachment
+            .write_input(b"must-not-reach-initial-pty")
+            .expect_err("the first snapshot must be acknowledged before input");
+        assert_eq!(initial_input_error.kind(), DomainErrorKind::NotSynchronized);
+        assert!(
+            prepared
+                .attachment
+                .snapshot_applied(prepared.snapshot.revision)
+                .expect("activate controller")
+                .is_none()
+        );
+
+        let replacement = prepared
+            .attachment
+            .sync_latest(prepared.snapshot.revision)
+            .expect("enter a deterministic visual resynchronization");
+        prepared
+            .attachment
+            .history_page_until(
+                TerminalHistoryDirection::Newest,
+                None,
+                10,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .expect("an existing controller may page history while its snapshot is in flight");
+        prepared
+            .attachment
+            .write_input(b"")
+            .expect("existing controller input may cross its visual-sync race window");
+        assert!(matches!(
+            prepared
+                .attachment
+                .scroll_viewport_until(
+                    TerminalScrollAction::ScrollByLines(3),
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .expect("an existing controller may project while its snapshot is in flight"),
+            TerminalViewportResult::Live(_)
+        ));
+        assert!(
+            prepared
+                .attachment
+                .snapshot_applied(replacement.revision)
+                .expect("acknowledge replacement snapshot")
+                .is_none()
+        );
+
+        let takeover_principal = service.local_principal(AttachmentId::from_array([0x92; 16]));
+        let takeover = service
+            .prepare_attach(
+                takeover_principal,
+                Some(SessionSelector::Id(summary.session_id)),
+                false,
+                true,
+                None,
+            )
+            .expect("takeover attachment prepares");
+        let prepared_error = takeover
+            .attachment
+            .scroll_viewport_until(
+                TerminalScrollAction::ScrollByLines(3),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .expect_err("an unacknowledged takeover cannot project");
+        assert_eq!(prepared_error.kind(), DomainErrorKind::NotSynchronized);
+        let prepared_input_error = takeover
+            .attachment
+            .write_input(b"must-not-reach-takeover-pty")
+            .expect_err("an unacknowledged takeover cannot write input");
+        assert_eq!(
+            prepared_input_error.kind(),
+            DomainErrorKind::NotSynchronized
+        );
+        let prepared_history_error = takeover
+            .attachment
+            .history_page_until(
+                TerminalHistoryDirection::Newest,
+                None,
+                10,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .expect_err("an unacknowledged takeover cannot page history");
+        assert_eq!(
+            prepared_history_error.kind(),
+            DomainErrorKind::NotSynchronized
+        );
+        assert!(
+            takeover
+                .attachment
+                .snapshot_applied(takeover.snapshot.revision)
+                .expect("prepare takeover")
+                .is_none()
+        );
+        let takeover_error = takeover
+            .attachment
+            .scroll_viewport_until(
+                TerminalScrollAction::ScrollByLines(3),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .expect_err("a takeover must commit before it becomes the controller");
+        assert_eq!(takeover_error.kind(), DomainErrorKind::NotSynchronized);
+        let takeover_input_error = takeover
+            .attachment
+            .write_input(b"must-not-reach-prepared-takeover-pty")
+            .expect_err("a takeover must commit before it can write input");
+        assert_eq!(
+            takeover_input_error.kind(),
+            DomainErrorKind::NotSynchronized
+        );
+
+        service.shutdown().expect("fixture session shuts down");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn automatic_resync_preserves_an_existing_semantic_viewport_baseline() {
+        let temporary = tempfile::tempdir().expect("temporary viewport resync fixture");
+        let service = unix_fixture_service(
+            DeviceId::from_array([0x93; 32]),
+            temporary.path().to_path_buf(),
+            "i=0; while [ \"$i\" -lt 12 ]; do printf 'line-%02d\\r\\n' \"$i\"; i=$((i + 1)); done; printf 'READY\\r\\n'; stty raw -echo; exec /bin/cat",
+        );
+        let controller = service.local_principal(AttachmentId::from_array([0x93; 16]));
+        let lease = service
+            .issue_operation_lease(controller)
+            .expect("fixture operation lease");
+        let summary = service
+            .create(
+                controller,
+                OperationId { lease, sequence: 1 },
+                SessionName::new("viewport-resync-baseline").expect("fixture session name"),
+                None,
+                Some(TerminalSize::new(3, 20)),
+            )
+            .expect("fixture session creates");
+        let prepared = service
+            .prepare_attach(
+                controller,
+                Some(SessionSelector::Id(summary.session_id)),
+                false,
+                false,
+                None,
+            )
+            .expect("controller attachment prepares");
+        assert!(
+            prepared
+                .attachment
+                .snapshot_applied(prepared.snapshot.revision)
+                .expect("activate controller")
+                .is_none()
+        );
+        let _ = wait_for_attachment_text(&prepared, b"READY").await;
+
+        let TerminalViewportResult::Frame(pinned) = prepared
+            .attachment
+            .scroll_viewport_until(
+                TerminalScrollAction::ScrollToOffset(4),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .expect("establish a non-live attachment viewport")
+        else {
+            panic!("fixture output must retain at least four history rows");
+        };
+        assert_eq!(pinned.metrics.offset_from_bottom, 4);
+
+        prepared
+            .attachment
+            .resize(TerminalSize::new(4, 20))
+            .expect("resize authoritative PTY and model");
+        let Some(AttachmentUpdate::Snapshot(replacement)) = prepared
+            .attachment
+            .next_update()
+            .expect("read automatic resize replacement")
+        else {
+            panic!("a model-height change must produce an automatic resync snapshot");
+        };
+
+        let TerminalViewportResult::Frame(rebased) = prepared
+            .attachment
+            .scroll_viewport_until(
+                TerminalScrollAction::ScrollByLines(1),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .expect("read-only scrolling crosses an existing visual-sync window")
+        else {
+            panic!("the preserved baseline plus one row must stay in history");
+        };
+        assert_eq!(
+            rebased.metrics.offset_from_bottom, 5,
+            "automatic resync must not restart relative scrolling from live offset zero"
+        );
+        assert_eq!(
+            rebased.disposition,
+            zterm_core::terminal::TerminalViewportDisposition::Rebased
+        );
+        assert!(
+            prepared
+                .attachment
+                .snapshot_applied(replacement.revision)
+                .expect("acknowledge automatic replacement")
+                .is_none()
+        );
+
+        service.shutdown().expect("fixture session shuts down");
     }
 
     #[cfg(unix)]
@@ -6216,32 +6577,35 @@ mod tests {
             .attachment
             .revision_watch()
             .expect("fixture revision watermark");
+        let mut baseline = prepared.snapshot.revision;
         tokio::time::timeout(Duration::from_secs(2), async {
-            while *revisions.borrow_and_update() <= prepared.snapshot.revision {
-                revisions
-                    .changed()
-                    .await
-                    .expect("driver revision stays open");
+            loop {
+                while *revisions.borrow_and_update() <= baseline {
+                    revisions
+                        .changed()
+                        .await
+                        .expect("driver revision stays open");
+                }
+                let snapshot = prepared
+                    .attachment
+                    .sync_latest(baseline)
+                    .expect("force one deterministic fixture snapshot");
+                baseline = snapshot.revision;
+                let found = terminal_snapshot_contains(&snapshot, expected);
+                assert!(
+                    prepared
+                        .attachment
+                        .snapshot_applied(snapshot.revision)
+                        .expect("acknowledge deterministic fixture snapshot")
+                        .is_none()
+                );
+                if found {
+                    return baseline;
+                }
             }
         })
         .await
-        .expect("fixture output reached the authoritative terminal");
-        let snapshot = prepared
-            .attachment
-            .sync_latest(prepared.snapshot.revision)
-            .expect("force one deterministic fixture snapshot");
-        assert!(
-            terminal_snapshot_contains(&snapshot, expected),
-            "fixture snapshot omitted the output synchronization marker"
-        );
-        assert!(
-            prepared
-                .attachment
-                .snapshot_applied(snapshot.revision)
-                .expect("acknowledge deterministic fixture snapshot")
-                .is_none()
-        );
-        snapshot.revision
+        .expect("fixture output synchronization marker reached the authoritative terminal")
     }
 
     #[cfg(unix)]

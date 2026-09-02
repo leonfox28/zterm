@@ -3,9 +3,12 @@
 {"file": ".trellis/spec/backend/pty-lifecycle.md", "reason": "确保 parser 迁移不替换 portable-pty，也不改变 child、reader、resize、wait、interrupt 与 close 所有权。"}
 {"file": ".trellis/spec/backend/session-service.md", "reason": "维持one-session-one-PTY、8-session数量/尺寸边界、controller/pending takeover、attachment与owner释放，同时删除aggregate memory admission。"}
 {"file": ".trellis/spec/backend/core-wire-domain.md", "reason": "指导 core 保持 Zterm-owned 纯 Rust DTO/wire 边界，防止 Alacritty 类型或 host engine dependency 泄漏。"}
+{"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/scroll-viewport-integration.md", "reason": "汇总已核实的capture根因、现有page限制、local/remote IPC约束、被否决方案、连续viewport投影与gutter几何决定，避免大规范注入截断。"}
 {"file": ".trellis/spec/backend/distribution-lifecycle.md", "reason": "保留 hosted CI、四个 native release artifacts、平台 floor、SBOM、license 与动态依赖检查。"}
 {"file": ".trellis/spec/guides/cross-platform-thinking-guide.md", "reason": "要求 macOS/Linux/Windows 各自由正确环境提供证据，并把 mobile 限定为 dependency isolation。"}
-{"file": ".trellis/spec/guides/evidence-driven-simplicity.md", "reason": "约束迁移不引入双 parser、runtime fallback、新 actor 或尚无消费者的 semantic/rendering surface。"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "连续 viewport 横跨 terminal model、Session attachment、proto/wire、local/remote bridge 和 CLI chrome，必须逐层追踪 action、metrics、frame 与错误语义。"}
+{"file": ".trellis/spec/guides/evidence-driven-simplicity.md", "reason": "约束 follow-up 复用现有 actor/history/resize/sync 边界，只增加已获批准且 CLI 与 Android 路线有明确消费者的最小 semantic viewport surface。"}
 {"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/alacritty-terminal-integration.md", "reason": "提供官方0.26.0 API/source证据、行为差异、ingress policy、projection、安全caps、crate boundary、取消aggregate admission和无性能测试决策。"}
 {"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/herdr-reference-architecture.md", "reason": "只借鉴 Herdr 的 authoritative state、per-client projection、backpressure 与 TERM 隔离原则，不复制其 unsafe/FFI 实现。"}
+{"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/nested-tui-scroll-routing.md", "reason": "落实 Herdr/Pi main/fullscreen 的标准 mode 驱动 wheel ownership、每 report 单一 owner、host capture 分层与禁止应用名特判。"}
 {"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/rust-vt-and-c-language-evaluation.md", "reason": "保留选择官方 Rust terminal core、拒绝社区 Ghostty wrapper与 C rewrite的决策背景，避免实现时恢复已否决路线。"}

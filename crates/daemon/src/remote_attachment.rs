@@ -17,7 +17,8 @@ use iroh::SecretKey;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf};
 use zterm_core::terminal::MAX_HISTORY_PAGE_ROWS;
 use zterm_core::{
-    AttachmentId, Capabilities, DeviceId, DomainErrorKind, ResumeViewId, Revision, SessionId,
+    AttachmentId, Capabilities, DeviceId, DomainErrorKind, ResourceLimits, ResumeViewId, Revision,
+    SessionId,
 };
 use zterm_proto::{DecodedFrame, FrameDecoder, WireKind, encode_message, v1};
 
@@ -183,6 +184,7 @@ impl RemoteAttachmentClient {
             resume_view_id,
             frozen_session_id: None,
             known_revision: None,
+            terminal_rows: None,
             latest_viewport,
             force_full: false,
             ever_active: false,
@@ -347,6 +349,7 @@ struct BridgeState {
     resume_view_id: ResumeViewId,
     frozen_session_id: Option<SessionId>,
     known_revision: Option<Revision>,
+    terminal_rows: Option<u32>,
     latest_viewport: Option<v1::TerminalViewport>,
     force_full: bool,
     ever_active: bool,
@@ -877,6 +880,7 @@ enum EpochPhase {
         expected: Revision,
         acknowledged: bool,
         needs_takeover: bool,
+        controller_was_active: bool,
     },
     Active,
 }
@@ -900,10 +904,12 @@ where
     LocalWriter: AsyncWrite + Unpin,
 {
     let history_paging = epoch.observer.supports(Capabilities::HISTORY_PAGING);
+    let terminal_viewport = epoch.observer.supports(Capabilities::TERMINAL_VIEWPORT);
     let mut phase = EpochPhase::Synchronizing {
         expected: epoch.initial_revision,
         acknowledged: false,
         needs_takeover: state.request.takeover && !state.ever_active,
+        controller_was_active: false,
     };
     let mut path_observation = tokio::time::interval(Duration::from_secs(1));
     path_observation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -922,6 +928,23 @@ where
                 let request_id = frame.request_id;
                 if frame.kind == WireKind::TerminalHistoryRequest && !history_paging {
                     if let Err(error) = write_unsupported_history_gap(
+                        frame,
+                        state,
+                        local_writer,
+                        Instant::now() + operation_timeout,
+                    ).await {
+                        write_error_best_effort(
+                            local_writer,
+                            request_id,
+                            &error,
+                            Instant::now() + operation_timeout,
+                        ).await;
+                        return Ok(EpochEnd::Terminal);
+                    }
+                    continue;
+                }
+                if frame.kind == WireKind::TerminalViewportRequest && !terminal_viewport {
+                    if let Err(error) = write_unsupported_viewport_gap(
                         frame,
                         state,
                         local_writer,
@@ -1171,6 +1194,19 @@ where
             .await?;
             Ok(false)
         }
+        WireKind::TerminalViewportRequest => {
+            let request: v1::TerminalViewportRequest = decode(&frame)?;
+            require_local_attachment(request.attachment_id.clone(), state.local_view_id)?;
+            validate_viewport_request(&request)?;
+            write_service_error(
+                local_writer,
+                request_id,
+                &transport_unavailable("remote attachment is not active"),
+                Instant::now() + operation_timeout,
+            )
+            .await?;
+            Ok(false)
+        }
         WireKind::SessionTakeoverRequest => {
             let request: v1::SessionTakeoverRequest = decode(&frame)?;
             require_local_attachment(request.attachment_id, state.local_view_id)?;
@@ -1259,6 +1295,7 @@ fn accept_initial_remote_update(
                 remote_attachment_id,
                 expected_remote_attachment_id,
             )?;
+            state.terminal_rows = Some(snapshot.rows);
             snapshot.attachment_id = Some(state.local_view_id.into());
             let revision = Revision::new(snapshot.revision);
             let local_bytes = encode_message(
@@ -1294,6 +1331,7 @@ fn accept_initial_remote_update(
                     known_revision: known,
                 });
             }
+            state.terminal_rows = Some(delta.rows);
             delta.attachment_id = Some(state.local_view_id.into());
             let revision = Revision::new(delta.to_revision);
             let local_bytes = encode_message(
@@ -1381,7 +1419,7 @@ where
         WireKind::TerminalInput => {
             let mut request: v1::TerminalInput = decode(&frame)?;
             require_local_attachment(request.attachment_id.clone(), state.local_view_id)?;
-            if !matches!(phase, EpochPhase::Active) {
+            if !visual_read_ready(phase) {
                 return Ok(None);
             }
             request.attachment_id = Some(remote_attachment_id.into());
@@ -1431,6 +1469,7 @@ where
                 expected,
                 acknowledged,
                 needs_takeover,
+                ..
             } = phase
             else {
                 return Ok(None);
@@ -1490,6 +1529,7 @@ where
                 expected,
                 acknowledged: true,
                 needs_takeover: false,
+                controller_was_active: true,
             };
             enter_synchronizing(
                 local_writer,
@@ -1504,7 +1544,7 @@ where
             let mut request: v1::TerminalHistoryRequest = decode(&frame)?;
             require_local_attachment(request.attachment_id.clone(), state.local_view_id)?;
             validate_history_request(&request)?;
-            if !matches!(phase, EpochPhase::Active) {
+            if !visual_read_ready(phase) {
                 write_service_error(
                     local_writer,
                     frame.request_id,
@@ -1522,6 +1562,42 @@ where
                 &mut state.pending_control,
                 frame.request_id,
                 WireKind::TerminalHistoryPage,
+            )?;
+            if let Err(error) = forward_remote(
+                frame,
+                request,
+                remote_writer,
+                Instant::now() + operation_timeout,
+            )
+            .await
+            {
+                Ok(Some(EpochEnd::Reconnect(error)))
+            } else {
+                Ok(None)
+            }
+        }
+        WireKind::TerminalViewportRequest => {
+            let mut request: v1::TerminalViewportRequest = decode(&frame)?;
+            require_local_attachment(request.attachment_id.clone(), state.local_view_id)?;
+            validate_viewport_request(&request)?;
+            if !visual_read_ready(phase) {
+                write_service_error(
+                    local_writer,
+                    frame.request_id,
+                    &DaemonError::new(
+                        DomainErrorKind::NotSynchronized,
+                        "viewport scrolling requires an active remote attachment",
+                    ),
+                    Instant::now() + operation_timeout,
+                )
+                .await?;
+                return Ok(None);
+            }
+            request.attachment_id = Some(remote_attachment_id.into());
+            retain_pending(
+                &mut state.pending_control,
+                frame.request_id,
+                WireKind::TerminalViewportFrame,
             )?;
             if let Err(error) = forward_remote(
                 frame,
@@ -1632,6 +1708,18 @@ where
     }
 }
 
+fn visual_read_ready(phase: &EpochPhase) -> bool {
+    matches!(phase, EpochPhase::Active)
+        || matches!(
+            phase,
+            EpochPhase::Synchronizing {
+                needs_takeover: false,
+                controller_was_active: true,
+                ..
+            }
+        )
+}
+
 async fn process_epoch_remote_frame<LocalWriter, RemoteWriter>(
     frame: DecodedFrame,
     remote_attachment_id: AttachmentId,
@@ -1712,6 +1800,7 @@ where
                     expected: known,
                     acknowledged: true,
                     needs_takeover: prepared_takeover,
+                    controller_was_active: !prepared_takeover,
                 };
                 enter_synchronizing(
                     local_writer,
@@ -1733,6 +1822,7 @@ where
             .map_err(protocol_error)?;
             write_local(local_writer, &bytes, Instant::now() + operation_timeout).await?;
             state.known_revision = Some(to_revision);
+            state.terminal_rows = Some(delta.rows);
             if let EpochPhase::Synchronizing { expected, .. } = phase {
                 *expected = to_revision;
             }
@@ -1743,17 +1833,19 @@ where
             require_remote_attachment(required.attachment_id.clone(), remote_attachment_id)?;
             required.attachment_id = Some(state.local_view_id.into());
             let expected = Revision::new(required.latest_revision);
-            let needs_takeover = matches!(
-                phase,
+            let (needs_takeover, controller_was_active) = match phase {
+                EpochPhase::Active => (false, true),
                 EpochPhase::Synchronizing {
-                    needs_takeover: true,
+                    needs_takeover,
+                    controller_was_active,
                     ..
-                }
-            );
+                } => (*needs_takeover, *controller_was_active),
+            };
             *phase = EpochPhase::Synchronizing {
                 expected,
                 acknowledged: false,
                 needs_takeover,
+                controller_was_active,
             };
             let bytes = encode_message(
                 WireKind::TerminalSyncRequired,
@@ -1780,17 +1872,19 @@ where
             freeze_session(state, session_id)?;
             snapshot.attachment_id = Some(state.local_view_id.into());
             let expected = Revision::new(snapshot.revision);
-            let needs_takeover = matches!(
-                phase,
+            let (needs_takeover, controller_was_active) = match phase {
+                EpochPhase::Active => (false, true),
                 EpochPhase::Synchronizing {
-                    needs_takeover: true,
+                    needs_takeover,
+                    controller_was_active,
                     ..
-                }
-            );
+                } => (*needs_takeover, *controller_was_active),
+            };
             *phase = EpochPhase::Synchronizing {
                 expected,
                 acknowledged: false,
                 needs_takeover,
+                controller_was_active,
             };
             state.force_full = false;
             let bytes = encode_message(
@@ -1808,6 +1902,7 @@ where
             )
             .await?;
             write_local(local_writer, &bytes, Instant::now() + operation_timeout).await?;
+            state.terminal_rows = Some(snapshot.rows);
             Ok(None)
         }
         WireKind::TerminalLeaseLost => {
@@ -1859,6 +1954,35 @@ where
                 frame.request_id,
                 frame.deadline_ms,
                 &page,
+            )
+            .map_err(protocol_error)?;
+            write_local(local_writer, &bytes, Instant::now() + operation_timeout).await?;
+            state.pending_control.remove(&frame.request_id);
+            Ok(None)
+        }
+        WireKind::TerminalViewportFrame => {
+            let expected = state
+                .pending_control
+                .get(&frame.request_id)
+                .copied()
+                .ok_or_else(|| malformed("unsolicited remote terminal viewport frame"))?;
+            if expected != WireKind::TerminalViewportFrame {
+                return Err(malformed(
+                    "remote attachment control response kind mismatch",
+                ));
+            }
+            let mut viewport: v1::TerminalViewportFrame = decode(&frame)?;
+            require_remote_attachment(viewport.attachment_id.clone(), remote_attachment_id)?;
+            let expected_rows = state
+                .terminal_rows
+                .ok_or_else(|| malformed("remote viewport frame has no terminal size baseline"))?;
+            validate_viewport_frame(&viewport, expected_rows)?;
+            viewport.attachment_id = Some(state.local_view_id.into());
+            let bytes = encode_message(
+                WireKind::TerminalViewportFrame,
+                frame.request_id,
+                frame.deadline_ms,
+                &viewport,
             )
             .map_err(protocol_error)?;
             write_local(local_writer, &bytes, Instant::now() + operation_timeout).await?;
@@ -2000,6 +2124,16 @@ fn retain_pending(
             "attachment control request_id must be unique and non-zero",
         ));
     }
+    if response_kind == WireKind::TerminalViewportFrame
+        && pending
+            .values()
+            .any(|pending_kind| *pending_kind == WireKind::TerminalViewportFrame)
+    {
+        return Err(DaemonError::new(
+            DomainErrorKind::ResourceExhausted,
+            "a terminal viewport response is already pending",
+        ));
+    }
     if pending.len() >= MAX_PENDING_CONTROL_REQUESTS {
         return Err(DaemonError::new(
             DomainErrorKind::ResourceExhausted,
@@ -2022,10 +2156,23 @@ where
     let pending = std::mem::take(&mut state.pending_control);
     let deadline = Instant::now() + operation_timeout;
     for (request_id, response_kind) in pending {
+        if response_kind == WireKind::TerminalHistoryPage {
+            // Legacy history paging is also replaceable presentation state.
+            // Keep the attachment alive so the following Reconnecting event
+            // can return the UI to live synchronization.
+            write_history_gap(writer, state.local_view_id, request_id, 0, deadline).await?;
+            continue;
+        }
+        if response_kind == WireKind::TerminalViewportFrame {
+            // A semantic viewport is read-only, replaceable presentation state.
+            // Resolve its correlation as a typed gap so the terminal driver can
+            // consume the following Reconnecting event instead of terminating
+            // the UI on a recoverable stream-epoch loss.
+            write_viewport_gap(writer, state.local_view_id, request_id, 0, deadline).await?;
+            continue;
+        }
         let error = match response_kind {
-            WireKind::SessionOperationLeaseResponse | WireKind::TerminalHistoryPage => {
-                transport_error.clone()
-            }
+            WireKind::SessionOperationLeaseResponse => transport_error.clone(),
             WireKind::SessionMutateResponse => DaemonError::new(
                 DomainErrorKind::OperationOutcomeUnknown,
                 "remote takeover result was lost with its stream epoch",
@@ -2206,12 +2353,23 @@ fn validate_snapshot(snapshot: &v1::TerminalSnapshot) -> Result<(), DaemonError>
         rows: snapshot.rows,
         columns: snapshot.columns,
     };
-    zterm_core::terminal::TerminalSize::try_from(viewport).map_err(protocol_error)?;
-    v1::TerminalActiveScreen::try_from(snapshot.active_screen)
+    validate_product_viewport(viewport)?;
+    let active_screen = v1::TerminalActiveScreen::try_from(snapshot.active_screen)
         .map_err(|_| malformed("terminal snapshot used an unknown active screen"))?;
+    if matches!(active_screen, v1::TerminalActiveScreen::Unspecified) {
+        return Err(malformed(
+            "terminal snapshot used an unspecified active screen",
+        ));
+    }
     if snapshot.modes.is_none() {
         return Err(malformed("terminal snapshot omitted modes"));
     }
+    validate_live_scroll_metrics(
+        snapshot.scroll_metrics.as_ref(),
+        snapshot.rows,
+        snapshot.revision,
+        snapshot.active_screen,
+    )?;
     Ok(())
 }
 
@@ -2220,11 +2378,67 @@ fn validate_delta(delta: &v1::TerminalDelta) -> Result<(), DaemonError> {
         rows: delta.rows,
         columns: delta.columns,
     };
-    zterm_core::terminal::TerminalSize::try_from(viewport).map_err(protocol_error)?;
-    v1::TerminalActiveScreen::try_from(delta.active_screen)
+    validate_product_viewport(viewport)?;
+    let active_screen = v1::TerminalActiveScreen::try_from(delta.active_screen)
         .map_err(|_| malformed("terminal delta used an unknown active screen"))?;
+    if matches!(active_screen, v1::TerminalActiveScreen::Unspecified) {
+        return Err(malformed(
+            "terminal delta used an unspecified active screen",
+        ));
+    }
     if delta.modes.is_none() {
         return Err(malformed("terminal delta omitted modes"));
+    }
+    validate_live_scroll_metrics(
+        delta.scroll_metrics.as_ref(),
+        delta.rows,
+        delta.to_revision,
+        delta.active_screen,
+    )?;
+    Ok(())
+}
+
+fn validate_product_viewport(viewport: v1::TerminalViewport) -> Result<(), DaemonError> {
+    let size = zterm_core::terminal::TerminalSize::try_from(viewport).map_err(protocol_error)?;
+    let limits = ResourceLimits::default();
+    if size.rows > limits.max_viewport_rows || size.columns > limits.max_viewport_columns {
+        return Err(malformed("terminal viewport exceeds product limits"));
+    }
+    Ok(())
+}
+
+fn validate_scroll_metrics(
+    metrics: Option<&v1::TerminalScrollMetrics>,
+    expected_rows: u32,
+) -> Result<(), DaemonError> {
+    if let Some(metrics) = metrics
+        && (metrics.viewport_rows == 0
+            || metrics.viewport_rows != expected_rows
+            || metrics.viewport_rows > u32::from(ResourceLimits::default().max_viewport_rows)
+            || metrics.epoch > metrics.revision
+            || metrics.offset_from_bottom > metrics.max_offset_from_bottom)
+    {
+        return Err(malformed("terminal scroll metrics are inconsistent"));
+    }
+    Ok(())
+}
+
+fn validate_live_scroll_metrics(
+    metrics: Option<&v1::TerminalScrollMetrics>,
+    expected_rows: u32,
+    expected_revision: u64,
+    active_screen: i32,
+) -> Result<(), DaemonError> {
+    validate_scroll_metrics(metrics, expected_rows)?;
+    let active_screen = v1::TerminalActiveScreen::try_from(active_screen)
+        .map_err(|_| malformed("terminal update used an unknown active screen"))?;
+    if let Some(metrics) = metrics
+        && (metrics.offset_from_bottom != 0
+            || metrics.revision != expected_revision
+            || metrics.epoch > metrics.revision
+            || active_screen != v1::TerminalActiveScreen::Main)
+    {
+        return Err(malformed("terminal live scroll metrics are inconsistent"));
     }
     Ok(())
 }
@@ -2246,6 +2460,18 @@ fn validate_history_request(request: &v1::TerminalHistoryRequest) -> Result<(), 
         ));
     }
     Ok(())
+}
+
+fn validate_viewport_request(request: &v1::TerminalViewportRequest) -> Result<(), DaemonError> {
+    match request
+        .action
+        .as_ref()
+        .and_then(|action| action.action.as_ref())
+    {
+        Some(v1::terminal_viewport_action::Action::ScrollByLines(_))
+        | Some(v1::terminal_viewport_action::Action::ScrollToOffset(_)) => Ok(()),
+        None => Err(malformed("terminal viewport action is missing")),
+    }
 }
 
 fn validate_history_page(page: &v1::TerminalHistoryPage) -> Result<(), DaemonError> {
@@ -2276,6 +2502,61 @@ fn validate_history_page(page: &v1::TerminalHistoryPage) -> Result<(), DaemonErr
         }
         v1::TerminalHistoryOutcome::Unspecified => {
             return Err(malformed("terminal history outcome is invalid"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_viewport_frame(
+    frame: &v1::TerminalViewportFrame,
+    expected_rows: u32,
+) -> Result<(), DaemonError> {
+    let outcome = v1::TerminalViewportOutcome::try_from(frame.outcome)
+        .map_err(|_| malformed("terminal viewport outcome is invalid"))?;
+    match outcome {
+        v1::TerminalViewportOutcome::Frame => {
+            let metrics = frame
+                .metrics
+                .as_ref()
+                .ok_or_else(|| malformed("terminal viewport frame omitted metrics"))?;
+            validate_scroll_metrics(Some(metrics), expected_rows)?;
+            let disposition = v1::TerminalViewportDisposition::try_from(frame.disposition)
+                .map_err(|_| malformed("terminal viewport disposition is invalid"))?;
+            if matches!(disposition, v1::TerminalViewportDisposition::Unspecified)
+                || metrics.offset_from_bottom == 0
+                || usize::try_from(metrics.viewport_rows).ok() != Some(frame.rows.len())
+                || metrics.epoch != frame.current_epoch
+                || metrics.revision != frame.current_revision
+            {
+                return Err(malformed("terminal viewport frame is inconsistent"));
+            }
+        }
+        v1::TerminalViewportOutcome::Live => {
+            let metrics = frame
+                .metrics
+                .as_ref()
+                .ok_or_else(|| malformed("terminal live viewport omitted metrics"))?;
+            validate_scroll_metrics(Some(metrics), expected_rows)?;
+            if metrics.offset_from_bottom != 0
+                || !frame.rows.is_empty()
+                || frame.disposition != v1::TerminalViewportDisposition::Unspecified as i32
+                || metrics.epoch != frame.current_epoch
+                || metrics.revision != frame.current_revision
+            {
+                return Err(malformed("terminal live viewport is inconsistent"));
+            }
+        }
+        v1::TerminalViewportOutcome::Changed | v1::TerminalViewportOutcome::Gap => {
+            if frame.metrics.is_some()
+                || !frame.rows.is_empty()
+                || frame.disposition != v1::TerminalViewportDisposition::Unspecified as i32
+                || frame.current_epoch > frame.current_revision
+            {
+                return Err(malformed("terminal viewport reset retained frame content"));
+            }
+        }
+        v1::TerminalViewportOutcome::Unspecified => {
+            return Err(malformed("terminal viewport outcome is invalid"));
         }
     }
     Ok(())
@@ -2342,8 +2623,28 @@ where
     let request: v1::TerminalHistoryRequest = decode(&frame)?;
     require_local_attachment(request.attachment_id.clone(), state.local_view_id)?;
     validate_history_request(&request)?;
+    write_history_gap(
+        writer,
+        state.local_view_id,
+        frame.request_id,
+        frame.deadline_ms,
+        deadline,
+    )
+    .await
+}
+
+async fn write_history_gap<Writer>(
+    writer: &mut Writer,
+    attachment_id: AttachmentId,
+    request_id: u64,
+    deadline_ms: u32,
+    deadline: Instant,
+) -> Result<(), DaemonError>
+where
+    Writer: AsyncWrite + Unpin,
+{
     let page = v1::TerminalHistoryPage {
-        attachment_id: Some(state.local_view_id.into()),
+        attachment_id: Some(attachment_id.into()),
         outcome: v1::TerminalHistoryOutcome::Gap as i32,
         cursor: None,
         rows: Vec::new(),
@@ -2352,9 +2653,60 @@ where
     };
     let bytes = encode_message(
         WireKind::TerminalHistoryPage,
+        request_id,
+        deadline_ms,
+        &page,
+    )
+    .map_err(protocol_error)?;
+    write_local(writer, &bytes, deadline).await
+}
+
+async fn write_unsupported_viewport_gap<Writer>(
+    frame: DecodedFrame,
+    state: &BridgeState,
+    writer: &mut Writer,
+    deadline: Instant,
+) -> Result<(), DaemonError>
+where
+    Writer: AsyncWrite + Unpin,
+{
+    let request: v1::TerminalViewportRequest = decode(&frame)?;
+    require_local_attachment(request.attachment_id.clone(), state.local_view_id)?;
+    validate_viewport_request(&request)?;
+    write_viewport_gap(
+        writer,
+        state.local_view_id,
         frame.request_id,
         frame.deadline_ms,
-        &page,
+        deadline,
+    )
+    .await
+}
+
+async fn write_viewport_gap<Writer>(
+    writer: &mut Writer,
+    attachment_id: AttachmentId,
+    request_id: u64,
+    deadline_ms: u32,
+    deadline: Instant,
+) -> Result<(), DaemonError>
+where
+    Writer: AsyncWrite + Unpin,
+{
+    let viewport = v1::TerminalViewportFrame {
+        attachment_id: Some(attachment_id.into()),
+        outcome: v1::TerminalViewportOutcome::Gap as i32,
+        disposition: v1::TerminalViewportDisposition::Unspecified as i32,
+        metrics: None,
+        rows: Vec::new(),
+        current_epoch: 0,
+        current_revision: 0,
+    };
+    let bytes = encode_message(
+        WireKind::TerminalViewportFrame,
+        request_id,
+        deadline_ms,
+        &viewport,
     )
     .map_err(protocol_error)?;
     write_local(writer, &bytes, deadline).await
@@ -2517,6 +2869,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn remote_live_scroll_metrics_are_bound_to_the_enclosing_revision() {
+        let main = v1::TerminalActiveScreen::Main as i32;
+        let metrics = v1::TerminalScrollMetrics {
+            epoch: 3,
+            revision: 7,
+            offset_from_bottom: 0,
+            max_offset_from_bottom: 12,
+            viewport_rows: 24,
+        };
+        assert!(validate_live_scroll_metrics(Some(&metrics), 24, 7, main).is_ok());
+        for invalid in [
+            v1::TerminalScrollMetrics {
+                offset_from_bottom: 1,
+                ..metrics
+            },
+            v1::TerminalScrollMetrics {
+                revision: 8,
+                ..metrics
+            },
+            v1::TerminalScrollMetrics {
+                epoch: 8,
+                ..metrics
+            },
+        ] {
+            assert_eq!(
+                validate_live_scroll_metrics(Some(&invalid), 24, 7, main)
+                    .expect_err("inconsistent live metrics")
+                    .kind(),
+                DomainErrorKind::MalformedFrame
+            );
+        }
+        assert!(
+            validate_live_scroll_metrics(
+                Some(&metrics),
+                24,
+                7,
+                v1::TerminalActiveScreen::Alternate as i32,
+            )
+            .is_err()
+        );
+    }
+
     #[derive(Clone)]
     struct FakeTransport {
         state: Arc<Mutex<FakeTransportState>>,
@@ -2542,6 +2937,7 @@ mod tests {
     #[derive(Default)]
     struct FakeEpochObserver {
         history_paging: bool,
+        terminal_viewport: bool,
         path_observations: Mutex<VecDeque<SelectedPathObservation>>,
     }
 
@@ -2552,7 +2948,16 @@ mod tests {
         ) -> Self {
             Self {
                 history_paging,
+                terminal_viewport: false,
                 path_observations: Mutex::new(observations.into_iter().collect()),
+            }
+        }
+
+        fn with_terminal_viewport() -> Self {
+            Self {
+                history_paging: true,
+                terminal_viewport: true,
+                path_observations: Mutex::new(VecDeque::new()),
             }
         }
 
@@ -2574,7 +2979,8 @@ mod tests {
         }
 
         fn supports(&self, capability: u64) -> bool {
-            capability == Capabilities::HISTORY_PAGING && self.history_paging
+            (capability == Capabilities::HISTORY_PAGING && self.history_paging)
+                || (capability == Capabilities::TERMINAL_VIEWPORT && self.terminal_viewport)
         }
     }
 
@@ -2615,8 +3021,56 @@ mod tests {
         assert_eq!(pending.len(), MAX_PENDING_CONTROL_REQUESTS);
     }
 
+    #[test]
+    fn pending_control_allows_only_one_semantic_viewport_response() {
+        let mut pending = BTreeMap::new();
+        retain_pending(&mut pending, 1, WireKind::TerminalViewportFrame)
+            .expect("first viewport response slot");
+        let error = retain_pending(&mut pending, 2, WireKind::TerminalViewportFrame)
+            .expect_err("a second viewport response cannot be outstanding");
+        assert_eq!(error.kind(), DomainErrorKind::ResourceExhausted);
+        retain_pending(&mut pending, 3, WireKind::TerminalHistoryPage)
+            .expect("an unrelated bounded control may remain outstanding");
+    }
+
+    #[test]
+    fn remote_viewport_frames_bind_to_current_model_height_and_product_limits() {
+        let mut frame = v1::TerminalViewportFrame {
+            attachment_id: None,
+            outcome: v1::TerminalViewportOutcome::Frame as i32,
+            disposition: v1::TerminalViewportDisposition::Exact as i32,
+            metrics: Some(v1::TerminalScrollMetrics {
+                epoch: 2,
+                revision: 5,
+                offset_from_bottom: 3,
+                max_offset_from_bottom: 10,
+                viewport_rows: 24,
+            }),
+            rows: vec![b"row".to_vec(); 24],
+            current_epoch: 2,
+            current_revision: 5,
+        };
+        assert!(validate_viewport_frame(&frame, 24).is_ok());
+        assert!(validate_viewport_frame(&frame, 23).is_err());
+
+        frame.metrics.as_mut().expect("metrics").viewport_rows = 81;
+        frame.rows.resize(81, b"row".to_vec());
+        assert!(validate_viewport_frame(&frame, 81).is_err());
+
+        frame.outcome = v1::TerminalViewportOutcome::Changed as i32;
+        frame.disposition = v1::TerminalViewportDisposition::Unspecified as i32;
+        frame.metrics = None;
+        frame.rows.clear();
+        frame.current_epoch = 6;
+        frame.current_revision = 5;
+        assert!(validate_viewport_frame(&frame, 24).is_err());
+        frame.current_epoch = 0;
+        frame.current_revision = 0;
+        assert!(validate_viewport_frame(&frame, 24).is_ok());
+    }
+
     #[tokio::test]
-    async fn peer_without_history_capability_returns_gap_and_keeps_epoch_active() {
+    async fn peer_without_history_or_viewport_capability_returns_gaps_and_keeps_epoch_active() {
         let target = device(0x31);
         let session_id = session(0x32);
         let local_id = attachment(0x33);
@@ -2701,8 +3155,33 @@ mod tests {
 
         write_message(
             &mut local_write,
-            WireKind::TerminalInput,
+            WireKind::TerminalViewportRequest,
             4,
+            &v1::TerminalViewportRequest {
+                attachment_id: Some(local_id.into()),
+                action: Some(v1::TerminalViewportAction {
+                    action: Some(v1::terminal_viewport_action::Action::ScrollByLines(3)),
+                }),
+            },
+        )
+        .await;
+        let gap = next_non_status_frame(&mut local_read, local_id).await;
+        assert_eq!(gap.kind, WireKind::TerminalViewportFrame);
+        assert_eq!(gap.request_id, 4);
+        let gap: v1::TerminalViewportFrame = gap
+            .decode_message(WireKind::TerminalViewportFrame)
+            .expect("unsupported-viewport gap frame");
+        assert_eq!(
+            v1::TerminalViewportOutcome::try_from(gap.outcome).expect("known viewport outcome"),
+            v1::TerminalViewportOutcome::Gap
+        );
+        assert!(gap.metrics.is_none());
+        assert!(gap.rows.is_empty());
+
+        write_message(
+            &mut local_write,
+            WireKind::TerminalInput,
+            5,
             &v1::TerminalInput {
                 operation_id: None,
                 attachment_id: Some(local_id.into()),
@@ -2714,7 +3193,7 @@ mod tests {
         assert_eq!(
             input.kind,
             WireKind::TerminalInput,
-            "no unsupported history frame may reach the old peer"
+            "no unsupported history or viewport frame may reach the old peer"
         );
         let input: v1::TerminalInput = input
             .decode_message(WireKind::TerminalInput)
@@ -2728,7 +3207,7 @@ mod tests {
         write_message(
             &mut local_write,
             WireKind::TerminalDetach,
-            5,
+            6,
             &v1::TerminalDetach {
                 attachment_id: Some(local_id.into()),
             },
@@ -2742,6 +3221,142 @@ mod tests {
             task.await
                 .expect("old-peer epoch task")
                 .expect("old-peer gap keeps the epoch valid"),
+            EpochEnd::Detached
+        );
+    }
+
+    #[tokio::test]
+    async fn negotiated_viewport_request_and_complete_frame_cross_the_remote_bridge_once() {
+        let target = device(0x41);
+        let session_id = session(0x42);
+        let local_id = attachment(0x43);
+        let remote_id = attachment(0x44);
+        let revision = Revision::new(5);
+        let (remote_bridge, remote_host) = duplex(64 * 1024);
+        let remote_bridge: BoxAttachmentStream = Box::new(remote_bridge);
+        let (remote_read, remote_write) = tokio::io::split(remote_bridge);
+        let epoch = RemoteEpoch {
+            reader: FramedReader::fresh(remote_read),
+            writer: remote_write,
+            observer: Arc::new(FakeEpochObserver::with_terminal_viewport()),
+            attachment_id: remote_id,
+            initial_revision: revision,
+        };
+        let (local_cli, local_bridge) = duplex(64 * 1024);
+        let (local_read, mut local_writer) = tokio::io::split(local_bridge);
+        let mut local_reader = FramedReader::fresh(local_read);
+        let mut state = bridge_state(target, local_id, session_id, revision);
+        let task = tokio::spawn(async move {
+            let mut desired = DesiredViewPhase::Synchronizing;
+            run_epoch(
+                epoch,
+                &mut local_reader,
+                &mut local_writer,
+                &mut state,
+                &mut desired,
+                Duration::from_secs(1),
+            )
+            .await
+        });
+
+        let (local_read, mut local_write) = tokio::io::split(local_cli);
+        let mut local_read = FramedReader::fresh(local_read);
+        let (remote_read, mut remote_write) = tokio::io::split(remote_host);
+        let mut remote_read = FramedReader::fresh(remote_read);
+        write_message(
+            &mut local_write,
+            WireKind::TerminalSnapshotApplied,
+            2,
+            &v1::TerminalSnapshotApplied {
+                attachment_id: Some(local_id.into()),
+                revision: revision.get(),
+            },
+        )
+        .await;
+        assert_eq!(
+            next_frame(&mut remote_read).await.kind,
+            WireKind::TerminalSnapshotApplied
+        );
+        expect_transport_state(
+            &mut local_read,
+            local_id,
+            v1::TerminalTransportState::Active,
+        )
+        .await;
+
+        write_message(
+            &mut local_write,
+            WireKind::TerminalViewportRequest,
+            3,
+            &v1::TerminalViewportRequest {
+                attachment_id: Some(local_id.into()),
+                action: Some(v1::TerminalViewportAction {
+                    action: Some(v1::terminal_viewport_action::Action::ScrollByLines(3)),
+                }),
+            },
+        )
+        .await;
+        let request = next_frame(&mut remote_read).await;
+        assert_eq!(request.kind, WireKind::TerminalViewportRequest);
+        assert_eq!(request.request_id, 3);
+        let request: v1::TerminalViewportRequest = request
+            .decode_message(WireKind::TerminalViewportRequest)
+            .expect("forwarded viewport request");
+        assert_eq!(
+            required_attachment_id(request.attachment_id).expect("remote attachment ID"),
+            remote_id
+        );
+
+        write_message(
+            &mut remote_write,
+            WireKind::TerminalViewportFrame,
+            3,
+            &v1::TerminalViewportFrame {
+                attachment_id: Some(remote_id.into()),
+                outcome: v1::TerminalViewportOutcome::Frame as i32,
+                disposition: v1::TerminalViewportDisposition::Exact as i32,
+                metrics: Some(v1::TerminalScrollMetrics {
+                    epoch: 2,
+                    revision: 5,
+                    offset_from_bottom: 3,
+                    max_offset_from_bottom: 10,
+                    viewport_rows: 24,
+                }),
+                rows: vec![b"row".to_vec(); 24],
+                current_epoch: 2,
+                current_revision: 5,
+            },
+        )
+        .await;
+        let frame = next_non_status_frame(&mut local_read, local_id).await;
+        assert_eq!(frame.kind, WireKind::TerminalViewportFrame);
+        assert_eq!(frame.request_id, 3);
+        let frame: v1::TerminalViewportFrame = frame
+            .decode_message(WireKind::TerminalViewportFrame)
+            .expect("forwarded viewport frame");
+        assert_eq!(
+            required_attachment_id(frame.attachment_id).expect("local attachment ID"),
+            local_id
+        );
+        assert_eq!(frame.rows.len(), 24);
+
+        write_message(
+            &mut local_write,
+            WireKind::TerminalDetach,
+            4,
+            &v1::TerminalDetach {
+                attachment_id: Some(local_id.into()),
+            },
+        )
+        .await;
+        assert_eq!(
+            next_frame(&mut remote_read).await.kind,
+            WireKind::TerminalDetach
+        );
+        assert_eq!(
+            task.await
+                .expect("viewport epoch task")
+                .expect("viewport bridge remains valid"),
             EpochEnd::Detached
         );
     }
@@ -4266,7 +4881,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn epoch_loss_resolves_sent_lease_and_takeover_without_replay() {
+    async fn epoch_loss_resolves_presentation_with_gaps_and_mutations_without_replay() {
         let target = device(0x64);
         let session_id = session(0x65);
         let local_id = attachment(0x66);
@@ -4274,7 +4889,10 @@ mod tests {
         let (bridge_stream, host_stream) = duplex(64 * 1024);
         let (reconnect_started_tx, reconnect_started_rx) = oneshot::channel();
         let transport = FakeTransport::scripted([
-            FakeOpen::Stream(Box::new(bridge_stream)),
+            FakeOpen::Observed(
+                Box::new(bridge_stream),
+                Arc::new(FakeEpochObserver::with_terminal_viewport()),
+            ),
             FakeOpen::Pending(reconnect_started_tx),
         ]);
         let client = RemoteAttachmentClient {
@@ -4297,6 +4915,14 @@ mod tests {
                 WireKind::TerminalSnapshotApplied
             );
             assert_eq!(next_frame(&mut reader).await.kind, WireKind::TerminalResize);
+            assert_eq!(
+                next_frame(&mut reader).await.kind,
+                WireKind::TerminalHistoryRequest
+            );
+            assert_eq!(
+                next_frame(&mut reader).await.kind,
+                WireKind::TerminalViewportRequest
+            );
             assert_eq!(
                 next_frame(&mut reader).await.kind,
                 WireKind::SessionOperationLeaseRequest
@@ -4346,6 +4972,30 @@ mod tests {
         .await;
         write_message(
             &mut local_write,
+            WireKind::TerminalHistoryRequest,
+            18,
+            &v1::TerminalHistoryRequest {
+                attachment_id: Some(local_id.into()),
+                direction: v1::TerminalHistoryDirection::Newest as i32,
+                cursor: None,
+                maximum_rows: 10,
+            },
+        )
+        .await;
+        write_message(
+            &mut local_write,
+            WireKind::TerminalViewportRequest,
+            19,
+            &v1::TerminalViewportRequest {
+                attachment_id: Some(local_id.into()),
+                action: Some(v1::TerminalViewportAction {
+                    action: Some(v1::terminal_viewport_action::Action::ScrollByLines(3)),
+                }),
+            },
+        )
+        .await;
+        write_message(
+            &mut local_write,
             WireKind::SessionOperationLeaseRequest,
             20,
             &v1::SessionOperationLeaseRequest {
@@ -4365,6 +5015,38 @@ mod tests {
             },
         )
         .await;
+
+        let history_gap = next_non_status_frame(&mut local_read, local_id).await;
+        assert_eq!(history_gap.kind, WireKind::TerminalHistoryPage);
+        assert_eq!(history_gap.request_id, 18);
+        let history_gap: v1::TerminalHistoryPage = history_gap
+            .decode_message(WireKind::TerminalHistoryPage)
+            .expect("epoch-loss history gap");
+        assert_eq!(
+            v1::TerminalHistoryOutcome::try_from(history_gap.outcome)
+                .expect("known history outcome"),
+            v1::TerminalHistoryOutcome::Gap
+        );
+        assert_eq!(
+            (history_gap.current_epoch, history_gap.current_revision),
+            (0, 0)
+        );
+
+        let viewport_gap = next_non_status_frame(&mut local_read, local_id).await;
+        assert_eq!(viewport_gap.kind, WireKind::TerminalViewportFrame);
+        assert_eq!(viewport_gap.request_id, 19);
+        let viewport_gap: v1::TerminalViewportFrame = viewport_gap
+            .decode_message(WireKind::TerminalViewportFrame)
+            .expect("epoch-loss viewport gap");
+        assert_eq!(
+            v1::TerminalViewportOutcome::try_from(viewport_gap.outcome)
+                .expect("known viewport outcome"),
+            v1::TerminalViewportOutcome::Gap
+        );
+        assert_eq!(
+            (viewport_gap.current_epoch, viewport_gap.current_revision),
+            (0, 0)
+        );
 
         let lease_error = next_non_status_frame(&mut local_read, local_id).await;
         assert_eq!(lease_error.request_id, 20);
@@ -5086,7 +5768,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn synchronization_phase_rejects_control_requests_without_stranding_waiters() {
+    async fn synchronization_phase_allows_only_existing_controller_race_requests() {
         let target = device(0x6f);
         let local_id = attachment(0x70);
         let remote_id = attachment(0x71);
@@ -5096,11 +5778,129 @@ mod tests {
             expected: Revision::new(5),
             acknowledged: false,
             needs_takeover: false,
+            controller_was_active: true,
         };
         let mut desired = DesiredViewPhase::Synchronizing;
         let (local_read, mut local_writer) = duplex(16 * 1024);
         let mut local_read = FramedReader::fresh(local_read);
-        let mut remote_sink = tokio::io::sink();
+        let (remote_read, mut remote_writer) = duplex(16 * 1024);
+        let mut remote_read = FramedReader::fresh(remote_read);
+
+        let input = decoded_message(
+            WireKind::TerminalInput,
+            38,
+            &v1::TerminalInput {
+                operation_id: None,
+                attachment_id: Some(local_id.into()),
+                bytes: b"existing-controller-race".to_vec(),
+            },
+        );
+        process_epoch_local_frame(
+            input,
+            &mut remote_writer,
+            remote_id,
+            &mut state,
+            &mut local_writer,
+            EpochControl {
+                phase: &mut phase,
+                desired_phase: &mut desired,
+                operation_timeout: Duration::from_secs(1),
+            },
+        )
+        .await
+        .expect("existing controller input crosses only its visual-sync race window");
+        let forwarded = next_frame(&mut remote_read).await;
+        assert_eq!(forwarded.kind, WireKind::TerminalInput);
+        assert_eq!(forwarded.request_id, 38);
+        let forwarded: v1::TerminalInput = forwarded
+            .decode_message(WireKind::TerminalInput)
+            .expect("forwarded controller input");
+        assert_eq!(forwarded.bytes, b"existing-controller-race");
+        assert_eq!(
+            required_attachment_id(forwarded.attachment_id).expect("remote attachment ID"),
+            remote_id
+        );
+
+        let history = decoded_message(
+            WireKind::TerminalHistoryRequest,
+            39,
+            &v1::TerminalHistoryRequest {
+                attachment_id: Some(local_id.into()),
+                direction: v1::TerminalHistoryDirection::Newest as i32,
+                cursor: None,
+                maximum_rows: 10,
+            },
+        );
+        process_epoch_local_frame(
+            history,
+            &mut remote_writer,
+            remote_id,
+            &mut state,
+            &mut local_writer,
+            EpochControl {
+                phase: &mut phase,
+                desired_phase: &mut desired,
+                operation_timeout: Duration::from_secs(1),
+            },
+        )
+        .await
+        .expect("an existing controller may page during visual synchronization");
+        let forwarded = next_frame(&mut remote_read).await;
+        assert_eq!(forwarded.kind, WireKind::TerminalHistoryRequest);
+        assert_eq!(forwarded.request_id, 39);
+        let forwarded: v1::TerminalHistoryRequest = forwarded
+            .decode_message(WireKind::TerminalHistoryRequest)
+            .expect("forwarded history request");
+        assert_eq!(
+            required_attachment_id(forwarded.attachment_id).expect("remote attachment ID"),
+            remote_id
+        );
+        assert_eq!(
+            state.pending_control.remove(&39),
+            Some(WireKind::TerminalHistoryPage)
+        );
+
+        let viewport = decoded_message(
+            WireKind::TerminalViewportRequest,
+            40,
+            &v1::TerminalViewportRequest {
+                attachment_id: Some(local_id.into()),
+                action: Some(v1::TerminalViewportAction {
+                    action: Some(v1::terminal_viewport_action::Action::ScrollByLines(3)),
+                }),
+            },
+        );
+        assert!(
+            process_epoch_local_frame(
+                viewport,
+                &mut remote_writer,
+                remote_id,
+                &mut state,
+                &mut local_writer,
+                EpochControl {
+                    phase: &mut phase,
+                    desired_phase: &mut desired,
+                    operation_timeout: Duration::from_secs(1),
+                },
+            )
+            .await
+            .expect("an existing controller may project during visual synchronization")
+            .is_none()
+        );
+        let forwarded = next_frame(&mut remote_read).await;
+        assert_eq!(forwarded.kind, WireKind::TerminalViewportRequest);
+        assert_eq!(forwarded.request_id, 40);
+        let forwarded: v1::TerminalViewportRequest = forwarded
+            .decode_message(WireKind::TerminalViewportRequest)
+            .expect("forwarded viewport request");
+        assert_eq!(
+            required_attachment_id(forwarded.attachment_id).expect("remote attachment ID"),
+            remote_id
+        );
+        assert_eq!(
+            state.pending_control.remove(&40),
+            Some(WireKind::TerminalViewportFrame)
+        );
 
         let lease = decoded_message(
             WireKind::SessionOperationLeaseRequest,
@@ -5112,7 +5912,7 @@ mod tests {
         assert!(
             process_epoch_local_frame(
                 lease,
-                &mut remote_sink,
+                &mut remote_writer,
                 remote_id,
                 &mut state,
                 &mut local_writer,
@@ -5129,6 +5929,190 @@ mod tests {
         let error = next_frame(&mut local_read).await;
         assert_eq!(error.request_id, 41);
         assert_eq!(service_error_kind(&error), DomainErrorKind::NotSynchronized);
+        assert!(state.pending_control.is_empty());
+
+        state.ever_active = false;
+        phase = EpochPhase::Synchronizing {
+            expected: Revision::new(5),
+            acknowledged: false,
+            needs_takeover: false,
+            controller_was_active: false,
+        };
+        let initial_viewport = decoded_message(
+            WireKind::TerminalViewportRequest,
+            42,
+            &v1::TerminalViewportRequest {
+                attachment_id: Some(local_id.into()),
+                action: Some(v1::TerminalViewportAction {
+                    action: Some(v1::terminal_viewport_action::Action::ScrollByLines(3)),
+                }),
+            },
+        );
+        process_epoch_local_frame(
+            initial_viewport,
+            &mut remote_writer,
+            remote_id,
+            &mut state,
+            &mut local_writer,
+            EpochControl {
+                phase: &mut phase,
+                desired_phase: &mut desired,
+                operation_timeout: Duration::from_secs(1),
+            },
+        )
+        .await
+        .expect("an unacknowledged initial viewport request is typed");
+        let error = next_frame(&mut local_read).await;
+        assert_eq!(error.request_id, 42);
+        assert_eq!(service_error_kind(&error), DomainErrorKind::NotSynchronized);
+        let initial_history = decoded_message(
+            WireKind::TerminalHistoryRequest,
+            44,
+            &v1::TerminalHistoryRequest {
+                attachment_id: Some(local_id.into()),
+                direction: v1::TerminalHistoryDirection::Newest as i32,
+                cursor: None,
+                maximum_rows: 10,
+            },
+        );
+        process_epoch_local_frame(
+            initial_history,
+            &mut remote_writer,
+            remote_id,
+            &mut state,
+            &mut local_writer,
+            EpochControl {
+                phase: &mut phase,
+                desired_phase: &mut desired,
+                operation_timeout: Duration::from_secs(1),
+            },
+        )
+        .await
+        .expect("an unacknowledged initial history request is typed");
+        let error = next_frame(&mut local_read).await;
+        assert_eq!(error.request_id, 44);
+        assert_eq!(service_error_kind(&error), DomainErrorKind::NotSynchronized);
+        state.ever_active = true;
+        let reconnect_input = decoded_message(
+            WireKind::TerminalInput,
+            46,
+            &v1::TerminalInput {
+                operation_id: None,
+                attachment_id: Some(local_id.into()),
+                bytes: b"must-drop-reconnect".to_vec(),
+            },
+        );
+        process_epoch_local_frame(
+            reconnect_input,
+            &mut remote_writer,
+            remote_id,
+            &mut state,
+            &mut local_writer,
+            EpochControl {
+                phase: &mut phase,
+                desired_phase: &mut desired,
+                operation_timeout: Duration::from_secs(1),
+            },
+        )
+        .await
+        .expect("new-epoch input is safely dropped before resumed activation");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), remote_read.next())
+                .await
+                .is_err(),
+            "true reconnect synchronization must not forward input"
+        );
+
+        state.ever_active = true;
+        phase = EpochPhase::Synchronizing {
+            expected: Revision::new(5),
+            acknowledged: true,
+            needs_takeover: true,
+            controller_was_active: false,
+        };
+        let takeover_viewport = decoded_message(
+            WireKind::TerminalViewportRequest,
+            43,
+            &v1::TerminalViewportRequest {
+                attachment_id: Some(local_id.into()),
+                action: Some(v1::TerminalViewportAction {
+                    action: Some(v1::terminal_viewport_action::Action::ScrollByLines(3)),
+                }),
+            },
+        );
+        process_epoch_local_frame(
+            takeover_viewport,
+            &mut remote_writer,
+            remote_id,
+            &mut state,
+            &mut local_writer,
+            EpochControl {
+                phase: &mut phase,
+                desired_phase: &mut desired,
+                operation_timeout: Duration::from_secs(1),
+            },
+        )
+        .await
+        .expect("a prepared takeover viewport request is typed");
+        let error = next_frame(&mut local_read).await;
+        assert_eq!(error.request_id, 43);
+        assert_eq!(service_error_kind(&error), DomainErrorKind::NotSynchronized);
+        let takeover_history = decoded_message(
+            WireKind::TerminalHistoryRequest,
+            45,
+            &v1::TerminalHistoryRequest {
+                attachment_id: Some(local_id.into()),
+                direction: v1::TerminalHistoryDirection::Newest as i32,
+                cursor: None,
+                maximum_rows: 10,
+            },
+        );
+        process_epoch_local_frame(
+            takeover_history,
+            &mut remote_writer,
+            remote_id,
+            &mut state,
+            &mut local_writer,
+            EpochControl {
+                phase: &mut phase,
+                desired_phase: &mut desired,
+                operation_timeout: Duration::from_secs(1),
+            },
+        )
+        .await
+        .expect("a prepared takeover history request is typed");
+        let error = next_frame(&mut local_read).await;
+        assert_eq!(error.request_id, 45);
+        assert_eq!(service_error_kind(&error), DomainErrorKind::NotSynchronized);
+        let takeover_input = decoded_message(
+            WireKind::TerminalInput,
+            47,
+            &v1::TerminalInput {
+                operation_id: None,
+                attachment_id: Some(local_id.into()),
+                bytes: b"must-drop-takeover".to_vec(),
+            },
+        );
+        process_epoch_local_frame(
+            takeover_input,
+            &mut remote_writer,
+            remote_id,
+            &mut state,
+            &mut local_writer,
+            EpochControl {
+                phase: &mut phase,
+                desired_phase: &mut desired,
+                operation_timeout: Duration::from_secs(1),
+            },
+        )
+        .await
+        .expect("takeover input is safely dropped before commit");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), remote_read.next())
+                .await
+                .is_err(),
+            "prepared takeover must not forward input"
+        );
         assert!(state.pending_control.is_empty());
     }
 
@@ -5825,6 +6809,7 @@ mod tests {
             resume_view_id: ResumeViewId::from_array([0xa1; 16]),
             frozen_session_id: Some(session_id),
             known_revision: Some(known_revision),
+            terminal_rows: Some(24),
             latest_viewport: None,
             force_full: false,
             ever_active: true,
@@ -5895,6 +6880,7 @@ mod tests {
             recent_history_ansi: Vec::new(),
             active_screen: v1::TerminalActiveScreen::Main as i32,
             modes: Some(v1::TerminalModes::default()),
+            scroll_metrics: None,
         }
     }
 
@@ -5913,6 +6899,7 @@ mod tests {
             active_screen: v1::TerminalActiveScreen::Main as i32,
             modes: Some(v1::TerminalModes::default()),
             attachment_id: Some(attachment_id.into()),
+            scroll_metrics: None,
         }
     }
 

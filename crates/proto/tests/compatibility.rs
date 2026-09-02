@@ -457,6 +457,12 @@ fn wire_kind_registry_is_unique_and_centrally_mapped() {
         WireKind::TerminalSyncRequired,
         WireKind::TerminalLeaseLost,
         WireKind::TerminalSessionEnded,
+        WireKind::TerminalTransportStateEvent,
+        WireKind::TerminalHistoryRequest,
+        WireKind::TerminalHistoryPage,
+        WireKind::TerminalConnectionStatusEvent,
+        WireKind::TerminalViewportRequest,
+        WireKind::TerminalViewportFrame,
     ];
 
     let mut seen = BTreeSet::new();
@@ -474,6 +480,15 @@ fn wire_kind_registry_is_unique_and_centrally_mapped() {
     assert_eq!(WireKind::LocalSessionUnaryRequest as u32, 24);
     assert_eq!(WireKind::PairBegin as u32, 100);
     assert_eq!(WireKind::ConnectionWelcome as u32, 105);
+    assert_eq!(WireKind::TerminalTransportStateEvent as u32, 311);
+    assert_eq!(WireKind::TerminalHistoryRequest as u32, 312);
+    assert_eq!(WireKind::TerminalHistoryPage as u32, 313);
+    assert_eq!(WireKind::TerminalConnectionStatusEvent as u32, 314);
+    assert_eq!(WireKind::TerminalViewportRequest as u32, 315);
+    assert_eq!(WireKind::TerminalViewportFrame as u32, 316);
+    assert_eq!(Capabilities::HISTORY_PAGING, 1_u64 << 17);
+    assert_eq!(Capabilities::AGENT_EVENTS, 1_u64 << 18);
+    assert_eq!(Capabilities::TERMINAL_VIEWPORT, 1_u64 << 19);
 }
 
 #[test]
@@ -682,6 +697,7 @@ fn generated_session_terminal_and_route_debug_is_redacted_without_wire_changes()
         recent_history_ansi: HISTORY_SENTINEL.to_vec(),
         active_screen: v1::TerminalActiveScreen::Main as i32,
         modes: Some(v1::TerminalModes::default()),
+        scroll_metrics: None,
     };
     let delta = v1::TerminalDelta {
         from_revision: 41,
@@ -692,6 +708,7 @@ fn generated_session_terminal_and_route_debug_is_redacted_without_wire_changes()
         active_screen: v1::TerminalActiveScreen::Main as i32,
         modes: Some(v1::TerminalModes::default()),
         attachment_id: snapshot.attachment_id.clone(),
+        scroll_metrics: None,
     };
     let input = v1::TerminalInput {
         operation_id: None,

@@ -235,6 +235,98 @@ pub enum TerminalHistoryResult {
     },
 }
 
+/// Renderer-neutral position and extent of one attachment-local viewport.
+///
+/// Offset zero is the live bottom. Positive offsets count logical rows toward
+/// older retained main-screen history.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerminalScrollMetrics {
+    /// Epoch which changes whenever retained row identity may have changed.
+    pub epoch: Revision,
+    /// Model revision observed while producing these metrics.
+    pub revision: Revision,
+    /// Current logical row offset from the live bottom.
+    pub offset_from_bottom: u64,
+    /// Largest retained logical row offset available in this epoch.
+    pub max_offset_from_bottom: u64,
+    /// Full model height represented by a viewport frame.
+    pub viewport_rows: u16,
+}
+
+impl TerminalScrollMetrics {
+    /// Returns whether the metrics describe a valid bounded viewport.
+    #[must_use]
+    pub const fn is_valid(self) -> bool {
+        self.viewport_rows > 0
+            && self.epoch.get() <= self.revision.get()
+            && self.offset_from_bottom <= self.max_offset_from_bottom
+    }
+}
+
+/// One semantic attachment-local scroll request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalScrollAction {
+    /// Move by logical rows; positive is older/up and negative is newer/down.
+    ScrollByLines(i32),
+    /// Jump to an absolute logical offset from the live bottom.
+    ScrollToOffset(u64),
+}
+
+/// Whether a complete history viewport preserved its previous row identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalViewportDisposition {
+    /// The requested action resolved within the same retained-history identity.
+    Exact,
+    /// Retained-history identity changed and the closest current frame replaced it.
+    Rebased,
+}
+
+/// One complete, daemon-authored attachment viewport.
+#[derive(Clone, Eq, PartialEq)]
+pub struct TerminalViewportFrame {
+    /// Whether the frame is exact or replaces an invalidated history epoch.
+    pub disposition: TerminalViewportDisposition,
+    /// Position and extent represented by the rows.
+    pub metrics: TerminalScrollMetrics,
+    /// Independently formatted canonical ANSI rows from top to bottom.
+    pub rows: Vec<Vec<u8>>,
+}
+
+impl fmt::Debug for TerminalViewportFrame {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalViewportFrame")
+            .field("disposition", &self.disposition)
+            .field("metrics", &self.metrics)
+            .field("row_count", &self.rows.len())
+            .field("ansi_bytes", &self.rows.iter().map(Vec::len).sum::<usize>())
+            .finish()
+    }
+}
+
+/// Result of applying one semantic scroll action to an attachment baseline.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TerminalViewportResult {
+    /// A complete non-live viewport is available.
+    Frame(TerminalViewportFrame),
+    /// The action reached the live bottom; callers must use the live sync path.
+    Live(TerminalScrollMetrics),
+    /// Main-screen row identity changed and no history frame can be asserted.
+    HistoryChanged {
+        /// Current retained-history epoch.
+        epoch: Revision,
+        /// Current model revision.
+        revision: Revision,
+    },
+    /// The supplied baseline was structurally invalid or from the future.
+    HistoryGap {
+        /// Current retained-history epoch.
+        epoch: Revision,
+        /// Current model revision.
+        revision: Revision,
+    },
+}
+
 /// Zterm-owned semantic projection used to compare terminal states.
 #[derive(Clone, Eq, PartialEq)]
 pub struct TerminalState {
@@ -399,6 +491,8 @@ pub struct TerminalSnapshot {
     pub recent_history_ansi: Vec<u8>,
     /// Input modes represented by the snapshot.
     pub modes: TerminalModes,
+    /// Live main-screen scroll extent, absent when it cannot be asserted.
+    pub scroll_metrics: Option<TerminalScrollMetrics>,
 }
 
 impl fmt::Debug for TerminalSnapshot {
@@ -413,6 +507,7 @@ impl fmt::Debug for TerminalSnapshot {
             .field("recent_history_ansi", &"[REDACTED]")
             .field("recent_history_ansi_len", &self.recent_history_ansi.len())
             .field("modes", &self.modes)
+            .field("scroll_metrics", &self.scroll_metrics)
             .finish()
     }
 }
@@ -453,6 +548,8 @@ pub struct TerminalDelta {
     pub ansi: Vec<u8>,
     /// Input modes represented after applying the delta.
     pub modes: TerminalModes,
+    /// Live main-screen scroll extent, absent when it cannot be asserted.
+    pub scroll_metrics: Option<TerminalScrollMetrics>,
 }
 
 impl fmt::Debug for TerminalDelta {
@@ -466,6 +563,7 @@ impl fmt::Debug for TerminalDelta {
             .field("ansi", &"[REDACTED]")
             .field("ansi_len", &self.ansi.len())
             .field("modes", &self.modes)
+            .field("scroll_metrics", &self.scroll_metrics)
             .finish()
     }
 }
@@ -541,6 +639,7 @@ mod tests {
             screen_ansi: screen.clone(),
             recent_history_ansi: b"\x1b[mold-line\r\nrecent-one\r\nrecent-two\r\n".to_vec(),
             modes: TerminalModes::default(),
+            scroll_metrics: None,
         };
         let maximum = screen.len() + b"\x1b[mrecent-two\r\n".len();
         assert!(snapshot.limit_ansi_payload(maximum));
@@ -604,6 +703,13 @@ mod tests {
             screen_ansi: SCREEN_SENTINEL.to_vec(),
             recent_history_ansi: HISTORY_SENTINEL.to_vec(),
             modes: TerminalModes::default(),
+            scroll_metrics: Some(TerminalScrollMetrics {
+                epoch: Revision::new(43),
+                revision: Revision::new(47),
+                offset_from_bottom: 0,
+                max_offset_from_bottom: 5,
+                viewport_rows: 41,
+            }),
         };
         let delta = TerminalDelta {
             from_revision: Revision::new(47),
@@ -612,6 +718,7 @@ mod tests {
             active_screen: ActiveScreen::Main,
             ansi: DELTA_SENTINEL.to_vec(),
             modes: TerminalModes::default(),
+            scroll_metrics: None,
         };
 
         let rendered = format!(

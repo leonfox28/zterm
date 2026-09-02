@@ -505,6 +505,8 @@ impl Capabilities {
     pub const HISTORY_PAGING: u64 = 1 << 17;
     /// Future dedicated Agent status and notification events.
     pub const AGENT_EVENTS: u64 = 1 << 18;
+    /// Attachment-local continuous terminal scroll viewports.
+    pub const TERMINAL_VIEWPORT: u64 = 1 << 19;
 
     /// Constructs a capability set while retaining unknown bits.
     #[must_use]
@@ -929,6 +931,9 @@ mod tests {
         let capabilities = Capabilities::from_bits_retain(Capabilities::LOCAL_LIFECYCLE | unknown);
         assert!(capabilities.contains(Capabilities::LOCAL_LIFECYCLE));
         assert_eq!(capabilities.bits() & unknown, unknown);
+        assert_eq!(Capabilities::HISTORY_PAGING, 1_u64 << 17);
+        assert_eq!(Capabilities::AGENT_EVENTS, 1_u64 << 18);
+        assert_eq!(Capabilities::TERMINAL_VIEWPORT, 1_u64 << 19);
 
         let limits = ResourceLimits::default();
         assert_eq!(limits.max_live_sessions, 8);

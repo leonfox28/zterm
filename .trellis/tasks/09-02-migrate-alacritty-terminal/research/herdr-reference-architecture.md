@@ -7,8 +7,9 @@
 - 调研日期：2026-09-02
 - Herdr Cargo 版本：`0.8.2`
 - vendored Ghostty 修订：`c5a21edfcbc2d5b46540ad91b7980aca31f5f1f3`
-- 2026-09-02 重新核验时 Herdr remote HEAD 仍为上述 `cc88b3b...`，因此下述文件和修订
-  仍代表当前实现，而不是已过期快照。
+- 首次核验的 Herdr remote HEAD 为上述 `cc88b3b...`。2026-09-02 滚动跟进调研时
+  remote HEAD 已前进到 `da49cb8a9dac6facc8f77671376914ee0ef47291`；本文仍以已锁定、
+  可复核的 `cc88b3b...` 为主要证据，并对新 HEAD 做差异核对。
 
 Herdr 是一个 agent-aware terminal multiplexer。它的核心用途与 Zterm 有明显重叠：后台
 server 持有真实 PTY、终端状态和 session，客户端可 attach/detach，远端客户端可以通过
@@ -163,6 +164,64 @@ Herdr 有两条主要远程路径：
 6. 不直接复制 Herdr 的 custom FFI/unsafe Send。若未来把“必须使用 Ghostty”提升为最高
    约束，应把一个 Zterm-owned audited unsafe FFI crate 作为显式安全政策变更重新评审，
    不能把它描述成仍满足 zero-unsafe policy。
+
+## 滚动 viewport 与可视滚动条跟进
+
+Herdr 的终端滚动不只是把鼠标滚轮换成一个固定命令，而是分为三层：
+
+1. `GhosttyPaneTerminal` 通过 `scroll_viewport_delta`、`scroll_viewport_bottom` 和
+   `scroll_viewport_row` 维护当前 viewport offset。
+2. 上层只消费 `ScrollMetrics { offset_from_bottom, max_offset_from_bottom,
+   viewport_rows }`，不依赖 Ghostty 的 scrollbar 内部类型。
+3. Ratatui UI 用这三个数值计算 thumb 长度和位置，并把点击/拖拽映射回
+   `offset_from_bottom`。
+
+它的 pane 滚动条默认开启。在主屏且 pane 宽度足够时，Herdr 会稳定预留右侧一列，
+即使还没有 scrollback 也不让 child 宽度随滚动条出现/消失而抖动；真正有历史时才
+绘制 track/thumb。备用屏和极窄 pane 不预留这一列。这个稳定 gutter 是 Herdr 作为
+pane compositor 容易做到的事；Zterm 当前是直接 ANSI attach，若照搬将使每个 child PTY
+少一列并触发 reflow，因此必须作为明确 UX 选择，不是鼠标 hotfix 的隐含细节。
+
+Herdr 的滚轮路由同样值得借鉴：
+
+- child 开启 mouse reporting 时，先回到 live bottom，再只转发一个 wheel report；
+- alternate screen + alternate-scroll 时，先回到 live bottom，再只编码一个上/下键；
+- 只有 `HostScroll` 才会改变 viewport，行数来自 `ui.mouse_scroll_lines`，默认为 3
+  且配置不允许 0。
+
+Alacritty 官方应用的 `scrolling.multiplier` 默认也是每个 input scroll increment 3 行。
+因此对 Zterm-owned history，“每个完整 SGR wheel report 默认 3 行”有两个成熟实现
+作为参照。但 SGR mouse 只携带方向/按键代码，不携带原始 pixel delta 或可靠的
+precision/discrete 标记；外层 Ghostty/kitty 可能已把一次物理手势变成多个 report。
+所以 Zterm 不应再对 child mouse report 做倍增，也不应假装能在当前 ANSI 输入协议下
+识别触控板像素级滚动。
+
+Zterm 当前的 `HistoryViewport` 已经是 per-attachment 状态，且 history cursor 已包含
+oldest/newest bounds，足以暴露与 Herdr 等价的 `ScrollMetrics`。但它还不是连续终端
+viewport：从 live 第一次上滚时，它忽略本次的行数并整页切入最新 history page；
+它不会组合“最后 N 行 history + 前 viewport-N 行 live screen”。因此修复鼠标上报只能
+让现有分页逻辑重新收到事件；要达到 Herdr/原生终端的逐行视图体验，还需要
+将 viewport offset、metrics 和“历史+当前屏”组合视图建模成明确契约。
+
+2026-09-02 用户随后批准采用这一 UX。Zterm 的实现边界与 Herdr 不完全相同：Herdr 可以让
+每个 Ghostty pane terminal 自己维护 display offset；Zterm 的 authoritative Alacritty model
+被 attachment 共享，所以不能把一个 client 的 offset 写入该全局 grid。收敛方案是在
+`ActorAttachment` 保存语义 offset/action baseline，由 `TerminalModel` 在一个 lock/revision
+下直接读取 `Line(-offset)..` 并返回组合 viewport frame；不调用 `scroll_display`，也不复制
+terminal engine。共享 core/proto 只保存 metrics/actions，CLI 自己负责 `▕/▐` 与 gutter，
+Android 后续可绘制 native overlay。
+
+批准的 gutter 也形成一个清晰 hit-test boundary：main screen 的 child PTY 是 `N-1` 列，
+第 `N` 列属于 Zterm chrome。因此直接在该列 wheel/click/drag 是显式 host 操作，不会被
+clamp 成 child 的最后一列；child rectangle 内仍完全按其标准 mouse/alternate-scroll mode
+路由。alternate screen 收回 gutter 后不存在这个例外。
+
+相关上游证据：
+
+- [Herdr terminal viewport and scroll metrics](https://github.com/herdrdev/herdr/blob/cc88b3b8e5bb9f7d9f23ed6ae85a52fd7b5b9ed6/src/pane/terminal.rs)
+- [Herdr interactive scrollbar geometry](https://github.com/herdrdev/herdr/blob/cc88b3b8e5bb9f7d9f23ed6ae85a52fd7b5b9ed6/src/ui/scrollbar.rs)
+- [Herdr default scroll lines](https://github.com/herdrdev/herdr/blob/cc88b3b8e5bb9f7d9f23ed6ae85a52fd7b5b9ed6/src/config.rs)
+- [Alacritty scrolling configuration](https://github.com/alacritty/alacritty/blob/master/extra/man/alacritty.5.scd)
 
 ## 上游证据
 

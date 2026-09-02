@@ -32,7 +32,16 @@ one request carrying `OperationId { lease_ordinal = 1, sequence = 2,
 daemon_incarnation = 3 }`. `WireKind` values are registered once in
 `crates/proto/src/lib.rs`; session lease kinds are 207/208 and the product ALPN
 is `zterm/1`. Terminal history uses additive kinds 312/313 and the same-UID-only
-connection-status event is kind 314.
+connection-status event is kind 314. Continuous terminal viewport uses additive
+kinds 315/316 and capability bit 19:
+
+```rust
+TerminalScrollMetrics { epoch, revision, offset_from_bottom,
+    max_offset_from_bottom, viewport_rows }
+TerminalScrollAction::{ScrollByLines(i32), ScrollToOffset(u64)}
+TerminalViewportResult::{Frame, Live, HistoryChanged, HistoryGap}
+Capabilities::TERMINAL_VIEWPORT == 1 << 19
+```
 
 ## 3. Contracts
 
@@ -58,6 +67,15 @@ connection-status event is kind 314.
   optional epoch/revision cursor, and a maximum row count; its correlated page
   has an explicit `Ok`, `Changed`, or `Gap` outcome. Page Debug reports only
   structural counts, never formatted terminal rows.
+- `Capabilities::TERMINAL_VIEWPORT` is active only for the complete semantic
+  request/frame path. Request action is exactly one signed relative or absolute
+  variant. A correlated frame has an explicit Frame/Live/Changed/Gap outcome;
+  Frame carries Exact/Rebased plus metrics and exactly `viewport_rows`
+  independently encoded rows, Live carries valid zero-offset metrics without
+  rows/disposition, and Changed/Gap carry only the current epoch/revision.
+  Snapshot/delta metrics are optional for mixed versions and absent on
+  alternate screen. Frame Debug reports structural counts and ANSI byte length,
+  never row content.
 - `DomainErrorKind::code` and `from_code` are the single stable error-category
   bridge used by wire and JSON projections; adapters do not invent aliases.
 - `OperationWindow` is fixed to one daemon-issued `OperationLease` and retains
@@ -103,8 +121,15 @@ connection-status event is kind 314.
 - Frames are `varint length + WireFrame`, capped at 8 MiB before body
   allocation. Control payloads are capped at 1 MiB before concrete-message
   decoding. `TerminalHistoryRequest` is control; `TerminalHistoryPage` is a
-  bounded content frame under the ordinary 8 MiB limit. Unknown protobuf
-  fields are compatible; unknown kind and wire major are explicit errors.
+  bounded content frame under the ordinary 8 MiB limit.
+  `TerminalViewportRequest` is control and `TerminalViewportFrame` is content
+  under the same limits. Unknown protobuf fields are compatible; unknown kind
+  and wire major are explicit errors.
+- Kind/capability allocation is append-only: history remains 312/313, local
+  status remains 314, viewport is 315/316, `AGENT_EVENTS` remains bit 18, and
+  viewport is bit 19. A peer without bit 19 receives no 315/316 frame; adapters
+  keep the unchanged 312/313 pager as the explicit fallback instead of
+  advertising or simulating semantic metrics.
 - `TerminalConnectionStatusEvent` carries only attachment ID, unknown/direct/
   relay, and optional bounded integer RTT. It is never a normal-ALPN service
   kind and contains no DeviceId, address, relay URL, candidate, or ticket.
@@ -125,6 +150,11 @@ connection-status event is kind 314.
 | frame prefix is malformed/non-canonical or body is truncated | protocol error scoped to that connection |
 | frame exceeds 8 MiB or control payload exceeds 1 MiB | reject before allocating/decoding the concrete body |
 | history direction/outcome is unspecified, row bound is invalid, or page cursor/count disagrees | reject as malformed before projection; do not expose row content |
+| viewport action/outcome/disposition is missing or inconsistent | reject as malformed before forwarding or rendering |
+| viewport metrics have zero rows, epoch after revision, or offset past maximum | reject as malformed; do not retain its rows or baseline |
+| viewport Frame row count differs from `viewport_rows`, exceeds the current model height/80 rows, or exceeds 8 MiB | reject before render; keep the attachment/session bounded |
+| viewport request exceeds the 1 MiB control limit | reject before concrete decode or Session dispatch |
+| peer lacks `TERMINAL_VIEWPORT` | send no kind 315/316; use unchanged capability-gated history paging or no history feature |
 | connection status arrives on remote normal ALPN | reject; status is same-UID local IPC only |
 | wire major or kind is unsupported | explicit protocol/service error; listener remains healthy |
 
@@ -150,9 +180,11 @@ connection-status event is kind 314.
   panic-safe duplicate waiters, and outcome unknown below the retired floor.
 - Proto tests cover round trip, unknown fields, unknown kinds, major mismatch,
   non-canonical/malformed varints, truncated bodies, and both size limits.
-- Proto/daemon tests cover additive kinds 312–314, alternate-scroll field 7,
-  all history outcomes, page/frame bounds, redacted Debug, exact request
-  correlation, and rejection of status on the remote service classifier.
+- Proto/daemon tests cover additive kinds 312–316, capability bits 17–19,
+  alternate-scroll field 7, optional snapshot/delta metrics, all history and
+  viewport outcomes, page/frame bounds, redacted Debug, exact request
+  correlation, mixed-version fallback, and rejection of status on the remote
+  service classifier.
 - `local_ipc` proves malformed/unsupported requests terminate only their own
   unary connection and do not poison the listener. `terminal_recovery` owns
   the equivalent duplex attachment isolation evidence.
@@ -165,6 +197,8 @@ connection-status event is kind 314.
 let epoch = wall_clock_nanos();
 let id = OperationId::new(epoch, next_sequence());
 send(encode_again(id, request)).await?;
+
+send_kind_315_to_every_peer(viewport_request).await?;
 ```
 
 This has no cross-process authority and can change request bytes between an
@@ -176,7 +210,13 @@ ambiguous attempt and its retry.
 let lease = client.daemon_issued_lease().await?;
 let id = checked_operation_id(lease)?;
 let encoded = encode_once(id, request)?;
-send_with_one_ambiguous_retry(&encoded, deadline).await
+send_with_one_ambiguous_retry(&encoded, deadline).await?;
+
+if peer_capabilities.contains(Capabilities::TERMINAL_VIEWPORT) {
+    send_viewport_request(action).await
+} else {
+    request_legacy_history_page().await
+}
 ```
 
 The daemon validates the incarnation and issued ordinal before effects, while
@@ -188,6 +228,9 @@ the client preserves the exact retry identity and payload.
 - Raw `u64` revisions in public terminal APIs.
 - A second frame parser in the CLI or daemon.
 - A host terminal engine dependency or upstream terminal type in core/proto.
+- Reusing kind 315/316 or bit 19, emitting them without negotiated
+  `TERMINAL_VIEWPORT`, accepting invalid metrics/row counts, or exposing
+  viewport row content through Debug.
 - Re-executing an operation whose result has fallen below the replay low-water
   mark.
 - Generating or accepting a client-invented lease ordinal/incarnation, wrapping

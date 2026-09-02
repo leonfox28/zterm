@@ -1,4 +1,4 @@
-# 迁移终端状态引擎至 `alacritty_terminal`
+# 迁移终端状态引擎至 `alacritty_terminal` 及连续滚动 follow-up
 
 ## Decision State
 
@@ -17,7 +17,7 @@
   估算Alacritty内部容量，也不因估算内存拒绝create/resize；8-session数量限制、viewport/
   scrollback上限和针对不可信PTY输出的buffer/content caps继续保留。
 - 本文、`design.md` 与 `implement.md` 是替代旧 Ghostty 方案的唯一可执行计划；旧调研仅作
-  决策历史。用户最终批准前不运行 `task.py start`，不修改产品代码。
+  决策历史。原迁移已在批准后进入实施；新增 scroll follow-up 受文末独立 planning gate 约束。
 
 ## Goal
 
@@ -36,7 +36,7 @@
   后续可在不更换 PTY/session 架构的前提下增加 GUI renderer、选择、搜索或 semantic wire。
 - 保持 Rust 产品代码无 `unsafe`，不承担第三方 Ghostty wrapper/FFI 的 soundness 与构建链。
 
-## Current State
+## Pre-migration Baseline (Historical)
 
 - `zterm-core::terminal::TerminalModel` 私有持有 `vt100::Parser`，公开值均为 Zterm-owned。
 - `TerminalDriver` 已有一个 ordered model thread、固定容量 no-drop PTY byte queue、共享 model
@@ -223,9 +223,11 @@ the local macOS arm64 implementation environment.
 
 - Ghostty、`libghostty-vt`、社区 Rust wrapper、Zig/C rewrite或 unsafe FFI adapter。
 - 替换 `portable-pty`，新增 PTY/session/pane层级，或改变 session persistence。
-- font shaping、glyph atlas、GPU/CPU renderer、desktop/mobile UI、selection/search交互。
+- font shaping、glyph atlas、GPU/CPU renderer、Android/iOS UI、selection/search交互；本次 follow-up
+  明确批准的 CLI 右侧字符滚动条除外。
 - Kitty graphics/keyboard protocol、OSC 8 hyperlink UI、advanced styles、palette/theme同步。
-- protobuf semantic surface v2或 wire-major变化。
+- protobuf semantic surface v2或 wire-major变化；本次 follow-up 允许在 v1 中增加有 capability
+  保护的 viewport request/frame 和可选 scroll metrics 字段。
 - Android/iOS local shell、mobile engine runtime/device/App Store/NDK验收。
 - candidate comparison、throughput/latency/CPU/RSS benchmark或性能优化承诺。
 - 对Alacritty内部grid/cache/processor capacity建立per-session或aggregate memory quota。
@@ -244,12 +246,187 @@ the local macOS arm64 implementation environment.
 - 固定 `TERM=xterm-256color` 需要目标宿主具备对应 terminfo；正式 native runner和 real PTY
   fixture必须验证，缺失时作为 blocker处理，不能回退继承外层 TERM。
 
-## Final Review Status
+## Original Migration Review Status
 
 - Product scope：已收敛。
 - Engine choice：已由用户确定。
 - Performance decision：已由用户确定不测。
 - PRD/design/implementation plan：已按官方Alacritty、禁止unsafe、不测性能、取消aggregate
   memory admission并保留安全caps的决定完成交叉检查；task context validation通过。
-- Implementation authorization：已于 2026-09-02 获得；任务已通过 `task.py start`
-  进入 `in_progress`。
+- Original migration implementation authorization：已于 2026-09-02 获得；任务已通过
+  `task.py start` 进入 `in_progress`。
+
+## Post-release Scroll Follow-up (Planning Reopened 2026-09-02)
+
+### Decision State
+
+- 2026-09-02，用户确认 wheel ownership：child 未声明接管时，由 Zterm 浏览
+  attachment-local history；child 通过标准 terminal mode 声明接管后，Zterm 不改变
+  自己的 viewport，只向 child 精确转发一次事件。
+- “转发”仍经过 Zterm。外层 Ghostty/kitty 向 Zterm 报告 SGR mouse，Zterm 根据 daemon
+  投影的权威 child modes 决定由哪一层消费；physical host capture 与 child-requested
+  modes 是两份独立状态。
+- 2026-09-02，用户批准 CLI 默认采用 Herdr 式右侧单列滚动条：main screen 稳定预留，
+  有历史才绘制并允许点击/拖拽，alternate screen 隐藏并收回该列。
+- 用户明确后续路线：本功能完成并验证 Linux/macOS 连接后，下一阶段是 Android App。
+  因而 scroll state/action/metrics 必须 renderer-agnostic；CLI 字符、颜色和 gutter 布局
+  不得进入共享协议。
+- fullscreen TUI 本身会 redraw；这不构成拒绝 gutter 的理由。需要验证的是 mode switch
+  带来的至多一次额外 PTY resize/SIGWINCH、远程同步期间的短暂旧几何，以及退出后的
+  main-screen reflow。
+
+### Goal
+
+修复普通 shell 中滚轮失效，并把现有整页 history browser 升级为 attachment-local、
+可逐行浏览的连续 viewport；提供默认可见且可交互的 CLI 滚动条，同时保证 Herdr、Pi
+等 nested TUI 每个 wheel report 始终只有一个 owner，并为随后 Android 原生 overlay
+复用语义 metrics/actions。
+
+### User Value
+
+- shell 用户可以像普通终端一样逐行/逐页查看历史，并从 thumb 看到当前位置或快速跳转。
+- fullscreen TUI 接管鼠标时不发生 Zterm 与 child 双重滚动，退出后无需应用特判即可恢复。
+- Linux/macOS 先验证同一协议和 ownership；Android 随后复用语义状态，不复制 CLI 字符布局。
+
+### Defect Evidence
+
+- `crates/cli/src/terminal_ui.rs:69-70` 的 `TerminalGuard` 请求 physical SGR mouse；
+  `crates/terminal/src/ansi.rs:133-143` 的受控 reset 又关闭 `1003/1006`；
+  `crates/cli/src/terminal_ui.rs:2601-2643` 的 snapshot 不恢复 capture，delta 只在狭窄
+  child-mode transition 后恢复。故障属于 CLI host-input integration，不是 Alacritty
+  scrollback 数据丢失。
+- `crates/cli/src/terminal_ui.rs:2038-2185` 的首次 `navigate(older, amount)` 请求 newest page
+  时没有保存 `amount`，而返回值只有 history rows；它无法表达“3 行 history + 其余 live
+  screen”，所以 capture hotfix 与连续 viewport 是两个独立验收项。
+
+### R10. Separate Physical Capture from Child Modes
+
+- 所有成功写入 physical terminal 的 snapshot、delta、resync replacement 和 history viewport
+  frame 都必须把 `HOST_INPUT_CAPTURE` 作为该次 render transaction 的最后一个 mode write，
+  然后 flush；普通 delta 不得依赖 child mode 是否刚好发生变化。
+- `TerminalRenderer` 继续保存 daemon-authored child modes，用它决定输入路由；不得因为对外层
+  重新声明 `1003/1006`，就在 child state 中伪造 mouse reporting。
+- detach、正常退出、signal、错误和 panic guard 仍通过唯一 `TerminalGuard` cleanup 恢复外层
+  terminal，不得遗留 raw mode 或 host mouse capture。
+
+### R11. Renderer-neutral Continuous Viewport
+
+- `zterm-core` 新增 Zterm-owned `TerminalScrollMetrics`：history epoch、model revision、
+  `offset_from_bottom`、`max_offset_from_bottom` 和 `viewport_rows`；offset `0` 明确定义为 live。
+- `zterm-core` 新增 `ScrollByLines(i32)` 和 `ScrollToOffset(u64)` 两个语义 action。
+  `ScrollByLines` 正数向 older/up，负数向 newer/down；所有 arithmetic checked/clamped。
+- scroll state 属于一个 attachment，不属于 Session 的 authoritative terminal state。
+  daemon attachment 保存 action baseline；CLI/未来 Android 只保留最后一次返回的 metrics/frame。
+  detach/reconnect 从 live 开始，不持久化 presentation offset。
+- `zterm-terminal` 从同一个 Alacritty grid 直接读取 logical lines，绝不调用或暂时修改共享
+  `display_offset`。offset 为 `N` 时，完整 viewport 依次投影 `Line(-N)..Line(rows-N-1)`；
+  因此从 live 首次上滚 3 行恰好得到 3 行 history 加 `rows-3` 行 live screen。
+- 一个 viewport frame 必须来自单个 model lock/revision，包含恰好 `viewport_rows` 个 canonical
+  ANSI rows；它不改变 revision、checkpoint、child PTY、Alacritty state 或其他 attachment。
+- 同一 history epoch 内有新 rows 进入 scrollback 时，下一次相对 action 先按
+  `new_max - previous_max` 提升 offset，以保持原内容锚定，再应用用户 delta。epoch 改变、
+  resize、clear 或 eviction 使精确锚点不可证明时，server 返回 `Rebased` 并在当前 retained
+  bounds 内取最近合法 offset，不静默拼接两个 epoch。
+- 普通键盘/paste/prefix input 在 history 中不会直接到 child：先进入 bounded
+  `ResumePending`，取得并 flush live sync（以及必要的 geometry resize），再精确转发一次。
+
+### R12. One Wheel Report, One Owner
+
+- Zterm 已显示自己的 history viewport 时，wheel/PageUp/PageDown 继续由 Zterm 拥有，直到
+  offset 回到 `0` 或普通 input 完成 live resume；后台 child mode 变化不得抢走 ownership。
+- live 时路由优先级为：child mouse-reporting → alternate screen + alternate-scroll →
+  Zterm main-screen history。只使用 `ActiveScreen` 与 `TerminalModes`，禁止 process name、
+  `TERM`、tmux marker 或 Herdr/Pi 专用分支。
+- child mouse-reporting 分支按声明 encoding 只写一个 mouse report；alternate-scroll 分支
+  只写一个 application/normal cursor-key sequence。两者都保持 Zterm offset 为 `0`。
+- Zterm-owned CLI wheel 每个完整 SGR report 固定映射 3 行；PageUp/PageDown 为
+  `viewport_rows - 1`，至少 1 行。本次不增加配置项。
+- 唯一例外是用户直接操作可见的 Zterm gutter：main screen 的 scrollbar column 位于 child
+  PTY rectangle 之外，其 wheel/press/drag/release 由 Zterm chrome 拥有，永不伪造为 child
+  最后一列事件。其他 child rectangle 内的事件遵循上述 mode ownership。
+
+### R13. Herdr-style CLI Scrollbar and Geometry
+
+- CLI 在 main screen 且受支持布局宽度大于 4 列时始终预留最右一列：child PTY 使用 `N-1`
+  列，gutter 使用第 `N` 列。history 从 0 变为非 0 时不得触发 resize；无 history 时 gutter
+  保持空白。
+- 有 history 时用单格 track/thumb（计划采用 `▕`/`▐`）显示 metrics。thumb 至少一行；长度按
+  `viewport_rows / (viewport_rows + max_offset)` 比例计算，位置把 oldest 映射到顶部、live
+  映射到底部，并使用 overflow-safe integer arithmetic。
+- track click 映射为绝对 `ScrollToOffset`；thumb drag 保留 grab offset，并把最新 pointer
+  位置 coalesce 为一个绝对 target。wheel burst/drag 在已有 request 时只保留有界累计或
+  最新 target，不建立 per-event network backlog。
+- remote connection status row 不属于 scrollbar track；超过产品最大 viewport 的 physical
+  rows/columns 也不进入 child/gutter coordinates。gutter 外的 mouse event 被丢弃。
+- live alternate screen 隐藏并清除 gutter，将 `N` 列全部归还 child；回到 live main 时恢复
+  `N-1 + 1`。每次 mode transition 最多提交一次新 size，same-size snapshot/delta 不得产生
+  resize loop。
+- 若 Zterm 已在 history 中，presentation screen 暂时保持 main/gutter；后台 child 切换
+  alternate 只更新待恢复的 authoritative state。用户回 live 后才按最新 screen 进行一次
+  geometry reconciliation。
+
+### R14. Additive Wire Compatibility and Android Boundary
+
+- proto v1 新增 `TerminalViewportRequest/Frame`、metrics/action/outcome message、新 wire kinds
+  和 `TERMINAL_VIEWPORT` capability；不改变 wire major。request 是 control frame，frame 是
+  content frame，继续受 1 MiB/8 MiB bounds、attachment identity、deadline 和 correlation约束。
+- snapshot/delta 以新增可选字段携带 live scroll metrics，使 scrollbar 在尚未滚动时也能
+  知道 history extent。旧 client 忽略未知字段；新 client 对未声明 capability/缺少 metrics
+  的旧 remote peer 使用现有 bounded history paging，隐藏不可用的 thumb，不发送未知 kind。
+- semantic viewport peer 每个 attachment 同时最多一个请求。`Ok` 返回一致 frame；`Rebased`
+  返回当前 epoch 的完整替代 frame；offset 到 `0` 返回 `Live` 并走既有 sync；alternate/
+  invalid state 返回明确 `Changed/Gap`，不能把错误 page 当作 current screen。
+- core/proto/wire 中不得出现 `▕`、`▐`、颜色、gutter column 或 pixel。下一阶段 Android 可用
+  同一 metrics/actions 绘制不占 PTY cell 的 native overlay；Android renderer、touch physics、
+  本地 PTY 和 device validation 不在本次实现。
+- Android 的后续 gesture adapter 应按 pixel delta / cell height 并保存 fractional remainder
+  产生 `ScrollByLines`；不能继承 CLI“每个 SGR report 3 行”的输入设备假设。
+
+### R15. Verification and Release Boundary
+
+- pseudo-TTY/byte-level tests覆盖初始 snapshot、普通 delta、resync、child enable/disable mouse、
+  history frame之后仍保留 host capture，以及所有 cleanup paths。
+- model/proto/session/local+remote tests覆盖 3-history+live composition、top/bottom clamp、absolute
+  jump、epoch rebase、one-outstanding/coalescing、malformed/oversized frame 和 mixed-version fallback。
+- CLI tests覆盖 routing matrix、one-report invariant、PageUp overlap、scrollbar math、click/drag、
+  width 4/5、remote status row、main↔alternate single resize、无 resize loop、history-pinned mode
+  change和 resume input exactly once。
+- 在进入 Android 阶段前，macOS 与 Linux 的 local/direct/relay 连接至少各完成一次真实 PTY
+  smoke；进入/退出 Herdr 或 Pi-style fullscreen 后 shell、resize、wheel、detach/reconnect 正常。
+  hosted-only evidence 必须明确来自对应 CI/runner，不得由本地 macOS 结果代替。
+- 延续用户决定：不运行 throughput、latency、CPU 或 RSS benchmark，也不据普通测试耗时作
+  性能结论。
+
+### Follow-up Acceptance Criteria
+
+- [ ] 普通 shell 在 snapshot、任意 delta 和 resync 后均能收到 wheel；退出后 outer terminal
+  raw/mouse state 完整恢复。
+- [ ] 首次 wheel-up 精确移动 3 行；连续 wheel、PageUp/PageDown、top/bottom 和 ordinary-input
+  resume 均符合 R11/R12，且一个 attachment 不改变另一个 attachment 或 authoritative model。
+- [ ] Herdr/Pi-style mouse modes 收到恰好一个 report；alternate-scroll 收到恰好一个 cursor key；
+  child 退出 mode 后 wheel ownership 自动回到 Zterm。
+- [ ] main-screen gutter 稳定预留、无 history 时不画、有 history 时可 wheel/click/drag；alternate
+  screen 收回整列，mode-driven resize 无 loop、输入丢失或不可恢复 stale frame。
+- [ ] 新 viewport wire/capability、optional metrics、frame bounds、redacted Debug、mixed-version
+  fallback 和 local/direct/relay paths 都有自动化证据；旧 history paging contract 保留。
+- [ ] macOS 与 Linux 的真实 local/direct/relay smoke 通过后，才将本 follow-up 标为完成并进入
+  Android App；未运行性能/RSS benchmark，未宣称 Android 已实现。
+
+### Out of Scope and Risks
+
+- 本次不实现 Android UI、pixel/inertial touch physics、CLI scroll-speed 配置、selection/search、
+  horizontal scrollbar 或 multipane compositor。
+- main screen 永久少一列是用户批准的 UX 成本；main↔alternate 会多一次 PTY resize/SIGWINCH，
+  最坏出现 child 自身 redraw 后再按新宽度 redraw。它必须被验证，但不是正确性 blocker。
+- outer terminal 可把一次物理触控板手势拆成多个 SGR reports；3 行是“每个 report”，不是
+  “每个物理手势”。当前 ANSI input 无法可靠恢复 pixel delta。
+- history capacity eviction 或 resize 后旧锚点可能已不存在；`Rebased` 只保证返回当前 retained
+  state 中最近的合法 viewport，不保证展示已经被淘汰的内容。
+- mixed-version remote peer 只能得到既有 page-based fallback，不能获得新 continuous frame 或
+  interactive thumb；升级两端后自动启用，不通过未知 wire kind 探测。
+
+### Planning Gate
+
+本 follow-up 的用户 UX 决策已经收敛。原迁移批准不覆盖这次新增的 wire、gutter 和 geometry
+范围；只有在 PRD、design、implement manifests 全部校验完成并展示最终摘要后，用户再次明确
+批准，才开始修改产品代码。

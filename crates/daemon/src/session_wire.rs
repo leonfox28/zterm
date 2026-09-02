@@ -22,7 +22,7 @@ use tokio::sync::{mpsc, oneshot};
 use zeroize::Zeroizing;
 #[cfg(unix)]
 use zterm_core::terminal::{
-    MAX_HISTORY_PAGE_ROWS, TerminalHistoryCursor, TerminalHistoryDirection,
+    MAX_HISTORY_PAGE_ROWS, TerminalHistoryCursor, TerminalHistoryDirection, TerminalScrollAction,
 };
 #[cfg(unix)]
 use zterm_core::{
@@ -1227,6 +1227,37 @@ async fn process_attachment_frame(
             .await?;
             Ok(false)
         }
+        WireKind::TerminalViewportRequest => {
+            let request: v1::TerminalViewportRequest = frame
+                .decode_message(WireKind::TerminalViewportRequest)
+                .map_err(protocol_error)?;
+            require_attachment_id(request.attachment_id, attachment)?;
+            let action = terminal_scroll_action(request.action)?;
+            let attachment_worker = Arc::clone(attachment);
+            let result = request_context
+                .run_effect(&server.sessions, deadline, move |_sessions, _principal| {
+                    attachment_worker.scroll_viewport_until(action, deadline)
+                })
+                .await?;
+            let message =
+                zterm_proto::terminal_viewport_frame_message(attachment.attachment_id(), result);
+            send_attachment_outbound_until(
+                outbound,
+                AttachmentOutbound::queued(
+                    encode_message(
+                        WireKind::TerminalViewportFrame,
+                        frame.request_id,
+                        0,
+                        &message,
+                    )
+                    .map_err(protocol_error)?,
+                    deadline,
+                ),
+                deadline,
+            )
+            .await?;
+            Ok(false)
+        }
         WireKind::TerminalInput => {
             let request: v1::TerminalInput = frame
                 .decode_message(WireKind::TerminalInput)
@@ -1816,6 +1847,21 @@ fn terminal_history_cursor(value: v1::TerminalHistoryCursor) -> TerminalHistoryC
         row_count: value.row_count,
         oldest_row: value.oldest_row,
         newest_row: value.newest_row,
+    }
+}
+
+#[cfg(unix)]
+fn terminal_scroll_action(
+    value: Option<v1::TerminalViewportAction>,
+) -> Result<TerminalScrollAction, DaemonError> {
+    match value.and_then(|value| value.action) {
+        Some(v1::terminal_viewport_action::Action::ScrollByLines(lines)) => {
+            Ok(TerminalScrollAction::ScrollByLines(lines))
+        }
+        Some(v1::terminal_viewport_action::Action::ScrollToOffset(offset)) => {
+            Ok(TerminalScrollAction::ScrollToOffset(offset))
+        }
+        None => Err(malformed("terminal viewport action is missing")),
     }
 }
 
@@ -2790,7 +2836,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn same_uid_and_authenticated_remote_history_route_to_one_session_owner() {
+    async fn same_uid_history_and_authenticated_remote_viewport_route_to_one_session_owner() {
         let temporary = tempfile::tempdir().expect("temporary history routing fixture");
         let own = device(0x19);
         let remote = device(0x1a);
@@ -2868,6 +2914,32 @@ mod tests {
             Revision::new(snapshot.revision),
         )
         .await;
+
+        peer.send(
+            WireKind::TerminalViewportRequest,
+            6,
+            &v1::TerminalViewportRequest {
+                attachment_id: Some(attachment_id.into()),
+                action: Some(v1::TerminalViewportAction {
+                    action: Some(v1::terminal_viewport_action::Action::ScrollByLines(3)),
+                }),
+            },
+        )
+        .await;
+        let viewport = peer.next().await;
+        assert_eq!(viewport.kind, WireKind::TerminalViewportFrame);
+        assert_eq!(viewport.request_id, 6);
+        let viewport: v1::TerminalViewportFrame = viewport
+            .decode_message(WireKind::TerminalViewportFrame)
+            .expect("authenticated remote viewport frame");
+        assert_eq!(
+            v1::TerminalViewportOutcome::try_from(viewport.outcome)
+                .expect("known viewport outcome"),
+            v1::TerminalViewportOutcome::Frame
+        );
+        let metrics = viewport.metrics.expect("viewport metrics");
+        assert_eq!(metrics.offset_from_bottom, 3);
+        assert_eq!(viewport.rows.len(), 3);
 
         peer.send(
             WireKind::TerminalHistoryRequest,

@@ -70,6 +70,28 @@ consumer. It does not nest or share the daemon's terminal-engine object. Test
 the fixed hosted TERM/COLORTERM profile at the PTY builder boundary rather than
 inferring child capabilities from the developer's outer terminal.
 
+For continuous viewport and scrollbar changes, keep the following acceptance
+matrix explicit:
+
+- The CLI owns physical SGR mouse capture (`1003` plus `1006`) independently of
+  child modes. Every composed repaint restores capture last and flushes once;
+  cleanup disables it on every exit path. Correctness must not depend on whether
+  the outer application is Ghostty, kitty, Alacritty, Terminal.app, or another
+  conforming terminal.
+- Native macOS and Linux each require local, direct-Iroh, and Relay smoke
+  evidence for shell scrolling, main/alternate transition, child mouse
+  ownership, resize, detach, and reconnect. Pure fake-stream/unit tests and a
+  compile-only hosted job are necessary but do not substitute for those six
+  runtime paths.
+- Record the host, path, commit, command/fixture, and result. An ignored Linux
+  test on macOS, a macOS local PTY fixture, or old release evidence must remain
+  visibly pending for the path it did not execute.
+- Android remains a remote renderer/controller consumer of core/proto semantic
+  metrics and frames. It must not link the host Alacritty model, local PTY, or
+  Unix CLI chrome. Begin Android implementation only after the macOS/Linux
+  local/direct/relay matrix above is recorded, so mobile work does not hide a
+  host transport or nested-TUI regression.
+
 ## Incident: Windows Rust Formatting Failure
 
 - **Root cause categories**: implicit assumption plus test coverage gap. The

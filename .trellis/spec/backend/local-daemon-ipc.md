@@ -4,7 +4,8 @@
 
 Apply this contract to the per-user daemon, Unix socket service, peer
 credentials, detached launch, setup/status/doctor/log commands, and lifecycle
-locks.
+locks. It also covers the Unix raw-terminal UI, its host mouse capture,
+attachment-local history viewport, and Zterm-owned status/scrollbar chrome.
 
 ## 2. Signatures
 
@@ -49,6 +50,15 @@ LocalRuntime::reset_identity(&self, expected_device_id: Option<DeviceId>, force:
 
 run_terminal(request: TerminalRequest, runtime: &LocalRuntime)
     -> Result<(), CliError>
+
+TerminalViewCommandWriter::request_viewport(action: TerminalScrollAction)
+    -> Result<(), DaemonError>
+ChromeLayout::new(physical: TerminalSize, remote: bool, screen: ActiveScreen)
+    -> ChromeLayout
+ScrollbarGeometry::new(track_rows: u16, metrics: TerminalScrollMetrics)
+    -> Option<ScrollbarGeometry>
+
+const HOST_INPUT_CAPTURE: &[u8] = b"\x1b[?1003h\x1b[?1006h";
 
 spawn_inside_runtime<T>(runtime: &tokio::runtime::Runtime, spawn: impl FnOnce() -> T)
     -> T
@@ -147,8 +157,13 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   local attachment ID and one `ConnectionDemand` for the view lifetime, while
   each remote stream receives a fresh host attachment ID. It emits local-only
   `Preparing`, `Synchronizing`, `Active`, and `Reconnecting` events, rewrites
-  attachment IDs at the boundary, drops input while non-active, and retains
-  only the latest validated viewport. Every open, initial exchange, full-sync
+  attachment IDs at the boundary, drops input while reconnecting/freshly
+  synchronizing, and retains only the latest validated viewport. Within one
+  already-active stream epoch, replacement snapshot synchronization records
+  `controller_was_active` and may forward the same controller's input/history/
+  viewport operations through the server's narrow visual-sync fence. A new
+  epoch, initial attach, or takeover cannot inherit that privilege. Every open,
+  initial exchange, full-sync
   exchange, remote write, local write, detach, and control forward is bounded by
   an existing absolute attempt/operation deadline; active reads remain
   long-lived and local EOF/detach remains authoritative. If a post-`Active`
@@ -164,6 +179,16 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   promoted peer did not advertise `HISTORY_PAGING`, the bridge returns an empty
   correlated `Gap` locally, sends no unknown kind remotely, and keeps the live
   attachment active.
+- Remote semantic scrolling uses the same pattern with
+  `TerminalViewportRequest/Frame`, at most one outstanding request, and the
+  negotiated `TERMINAL_VIEWPORT` bit. Relative wheel actions saturating-add
+  while a response is pending; an absolute drag target replaces the queued
+  action. Returning live supersedes queued scroll. A capability-less peer is
+  never sent kind 315/316 and remains on the unchanged legacy history pager.
+  Losing a stream epoch resolves pending semantic viewport and legacy history
+  once with a correlated content-free Gap (`current_epoch=0`,
+  `current_revision=0`), then emits `Reconnecting`; it does not turn a normal
+  reconnect into a fatal UI service error or replay the request.
 - `TerminalConnectionStatusEvent` is same-UID/local-only. The bridge emits an
   initial/reattachment unknown sample and changed selected-path/RTT samples no
   faster than once per second; operations combine them with the attach-time
@@ -196,10 +221,12 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   the last submitted size and suppresses identical repeated signals because a
   semantic no-op need not produce another replacement snapshot or completion
   barrier. Because server output can begin another snapshot after the client
-  observed `Active`, Session admits replaceable resize only from the exact
-  current controller while its sync target remains `Active`; input, history,
-  prepared takeover, and stale/non-controller attachments retain the strict
-  `Active`/lease checks. The CLI never retries or replays resize. Viewport
+  observed `Active`, Session admits replaceable resize from the exact current
+  controller while its sync target remains `Active`; input, history, and
+  semantic viewport may cross that same window only when the attachment was
+  already Active in the current stream epoch. Fresh/takeover and stale/non-
+  controller attachments retain strict synchronization/lease checks. The CLI
+  never retries or replays resize. Viewport
   publication or a local socket-write acknowledgement alone is not an input
   fence. Pure UI and Session tests own the exact reader-replacement,
   resize-state, and in-flight-snapshot ordering. The multiprocess PTY fixture
@@ -217,6 +244,36 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   restores child cursor and style. Wheel/Page routing depends only on
   authoritative main/alternate, mouse, and alternate-scroll modes; there are
   no tmux/Herdr/application-name branches.
+- On the main screen, usable widths greater than four reserve exactly the final
+  column for Zterm chrome; the child receives `N-1` columns. Widths 1–4 and the
+  alternate screen give the child the full usable width. A remote status row is
+  outside both the child and gutter. A pinned history presentation remains
+  effectively Main even if background child output enters alternate, so it is
+  not resized or overwritten until return-to-live. Main/alternate transitions
+  submit at most one geometry change, and `ResizeCoalescer::last_submitted`
+  suppresses the resize-produced same-screen replacement.
+- A main gutter with no valid history metrics is cleared and blank. With
+  history it renders `▕` track and a proportional, minimum-one-row `▐` thumb;
+  live maps to bottom and oldest maps to top using overflow-safe arithmetic.
+  Track click and drag emit absolute offsets. A drag remains chrome-owned when
+  motion/release leaves the gutter, clamps to the usable track, and always ends
+  on release/capture loss. Child mouse coordinates are never clamped into the
+  gutter or status row.
+- Wheel ownership is evaluated in this order: an already-pinned history view,
+  the Zterm gutter, the live child's declared mouse-reporting mode, live
+  alternate screen with alternate-scroll, then Zterm main history. Zterm wheel
+  navigation is three logical rows and PageUp/PageDown is `rows - 1`. A child
+  mouse branch forwards exactly one encoded mouse event; alternate-scroll emits
+  exactly one cursor-key sequence. Main plus alternate-scroll alone still
+  belongs to Zterm, and alternate without either child mode receives no
+  invented scroll input. This mode-driven rule is what makes nested Herdr,
+  PiAgent, tmux, and other TUIs coexist without process-name detection.
+- Snapshot, applied delta, resync replacement, viewport/history, status, and
+  scrollbar repaint are one output transaction: child/history bytes first,
+  then status/gutter chrome, then `HOST_INPUT_CAPTURE`, then exactly one flush.
+  Child mode sequences may change semantic routing but cannot leave physical
+  outer capture disabled. Raw-mode cleanup still disables capture/restores the
+  user's terminal on normal exit, signal, error, and panic.
 - The UI history state is exhaustively `Live`, `History`, or `ResumePending`.
   Pinned views drain live revisions without applying their ANSI; returning
   live requests one full sync and retains at most the fixed input bound, then
@@ -229,6 +286,13 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   is incomplete, the UI keeps consuming that paste under the old input epoch,
   then performs the authoritative reader join/flush/new-epoch fence before
   forwarding the complete retained unit exactly once.
+- `TerminalSyncRequired`/replacement snapshot is a background visual sync, not
+  a transport reconnect: an already-pinned semantic or legacy history frame,
+  drag state, and server scroll baseline stay intact, and the CLI does not send
+  a redundant sync request. A true `Reconnecting` transition clears the
+  presentation, drag/queued actions, and live metrics. A live view may enter
+  new history only while transport state is `Active`; gutter input during a
+  fresh synchronization is swallowed rather than leaked to the child.
 - Closure correlation has two ordered owners under the same bounded window.
   First, command-side EPIPE/reset-equivalent local attachment closure drains a
   buffered typed lease/session/service outcome. Second, the spawned terminal
@@ -326,8 +390,13 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
 | remote mutation outer envelope was partially/fully written but has no fully validated correlated response | `operation_outcome_unknown`; do not reconnect or replay the envelope |
 | read-only remote outer envelope has a post-write failure | retry once with identical envelope bytes and the same deadline |
 | remote attachment stream is lost with a pending lease / takeover | original typed transport failure / `operation_outcome_unknown`; remove the pending cell and never replay it |
-| remote attachment stream is lost with a pending history page | typed transport failure; remove the pending cell and never replay it |
+| remote attachment stream is lost with a pending history/viewport response | resolve its original correlation once as content-free Gap(0/0), then reconnect; remove the pending cell and never replay it |
 | history page is uncorrelated, oversized, or cursor-inconsistent | malformed frame scoped to the view; never render or retain its rows |
+| viewport frame is uncorrelated, has invalid metrics/outcome/disposition, or row count differs from current height | malformed frame scoped to the view; never render or retain its rows/baseline |
+| peer lacks `TERMINAL_VIEWPORT` | send no viewport kind; retain legacy history paging and a blank, non-fake gutter |
+| live wheel occurs during fresh synchronization | swallow Zterm gutter/history navigation and do not forward it to the child; an already-pinned view may continue only across background replacement sync |
+| child declares mouse reporting / alternate+alternate-scroll | forward exactly one mouse report / one cursor-key sequence; do not move Zterm history |
+| composed render path omits host capture or flushes before chrome/capture | renderer contract failure; snapshot/delta/history/chrome tests must compare exact byte order and one flush |
 | command write closure races a buffered typed lifecycle event | publish the typed event; suppress raw `Broken pipe`/OS text and do not retry the command |
 | terminal driver command sender/response owner closes after its final typed event/error entered the event queue | suppress the command-channel fallback and let the queued event win; if no event is confirmed within the same bounded window, return normalized `daemon_stopped` |
 | `create_main` request was written but no complete correlated initial result is validated | `operation_outcome_unknown`; do not claim the default Session was absent or retry under a new identity |
@@ -361,6 +430,9 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
 - **Good:** prove shell-ready and eventual interactive echo through the
   production terminal entry; exercise resize plus signal restoration separately
   from prefix detach, while pure tests own the exact Active input fence.
+- **Good:** let terminal modes select wheel ownership, retain one attachment's
+  semantic viewport across a background replacement snapshot, and compose
+  child bytes, chrome, host capture, and one flush as a single repaint.
 - **Bad:** trust socket permissions without peer credentials, decode before the
   UID gate, let clap accept a ticket/path/socket override, block the
   current-thread runtime on PTY work, or remove a socket by pathname without
@@ -421,15 +493,19 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   then accepts a truthful stop retry.
 - `remote_attachment` proves stable-local/fresh-remote ID mapping, bounded
   reconnect cancellation and writes, snapshot-first input gating, viewport
-  coalescing, paused-time half-open occupancy retry, first-ever occupancy
-  termination, correlated control completion, other terminal error projection,
-  and state-event ordering over pure fake streams. The local attachment client
+  coalescing, semantic capability fallback, replacement-sync forwarding only
+  for an already-active controller, typed Gap completion on epoch loss,
+  paused-time half-open occupancy retry, first-ever occupancy termination,
+  correlated control completion, other terminal error projection, and
+  state-event ordering over pure fake streams. The local attachment client
   separately proves routing and validated transport-state consumption over a
   real same-UID Unix duplex connection.
 - `terminal_ui` pure tests cover remote rows-minus-one/one-row geometry,
   oversized physical-to-bounded child projection for initial attach and resize,
-  complete reverse-video Unicode-safe status output, mode-derived wheel/Page
-  routing, and exact-once input across Live/History/ResumePending. Operations
+  stable main gutter/alternate reclaim, all scrollbar positions and drag
+  clamping, exact composed output/capture/flush order, complete reverse-video
+  Unicode-safe status output, mode-derived one-report wheel/Page routing, and
+  exact-once input across Live/History/ResumePending/background sync. Operations
   tests prove both local-stream closure and top-level command send/response-owner
   closure defer to an already queued typed terminal outcome, while closure with
   no event is normalized without raw OS text. The top-level schedule uses one
@@ -438,7 +514,10 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   same generic path.
 - The CLI multiprocess PTY gate uses a task-private deterministic shell. The
   connect child proves ready -> eventual interactive echo -> default detach
-  through the unmodified `run_terminal`; the bare child separately proves
+  through the unmodified `run_terminal`; its scroll mode uses a real outer PTY,
+  revision/echo barrier, and SGR wheel report to prove a target exactly three
+  rows above a 24-row live viewport is repainted, then detached/restored. The
+  bare child separately proves
   SIGWINCH revision/viewport, SIGTERM cancellation, termios restoration,
   bounded reap, and panic cleanup. Stress it sequentially and concurrently,
   then assert no fixture daemon is orphaned. No diagnostic may contain
@@ -452,6 +531,8 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
 let request = decode(stream.read().await?)?; // peer not authenticated
 service.dispatch(request);                   // may block Tokio inline
 remove_file(socket_path)?;                   // pathname may be replaced
+
+if process_name == "herdr" { forward_wheel() } // application heuristic
 ```
 
 ### Correct
@@ -461,6 +542,13 @@ verify_same_uid(&stream)?;
 let request = read_one_strict_frame_and_eof(&mut stream).await?;
 let reply = spawn_blocking(move || service.dispatch(request)).await??;
 remove_socket_only_if_token_matches(socket_path, listener_token)?;
+
+match (pinned, gutter_hit, modes.mouse, screen, modes.alternate_scroll) {
+    (true, ..) | (_, true, ..) => scroll_zterm_viewport(),
+    (_, _, true, ..) => forward_one_mouse_report(),
+    (_, _, false, Alternate, true) => forward_one_cursor_key(),
+    _ => scroll_zterm_main_history(),
+}
 ```
 
 ```rust
@@ -490,6 +578,13 @@ phase when their synchronization can race input.
   Tokio runtime.
 - Calling `tokio::spawn` from synchronous daemon startup outside the exact
   daemon-owned runtime's `enter()` guard.
+- Routing wheel input from process names, TERM, screen text, or special cases
+  for tmux/Herdr/PiAgent instead of authoritative terminal modes.
+- Storing semantic scroll position in the shared model/resume checkpoint,
+  sending viewport kinds to a capability-less peer, or treating an in-epoch
+  replacement snapshot as a new transport reconnect.
+- Flushing child ANSI before status/gutter/capture composition, or permitting a
+  child mode transition to leave outer `1003/1006` capture disabled.
 - Removing or rebinding a socket without the held daemon lock and exact
   device/inode/change-time ownership token.
 - Reporting successful stop before every registry-owned child/thread/reservation

@@ -26,7 +26,7 @@ use tokio::task::JoinSet;
 use zeroize::{Zeroize, Zeroizing};
 #[cfg(unix)]
 use zterm_core::terminal::{
-    MAX_HISTORY_PAGE_ROWS, TerminalHistoryCursor, TerminalHistoryDirection,
+    MAX_HISTORY_PAGE_ROWS, TerminalHistoryCursor, TerminalHistoryDirection, TerminalScrollAction,
 };
 #[cfg(unix)]
 use zterm_core::{
@@ -519,6 +519,8 @@ pub enum LocalAttachmentEvent {
     Delta(v1::TerminalDelta),
     /// One correlated bounded page from daemon-authoritative history.
     HistoryPage(v1::TerminalHistoryPage),
+    /// One correlated complete attachment-local semantic viewport outcome.
+    ViewportFrame(v1::TerminalViewportFrame),
     /// The following snapshot must replace the client state atomically.
     SyncRequired(v1::TerminalSyncRequired),
     /// A prepared takeover committed successfully.
@@ -561,6 +563,11 @@ impl fmt::Debug for LocalAttachmentEvent {
                 .debug_struct("HistoryPage")
                 .field("outcome", &page.outcome)
                 .field("row_count", &page.rows.len())
+                .finish_non_exhaustive(),
+            Self::ViewportFrame(frame) => formatter
+                .debug_struct("ViewportFrame")
+                .field("outcome", &frame.outcome)
+                .field("row_count", &frame.rows.len())
                 .finish_non_exhaustive(),
             Self::SyncRequired(required) => formatter
                 .debug_struct("SyncRequired")
@@ -612,11 +619,13 @@ pub struct LocalAttachmentClient {
     attachment_id: AttachmentId,
     target: ResolvedSessionTarget,
     initial_snapshot: v1::TerminalSnapshot,
+    terminal_rows: u32,
     next_request_id: u64,
     operation_lease: Option<OperationLease>,
     next_operation_sequence: u64,
     pending_takeover_request_id: Option<u64>,
     pending_history_request_id: Option<u64>,
+    pending_viewport_request_id: Option<u64>,
 }
 
 #[cfg(unix)]
@@ -637,6 +646,10 @@ impl fmt::Debug for LocalAttachmentClient {
             .field(
                 "has_pending_history",
                 &self.pending_history_request_id.is_some(),
+            )
+            .field(
+                "has_pending_viewport",
+                &self.pending_viewport_request_id.is_some(),
             )
             .finish_non_exhaustive()
     }
@@ -818,6 +831,7 @@ impl LocalAttachmentClient {
             let session_id = required_snapshot_session_id(&initial_snapshot)?;
             let attachment_id = required_snapshot_attachment_id(&initial_snapshot)?;
             validate_snapshot_viewport(&initial_snapshot)?;
+            let terminal_rows = initial_snapshot.rows;
             for state in &pre_snapshot_states {
                 let state_attachment: AttachmentId = state
                     .attachment_id
@@ -838,11 +852,13 @@ impl LocalAttachmentClient {
                 attachment_id,
                 target,
                 initial_snapshot,
+                terminal_rows,
                 next_request_id: request_id + 1,
                 operation_lease: None,
                 next_operation_sequence: 1,
                 pending_takeover_request_id: None,
                 pending_history_request_id: None,
+                pending_viewport_request_id: None,
             }))
         })
         .await;
@@ -910,12 +926,15 @@ impl LocalAttachmentClient {
                     recent_history_ansi: Vec::new(),
                     active_screen: v1::TerminalActiveScreen::Main as i32,
                     modes: Some(v1::TerminalModes::default()),
+                    scroll_metrics: None,
                 },
+                terminal_rows: 24,
                 next_request_id: 2,
                 operation_lease: None,
                 next_operation_sequence: 1,
                 pending_takeover_request_id: None,
                 pending_history_request_id: None,
+                pending_viewport_request_id: None,
             },
             peer,
         )
@@ -1019,6 +1038,40 @@ impl LocalAttachmentClient {
         Ok(())
     }
 
+    /// Requests one complete attachment-local semantic viewport outcome.
+    /// Exactly one viewport request may be outstanding per view.
+    pub(crate) async fn request_viewport(
+        &mut self,
+        action: TerminalScrollAction,
+    ) -> Result<(), DaemonError> {
+        if self.pending_viewport_request_id.is_some() {
+            return Err(resource_error(
+                "a terminal viewport response is already pending",
+            ));
+        }
+        let action = match action {
+            TerminalScrollAction::ScrollByLines(lines) => {
+                v1::terminal_viewport_action::Action::ScrollByLines(lines)
+            }
+            TerminalScrollAction::ScrollToOffset(offset) => {
+                v1::terminal_viewport_action::Action::ScrollToOffset(offset)
+            }
+        };
+        let request_id = self
+            .send(
+                WireKind::TerminalViewportRequest,
+                &v1::TerminalViewportRequest {
+                    attachment_id: Some(self.attachment_id.into()),
+                    action: Some(v1::TerminalViewportAction {
+                        action: Some(action),
+                    }),
+                },
+            )
+            .await?;
+        self.pending_viewport_request_id = Some(request_id);
+        Ok(())
+    }
+
     /// Commits a previously prepared and acknowledged takeover attachment.
     pub async fn takeover(&mut self) -> Result<(), DaemonError> {
         self.begin_takeover().await.map(|_| ())
@@ -1099,6 +1152,9 @@ impl LocalAttachmentClient {
             if self.pending_history_request_id == Some(frame.request_id) {
                 self.pending_history_request_id = None;
             }
+            if self.pending_viewport_request_id == Some(frame.request_id) {
+                self.pending_viewport_request_id = None;
+            }
             if error.kind() == DomainErrorKind::OperationOutcomeUnknown {
                 self.operation_lease = None;
                 self.next_operation_sequence = 1;
@@ -1136,6 +1192,7 @@ impl LocalAttachmentClient {
                     .map_err(protocol_error)?;
                 self.require_snapshot_identity(&snapshot)?;
                 validate_snapshot_viewport(&snapshot)?;
+                self.terminal_rows = snapshot.rows;
                 Ok(LocalAttachmentEvent::Snapshot(snapshot))
             }
             WireKind::TerminalDelta => {
@@ -1143,6 +1200,14 @@ impl LocalAttachmentClient {
                     .decode_message(WireKind::TerminalDelta)
                     .map_err(protocol_error)?;
                 self.require_attachment(delta.attachment_id.clone())?;
+                validate_product_viewport(delta.rows, delta.columns)?;
+                validate_live_scroll_metrics(
+                    delta.scroll_metrics.as_ref(),
+                    delta.rows,
+                    delta.to_revision,
+                    delta.active_screen,
+                )?;
+                self.terminal_rows = delta.rows;
                 Ok(LocalAttachmentEvent::Delta(delta))
             }
             WireKind::TerminalHistoryPage => {
@@ -1156,6 +1221,18 @@ impl LocalAttachmentClient {
                 validate_history_page(&page)?;
                 self.pending_history_request_id = None;
                 Ok(LocalAttachmentEvent::HistoryPage(page))
+            }
+            WireKind::TerminalViewportFrame => {
+                if self.pending_viewport_request_id != Some(frame.request_id) {
+                    return Err(malformed("terminal viewport frame correlation mismatch"));
+                }
+                let viewport: v1::TerminalViewportFrame = frame
+                    .decode_message(WireKind::TerminalViewportFrame)
+                    .map_err(protocol_error)?;
+                self.require_attachment(viewport.attachment_id.clone())?;
+                validate_viewport_frame(&viewport, self.terminal_rows)?;
+                self.pending_viewport_request_id = None;
+                Ok(LocalAttachmentEvent::ViewportFrame(viewport))
             }
             WireKind::TerminalSyncRequired => {
                 let required: v1::TerminalSyncRequired = frame
@@ -1451,12 +1528,124 @@ fn required_snapshot_attachment_id(
 
 #[cfg(unix)]
 fn validate_snapshot_viewport(snapshot: &v1::TerminalSnapshot) -> Result<(), DaemonError> {
-    let _: zterm_core::terminal::TerminalSize = v1::TerminalViewport {
-        rows: snapshot.rows,
-        columns: snapshot.columns,
+    validate_product_viewport(snapshot.rows, snapshot.columns)?;
+    validate_live_scroll_metrics(
+        snapshot.scroll_metrics.as_ref(),
+        snapshot.rows,
+        snapshot.revision,
+        snapshot.active_screen,
+    )?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_product_viewport(rows: u32, columns: u32) -> Result<(), DaemonError> {
+    let size: zterm_core::terminal::TerminalSize = v1::TerminalViewport { rows, columns }
+        .try_into()
+        .map_err(protocol_error)?;
+    let limits = ResourceLimits::default();
+    if size.rows > limits.max_viewport_rows || size.columns > limits.max_viewport_columns {
+        return Err(malformed("terminal viewport exceeds product limits"));
     }
-    .try_into()
-    .map_err(protocol_error)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_scroll_metrics(
+    metrics: Option<&v1::TerminalScrollMetrics>,
+    expected_rows: u32,
+) -> Result<(), DaemonError> {
+    if let Some(metrics) = metrics
+        && (metrics.viewport_rows == 0
+            || metrics.viewport_rows != expected_rows
+            || metrics.viewport_rows > u32::from(ResourceLimits::default().max_viewport_rows)
+            || metrics.epoch > metrics.revision
+            || metrics.offset_from_bottom > metrics.max_offset_from_bottom)
+    {
+        return Err(malformed("terminal scroll metrics are inconsistent"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_live_scroll_metrics(
+    metrics: Option<&v1::TerminalScrollMetrics>,
+    expected_rows: u32,
+    expected_revision: u64,
+    active_screen: i32,
+) -> Result<(), DaemonError> {
+    validate_scroll_metrics(metrics, expected_rows)?;
+    let active_screen = v1::TerminalActiveScreen::try_from(active_screen)
+        .map_err(|_| malformed("terminal update used an unknown active screen"))?;
+    if matches!(active_screen, v1::TerminalActiveScreen::Unspecified) {
+        return Err(malformed(
+            "terminal update used an unspecified active screen",
+        ));
+    }
+    if let Some(metrics) = metrics
+        && (metrics.offset_from_bottom != 0
+            || metrics.revision != expected_revision
+            || metrics.epoch > metrics.revision
+            || active_screen != v1::TerminalActiveScreen::Main)
+    {
+        return Err(malformed("terminal live scroll metrics are inconsistent"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_viewport_frame(
+    frame: &v1::TerminalViewportFrame,
+    expected_rows: u32,
+) -> Result<(), DaemonError> {
+    let outcome = v1::TerminalViewportOutcome::try_from(frame.outcome)
+        .map_err(|_| malformed("terminal viewport outcome is invalid"))?;
+    match outcome {
+        v1::TerminalViewportOutcome::Frame => {
+            let metrics = frame
+                .metrics
+                .as_ref()
+                .ok_or_else(|| malformed("terminal viewport frame omitted metrics"))?;
+            validate_scroll_metrics(Some(metrics), expected_rows)?;
+            let disposition = v1::TerminalViewportDisposition::try_from(frame.disposition)
+                .map_err(|_| malformed("terminal viewport disposition is invalid"))?;
+            if matches!(disposition, v1::TerminalViewportDisposition::Unspecified)
+                || metrics.offset_from_bottom == 0
+                || usize::try_from(metrics.viewport_rows).ok() != Some(frame.rows.len())
+                || metrics.epoch != frame.current_epoch
+                || metrics.revision != frame.current_revision
+            {
+                return Err(malformed("terminal viewport frame is inconsistent"));
+            }
+        }
+        v1::TerminalViewportOutcome::Live => {
+            let metrics = frame
+                .metrics
+                .as_ref()
+                .ok_or_else(|| malformed("terminal live viewport omitted metrics"))?;
+            validate_scroll_metrics(Some(metrics), expected_rows)?;
+            if metrics.offset_from_bottom != 0
+                || !frame.rows.is_empty()
+                || frame.disposition != v1::TerminalViewportDisposition::Unspecified as i32
+                || metrics.epoch != frame.current_epoch
+                || metrics.revision != frame.current_revision
+            {
+                return Err(malformed("terminal live viewport is inconsistent"));
+            }
+        }
+        v1::TerminalViewportOutcome::Changed | v1::TerminalViewportOutcome::Gap => {
+            if frame.metrics.is_some()
+                || !frame.rows.is_empty()
+                || frame.disposition != v1::TerminalViewportDisposition::Unspecified as i32
+                || frame.current_epoch > frame.current_revision
+            {
+                return Err(malformed("terminal viewport reset retained frame content"));
+            }
+        }
+        v1::TerminalViewportOutcome::Unspecified => {
+            return Err(malformed("terminal viewport outcome is invalid"));
+        }
+    }
     Ok(())
 }
 
@@ -2900,6 +3089,101 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn live_scroll_metrics_match_enclosing_snapshot_and_delta_revisions() {
+        let main = v1::TerminalActiveScreen::Main as i32;
+        let metrics = v1::TerminalScrollMetrics {
+            epoch: 3,
+            revision: 7,
+            offset_from_bottom: 0,
+            max_offset_from_bottom: 12,
+            viewport_rows: 24,
+        };
+        assert!(validate_live_scroll_metrics(Some(&metrics), 24, 7, main).is_ok());
+
+        let mut invalid = metrics;
+        invalid.offset_from_bottom = 1;
+        assert_eq!(
+            validate_live_scroll_metrics(Some(&invalid), 24, 7, main)
+                .expect_err("snapshot metrics must describe live bottom")
+                .kind(),
+            DomainErrorKind::MalformedFrame
+        );
+        invalid = metrics;
+        invalid.revision = 8;
+        assert!(validate_live_scroll_metrics(Some(&invalid), 24, 7, main).is_err());
+        invalid = metrics;
+        invalid.epoch = 8;
+        assert!(validate_live_scroll_metrics(Some(&invalid), 24, 7, main).is_err());
+        assert!(
+            validate_live_scroll_metrics(
+                Some(&metrics),
+                24,
+                7,
+                v1::TerminalActiveScreen::Alternate as i32,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_live_scroll_metrics(None, 24, 7, v1::TerminalActiveScreen::Alternate as i32,)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn viewport_frames_bind_to_current_height_product_bounds_and_monotonic_revision() {
+        let mut frame = v1::TerminalViewportFrame {
+            attachment_id: None,
+            outcome: v1::TerminalViewportOutcome::Frame as i32,
+            disposition: v1::TerminalViewportDisposition::Exact as i32,
+            metrics: Some(v1::TerminalScrollMetrics {
+                epoch: 3,
+                revision: 7,
+                offset_from_bottom: 2,
+                max_offset_from_bottom: 12,
+                viewport_rows: 24,
+            }),
+            rows: vec![b"row".to_vec(); 24],
+            current_epoch: 3,
+            current_revision: 7,
+        };
+        assert!(validate_viewport_frame(&frame, 24).is_ok());
+        assert!(validate_viewport_frame(&frame, 23).is_err());
+
+        frame.metrics.as_mut().expect("metrics").viewport_rows = 81;
+        frame.rows.resize(81, b"row".to_vec());
+        assert!(validate_viewport_frame(&frame, 81).is_err());
+
+        frame.outcome = v1::TerminalViewportOutcome::Gap as i32;
+        frame.disposition = v1::TerminalViewportDisposition::Unspecified as i32;
+        frame.metrics = None;
+        frame.rows.clear();
+        frame.current_epoch = 8;
+        frame.current_revision = 7;
+        assert!(validate_viewport_frame(&frame, 24).is_err());
+        frame.current_epoch = 0;
+        frame.current_revision = 0;
+        assert!(validate_viewport_frame(&frame, 24).is_ok());
+    }
+
+    #[tokio::test]
+    async fn local_viewport_client_allows_only_one_outstanding_request() {
+        let (mut client, _peer) = LocalAttachmentClient::terminal_driver_test_pair(
+            ResolvedSessionTarget::local(),
+            SessionId::from_array([0x41; 16]),
+            AttachmentId::from_array([0x42; 16]),
+        );
+        client
+            .request_viewport(TerminalScrollAction::ScrollByLines(3))
+            .await
+            .expect("first semantic viewport request");
+        let error = client
+            .request_viewport(TerminalScrollAction::ScrollByLines(3))
+            .await
+            .expect_err("second request must be bounded until correlation");
+        assert_eq!(error.kind(), DomainErrorKind::ResourceExhausted);
+    }
+
     #[tokio::test]
     async fn completed_handlers_are_reaped_before_subsequent_connection_churn() {
         let temporary = tempfile::tempdir().expect("temporary handler-reap fixture");
@@ -3150,6 +3434,7 @@ mod tests {
                             recent_history_ansi: Vec::new(),
                             active_screen: v1::TerminalActiveScreen::Main as i32,
                             modes: Some(v1::TerminalModes::default()),
+                            scroll_metrics: None,
                         },
                     )
                     .expect("bounded initial snapshot"),
@@ -3653,6 +3938,7 @@ mod tests {
                                     recent_history_ansi: Vec::new(),
                                     active_screen: v1::TerminalActiveScreen::Main as i32,
                                     modes: Some(v1::TerminalModes::default()),
+                                    scroll_metrics: None,
                                 },
                             )
                             .expect("bounded committed create-main snapshot"),
