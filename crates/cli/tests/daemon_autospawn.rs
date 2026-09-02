@@ -162,6 +162,7 @@ fn run_terminal_child_if_requested() -> bool {
 async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
     let first = run(
         &runtime,
+        "initial setup",
         [
             "zterm",
             "setup",
@@ -193,20 +194,25 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
         0o700
     );
 
-    let repeated = run(&runtime, ["zterm", "setup"]).await;
+    let repeated = run(&runtime, "repeated setup", ["zterm", "setup"]).await;
     assert_eq!(first, repeated);
     assert_eq!(
         std::fs::read(state.paths.identity()).expect("stable identity"),
         key
     );
-    let human = run(&runtime, ["zterm", "status"]).await;
+    let human = run(&runtime, "running status", ["zterm", "status"]).await;
     assert!(human.contains("State: running"));
     assert!(human.contains("Network: disabled"));
     assert!(human.contains("Endpoint bound: false"));
     assert!(human.contains("Address publish: disabled"));
     assert!(human.contains("Address lookup: disabled"));
     assert!(human.contains("Paths: direct=0, relay=0"));
-    let json = run(&runtime, ["zterm", "status", "--json"]).await;
+    let json = run(
+        &runtime,
+        "running status JSON",
+        ["zterm", "status", "--json"],
+    )
+    .await;
     let json: serde_json::Value = serde_json::from_str(&json).expect("running JSON");
     assert_eq!(json["state"], "running");
     assert_eq!(json["device_name"], "cli-host");
@@ -222,7 +228,12 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
     assert_eq!(json["direct_path_count"], 0);
     assert_eq!(json["relay_path_count"], 0);
     assert_eq!(json["network_diagnostic"], serde_json::Value::Null);
-    let doctor = run(&runtime, ["zterm", "doctor", "--json"]).await;
+    let doctor = run(
+        &runtime,
+        "running doctor JSON",
+        ["zterm", "doctor", "--json"],
+    )
+    .await;
     let doctor: serde_json::Value = serde_json::from_str(&doctor).expect("running doctor JSON");
     assert_eq!(doctor["healthy"], true);
     let running_network = doctor["checks"]
@@ -239,9 +250,14 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
             .contains("state=disabled")
     );
 
-    run(&runtime, ["zterm", "daemon", "stop"]).await;
+    run(&runtime, "initial daemon stop", ["zterm", "daemon", "stop"]).await;
     wait_for_socket(&state.paths, false).await;
-    let stopped = run(&runtime, ["zterm", "status", "--json"]).await;
+    let stopped = run(
+        &runtime,
+        "stopped status JSON",
+        ["zterm", "status", "--json"],
+    )
+    .await;
     let stopped: serde_json::Value = serde_json::from_str(&stopped).expect("stopped JSON");
     assert_eq!(stopped["state"], "configured_stopped");
     assert_eq!(stopped["network_state"], "stopped");
@@ -249,7 +265,12 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
     assert_eq!(stopped["address_publish_state"], "disabled");
     assert_eq!(stopped["address_lookup_state"], "disabled");
     assert!(!state.paths.socket().exists(), "status does not restart");
-    let doctor = run(&runtime, ["zterm", "doctor", "--json"]).await;
+    let doctor = run(
+        &runtime,
+        "stopped doctor JSON",
+        ["zterm", "doctor", "--json"],
+    )
+    .await;
     let doctor: serde_json::Value = serde_json::from_str(&doctor).expect("stopped doctor JSON");
     assert_eq!(doctor["healthy"], true);
     let stopped_network = doctor["checks"]
@@ -291,7 +312,12 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
     assert_eq!(tail.len(), 1_000);
     assert_eq!(tail.first().map(String::as_str), Some("bounded-tail-100"));
     assert_eq!(tail.last().map(String::as_str), Some("bounded-tail-1099"));
-    let rendered_log = run(&runtime, ["zterm", "logs", "--lines", "1"]).await;
+    let rendered_log = run(
+        &runtime,
+        "bounded log tail",
+        ["zterm", "logs", "--lines", "1"],
+    )
+    .await;
     assert!(rendered_log.ends_with("bounded-tail-1099\n"));
 
     let unconfirmed_reset = execute(
@@ -311,7 +337,7 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
         key
     );
 
-    let restarted = run(&runtime, ["zterm", "daemon", "restart"]).await;
+    let restarted = run(&runtime, "daemon restart", ["zterm", "daemon", "restart"]).await;
     assert!(restarted.contains("Daemon ready"));
     assert!(state.paths.socket().exists(), "restart starts daemon");
     assert_eq!(
@@ -346,7 +372,12 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
         .await
         .expect("connect local main after deferred TTY preflight");
     let main_id = main.session_id();
-    let sessions = run(&runtime, ["zterm", "session", "list", "local", "--json"]).await;
+    let sessions = run(
+        &runtime,
+        "local Session list JSON",
+        ["zterm", "session", "list", "local", "--json"],
+    )
+    .await;
     let sessions: serde_json::Value = serde_json::from_str(&sessions).expect("session JSON");
     assert_eq!(sessions.as_array().expect("session list").len(), 1);
     assert_eq!(sessions[0]["session_id"], main_id.to_string());
@@ -399,6 +430,7 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
     let build_id_text = build_id.to_string();
     let renamed = run(
         &runtime,
+        "local Session rename",
         [
             "zterm",
             "session",
@@ -431,6 +463,7 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
     );
     let closed = run(
         &runtime,
+        "local Session close",
         ["zterm", "session", "close", "local", "review", "--yes"],
     )
     .await;
@@ -450,6 +483,7 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
 
     let reset = run(
         &runtime,
+        "forced identity reset",
         ["zterm", "reset", "--identity", "--yes", "--force"],
     )
     .await;
@@ -462,6 +496,7 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
 
     let retry = run(
         &runtime,
+        "idempotent identity reset",
         ["zterm", "reset", "--identity", "--yes", "--force"],
     )
     .await;
@@ -470,6 +505,7 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
 
     let configured_again = run(
         &runtime,
+        "setup after identity reset",
         [
             "zterm",
             "setup",
@@ -483,7 +519,12 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
     assert!(configured_again.contains("Configured cli-host-reset"));
     let replacement_key = std::fs::read(state.paths.identity()).expect("replacement identity");
     assert_ne!(replacement_key, key, "reset never performs automatic setup");
-    run(&runtime, ["zterm", "daemon", "stop", "--force"]).await;
+    run(
+        &runtime,
+        "final forced daemon stop",
+        ["zterm", "daemon", "stop", "--force"],
+    )
+    .await;
     wait_for_socket(&state.paths, false).await;
 }
 
@@ -501,16 +542,23 @@ async fn cleanup_failed_daemon(
 }
 
 #[cfg(unix)]
-async fn run<const N: usize>(runtime: &LocalRuntime, arguments: [&str; N]) -> String {
-    execute(
+async fn run<const N: usize>(
+    runtime: &LocalRuntime,
+    // Never derive this label from argv: future commands may carry a cwd or
+    // another sensitive value. CliError owns the bounded user-safe detail.
+    operation: &'static str,
+    arguments: [&str; N],
+) -> String {
+    let outcome = execute(
         Cli::try_parse_from(arguments).expect("command parses"),
         runtime,
         InteractionMode::NonInteractive,
     )
     .await
-    .expect("command succeeds")
-    .into_text()
-    .expect("command returns ordinary text")
+    .unwrap_or_else(|error| panic!("{operation} succeeds: {error}"));
+    outcome
+        .into_text()
+        .unwrap_or_else(|error| panic!("{operation} returns ordinary text: {error}"))
 }
 
 #[cfg(unix)]
