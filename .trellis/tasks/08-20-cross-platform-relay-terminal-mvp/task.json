@@ -27,7 +27,8 @@
     "08-22-transport-auth",
     "08-23-remote-cli",
     "08-24-distribution-release",
-    "08-24-e2e-hardening"
+    "08-24-e2e-hardening",
+    "09-02-migrate-alacritty-terminal"
   ],
   "parent": null,
   "relatedFiles": [

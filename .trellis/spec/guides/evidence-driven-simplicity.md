@@ -29,10 +29,17 @@ Validate an invariant once at its owning boundary:
 | Registry image integrity | Registry and container engine |
 | Runtime availability | One post-start service check |
 | User input | The first externally controlled input boundary |
+| PTY output controls and terminal extras | One bounded policy before the host terminal engine |
 
 Repeat a validation only when the second check catches a different failure.
 The review or test description must name that distinct failure; “defense in
 depth” by itself is not sufficient.
+
+A third-party terminal grid may manage its own allocation while the product
+still bounds input-controlled strings, replies, events, and combining extras.
+Do not reconstruct allocator/RSS admission from `size_of` or cache capacity
+unless an approved product rule consumes that estimate. Count/dimension limits
+and hostile-input caps remain useful because they protect different boundaries.
 
 ## Recovery and state
 

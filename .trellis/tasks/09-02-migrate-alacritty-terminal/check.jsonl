@@ -1,0 +1,11 @@
+{"file": ".trellis/spec/backend/terminal-model.md", "reason": "复核Alacritty adapter仍满足revision/state/snapshot/delta/history/effects和PTY-input安全caps，并已删除aggregate/RSS/benchmark旧门。"}
+{"file": ".trellis/spec/backend/terminal-driver.md", "reason": "复核 driver 没有新增 actor/backlog，PTY bytes不丢、replies有序、resize/finalize/failure语义不变。"}
+{"file": ".trellis/spec/backend/pty-lifecycle.md", "reason": "复核 portable-pty 仍是唯一 PTY/process owner，所有 create/wait/interrupt/close 路径恰好释放一次。"}
+{"file": ".trellis/spec/backend/session-service.md", "reason": "复核one-session-one-PTY、8-session数量/尺寸边界、controller takeover、detach/reconnect与owner release，且不存在aggregate memory bookkeeping。"}
+{"file": ".trellis/spec/backend/core-wire-domain.md", "reason": "复核core/proto graph不含engine，CLI无direct engine依赖或type泄漏，wire major和redaction contract未漂移。"}
+{"file": ".trellis/spec/backend/distribution-lifecycle.md", "reason": "复核新Rust dependency进入所有hosted/release gates，且正式artifact没有新增terminal动态库或平台承诺。"}
+{"file": ".trellis/spec/guides/cross-platform-thinking-guide.md", "reason": "复核每个平台声明都有对应证据，Windows与mobile没有从compile isolation被夸大为runtime支持。"}
+{"file": ".trellis/spec/guides/evidence-driven-simplicity.md", "reason": "复核最终只有单一engine、既有model thread和必要policy/encoder，没有fallback、重复state或提前设计未来UI。"}
+{"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/alacritty-terminal-integration.md", "reason": "逐项核对exact pin、upstream behavior、query/security policy、cell-extra caps、projection/history、取消aggregate admission、dependency isolation与明确不测性能。"}
+{"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/herdr-reference-architecture.md", "reason": "复核只吸收可迁移的ownership/projection/backpressure/TERM经验，没有引入Herdr的unsafe wrapper或pane tree。"}
+{"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/rust-vt-and-c-language-evaluation.md", "reason": "复核最终依赖确为官方Rust crate，未重新引入社区wrapper、Ghostty FFI、Zig/C工具链或Zterm-owned unsafe。"}

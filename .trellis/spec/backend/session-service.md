@@ -2,7 +2,7 @@
 
 ## 1. Scope / Trigger
 
-Apply this contract to `zterm-daemon::session`, live-session resource
+Apply this contract to `zterm-daemon::session`, live-session count/dimension
 admission, controller attachments, and daemon shutdown. The service is the
 single transport-independent owner used by same-UID local IPC and the
 authenticated remote adapter.
@@ -34,13 +34,14 @@ SessionAttachment::history_page(direction, cursor, maximum_rows)
 ```
 
 Adapters may call the deadline-bearing `*_until(..., Instant)` variants, but
-they must not duplicate registry, replay, resource, or controller logic.
+they must not duplicate registry, replay, session-reservation, or controller logic.
 
 ## 3. Contracts
 
 - A `SessionService` owns one in-memory ID/name registry per daemon. A session
   owns one login-shell PTY, one `TerminalDriver`, attachment checkpoints, one
-  controller lease, and one fixed-cell resource reservation.
+  controller lease, one `zterm-terminal` authoritative model, and one
+  session-count reservation.
 - M4 keeps the transport-independent service API synchronous, but each live
   session is owned by one dedicated OS-thread `SessionActor` with a fixed
   16-command synchronous mailbox. PTY write/flush, resize, snapshots, model
@@ -73,26 +74,27 @@ they must not duplicate registry, replay, resource, or controller logic.
 - `SessionName` is the only name validator: UTF-8, 1–64 bytes, case-sensitive,
   no surrounding whitespace, and no Unicode control characters.
 - A create first owns one unforgeable in-process token. Under the single lock
-  order `registry state -> resources`, candidate `SessionId` collision checks,
-  ID reservation, resource insertion, and association with the `Starting`
-  name slot are atomic; insertion cannot overwrite another projection. The
+  order `registry state -> session reservations`, candidate `SessionId`
+  collision checks, ID/count reservation, and association with the `Starting`
+  name slot are atomic; insertion cannot overwrite another owner. The
   started actor transfers to `CreationOwner` before ordinary provisional
-  registration can fail. Name, resource, provisional, and live entries carry
+  registration can fail. Name, reservation, provisional, and live entries carry
   the same token and cleanup uses compare-and-remove, so an unrelated owner is
   never released. Rename checks the same name-slot map, so create-vs-rename can
   never publish duplicate names.
 - Cancellation prevents publication but does not remove a `Starting` slot
-  which owns a resource/actor. Publication loss explicitly interrupts, reaps,
+  which owns a reservation/actor. Publication loss explicitly interrupts, reaps,
   drains, and joins the new driver before releasing its token and name. If
   bounded cleanup or registration fails, a provisional/cleanup-only actor stays
   registry-visible and the original name remains unavailable until the actor
   finalizer proves child/thread release. Shutdown enumerates all such owners.
   No registry lock is held while spawning, waiting, finalizing, or writing a
   socket.
-- Admission permits at most eight sessions, 2,000 history rows each, a
-  240-column by 80-row viewport, and 128 MiB summed fixed-cell projection.
-  Missing viewport uses 120 columns by 40 rows. Resize reserves the projection
-  delta before native/model resize and rolls it back on failure.
+- Admission permits at most eight sessions, fixes model history at 2,000 rows,
+  and accepts at most a 240-column by 80-row viewport. Missing viewport uses
+  120 columns by 40 rows. Create reserves only the session identity/count;
+  resize validates dimensions and revision before native/model mutation. No
+  estimated terminal-memory total participates in create or resize.
 - One controller is allowed per session. A normal second attach is occupied.
   Principal kind has no priority: same-UID local cannot implicitly replace a
   remote controller, and remote cannot implicitly replace local. Both must use
@@ -108,7 +110,11 @@ they must not duplicate registry, replay, resource, or controller logic.
   close authority.
 - Every full snapshot must be acknowledged at its exact revision before input
   or resize. A mismatch discards the checkpoint and returns a latest snapshot;
-  input is not queued while synchronization is pending.
+  input is not queued while synchronization is pending. Once that exact
+  acknowledgement is accepted, contiguous live deltas may arrive before an
+  activation barrier or takeover response. Adapters advance the acknowledged
+  revision through that chain while preserving pending-takeover state; a gap
+  requests a fresh authoritative sync and never silently activates it.
 - History is a controller-only, active/main-screen read. The Session actor
   validates attachment/controller ownership, synchronization state, direction,
   cursor epoch/range, and the fixed row bound once, then asks the retained
@@ -119,11 +125,12 @@ they must not duplicate registry, replay, resource, or controller logic.
   replacement snapshot. An adapter must inspect the current lifecycle value
   immediately after subscribing; a transition which happened before
   `subscribe()` is already considered seen by `changed()`.
-- Each attachment checkpoint reconstructs only the current main and alternate
-  visible grids in a zero-scrollback parser. It does not clone host history;
-  checkpoint capacity is fixed at `rows * columns * 2` cells independent of the
-  configured 2,000 history rows. Main/alternate transitions, styles, Unicode,
-  and resize-to-resync remain semantically equivalent to the latest snapshot.
+- Each attachment checkpoint stores one Zterm-owned projection of the latest
+  active viewport. It holds neither Alacritty engine state, inactive-screen
+  state, nor host history; checkpoint capacity is fixed at `rows * columns`
+  cells independent of the configured 2,000 history rows. Main/alternate
+  transitions resynchronize, while styles, Unicode, and resize-to-resync remain
+  semantically equivalent to the latest snapshot.
 - An authenticated remote controller may move exactly one visible checkpoint
   into the Session's bounded resume cell only when its authenticated reader
   reaches clean EOF with no partial frame. The key binds the accepted principal
@@ -139,6 +146,11 @@ they must not duplicate registry, replay, resource, or controller logic.
   notifications race, the terminal lifecycle event wins. The owner finalizes
   PTY/model drain first, and the socket writer emits one last merged update
   before `SessionEnded`, so root-shell tail output is not discarded.
+- An explicit detach racing a writable revision-only delta remains an explicit
+  detach, not transport loss. If the writer first observes the closed peer,
+  the attachment server gives its already-running reader at most the existing
+  operation timeout to classify the queued detach or clean EOF; it adds no
+  unbounded wait and saves no remote resume checkpoint for explicit detach.
 - Create, rename, close, and takeover register through a short global replay
   lookup and then coordinate on one fingerprinted per-operation cell. The
   winner executes outside the replay registry lock; the same ID and semantic
@@ -167,13 +179,13 @@ they must not duplicate registry, replay, resource, or controller logic.
   actor/token; normal operations may still report synchronization failure. A
   panic completes replay/creation waiters truthfully, leaves unfinished
   ownership visible, and makes cleanup retriable; it cannot strand a matching
-  name reservation, resource projection, pending interrupt, worker end state,
+  name/session-count reservation, pending interrupt, worker end state,
   child, or registry entry. `Drop` never joins inline: it first interrupts and
   aborts, exclusively takes any handle, and hands it to a self-join-safe
   background reaper. Actor registry ownership is released only after the
   driver's child/thread completion signal, not merely after reaper admission.
 - Root exit and explicit close may race. Ending is idempotent and registry
-  removal is compare-and-remove against the same actor, so resource release
+  removal is compare-and-remove against the same actor, so reservation release
   occurs once and cannot remove a later session reusing the name.
 - Explicit close uses child control separated from the potentially blocked PTY
   writer. Daemon shutdown requests interruption for every live/provisional
@@ -191,7 +203,7 @@ they must not duplicate registry, replay, resource, or controller logic.
 | --- | --- |
 | invalid/reserved/conflicting name | typed error, no PTY or index mutation |
 | invalid or inaccessible cwd | `invalid_working_directory`, no publication |
-| ninth session, invalid viewport, aggregate projection overflow | `resource_exhausted` |
+| ninth session or invalid viewport | `resource_exhausted`; no PTY/model mutation |
 | normal second controller | `session_occupied` |
 | overlapping first attach after one request owns/pends the controller | `session_occupied`; the registry still contains exactly one `main` |
 | input/resize before exact snapshot acknowledgement | `not_synchronized` |
@@ -206,7 +218,7 @@ they must not duplicate registry, replay, resource, or controller logic.
 
 ## 5. Good / Base / Bad Cases
 
-- **Good:** create owns a name/ID/resource token atomically, publishes only after
+- **Good:** create owns a name/ID/session-count token atomically, publishes only after
   actor startup, and retains that ownership visibly until child and threads are
   proven released.
 - **Base:** detaching the only controller leaves the PTY draining and the
@@ -238,8 +250,8 @@ they must not duplicate registry, replay, resource, or controller logic.
   cover matching-only detach across Sessions, stale-effect rejection,
   idempotence, preservation of local/other-remote attachments, durable restart
   state, and survival of the same Session/PTY.
-- `session_limits` covers the eighth/ninth session, maximum viewport, aggregate
-  projection, and failed-resize rollback.
+- `session_limits` covers the eighth/ninth session, maximum viewport, resize
+  validation without mutation, and the absence of terminal-memory admission.
 - `local_session_ipc` and `terminal_recovery` prove the same service through a
   real peer-authorized Unix socket, including daemon stop and connection-local
   protocol failure.
@@ -247,7 +259,7 @@ they must not duplicate registry, replay, resource, or controller logic.
   same-key join, create/rename reservation, publication-loss cleanup, blocked
   actor deadline isolation, issued-lease retirement/restart/exhaustion,
   panic-safe replay waiters, unwind cleanup, provisional publication ownership,
-  atomic ID/resource collision handling, cleanup-timeout name retention,
+  atomic ID/reservation collision handling, cleanup-timeout name retention,
   poison-aware compare removal, lock-order concurrency, and truthful concurrent
   shutdown/error collection. `local_session_ipc`
   additionally proves takeover continuation after real response loss, a
@@ -295,7 +307,7 @@ actor.try_submit(command)?;               // bounded per-session mailbox
 ```
 
 Creation and cleanup additionally compare one ownership token across the name,
-provisional/live actor, and resource projection before removing anything.
+provisional/live actor, and session-count reservation before removing anything.
 
 Signal-sensitive fixture ordering follows the same ownership rule:
 

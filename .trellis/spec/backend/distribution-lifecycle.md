@@ -136,6 +136,12 @@ workspace version.
   human may push the exact annotated `v` + Cargo-version tag only afterward.
   Formal versions must not contain SemVer build metadata because the same text
   is also an OCI tag and `+` is not legal there.
+- The host-only `zterm-terminal` crate and pinned official
+  `alacritty_terminal` dependency compile in every native release build and in
+  the hosted Windows shared boundary. They are Rust-linked into the product
+  binary and must not add a separately distributed terminal dynamic library.
+  `zterm-core` and `zterm-proto` remain engine-free for remote/mobile clients;
+  this isolation is not a claim of mobile local-PTY support.
 - Containerized native jobs must add only the exact quoted `$GITHUB_WORKSPACE`
   as Git `safe.directory` after checkout and before Git-backed source-policy
   checks. A wildcard or broader trusted path is forbidden. Tool paths must be
@@ -220,6 +226,10 @@ workspace version.
 - `cargo test -p zterm-daemon distribution::tests` asserts valid preparation,
   bad archive rejection before candidate execution, and canonical exact/latest
   selection.
+- Source/dependency policy and hosted native jobs verify the exact official
+  Alacritty pin, license/advisory status, core/proto graph isolation, explicit
+  Windows `zterm-terminal` compilation, and unchanged artifact dynamic-library
+  inventory.
 - Platform executable tests assert installed-file owner/mode/symlink rejection,
   install-directory shape, no-clobber install, retained-backup rollback, and
   exact removal.

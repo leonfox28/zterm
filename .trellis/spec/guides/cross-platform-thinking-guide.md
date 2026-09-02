@@ -54,6 +54,19 @@ hide native-runner failures with `allow` attributes or fake references. A
 cross-compile that stops inside a native dependency is useful diagnostics, but
 only the hosted target runner is acceptance evidence.
 
+For host-only terminal engines, distinguish three separate claims:
+
+- macOS/Linux behavior belongs to native real-PTY tests on each hosted OS;
+- Windows shared-boundary acceptance compiles/tests the engine crate but does
+  not imply that the Unix login-shell runtime exists on Windows;
+- Android/iOS remote-client acceptance is dependency isolation of core/proto,
+  not a claim that the host engine, local PTY, or renderer is supported there.
+
+An outer Ghostty, kitty, Alacritty, or tmux process is another independent ANSI
+consumer. It does not nest or share the daemon's terminal-engine object. Test
+the fixed hosted TERM/COLORTERM profile at the PTY builder boundary rather than
+inferring child capabilities from the developer's outer terminal.
+
 ## Incident: Windows Rust Formatting Failure
 
 - **Root cause categories**: implicit assumption plus test coverage gap. The
