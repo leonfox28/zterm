@@ -94,6 +94,19 @@ observes top-level SGR parameter consumption: ordinary indexed/RGB components
 remain compatible, and leading-zero underline-color forms are contained before
 they can create `CellExtra` state.
 
+## Hosted CI Follow-up
+
+The first PR #2 CI run exposed two platform-policy defects rather than terminal
+semantic failures. The portable job set `CARGO_TERM_COLOR=always`, which added
+ANSI escapes to a byte-exact `cargo tree` comparison. The policy script now
+owns `CARGO_TERM_COLOR=never` and passes when the caller forces `always`. The
+Windows job also compiled two Unix login-shell profile constants without their
+only consumer and rejected the dead code under `-D warnings`; the constants
+now use the exact same Unix/non-Android/non-Redox cfg as the builder and its
+tests, without a warning suppression. Native focused checks pass; the next
+hosted Windows run remains the acceptance owner because the developer host has
+no Windows SDK C headers for `ring`.
+
 ## Verification Record
 
 | Check | Result |

@@ -186,6 +186,7 @@ released when the Session model is dropped.
 | event/title/control/combining cap reached | bounded summary/classification; no payload leak |
 | future/incompatible/inefficient checkpoint | one full `Resync` |
 | active screen alone exceeds requested frame budget | preserve screen, clear history, return `false` |
+| CI forces colored Cargo output | dependency-tree policy overrides color to `never` before byte comparison |
 
 ## 10. Required Evidence
 
@@ -201,6 +202,9 @@ released when the Session model is dropped.
   ordering, resize, detach/reconnect, and lifecycle ownership.
 - Format, Clippy with warnings denied, workspace tests, docs, cargo-deny,
   source policy, and dependency-tree isolation are required.
+- The executable dependency-tree policy owns `CARGO_TERM_COLOR=never` and must
+  produce the same canonical ASCII tree when its caller sets
+  `CARGO_TERM_COLOR=always`; terminal presentation escapes are never graph data.
 
 Do not run or recreate terminal throughput, latency, CPU, RSS, or candidate
 comparison benchmarks for this contract.
@@ -231,3 +235,14 @@ match model.delta_or_resync(&checkpoint) {
 Keep one host-authoritative model, expose only Zterm-owned contracts, bound
 input-controlled state before the engine, and recover clients from latest
 state rather than an output log.
+
+For byte-exact dependency evidence, inheriting presentation settings is also
+wrong:
+
+```sh
+# Wrong: CI can inject ANSI escapes into the captured bytes.
+tree=$(cargo tree --charset ascii)
+
+# Correct: the comparison owner fixes its own presentation contract.
+tree=$(CARGO_TERM_COLOR=never cargo tree --charset ascii)
+```

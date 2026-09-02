@@ -2,6 +2,10 @@
 
 set -eu
 
+# The dependency trees below are compared byte-for-byte. Override callers such
+# as GitHub Actions which force ANSI color through their ambient environment.
+export CARGO_TERM_COLOR=never
+
 reject_host_engine() {
     package=$1
     tree=$(cargo +1.98.0 tree --locked -p "$package" --charset ascii)

@@ -44,6 +44,9 @@ Before changing source attributes or cross-platform workflows:
 - [ ] Run `just check` before push or delivery. It is the authoritative local
       gate, while hosted runners retain evidence for their own checkout bytes.
 - [ ] Let the Linux, macOS, and Windows matrix execute the same policy probe.
+- [ ] When a policy compares command output byte-for-byte, set color and other
+      presentation controls at that command's owning boundary; do not inherit
+      runner-wide formatting such as `CARGO_TERM_COLOR=always`.
 - [ ] Consider adjacent platform assumptions: executable bits, case-sensitive
       paths, path separators, symlinks, and default shells.
 
