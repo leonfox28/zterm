@@ -16,10 +16,13 @@ use std::time::{Duration, Instant};
 
 use iroh::SecretKey;
 use tokio::sync::watch;
+#[cfg(all(unix, test))]
+use zterm_core::terminal::TerminalHistoryWindowAnchor;
 use zterm_core::terminal::{TerminalDelta, TerminalDeltaResult, TerminalSize, TerminalSnapshot};
 #[cfg(unix)]
 use zterm_core::terminal::{
-    TerminalHistoryCursor, TerminalHistoryDirection, TerminalHistoryResult, TerminalScrollAction,
+    TerminalHistoryCursor, TerminalHistoryDirection, TerminalHistoryResult,
+    TerminalHistoryWindowQuery, TerminalHistoryWindowResult, TerminalScrollAction,
     TerminalScrollMetrics, TerminalViewportResult,
 };
 use zterm_core::{
@@ -312,6 +315,23 @@ impl SessionAttachment {
                 meta,
                 attachment_id: self.attachment_id,
                 action,
+                reply,
+            })
+    }
+
+    /// Returns one stateless client-owned history window without changing any
+    /// attachment scroll baseline or live checkpoint.
+    #[cfg(unix)]
+    pub(crate) fn history_window_until(
+        &self,
+        query: TerminalHistoryWindowQuery,
+        deadline: Instant,
+    ) -> Result<TerminalHistoryWindowResult, DaemonError> {
+        self.actor
+            .request(deadline, |meta, reply| SessionCommand::HistoryWindow {
+                meta,
+                attachment_id: self.attachment_id,
+                query,
                 reply,
             })
     }
@@ -2544,6 +2564,13 @@ enum SessionCommand {
         action: TerminalScrollAction,
         reply: SyncSender<Result<TerminalViewportResult, DaemonError>>,
     },
+    #[cfg(unix)]
+    HistoryWindow {
+        meta: CommandMeta,
+        attachment_id: AttachmentId,
+        query: TerminalHistoryWindowQuery,
+        reply: SyncSender<Result<TerminalHistoryWindowResult, DaemonError>>,
+    },
     WriteInput {
         meta: CommandMeta,
         attachment_id: AttachmentId,
@@ -3188,6 +3215,15 @@ fn dispatch_command(
         } => respond(actor, meta, reply, || {
             scroll_viewport(runtime, attachment_id, action)
         }),
+        #[cfg(unix)]
+        SessionCommand::HistoryWindow {
+            meta,
+            attachment_id,
+            query,
+            reply,
+        } => respond(actor, meta, reply, || {
+            history_window(runtime, attachment_id, query)
+        }),
         SessionCommand::WriteInput {
             meta,
             attachment_id,
@@ -3667,6 +3703,22 @@ fn scroll_viewport(
         TerminalViewportResult::HistoryChanged { .. } => attachment.scroll_metrics,
     };
     Ok(result)
+}
+
+#[cfg(unix)]
+fn history_window(
+    runtime: &SessionRuntime,
+    attachment_id: AttachmentId,
+    query: TerminalHistoryWindowQuery,
+) -> Result<TerminalHistoryWindowResult, DaemonError> {
+    require_existing_visual_sync_controller(runtime, attachment_id)?;
+    runtime
+        .attachments
+        .get(&attachment_id)
+        .ok_or_else(lease_lost)?
+        .terminal
+        .history_window(query)
+        .map_err(map_driver_error)
 }
 
 fn write_input(
@@ -4832,6 +4884,29 @@ mod tests {
             initial_history_error.kind(),
             DomainErrorKind::NotSynchronized
         );
+        let initial_metrics = prepared
+            .snapshot
+            .scroll_metrics
+            .expect("main-screen snapshot carries history coordinates");
+        let window_query = TerminalHistoryWindowQuery {
+            anchor: TerminalHistoryWindowAnchor {
+                epoch: initial_metrics.epoch,
+                revision: initial_metrics.revision,
+                max_offset_from_bottom: initial_metrics.max_offset_from_bottom,
+                viewport: prepared.snapshot.size,
+            },
+            target_offset_from_bottom: 0,
+            older_margin_rows: 0,
+            newer_margin_rows: 0,
+        };
+        let initial_window_error = prepared
+            .attachment
+            .history_window_until(window_query, Instant::now() + Duration::from_secs(1))
+            .expect_err("the first snapshot must be acknowledged before window projection");
+        assert_eq!(
+            initial_window_error.kind(),
+            DomainErrorKind::NotSynchronized
+        );
         let initial_input_error = prepared
             .attachment
             .write_input(b"must-not-reach-initial-pty")
@@ -4858,6 +4933,13 @@ mod tests {
                 Instant::now() + Duration::from_secs(1),
             )
             .expect("an existing controller may page history while its snapshot is in flight");
+        assert!(matches!(
+            prepared
+                .attachment
+                .history_window_until(window_query, Instant::now() + Duration::from_secs(1))
+                .expect("a stateless window crosses an existing visual-sync race window"),
+            TerminalHistoryWindowResult::Frame(_)
+        ));
         prepared
             .attachment
             .write_input(b"")

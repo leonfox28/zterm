@@ -51,6 +51,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ".zterm.v1.TerminalInput",
         ".zterm.v1.TerminalHistoryPage",
         ".zterm.v1.TerminalViewportFrame",
+        ".zterm.v1.TerminalHistoryWindowFrame",
     ]);
     config.compile_protos(&schemas, &[proto_root])?;
 

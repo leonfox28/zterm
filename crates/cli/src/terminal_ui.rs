@@ -50,10 +50,12 @@ mod unix {
     use zterm_core::terminal::{
         ALTERNATE_SCREEN_SELECTION_ANSI, ActiveScreen, MAIN_SCREEN_SELECTION_ANSI,
         MAX_HISTORY_PAGE_ROWS, TerminalHistoryCursor, TerminalHistoryDirection,
-        TerminalHistoryPage, TerminalHistoryResult, TerminalModes, TerminalMouseEncoding,
-        TerminalMouseMode, TerminalScrollAction, TerminalScrollMetrics, TerminalSize,
-        TerminalViewportFrame, TerminalViewportResult,
+        TerminalHistoryPage, TerminalHistoryResult, TerminalHistoryWindowAnchor,
+        TerminalHistoryWindowQuery, TerminalHistoryWindowResult, TerminalModes,
+        TerminalMouseEncoding, TerminalMouseMode, TerminalScrollAction, TerminalScrollMetrics,
+        TerminalSize, TerminalViewportDisposition, TerminalViewportFrame, TerminalViewportResult,
     };
+    use zterm_core::viewport_cache::{CachedViewportWindow, ViewportCache, ViewportCacheUpdate};
     use zterm_core::{DomainErrorKind, RESERVED_DEVICE_ALIAS, ResourceLimits, Revision, SessionId};
     use zterm_daemon::error::DaemonError;
     use zterm_daemon::operations::{
@@ -68,7 +70,11 @@ mod unix {
     const STDIN_CHUNK_BYTES: usize = 4 * 1024;
     const CONTROL_PREFIX_TIMEOUT: Duration = Duration::from_secs(1);
     const DETACH_TIMEOUT: Duration = Duration::from_secs(2);
+    const DRAG_REQUEST_INTERVAL: Duration = Duration::from_millis(33);
+    const HOST_SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
+    const HOST_SYNC_END: &[u8] = b"\x1b[?2026l";
     const HOST_INPUT_CAPTURE: &[u8] = b"\x1b[?1003h\x1b[?1006h";
+    const HISTORY_LOADING_NOTICE: &str = "[zterm: loading retained history]";
     const ENTER_TERMINAL_UI: &[u8] = b"\x1b[?1049h\x1b[?25l\x1b[?1003h\x1b[?1006h";
     const RECONNECTING_STATUS: &[u8] = b"\r\n[zterm: reconnecting]\r\n";
     const HOST_SEQUENCE_BOUND: usize = 64;
@@ -78,6 +84,7 @@ mod unix {
     const PASTE_START: &[u8] = b"\x1b[200~";
     const PASTE_END: &[u8] = b"\x1b[201~";
     const RESTORE_TERMINAL_UI: &[u8] = concat!(
+        "\x1b[?2026l",
         "\x1b[?9l",
         "\x1b[?1000l",
         "\x1b[?1001l",
@@ -320,6 +327,13 @@ mod unix {
             }
         };
         let (mut events, writer) = view.split();
+        if let Some(query) = viewport.prefetch_live()
+            && writer.request_history_window(query).await.is_err()
+        {
+            // Live prefetch is opportunistic. Preserve the valid attachment
+            // and let the first real gesture retry or negotiate fallback.
+            viewport.window_cache.defer_pending_request();
+        }
         let mut sync_requested = false;
         let mut input_codec = HostInputCodec::new();
         let mut deferred_active = false;
@@ -502,6 +516,7 @@ mod unix {
                             );
                             viewport.set_layout(layout);
                             let _ = resize_coalescer.observe(layout.child, transport_state);
+                            let history_refill = viewport.refetch_history_window();
                             let rendered = if pinned_history {
                                 renderer
                                     .observe_snapshot((&snapshot).into())
@@ -527,6 +542,11 @@ mod unix {
                             prefix.clear_pending();
                             sync_requested = false;
                             if let Err(error) = writer.snapshot_applied(snapshot.revision()).await {
+                                break Err(error.into());
+                            }
+                            if let Some(query) = history_refill
+                                && let Err(error) = writer.request_history_window(query).await
+                            {
                                 break Err(error.into());
                             }
                         }
@@ -637,6 +657,21 @@ mod unix {
                         }
                         TerminalViewEvent::Viewport(result) => {
                             let effect = viewport.apply_viewport(result)?;
+                            if apply_viewport_effect(
+                                effect,
+                                &viewport,
+                                &writer,
+                                renderer.revision(),
+                                &mut status_renderer,
+                                transport_state,
+                            )
+                            .await?
+                            {
+                                sync_requested = true;
+                            }
+                        }
+                        TerminalViewEvent::HistoryWindow(result) => {
+                            let effect = viewport.apply_history_window(result)?;
                             if apply_viewport_effect(
                                 effect,
                                 &viewport,
@@ -796,7 +831,7 @@ mod unix {
                                             continue;
                                         }
                                         if viewport.is_history() && mouse.is_wheel() {
-                                            let effect = viewport.navigate(mouse.wheel_is_up(), 3);
+                                            let effect = viewport.navigate(mouse.wheel_is_up(), 1);
                                             if apply_viewport_effect(
                                                 effect,
                                                 &viewport,
@@ -835,7 +870,7 @@ mod unix {
                                                     renderer.modes(),
                                                 ) =>
                                             {
-                                                let effect = viewport.navigate(mouse.wheel_is_up(), 3);
+                                                let effect = viewport.navigate(mouse.wheel_is_up(), 1);
                                                 if apply_viewport_effect(
                                                     effect,
                                                     &viewport,
@@ -2152,10 +2187,9 @@ mod unix {
             writer: &mut impl Write,
             transport_state: TerminalViewTransportState,
         ) -> Result<(), CliError> {
-            self.write(writer, transport_state)
-                .and_then(|()| writer.write_all(HOST_INPUT_CAPTURE))
-                .and_then(|()| writer.flush())
-                .map_err(|error| terminal_io("render terminal status", error))
+            present_atomic(writer, "render terminal status", |frame| {
+                self.write(frame, transport_state)
+            })
         }
 
         fn write(
@@ -2171,7 +2205,7 @@ mod unix {
             {
                 bytes.extend_from_slice(b"\x1b7\x1b[");
                 bytes.extend_from_slice(previous.to_string().as_bytes());
-                bytes.extend_from_slice(b";1H\x1b[0m\x1b[2K\x1b8");
+                bytes.extend_from_slice(b";1H\x1b[0m\x1b[K\x1b8");
             }
             if let (Some(row), Some(device)) = (current_row, self.device.as_deref()) {
                 let (path, latency) = if transport_state == TerminalViewTransportState::Active {
@@ -2191,13 +2225,13 @@ mod unix {
                 let (clipped, width) = clip_display_width(&text, self.physical_size.columns);
                 bytes.extend_from_slice(b"\x1b7\x1b[");
                 bytes.extend_from_slice(row.to_string().as_bytes());
-                bytes.extend_from_slice(b";1H\x1b[0;7m\x1b[2K");
+                bytes.extend_from_slice(b";1H\x1b[0;7m");
                 bytes.extend_from_slice(clipped.as_bytes());
                 bytes.extend(std::iter::repeat_n(
                     b' ',
                     usize::from(self.physical_size.columns).saturating_sub(width),
                 ));
-                bytes.extend_from_slice(b"\x1b[0m\x1b8");
+                bytes.extend_from_slice(b"\x1b[K\x1b[0m\x1b8");
             }
             self.previous_row = current_row;
             writer.write_all(&bytes)
@@ -2230,11 +2264,20 @@ mod unix {
         Render,
         Request(HistoryRequest),
         RequestViewport(TerminalScrollAction),
+        RequestHistoryWindow(TerminalHistoryWindowQuery),
+        RenderAndRequestHistoryWindow(TerminalHistoryWindowQuery),
         Resume,
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum HistoryProtocol {
+        Window,
+        Viewport,
+        Pager,
+    }
+
     struct HistoryViewport {
-        semantic: bool,
+        protocol: HistoryProtocol,
         page: Option<TerminalHistoryPage>,
         frame: Option<TerminalViewportFrame>,
         offset: usize,
@@ -2259,8 +2302,13 @@ mod unix {
         live_metrics: Option<TerminalScrollMetrics>,
         gutter_column: Option<u16>,
         drag_grab_row: Option<u16>,
+        drag_last_request: Option<Instant>,
+        drag_deferred_target: Option<u64>,
         stale_gutter_column: Cell<Option<u16>>,
         discard_viewport_response: bool,
+        discard_window_response: bool,
+        window_supported: bool,
+        window_cache: ViewportCache<Vec<u8>>,
     }
 
     type VisibleHistoryRows<'a> = (&'a [Vec<u8>], usize, Option<&'static str>);
@@ -2274,24 +2322,33 @@ mod unix {
                 live_metrics: None,
                 gutter_column: None,
                 drag_grab_row: None,
+                drag_last_request: None,
+                drag_deferred_target: None,
                 stale_gutter_column: Cell::new(None),
                 discard_viewport_response: false,
+                discard_window_response: false,
+                window_supported: true,
+                window_cache: ViewportCache::new(),
             }
         }
 
-        const fn with_layout(
-            layout: ChromeLayout,
-            live_metrics: Option<TerminalScrollMetrics>,
-        ) -> Self {
-            Self {
+        fn with_layout(layout: ChromeLayout, live_metrics: Option<TerminalScrollMetrics>) -> Self {
+            let mut controller = Self {
                 state: ViewportState::Live,
                 content_size: layout.child,
                 live_metrics,
                 gutter_column: layout.gutter_column,
                 drag_grab_row: None,
+                drag_last_request: None,
+                drag_deferred_target: None,
                 stale_gutter_column: Cell::new(None),
                 discard_viewport_response: false,
-            }
+                discard_window_response: false,
+                window_supported: true,
+                window_cache: ViewportCache::new(),
+            };
+            controller.observe_window_anchor(live_metrics);
+            controller
         }
 
         const fn content_size(&self) -> TerminalSize {
@@ -2311,6 +2368,7 @@ mod unix {
         }
 
         fn resize(&mut self, content_size: TerminalSize) {
+            let changed = self.content_size != content_size;
             self.content_size = content_size;
             if let ViewportState::History(history) = &mut self.state
                 && let Some(page) = &history.page
@@ -2320,6 +2378,9 @@ mod unix {
                         .len()
                         .saturating_sub(usize::from(content_size.rows)),
                 );
+            }
+            if changed {
+                self.observe_window_anchor(self.live_metrics);
             }
         }
 
@@ -2331,7 +2392,51 @@ mod unix {
             self.gutter_column = layout.gutter_column;
             if self.gutter_column.is_none() {
                 self.drag_grab_row = None;
+                self.drag_last_request = None;
+                self.drag_deferred_target = None;
             }
+        }
+
+        fn observe_window_anchor(&mut self, metrics: Option<TerminalScrollMetrics>) {
+            let Some(metrics) = metrics.filter(|metrics| metrics.is_valid()) else {
+                return;
+            };
+            let _ = self
+                .window_cache
+                .observe_anchor(TerminalHistoryWindowAnchor {
+                    epoch: metrics.epoch,
+                    revision: metrics.revision,
+                    max_offset_from_bottom: metrics.max_offset_from_bottom,
+                    viewport: self.content_size,
+                });
+        }
+
+        fn prefetch_live(&mut self) -> Option<TerminalHistoryWindowQuery> {
+            if !self.window_supported
+                || !self.is_live()
+                || self
+                    .live_metrics
+                    .is_none_or(|metrics| metrics.max_offset_from_bottom == 0)
+            {
+                return None;
+            }
+            self.window_cache.set_target(0).request
+        }
+
+        fn refetch_history_window(&mut self) -> Option<TerminalHistoryWindowQuery> {
+            let is_window_history = matches!(
+                &self.state,
+                ViewportState::History(history) if history.protocol == HistoryProtocol::Window
+            );
+            if !self.window_supported
+                || !is_window_history
+                || self.window_cache.visible_rows().is_some()
+            {
+                return None;
+            }
+            self.window_cache
+                .set_target(self.window_cache.desired_offset_from_bottom())
+                .request
         }
 
         fn effective_screen(&self, authoritative: ActiveScreen) -> ActiveScreen {
@@ -2352,9 +2457,31 @@ mod unix {
             mouse: &SgrMouse,
             allow_live_navigation: bool,
         ) -> Option<ViewportEffect> {
+            self.handle_gutter_mouse_at(mouse, allow_live_navigation, Instant::now())
+        }
+
+        fn handle_gutter_mouse_at(
+            &mut self,
+            mouse: &SgrMouse,
+            allow_live_navigation: bool,
+            now: Instant,
+        ) -> Option<ViewportEffect> {
             if let Some(grab) = self.drag_grab_row {
                 if mouse.release {
                     self.drag_grab_row = None;
+                    self.drag_last_request = None;
+                    if let Some(target) = self.drag_deferred_target.take() {
+                        self.window_cache.defer_pending_request();
+                        return Some(self.scroll_to_offset(target));
+                    }
+                    if matches!(
+                        &self.state,
+                        ViewportState::History(history)
+                            if history.protocol == HistoryProtocol::Window
+                    ) && self.window_cache.desired_offset_from_bottom() == 0
+                    {
+                        return Some(self.start_resume(Vec::new()));
+                    }
                     return Some(ViewportEffect::None);
                 }
                 if mouse.is_motion() {
@@ -2373,9 +2500,20 @@ mod unix {
                     let row = mouse.row.clamp(1, self.content_size.rows);
                     let target =
                         geometry.offset_for_pointer(row, grab, metrics.max_offset_from_bottom);
-                    return Some(self.scroll_to_offset(target));
+                    if matches!(
+                        &self.state,
+                        ViewportState::History(history)
+                            if history.protocol == HistoryProtocol::Window
+                    ) && target == self.window_cache.desired_offset_from_bottom()
+                    {
+                        return Some(ViewportEffect::None);
+                    }
+                    let effect = self.scroll_to_offset(target);
+                    return Some(self.pace_drag_effect(effect, target, now));
                 }
                 self.drag_grab_row = None;
+                self.drag_last_request = None;
+                self.drag_deferred_target = None;
             }
             if Some(mouse.column) != self.gutter_column || mouse.row > self.content_size.rows {
                 return None;
@@ -2384,13 +2522,18 @@ mod unix {
                 return Some(ViewportEffect::None);
             }
             if mouse.is_wheel() {
-                return Some(self.navigate(mouse.wheel_is_up(), 3));
+                return Some(self.navigate(mouse.wheel_is_up(), 1));
             }
             if mouse.release {
                 self.drag_grab_row = None;
+                self.drag_last_request = None;
+                self.drag_deferred_target = None;
                 return Some(ViewportEffect::None);
             }
-            if matches!(&self.state, ViewportState::History(history) if !history.semantic) {
+            if matches!(
+                &self.state,
+                ViewportState::History(history) if history.protocol == HistoryProtocol::Pager
+            ) {
                 return Some(ViewportEffect::None);
             }
             let Some(metrics) = self.scroll_metrics() else {
@@ -2408,9 +2551,48 @@ mod unix {
                 self.drag_grab_row = Some(grab);
                 let target =
                     geometry.offset_for_pointer(mouse.row, grab, metrics.max_offset_from_bottom);
-                return Some(self.scroll_to_offset(target));
+                let effect = self.scroll_to_offset(target);
+                if matches!(
+                    &effect,
+                    ViewportEffect::RequestHistoryWindow(_)
+                        | ViewportEffect::RenderAndRequestHistoryWindow(_)
+                ) {
+                    self.drag_last_request = Some(now);
+                }
+                return Some(effect);
             }
             Some(ViewportEffect::None)
+        }
+
+        fn pace_drag_effect(
+            &mut self,
+            effect: ViewportEffect,
+            target: u64,
+            now: Instant,
+        ) -> ViewportEffect {
+            let is_window_request = matches!(
+                &effect,
+                ViewportEffect::RequestHistoryWindow(_)
+                    | ViewportEffect::RenderAndRequestHistoryWindow(_)
+            );
+            if !is_window_request {
+                return effect;
+            }
+            if self
+                .drag_last_request
+                .is_some_and(|last| now.saturating_duration_since(last) < DRAG_REQUEST_INTERVAL)
+            {
+                self.window_cache.defer_pending_request();
+                self.drag_deferred_target = Some(target);
+                return if matches!(&effect, ViewportEffect::RenderAndRequestHistoryWindow(_)) {
+                    ViewportEffect::Render
+                } else {
+                    ViewportEffect::None
+                };
+            }
+            self.drag_last_request = Some(now);
+            self.drag_deferred_target = None;
+            effect
         }
 
         fn navigate(&mut self, older: bool, amount: usize) -> ViewportEffect {
@@ -2424,29 +2606,48 @@ mod unix {
                 {
                     return ViewportEffect::None;
                 }
+                if self.window_supported && self.window_cache.anchor().is_some() {
+                    let maximum = self
+                        .window_cache
+                        .anchor()
+                        .map_or(0, |anchor| anchor.max_offset_from_bottom);
+                    let target = u64::try_from(amount).unwrap_or(u64::MAX).min(maximum);
+                    let update = self.window_cache.set_target(target);
+                    self.state = ViewportState::History(HistoryViewport {
+                        protocol: HistoryProtocol::Window,
+                        page: None,
+                        frame: None,
+                        offset: 0,
+                        pending: None,
+                        viewport_pending: false,
+                        queued_scroll: None,
+                        notice: None,
+                    });
+                    return history_window_effect(update);
+                }
                 if self.live_metrics.is_some() {
                     let action = scroll_lines_action(true, amount);
                     self.state = ViewportState::History(HistoryViewport {
-                        semantic: true,
+                        protocol: HistoryProtocol::Viewport,
                         page: None,
                         frame: None,
                         offset: 0,
                         pending: None,
                         viewport_pending: true,
                         queued_scroll: None,
-                        notice: Some("[zterm: loading retained history]"),
+                        notice: Some(HISTORY_LOADING_NOTICE),
                     });
                     return ViewportEffect::RequestViewport(action);
                 }
                 self.state = ViewportState::History(HistoryViewport {
-                    semantic: false,
+                    protocol: HistoryProtocol::Pager,
                     page: None,
                     frame: None,
                     offset: 0,
                     pending: Some(TerminalHistoryDirection::Newest),
                     viewport_pending: false,
                     queued_scroll: None,
-                    notice: Some("[zterm: loading retained history]"),
+                    notice: Some(HISTORY_LOADING_NOTICE),
                 });
                 return ViewportEffect::Request(HistoryRequest {
                     direction: TerminalHistoryDirection::Newest,
@@ -2456,7 +2657,24 @@ mod unix {
             let ViewportState::History(history) = &mut self.state else {
                 return ViewportEffect::None;
             };
-            if history.semantic {
+            if history.protocol == HistoryProtocol::Window {
+                let current = self.window_cache.desired_offset_from_bottom();
+                let amount = u64::try_from(amount).unwrap_or(u64::MAX);
+                let maximum = self
+                    .window_cache
+                    .anchor()
+                    .map_or(current, |anchor| anchor.max_offset_from_bottom);
+                let target = if older {
+                    current.saturating_add(amount).min(maximum)
+                } else {
+                    current.saturating_sub(amount)
+                };
+                if target == 0 {
+                    return self.start_resume(Vec::new());
+                }
+                return history_window_effect(self.window_cache.set_target(target));
+            }
+            if history.protocol == HistoryProtocol::Viewport {
                 let action = scroll_lines_action(older, amount);
                 if history.viewport_pending {
                     history.queued_scroll =
@@ -2471,7 +2689,7 @@ mod unix {
             }
             let Some(page) = &history.page else {
                 if older {
-                    history.notice = Some("[zterm: loading retained history]");
+                    history.notice = Some(HISTORY_LOADING_NOTICE);
                     history.pending = Some(TerminalHistoryDirection::Newest);
                     return ViewportEffect::Request(HistoryRequest {
                         direction: TerminalHistoryDirection::Newest,
@@ -2523,7 +2741,7 @@ mod unix {
                     "terminal history page arrived without a pending history view",
                 ));
             };
-            if history.semantic {
+            if history.protocol != HistoryProtocol::Pager {
                 return Err(terminal_daemon_error(
                     DomainErrorKind::MalformedFrame,
                     "legacy history page arrived for a semantic viewport",
@@ -2582,7 +2800,7 @@ mod unix {
                     "terminal viewport frame arrived without a history view",
                 ));
             };
-            if !history.semantic || !history.viewport_pending {
+            if history.protocol != HistoryProtocol::Viewport || !history.viewport_pending {
                 return Err(terminal_daemon_error(
                     DomainErrorKind::MalformedFrame,
                     "terminal viewport frame arrived without a pending semantic request",
@@ -2602,15 +2820,27 @@ mod unix {
                 }
                 TerminalViewportResult::HistoryChanged { .. } => {
                     history.queued_scroll = None;
-                    history.notice = Some(
-                        "[zterm: retained history changed; press a normal key to return live]",
-                    );
+                    return Ok(ViewportEffect::None);
+                }
+                TerminalViewportResult::HistoryGap { epoch, revision }
+                    if epoch.get() == 0 && revision.get() == 0 =>
+                {
+                    history.protocol = HistoryProtocol::Pager;
+                    history.page = None;
+                    history.frame = None;
+                    history.offset = 0;
+                    history.pending = Some(TerminalHistoryDirection::Newest);
+                    history.viewport_pending = false;
+                    history.queued_scroll = None;
+                    history.notice = Some(HISTORY_LOADING_NOTICE);
+                    return Ok(ViewportEffect::Request(HistoryRequest {
+                        direction: TerminalHistoryDirection::Newest,
+                        cursor: None,
+                    }));
                 }
                 TerminalViewportResult::HistoryGap { .. } => {
                     history.queued_scroll = None;
-                    history.notice = Some(
-                        "[zterm: retained history is no longer available; press a normal key to return live]",
-                    );
+                    return Ok(ViewportEffect::None);
                 }
             }
             if let Some(action) = history.queued_scroll.take() {
@@ -2621,26 +2851,139 @@ mod unix {
             }
         }
 
+        fn apply_history_window(
+            &mut self,
+            result: TerminalHistoryWindowResult,
+        ) -> Result<ViewportEffect, CliError> {
+            if self.discard_window_response {
+                self.discard_window_response = false;
+                return Ok(ViewportEffect::None);
+            }
+            if !self.window_cache.request_pending() {
+                return Err(terminal_daemon_error(
+                    DomainErrorKind::MalformedFrame,
+                    "terminal history window arrived without a pending request",
+                ));
+            }
+            match result {
+                TerminalHistoryWindowResult::Frame(frame) => {
+                    if frame.anchor.viewport != self.content_size {
+                        self.window_cache.defer_pending_request();
+                        let update = self
+                            .window_cache
+                            .set_target(self.window_cache.desired_offset_from_bottom());
+                        return Ok(history_window_effect(update));
+                    }
+                    let rebased = frame.disposition == TerminalViewportDisposition::Rebased;
+                    let installed = self
+                        .window_cache
+                        .install_window(CachedViewportWindow {
+                            disposition: frame.disposition,
+                            anchor: frame.anchor,
+                            target_offset_from_bottom: frame.target_offset_from_bottom,
+                            first_row_from_live_top: frame.first_row_from_live_top,
+                            rows: frame.ansi_rows,
+                        })
+                        .map_err(|_| {
+                            terminal_daemon_error(
+                                DomainErrorKind::MalformedFrame,
+                                "terminal history window failed cache validation",
+                            )
+                        })?;
+                    if installed.render_local {
+                        if self.window_cache.desired_offset_from_bottom() == 0 && self.is_live() {
+                            return Ok(ViewportEffect::None);
+                        }
+                        if let ViewportState::History(history) = &mut self.state
+                            && history.protocol == HistoryProtocol::Window
+                        {
+                            history.notice = rebased.then_some(
+                                "[zterm: retained history changed; showing closest view]",
+                            );
+                        }
+                    }
+                    Ok(match (installed.render_local, installed.request) {
+                        (true, Some(query)) => ViewportEffect::RenderAndRequestHistoryWindow(query),
+                        (true, None) => ViewportEffect::Render,
+                        (false, Some(query)) => ViewportEffect::RequestHistoryWindow(query),
+                        (false, None) => ViewportEffect::None,
+                    })
+                }
+                TerminalHistoryWindowResult::HistoryChanged { epoch, revision }
+                | TerminalHistoryWindowResult::HistoryGap { epoch, revision } => {
+                    self.window_cache.defer_pending_request();
+                    self.window_cache.invalidate_rows();
+                    if epoch.get() == 0 && revision.get() == 0 {
+                        self.window_supported = false;
+                        let target = self.window_cache.desired_offset_from_bottom();
+                        if target == 0 {
+                            return Ok(ViewportEffect::None);
+                        }
+                        self.state = ViewportState::History(HistoryViewport {
+                            protocol: HistoryProtocol::Viewport,
+                            page: None,
+                            frame: None,
+                            offset: 0,
+                            pending: None,
+                            viewport_pending: true,
+                            queued_scroll: None,
+                            notice: None,
+                        });
+                        return Ok(ViewportEffect::RequestViewport(
+                            TerminalScrollAction::ScrollToOffset(target),
+                        ));
+                    }
+                    // A content-free changed/gap response is not a complete
+                    // replacement. Keep the last committed host frame intact;
+                    // the next gesture may retry or normal input may resume.
+                    Ok(ViewportEffect::None)
+                }
+            }
+        }
+
         fn scroll_to_offset(&mut self, offset: u64) -> ViewportEffect {
             let ViewportState::History(history) = &mut self.state else {
                 if self.live_metrics.is_none() || offset == 0 {
                     return ViewportEffect::None;
                 }
+                if self.window_supported && self.window_cache.anchor().is_some() {
+                    let update = self.window_cache.set_target(offset);
+                    self.state = ViewportState::History(HistoryViewport {
+                        protocol: HistoryProtocol::Window,
+                        page: None,
+                        frame: None,
+                        offset: 0,
+                        pending: None,
+                        viewport_pending: false,
+                        queued_scroll: None,
+                        notice: None,
+                    });
+                    return history_window_effect(update);
+                }
                 self.state = ViewportState::History(HistoryViewport {
-                    semantic: true,
+                    protocol: HistoryProtocol::Viewport,
                     page: None,
                     frame: None,
                     offset: 0,
                     pending: None,
                     viewport_pending: true,
                     queued_scroll: None,
-                    notice: Some("[zterm: loading retained history]"),
+                    notice: Some(HISTORY_LOADING_NOTICE),
                 });
                 return ViewportEffect::RequestViewport(TerminalScrollAction::ScrollToOffset(
                     offset,
                 ));
             };
-            if !history.semantic {
+            if history.protocol == HistoryProtocol::Window {
+                if offset == 0 {
+                    if self.drag_grab_row.is_some() {
+                        return history_window_effect(self.window_cache.set_target(0));
+                    }
+                    return self.start_resume(Vec::new());
+                }
+                return history_window_effect(self.window_cache.set_target(offset));
+            }
+            if history.protocol != HistoryProtocol::Viewport {
                 return ViewportEffect::None;
             }
             let action = TerminalScrollAction::ScrollToOffset(offset);
@@ -2656,20 +2999,42 @@ mod unix {
         fn scroll_metrics(&self) -> Option<TerminalScrollMetrics> {
             match &self.state {
                 ViewportState::Live => self.live_metrics,
-                ViewportState::History(history) if history.semantic => history
-                    .frame
-                    .as_ref()
-                    .map(|frame| frame.metrics)
-                    .or(self.live_metrics),
+                ViewportState::History(history)
+                    if history.protocol == HistoryProtocol::Viewport =>
+                {
+                    history
+                        .frame
+                        .as_ref()
+                        .map(|frame| frame.metrics)
+                        .or(self.live_metrics)
+                }
+                ViewportState::History(history) if history.protocol == HistoryProtocol::Window => {
+                    self.window_cache
+                        .anchor()
+                        .map(|anchor| TerminalScrollMetrics {
+                            epoch: anchor.epoch,
+                            revision: anchor.revision,
+                            offset_from_bottom: if self.window_cache.visible_rows().is_some() {
+                                self.window_cache.desired_offset_from_bottom()
+                            } else {
+                                self.window_cache
+                                    .presented_offset_from_bottom()
+                                    .unwrap_or(self.window_cache.desired_offset_from_bottom())
+                            },
+                            max_offset_from_bottom: anchor.max_offset_from_bottom,
+                            viewport_rows: anchor.viewport.rows,
+                        })
+                }
                 ViewportState::History(_) => None,
                 ViewportState::ResumePending { .. } => None,
             }
         }
 
         fn observe_live_metrics(&mut self, metrics: Option<TerminalScrollMetrics>) {
-            if self.is_live() || self.is_resume_pending() {
+            if metrics.is_some() || self.is_live() || self.is_resume_pending() {
                 self.live_metrics = metrics;
             }
+            self.observe_window_anchor(metrics);
         }
 
         fn retain_or_resume(&mut self, bytes: Vec<u8>) -> Result<ViewportEffect, CliError> {
@@ -2701,9 +3066,14 @@ mod unix {
         fn start_resume(&mut self, retained_input: Vec<u8>) -> ViewportEffect {
             self.discard_viewport_response |= matches!(
                 &self.state,
-                ViewportState::History(history) if history.semantic && history.viewport_pending
+                ViewportState::History(history)
+                    if history.protocol == HistoryProtocol::Viewport && history.viewport_pending
             );
+            self.discard_window_response |= self.window_cache.request_pending();
+            self.window_cache.invalidate();
             self.drag_grab_row = None;
+            self.drag_last_request = None;
+            self.drag_deferred_target = None;
             self.state = ViewportState::ResumePending {
                 retained_input,
                 snapshot_applied: false,
@@ -2720,6 +3090,7 @@ mod unix {
 
         fn observe_snapshot(&mut self, metrics: Option<TerminalScrollMetrics>) {
             self.live_metrics = metrics;
+            self.observe_window_anchor(metrics);
             match &mut self.state {
                 ViewportState::Live | ViewportState::History(_) => {}
                 ViewportState::ResumePending {
@@ -2736,8 +3107,13 @@ mod unix {
 
         fn reset_presentation_for_reconnect(&mut self) {
             self.drag_grab_row = None;
+            self.drag_last_request = None;
+            self.drag_deferred_target = None;
             if self.is_history() {
                 let _ = self.start_resume(Vec::new());
+            } else {
+                self.discard_window_response |= self.window_cache.request_pending();
+                self.window_cache.invalidate();
             }
         }
 
@@ -2761,28 +3137,26 @@ mod unix {
             let ViewportState::History(history) = &self.state else {
                 return None;
             };
-            if history.semantic {
-                let rows = history.frame.as_ref().map_or(&[][..], |frame| {
-                    let end = usize::from(self.content_size.rows).min(frame.rows.len());
-                    &frame.rows[..end]
-                });
+            if history.protocol == HistoryProtocol::Window {
+                let rows = self
+                    .window_cache
+                    .visible_rows()
+                    .or_else(|| self.window_cache.presented_rows())?;
                 return Some((rows, usize::from(self.content_size.rows), history.notice));
             }
-            let rows = history.page.as_ref().map_or(&[][..], |page| {
-                let end = history
-                    .offset
-                    .saturating_add(usize::from(self.content_size.rows))
-                    .min(page.rows.len());
-                &page.rows[history.offset.min(end)..end]
-            });
+            if history.protocol == HistoryProtocol::Viewport {
+                let frame = history.frame.as_ref()?;
+                let end = usize::from(self.content_size.rows).min(frame.rows.len());
+                let rows = &frame.rows[..end];
+                return Some((rows, usize::from(self.content_size.rows), history.notice));
+            }
+            let page = history.page.as_ref()?;
+            let end = history
+                .offset
+                .saturating_add(usize::from(self.content_size.rows))
+                .min(page.rows.len());
+            let rows = &page.rows[history.offset.min(end)..end];
             Some((rows, usize::from(self.content_size.rows), history.notice))
-        }
-
-        fn resume_notice(&self) -> Option<(&'static str, usize)> {
-            matches!(self.state, ViewportState::ResumePending { .. }).then_some((
-                "[zterm: returning to the live terminal]",
-                usize::from(self.content_size.rows),
-            ))
         }
     }
 
@@ -2793,6 +3167,15 @@ mod unix {
         } else {
             amount.saturating_neg()
         })
+    }
+
+    fn history_window_effect(update: ViewportCacheUpdate) -> ViewportEffect {
+        match (update.render_local, update.request) {
+            (true, Some(query)) => ViewportEffect::RenderAndRequestHistoryWindow(query),
+            (true, None) => ViewportEffect::Render,
+            (false, Some(query)) => ViewportEffect::RequestHistoryWindow(query),
+            (false, None) => ViewportEffect::None,
+        }
     }
 
     fn coalesce_scroll_action(
@@ -3103,6 +3486,29 @@ mod unix {
         sequence.to_vec()
     }
 
+    fn present_atomic(
+        writer: &mut impl Write,
+        operation: &'static str,
+        build: impl FnOnce(&mut Vec<u8>) -> io::Result<()>,
+    ) -> Result<(), CliError> {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(HOST_SYNC_BEGIN);
+        build(&mut frame).map_err(|error| terminal_io(operation, error))?;
+        frame.extend_from_slice(HOST_INPUT_CAPTURE);
+        frame.extend_from_slice(HOST_SYNC_END);
+        if let Err(error) = writer.write_all(&frame) {
+            // `write_all` may have emitted the synchronized-update opener
+            // before failing. Always make a best-effort attempt to release the
+            // outer terminal before returning the original I/O error.
+            let _ = writer.write_all(HOST_SYNC_END);
+            let _ = writer.flush();
+            return Err(terminal_io(operation, error));
+        }
+        writer
+            .flush()
+            .map_err(|error| terminal_io(operation, error))
+    }
+
     struct TerminalRenderer {
         revision: Option<Revision>,
         active_screen: ActiveScreen,
@@ -3143,20 +3549,15 @@ mod unix {
         ) -> Result<(), CliError>
         where
             Writer: Write,
-            Chrome: FnOnce(&mut Writer) -> io::Result<()>,
+            Chrome: FnOnce(&mut Vec<u8>) -> io::Result<()>,
         {
-            writer
-                .write_all(snapshot.recent_history_ansi)
-                .and_then(|()| {
-                    writer.write_all(snapshot_screen_ansi(
-                        snapshot.screen_ansi,
-                        snapshot.active_screen,
-                    )?)
-                })
-                .and_then(|()| chrome(writer))
-                .and_then(|()| writer.write_all(HOST_INPUT_CAPTURE))
-                .and_then(|()| writer.flush())
+            let screen = snapshot_screen_ansi(snapshot.screen_ansi, snapshot.active_screen)
                 .map_err(|error| terminal_io("render terminal snapshot", error))?;
+            present_atomic(writer, "render terminal snapshot", |frame| {
+                frame.write_all(snapshot.recent_history_ansi)?;
+                frame.write_all(screen)?;
+                chrome(frame)
+            })?;
             self.revision = Some(snapshot.revision);
             self.active_screen = snapshot.active_screen;
             self.modes = snapshot.modes;
@@ -3180,17 +3581,15 @@ mod unix {
         ) -> Result<DeltaRender, CliError>
         where
             Writer: Write,
-            Chrome: FnOnce(&mut Writer) -> io::Result<()>,
+            Chrome: FnOnce(&mut Vec<u8>) -> io::Result<()>,
         {
             let Some(ansi) = self.validate_delta(delta)? else {
                 return Ok(DeltaRender::Gap);
             };
-            writer
-                .write_all(ansi)
-                .and_then(|()| chrome(writer))
-                .and_then(|()| writer.write_all(HOST_INPUT_CAPTURE))
-                .and_then(|()| writer.flush())
-                .map_err(|error| terminal_io("render terminal delta", error))?;
+            present_atomic(writer, "render terminal delta", |frame| {
+                frame.write_all(ansi)?;
+                chrome(frame)
+            })?;
             self.revision = Some(delta.to_revision);
             self.active_screen = delta.active_screen;
             self.modes = delta.modes;
@@ -3333,10 +3732,9 @@ mod unix {
     ) -> Result<(), CliError> {
         let stdout = io::stdout();
         let mut output = stdout.lock();
-        write_chrome(&mut output, viewport, renderer, state)
-            .and_then(|()| output.write_all(HOST_INPUT_CAPTURE))
-            .and_then(|()| output.flush())
-            .map_err(|error| terminal_io("render terminal chrome", error))
+        present_atomic(&mut output, "render terminal chrome", |frame| {
+            write_chrome(frame, viewport, renderer, state)
+        })
     }
 
     fn render_history_stdout(
@@ -3397,10 +3795,9 @@ mod unix {
         writer: &mut impl Write,
         viewport: &ViewportController,
     ) -> Result<(), CliError> {
-        write_scrollbar(writer, viewport)
-            .and_then(|()| writer.write_all(HOST_INPUT_CAPTURE))
-            .and_then(|()| writer.flush())
-            .map_err(|error| terminal_io("render terminal scrollbar", error))
+        present_atomic(writer, "render terminal scrollbar", |frame| {
+            write_scrollbar(frame, viewport)
+        })
     }
 
     fn render_history_with_chrome(
@@ -3409,26 +3806,23 @@ mod unix {
         status: &mut StatusRenderer,
         transport_state: TerminalViewTransportState,
     ) -> Result<(), CliError> {
-        write_history(writer, viewport)
-            .and_then(|()| write_chrome(writer, viewport, status, transport_state))
-            .and_then(|()| writer.write_all(HOST_INPUT_CAPTURE))
-            .and_then(|()| writer.flush())
-            .map_err(|error| terminal_io("render terminal history and chrome", error))
+        present_atomic(writer, "render terminal history and chrome", |frame| {
+            write_history(frame, viewport)?;
+            write_chrome(frame, viewport, status, transport_state)
+        })
     }
 
     fn write_history(writer: &mut impl Write, viewport: &ViewportController) -> io::Result<()> {
-        let (rows, height, notice) =
-            if let Some((rows, height, notice)) = viewport.visible_history_rows() {
-                (rows, height, notice)
-            } else if let Some((notice, height)) = viewport.resume_notice() {
-                (&[][..], height, Some(notice))
-            } else {
-                return Ok(());
-            };
+        let Some((rows, height, notice)) = viewport.visible_history_rows() else {
+            // Request, resize, resume, and content-free gap states keep the
+            // last complete host presentation untouched until its replacement
+            // is ready. Chrome may still be repaired in the same transaction.
+            return Ok(());
+        };
         let top_padding = height.saturating_sub(rows.len());
         writer.write_all(b"\x1b[?25l\x1b[0m")?;
         for terminal_row in 0..height {
-            write!(writer, "\x1b[{};1H\x1b[0m\x1b[2K", terminal_row + 1)?;
+            write!(writer, "\x1b[{};1H\x1b[0m", terminal_row + 1)?;
             if terminal_row == 0
                 && let Some(notice) = notice
             {
@@ -3439,6 +3833,7 @@ mod unix {
                     writer.write_all(row)?;
                 }
             }
+            writer.write_all(b"\x1b[K")?;
         }
         Ok(())
     }
@@ -3470,19 +3865,25 @@ mod unix {
                 Ok(false)
             }
             ViewportEffect::Request(request) => {
-                render_view_stdout(viewport, status, transport_state)?;
                 writer
                     .request_history(request.direction, request.cursor, MAX_HISTORY_PAGE_ROWS)
                     .await?;
                 Ok(false)
             }
             ViewportEffect::RequestViewport(action) => {
-                render_view_stdout(viewport, status, transport_state)?;
                 writer.request_viewport(action).await?;
                 Ok(false)
             }
-            ViewportEffect::Resume => {
+            ViewportEffect::RequestHistoryWindow(query) => {
+                writer.request_history_window(query).await?;
+                Ok(false)
+            }
+            ViewportEffect::RenderAndRequestHistoryWindow(query) => {
                 render_view_stdout(viewport, status, transport_state)?;
+                writer.request_history_window(query).await?;
+                Ok(false)
+            }
+            ViewportEffect::Resume => {
                 writer.request_sync(revision).await?;
                 Ok(true)
             }
@@ -3496,10 +3897,9 @@ mod unix {
         if state != TerminalViewTransportState::Reconnecting {
             return Ok(());
         }
-        writer
-            .write_all(RECONNECTING_STATUS)
-            .and_then(|()| writer.flush())
-            .map_err(|error| terminal_io("render terminal transport state", error))
+        present_atomic(writer, "render terminal transport state", |frame| {
+            frame.write_all(RECONNECTING_STATUS)
+        })
     }
 
     fn snapshot_screen_ansi(ansi: &[u8], active_screen: ActiveScreen) -> io::Result<&[u8]> {
@@ -3767,8 +4167,13 @@ mod unix {
                     live_metrics: None,
                     gutter_column: None,
                     drag_grab_row: None,
+                    drag_last_request: None,
+                    drag_deferred_target: None,
                     stale_gutter_column: Cell::new(None),
                     discard_viewport_response: false,
+                    discard_window_response: false,
+                    window_supported: true,
+                    window_cache: ViewportCache::new(),
                 };
                 if cycle == 0 {
                     let mut codec = HostInputCodec::new();
@@ -3984,8 +4389,10 @@ mod unix {
             assert_eq!(
                 output,
                 [
-                    b"\x1b7\x1b[4;1H\x1b[0;7m\x1b[2K\xe5\xbc\x80\xe5\x8f\x91\xe6\x9c\xba | direct | 42 ms   \x1b[0m\x1b8".as_slice(),
+                    HOST_SYNC_BEGIN,
+                    b"\x1b7\x1b[4;1H\x1b[0;7m\xe5\xbc\x80\xe5\x8f\x91\xe6\x9c\xba | direct | 42 ms   \x1b[K\x1b[0m\x1b8".as_slice(),
                     HOST_INPUT_CAPTURE,
+                    HOST_SYNC_END,
                 ]
                 .concat()
             );
@@ -4019,9 +4426,11 @@ mod unix {
             assert_eq!(
                 narrow_output,
                 [
-                    b"\x1b7\x1b[2;1H\x1b[0;7m\x1b[2K\xe5\xbc\x80\xe5\x8f\x91 \x1b[0m\x1b8"
+                    HOST_SYNC_BEGIN,
+                    b"\x1b7\x1b[2;1H\x1b[0;7m\xe5\xbc\x80\xe5\x8f\x91 \x1b[K\x1b[0m\x1b8"
                         .as_slice(),
                     HOST_INPUT_CAPTURE,
+                    HOST_SYNC_END,
                 ]
                 .concat()
             );
@@ -4157,6 +4566,43 @@ mod unix {
         }
 
         #[test]
+        fn loading_and_resume_pending_never_emit_an_intermediate_content_frame() {
+            let mut viewport = ViewportController::new(TerminalSize::new(2, 20));
+            assert!(matches!(
+                viewport.navigate(true, 1),
+                ViewportEffect::Request(_)
+            ));
+            let mut loading = Vec::new();
+            write_history(&mut loading, &viewport).expect("loading render is a no-op");
+            assert!(loading.is_empty());
+
+            viewport
+                .apply_history(TerminalHistoryResult::Page(TerminalHistoryPage {
+                    cursor: TerminalHistoryCursor {
+                        epoch: Revision::new(1),
+                        revision: Revision::new(2),
+                        start_row: 0,
+                        row_count: 2,
+                        oldest_row: 0,
+                        newest_row: 2,
+                    },
+                    rows: vec![b"old-a".to_vec(), b"old-b".to_vec()],
+                }))
+                .expect("complete legacy page");
+            let mut complete = Vec::new();
+            write_history(&mut complete, &viewport).expect("complete frame renders");
+            assert!(contains_bytes(&complete, b"old-a"));
+
+            assert!(matches!(
+                viewport.start_resume(Vec::new()),
+                ViewportEffect::Resume
+            ));
+            let mut returning = Vec::new();
+            write_history(&mut returning, &viewport).expect("resume-pending render is a no-op");
+            assert!(returning.is_empty());
+        }
+
+        #[test]
         fn semantic_viewport_coalesces_one_pending_request_and_resumes_live_once() {
             let layout = ChromeLayout::new(TerminalSize::new(3, 10), false, ActiveScreen::Main);
             let live = TerminalScrollMetrics {
@@ -4167,6 +4613,7 @@ mod unix {
                 viewport_rows: 3,
             };
             let mut viewport = ViewportController::with_layout(layout, Some(live));
+            viewport.window_supported = false;
             assert!(matches!(
                 viewport.navigate(true, 3),
                 ViewportEffect::RequestViewport(TerminalScrollAction::ScrollByLines(3))
@@ -4219,6 +4666,292 @@ mod unix {
             viewport.observe_snapshot(Some(live));
             assert_eq!(viewport.finish_resume(), Some(Vec::new()));
             assert_eq!(viewport.finish_resume(), None);
+        }
+
+        #[test]
+        fn history_window_coalesces_latest_target_and_moves_locally_by_one_line() {
+            let layout = ChromeLayout::new(TerminalSize::new(3, 10), false, ActiveScreen::Main);
+            let live = TerminalScrollMetrics {
+                epoch: Revision::new(2),
+                revision: Revision::new(7),
+                offset_from_bottom: 0,
+                max_offset_from_bottom: 10,
+                viewport_rows: 3,
+            };
+            let mut viewport = ViewportController::with_layout(layout, Some(live));
+            let ViewportEffect::RequestHistoryWindow(first) = viewport.navigate(true, 1) else {
+                panic!("one host wheel report should request one absolute history line");
+            };
+            assert_eq!(first.target_offset_from_bottom, 1);
+            assert!(matches!(viewport.navigate(true, 2), ViewportEffect::None));
+
+            let rows = (-7_i64..2)
+                .map(|row| row.to_string().into_bytes())
+                .collect::<Vec<_>>();
+            assert!(matches!(
+                viewport
+                    .apply_history_window(TerminalHistoryWindowResult::Frame(
+                        zterm_core::terminal::TerminalHistoryWindowFrame {
+                            disposition: TerminalViewportDisposition::Exact,
+                            anchor: TerminalHistoryWindowAnchor {
+                                epoch: live.epoch,
+                                revision: live.revision,
+                                max_offset_from_bottom: live.max_offset_from_bottom,
+                                viewport: layout.child,
+                            },
+                            target_offset_from_bottom: 1,
+                            first_row_from_live_top: -7,
+                            ansi_rows: rows,
+                        },
+                    ))
+                    .expect("valid coalesced history window"),
+                ViewportEffect::Render
+            ));
+            assert_eq!(
+                viewport.visible_history_rows().map(|visible| visible.0),
+                Some(&[b"-3".to_vec(), b"-2".to_vec(), b"-1".to_vec()][..])
+            );
+            assert!(matches!(viewport.navigate(true, 1), ViewportEffect::Render));
+            assert_eq!(viewport.window_cache.desired_offset_from_bottom(), 4);
+            assert_eq!(
+                viewport.visible_history_rows().map(|visible| visible.0),
+                Some(&[b"-4".to_vec(), b"-3".to_vec(), b"-2".to_vec()][..])
+            );
+        }
+
+        #[test]
+        fn unsupported_history_window_falls_back_to_existing_semantic_viewport() {
+            let layout = ChromeLayout::new(TerminalSize::new(3, 10), false, ActiveScreen::Main);
+            let live = TerminalScrollMetrics {
+                epoch: Revision::new(1),
+                revision: Revision::new(2),
+                offset_from_bottom: 0,
+                max_offset_from_bottom: 6,
+                viewport_rows: 3,
+            };
+            let mut viewport = ViewportController::with_layout(layout, Some(live));
+            assert!(matches!(
+                viewport.navigate(true, 1),
+                ViewportEffect::RequestHistoryWindow(_)
+            ));
+            assert!(matches!(
+                viewport
+                    .apply_history_window(TerminalHistoryWindowResult::HistoryGap {
+                        epoch: Revision::new(0),
+                        revision: Revision::new(0),
+                    })
+                    .expect("capability gap is a negotiated fallback"),
+                ViewportEffect::RequestViewport(TerminalScrollAction::ScrollToOffset(1))
+            ));
+            assert!(!viewport.window_supported);
+            assert!(matches!(
+                viewport
+                    .apply_viewport(TerminalViewportResult::HistoryGap {
+                        epoch: Revision::ZERO,
+                        revision: Revision::ZERO,
+                    })
+                    .expect("missing viewport capability falls back once more"),
+                ViewportEffect::Request(HistoryRequest {
+                    direction: TerminalHistoryDirection::Newest,
+                    cursor: None,
+                })
+            ));
+            assert!(matches!(
+                viewport.state,
+                ViewportState::History(HistoryViewport {
+                    protocol: HistoryProtocol::Pager,
+                    ..
+                })
+            ));
+        }
+
+        #[test]
+        fn transport_loss_gap_keeps_window_capability_and_does_not_repaint_old_content() {
+            let layout = ChromeLayout::new(TerminalSize::new(3, 10), false, ActiveScreen::Main);
+            let live = TerminalScrollMetrics {
+                epoch: Revision::new(2),
+                revision: Revision::new(7),
+                offset_from_bottom: 0,
+                max_offset_from_bottom: 10,
+                viewport_rows: 3,
+            };
+            let mut viewport = ViewportController::with_layout(layout, Some(live));
+            assert!(matches!(
+                viewport.navigate(true, 1),
+                ViewportEffect::RequestHistoryWindow(_)
+            ));
+            viewport
+                .apply_history_window(TerminalHistoryWindowResult::Frame(
+                    zterm_core::terminal::TerminalHistoryWindowFrame {
+                        disposition: TerminalViewportDisposition::Exact,
+                        anchor: TerminalHistoryWindowAnchor {
+                            epoch: live.epoch,
+                            revision: live.revision,
+                            max_offset_from_bottom: live.max_offset_from_bottom,
+                            viewport: layout.child,
+                        },
+                        target_offset_from_bottom: 1,
+                        first_row_from_live_top: -7,
+                        ansi_rows: (-7_i64..2)
+                            .map(|row| row.to_string().into_bytes())
+                            .collect(),
+                    },
+                ))
+                .expect("complete initial window");
+            assert!(matches!(
+                viewport.scroll_to_offset(9),
+                ViewportEffect::RequestHistoryWindow(_)
+            ));
+
+            assert!(matches!(
+                viewport
+                    .apply_history_window(TerminalHistoryWindowResult::HistoryGap {
+                        epoch: Revision::new(2),
+                        revision: Revision::new(7),
+                    })
+                    .expect("correlated stream-loss gap"),
+                ViewportEffect::None
+            ));
+            assert!(viewport.window_supported);
+            assert!(matches!(
+                viewport.state,
+                ViewportState::History(HistoryViewport {
+                    protocol: HistoryProtocol::Window,
+                    ..
+                })
+            ));
+            let mut repaint = Vec::new();
+            write_history(&mut repaint, &viewport).expect("content-free gap render is a no-op");
+            assert!(repaint.is_empty());
+        }
+
+        #[test]
+        fn resized_pinned_window_refetches_only_after_authoritative_anchor_update() {
+            let layout = ChromeLayout::new(TerminalSize::new(3, 10), false, ActiveScreen::Main);
+            let live = TerminalScrollMetrics {
+                epoch: Revision::new(2),
+                revision: Revision::new(7),
+                offset_from_bottom: 0,
+                max_offset_from_bottom: 10,
+                viewport_rows: 3,
+            };
+            let mut viewport = ViewportController::with_layout(layout, Some(live));
+            assert!(matches!(
+                viewport.navigate(true, 1),
+                ViewportEffect::RequestHistoryWindow(_)
+            ));
+            viewport
+                .apply_history_window(TerminalHistoryWindowResult::Frame(
+                    zterm_core::terminal::TerminalHistoryWindowFrame {
+                        disposition: TerminalViewportDisposition::Exact,
+                        anchor: TerminalHistoryWindowAnchor {
+                            epoch: live.epoch,
+                            revision: live.revision,
+                            max_offset_from_bottom: live.max_offset_from_bottom,
+                            viewport: layout.child,
+                        },
+                        target_offset_from_bottom: 1,
+                        first_row_from_live_top: -7,
+                        ansi_rows: vec![b"row".to_vec(); 9],
+                    },
+                ))
+                .expect("complete initial window");
+
+            viewport.resize(TerminalSize::new(4, 10));
+            assert!(viewport.window_cache.visible_rows().is_none());
+            assert!(!viewport.window_cache.request_pending());
+            let resized_live = TerminalScrollMetrics {
+                revision: Revision::new(8),
+                viewport_rows: 4,
+                ..live
+            };
+            viewport.observe_snapshot(Some(resized_live));
+            let refill = viewport
+                .refetch_history_window()
+                .expect("authoritative resized anchor triggers one replacement query");
+            assert_eq!(refill.anchor.viewport, TerminalSize::new(4, 10));
+            assert_eq!(refill.anchor.revision, Revision::new(8));
+            assert_eq!(refill.target_offset_from_bottom, 1);
+        }
+
+        #[test]
+        fn drag_motion_is_paced_but_release_submits_the_final_absolute_target() {
+            let layout = ChromeLayout::new(TerminalSize::new(4, 10), false, ActiveScreen::Main);
+            let live = TerminalScrollMetrics {
+                epoch: Revision::new(1),
+                revision: Revision::new(2),
+                offset_from_bottom: 0,
+                max_offset_from_bottom: 12,
+                viewport_rows: 4,
+            };
+            let mut viewport = ViewportController::with_layout(layout, Some(live));
+            viewport.state = ViewportState::History(HistoryViewport {
+                protocol: HistoryProtocol::Window,
+                page: None,
+                frame: None,
+                offset: 0,
+                pending: None,
+                viewport_pending: false,
+                queued_scroll: None,
+                notice: None,
+            });
+            let now = Instant::now();
+            viewport.drag_grab_row = Some(0);
+            assert!(viewport.window_cache.set_target(4).request.is_some());
+            viewport.window_cache.defer_pending_request();
+            viewport.drag_deferred_target = Some(4);
+            let unchanged_motion = SgrMouse {
+                code: 32,
+                column: 10,
+                row: 3,
+                release: false,
+                raw: b"\x1b[<32;10;3M".to_vec(),
+            };
+            assert!(matches!(
+                viewport.handle_gutter_mouse_at(&unchanged_motion, true, now),
+                Some(ViewportEffect::None)
+            ));
+            assert_eq!(viewport.drag_deferred_target, Some(4));
+
+            viewport.drag_last_request = Some(now);
+            let update = viewport.window_cache.set_target(5);
+            let paced = viewport.pace_drag_effect(
+                history_window_effect(update),
+                5,
+                now + Duration::from_millis(1),
+            );
+            assert!(matches!(paced, ViewportEffect::None));
+            assert!(!viewport.window_cache.request_pending());
+
+            let release = SgrMouse {
+                code: 0,
+                column: 1,
+                row: 1,
+                release: true,
+                raw: b"\x1b[<0;1;1m".to_vec(),
+            };
+            assert!(matches!(
+                viewport.handle_gutter_mouse_at(
+                    &release,
+                    true,
+                    now + Duration::from_millis(2)
+                ),
+                Some(ViewportEffect::RequestHistoryWindow(query))
+                    if query.target_offset_from_bottom == 5
+            ));
+
+            viewport.window_cache.defer_pending_request();
+            viewport.drag_last_request = Some(now);
+            let update = viewport.window_cache.set_target(6);
+            assert!(matches!(
+                viewport.pace_drag_effect(
+                    history_window_effect(update),
+                    6,
+                    now + DRAG_REQUEST_INTERVAL,
+                ),
+                ViewportEffect::RequestHistoryWindow(query)
+                    if query.target_offset_from_bottom == 6
+            ));
         }
 
         #[test]
@@ -4319,6 +5052,7 @@ mod unix {
             assert_eq!(live_viewport.drag_grab_row, None);
 
             let mut semantic = ViewportController::with_layout(layout, Some(live));
+            semantic.window_supported = false;
             assert!(matches!(
                 semantic.navigate(true, 3),
                 ViewportEffect::RequestViewport(_)
@@ -4376,6 +5110,7 @@ mod unix {
                 viewport_rows: 3,
             };
             let mut viewport = ViewportController::with_layout(layout, Some(live));
+            viewport.window_supported = false;
             assert!(matches!(
                 viewport.navigate(true, 3),
                 ViewportEffect::RequestViewport(_)
@@ -4477,7 +5212,7 @@ mod unix {
             render_scrollbar(&mut output, &viewport).expect("render scrollbar transaction");
             assert!(contains_bytes(&output, "▕".as_bytes()));
             assert!(contains_bytes(&output, "▐".as_bytes()));
-            assert!(output.ends_with(HOST_INPUT_CAPTURE));
+            assert!(output.ends_with(&[HOST_INPUT_CAPTURE, HOST_SYNC_END].concat()));
 
             let gutter_press = SgrMouse {
                 code: 0,
@@ -4488,9 +5223,8 @@ mod unix {
             };
             assert!(matches!(
                 viewport.handle_gutter_mouse(&gutter_press, true),
-                Some(ViewportEffect::RequestViewport(
-                    TerminalScrollAction::ScrollToOffset(12)
-                ))
+                Some(ViewportEffect::RequestHistoryWindow(query))
+                    if query.target_offset_from_bottom == 12
             ));
             let child_press = SgrMouse {
                 column: 7,
@@ -4520,9 +5254,8 @@ mod unix {
             };
             assert!(matches!(
                 viewport.handle_gutter_mouse(&press, true),
-                Some(ViewportEffect::RequestViewport(
-                    TerminalScrollAction::ScrollToOffset(12)
-                ))
+                Some(ViewportEffect::RequestHistoryWindow(query))
+                    if query.target_offset_from_bottom == 12
             ));
             assert!(viewport.drag_grab_row.is_some());
 
@@ -4548,7 +5281,7 @@ mod unix {
             };
             assert!(matches!(
                 viewport.handle_gutter_mouse(&outside_release, true),
-                Some(ViewportEffect::None)
+                Some(ViewportEffect::Resume)
             ));
             assert_eq!(viewport.drag_grab_row, None);
             assert!(
@@ -4600,6 +5333,7 @@ mod unix {
                 viewport_rows: 3,
             };
             let mut viewport = ViewportController::with_layout(layout, Some(live));
+            viewport.window_supported = false;
             assert!(matches!(
                 viewport.navigate(true, 3),
                 ViewportEffect::RequestViewport(_)
@@ -4701,7 +5435,13 @@ mod unix {
                 .expect("snapshot");
             assert_eq!(
                 output,
-                [b"historyscreen".as_slice(), HOST_INPUT_CAPTURE].concat()
+                [
+                    HOST_SYNC_BEGIN,
+                    b"historyscreen".as_slice(),
+                    HOST_INPUT_CAPTURE,
+                    HOST_SYNC_END,
+                ]
+                .concat()
             );
 
             assert_eq!(
@@ -4721,7 +5461,13 @@ mod unix {
             );
             assert_eq!(
                 output,
-                [b"historyscreen".as_slice(), HOST_INPUT_CAPTURE].concat()
+                [
+                    HOST_SYNC_BEGIN,
+                    b"historyscreen".as_slice(),
+                    HOST_INPUT_CAPTURE,
+                    HOST_SYNC_END,
+                ]
+                .concat()
             );
 
             assert_eq!(
@@ -4742,10 +5488,14 @@ mod unix {
             assert_eq!(
                 output,
                 [
+                    HOST_SYNC_BEGIN,
                     b"historyscreen".as_slice(),
                     HOST_INPUT_CAPTURE,
+                    HOST_SYNC_END,
+                    HOST_SYNC_BEGIN,
                     b"delta",
                     HOST_INPUT_CAPTURE,
+                    HOST_SYNC_END,
                 ]
                 .concat()
             );
@@ -4791,7 +5541,13 @@ mod unix {
             );
             assert_eq!(
                 output,
-                [child_disable.as_slice(), HOST_INPUT_CAPTURE].concat()
+                [
+                    HOST_SYNC_BEGIN,
+                    child_disable.as_slice(),
+                    HOST_INPUT_CAPTURE,
+                    HOST_SYNC_END,
+                ]
+                .concat()
             );
             assert_eq!(renderer.modes(), TerminalModes::default());
             assert!(history_owns_gestures(
@@ -4826,11 +5582,13 @@ mod unix {
             #[derive(Default)]
             struct RecordingWriter {
                 bytes: Vec<u8>,
+                writes: usize,
                 flushes: usize,
             }
 
             impl Write for RecordingWriter {
                 fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                    self.writes += 1;
                     self.bytes.extend_from_slice(bytes);
                     Ok(bytes.len())
                 }
@@ -4880,7 +5638,8 @@ mod unix {
                     },
                 )
                 .expect("fully flushed snapshot");
-            let mut expected = b"historyscreen".to_vec();
+            let mut expected = HOST_SYNC_BEGIN.to_vec();
+            expected.extend_from_slice(b"historyscreen");
             write_chrome(
                 &mut expected,
                 &viewport,
@@ -4889,7 +5648,9 @@ mod unix {
             )
             .expect("expected snapshot chrome");
             expected.extend_from_slice(HOST_INPUT_CAPTURE);
+            expected.extend_from_slice(HOST_SYNC_END);
             assert_eq!(output.bytes, expected);
+            assert_eq!(output.writes, 1);
             assert_eq!(output.flushes, 1);
             assert_eq!(renderer.revision(), Revision::new(9));
 
@@ -4913,6 +5674,7 @@ mod unix {
                     },
                 )
                 .expect("fully flushed delta");
+            expected.extend_from_slice(HOST_SYNC_BEGIN);
             expected.extend_from_slice(b"delta");
             write_chrome(
                 &mut expected,
@@ -4922,9 +5684,12 @@ mod unix {
             )
             .expect("expected delta chrome");
             expected.extend_from_slice(HOST_INPUT_CAPTURE);
+            expected.extend_from_slice(HOST_SYNC_END);
             assert_eq!(output.bytes, expected);
+            assert_eq!(output.writes, 2);
             assert_eq!(output.flushes, 2);
 
+            viewport.window_supported = false;
             assert!(matches!(
                 viewport.navigate(true, 3),
                 ViewportEffect::RequestViewport(_)
@@ -4946,6 +5711,7 @@ mod unix {
                 TerminalViewTransportState::Active,
             )
             .expect("fully flushed history and chrome");
+            expected.extend_from_slice(HOST_SYNC_BEGIN);
             write_history(&mut expected, &viewport).expect("expected history rows");
             write_chrome(
                 &mut expected,
@@ -4955,8 +5721,51 @@ mod unix {
             )
             .expect("expected history chrome");
             expected.extend_from_slice(HOST_INPUT_CAPTURE);
+            expected.extend_from_slice(HOST_SYNC_END);
             assert_eq!(output.bytes, expected);
+            assert_eq!(output.writes, 3);
             assert_eq!(output.flushes, 3);
+        }
+
+        #[test]
+        fn partial_atomic_write_best_effort_closes_synchronized_presentation() {
+            #[derive(Default)]
+            struct PartialWriter {
+                bytes: Vec<u8>,
+                writes: usize,
+                flushes: usize,
+            }
+
+            impl Write for PartialWriter {
+                fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                    self.writes += 1;
+                    if self.writes == 2 {
+                        return Err(io::Error::other("injected partial write failure"));
+                    }
+                    let count = if self.writes == 1 {
+                        bytes.len().min(4)
+                    } else {
+                        bytes.len()
+                    };
+                    self.bytes.extend_from_slice(&bytes[..count]);
+                    Ok(count)
+                }
+
+                fn flush(&mut self) -> io::Result<()> {
+                    self.flushes += 1;
+                    Ok(())
+                }
+            }
+
+            let mut writer = PartialWriter::default();
+            present_atomic(&mut writer, "test atomic presentation", |frame| {
+                frame.write_all(b"replacement")
+            })
+            .expect_err("the injected partial write remains visible to the caller");
+
+            assert!(writer.bytes.ends_with(HOST_SYNC_END));
+            assert_eq!(writer.writes, 3);
+            assert_eq!(writer.flushes, 1);
         }
 
         #[test]
@@ -4986,7 +5795,16 @@ mod unix {
                 .expect("reconnecting status");
             render_transport_state(&mut output, TerminalViewTransportState::Active)
                 .expect("active is silent");
-            assert_eq!(output.bytes, RECONNECTING_STATUS);
+            assert_eq!(
+                output.bytes,
+                [
+                    HOST_SYNC_BEGIN,
+                    RECONNECTING_STATUS,
+                    HOST_INPUT_CAPTURE,
+                    HOST_SYNC_END,
+                ]
+                .concat()
+            );
             assert_eq!(output.flushes, 1);
         }
 

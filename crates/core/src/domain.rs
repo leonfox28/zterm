@@ -507,6 +507,8 @@ impl Capabilities {
     pub const AGENT_EVENTS: u64 = 1 << 18;
     /// Attachment-local continuous terminal scroll viewports.
     pub const TERMINAL_VIEWPORT: u64 = 1 << 19;
+    /// Stateless bounded terminal history windows for client-owned viewports.
+    pub const TERMINAL_HISTORY_WINDOW: u64 = 1 << 20;
 
     /// Constructs a capability set while retaining unknown bits.
     #[must_use]
@@ -934,6 +936,7 @@ mod tests {
         assert_eq!(Capabilities::HISTORY_PAGING, 1_u64 << 17);
         assert_eq!(Capabilities::AGENT_EVENTS, 1_u64 << 18);
         assert_eq!(Capabilities::TERMINAL_VIEWPORT, 1_u64 << 19);
+        assert_eq!(Capabilities::TERMINAL_HISTORY_WINDOW, 1_u64 << 20);
 
         let limits = ResourceLimits::default();
         assert_eq!(limits.max_live_sessions, 8);

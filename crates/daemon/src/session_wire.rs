@@ -22,7 +22,8 @@ use tokio::sync::{mpsc, oneshot};
 use zeroize::Zeroizing;
 #[cfg(unix)]
 use zterm_core::terminal::{
-    MAX_HISTORY_PAGE_ROWS, TerminalHistoryCursor, TerminalHistoryDirection, TerminalScrollAction,
+    MAX_HISTORY_PAGE_ROWS, TerminalHistoryCursor, TerminalHistoryDirection,
+    TerminalHistoryWindowAnchor, TerminalHistoryWindowQuery, TerminalScrollAction, TerminalSize,
 };
 #[cfg(unix)]
 use zterm_core::{
@@ -1258,6 +1259,39 @@ async fn process_attachment_frame(
             .await?;
             Ok(false)
         }
+        WireKind::TerminalHistoryWindowRequest => {
+            let request: v1::TerminalHistoryWindowRequest = frame
+                .decode_message(WireKind::TerminalHistoryWindowRequest)
+                .map_err(protocol_error)?;
+            let query = terminal_history_window_query(&request)?;
+            require_attachment_id(request.attachment_id, attachment)?;
+            let attachment_worker = Arc::clone(attachment);
+            let result = request_context
+                .run_effect(&server.sessions, deadline, move |_sessions, _principal| {
+                    attachment_worker.history_window_until(query, deadline)
+                })
+                .await?;
+            let message = zterm_proto::terminal_history_window_frame_message(
+                attachment.attachment_id(),
+                result,
+            );
+            send_attachment_outbound_until(
+                outbound,
+                AttachmentOutbound::queued(
+                    encode_message(
+                        WireKind::TerminalHistoryWindowFrame,
+                        frame.request_id,
+                        0,
+                        &message,
+                    )
+                    .map_err(protocol_error)?,
+                    deadline,
+                ),
+                deadline,
+            )
+            .await?;
+            Ok(false)
+        }
         WireKind::TerminalInput => {
             let request: v1::TerminalInput = frame
                 .decode_message(WireKind::TerminalInput)
@@ -1863,6 +1897,47 @@ fn terminal_scroll_action(
         }
         None => Err(malformed("terminal viewport action is missing")),
     }
+}
+
+#[cfg(unix)]
+fn terminal_history_window_query(
+    request: &v1::TerminalHistoryWindowRequest,
+) -> Result<TerminalHistoryWindowQuery, DaemonError> {
+    let anchor = request
+        .anchor
+        .as_ref()
+        .ok_or_else(|| malformed("terminal history window omitted anchor"))?;
+    let rows = u16::try_from(anchor.viewport_rows)
+        .ok()
+        .filter(|rows| *rows > 0)
+        .ok_or_else(|| malformed("terminal history window rows are invalid"))?;
+    let columns = u16::try_from(anchor.viewport_columns)
+        .ok()
+        .filter(|columns| *columns > 0)
+        .ok_or_else(|| malformed("terminal history window columns are invalid"))?;
+    let limits = ResourceLimits::default();
+    if rows > limits.max_viewport_rows || columns > limits.max_viewport_columns {
+        return Err(malformed(
+            "terminal history window viewport exceeds product limits",
+        ));
+    }
+    let query = TerminalHistoryWindowQuery {
+        anchor: TerminalHistoryWindowAnchor {
+            epoch: Revision::new(anchor.epoch),
+            revision: Revision::new(anchor.revision),
+            max_offset_from_bottom: anchor.max_offset_from_bottom,
+            viewport: TerminalSize::new(rows, columns),
+        },
+        target_offset_from_bottom: request.target_offset_from_bottom,
+        older_margin_rows: u16::try_from(request.older_margin_rows)
+            .map_err(|_| malformed("terminal history window older margin is invalid"))?,
+        newer_margin_rows: u16::try_from(request.newer_margin_rows)
+            .map_err(|_| malformed("terminal history window newer margin is invalid"))?,
+    };
+    query
+        .is_valid()
+        .then_some(query)
+        .ok_or_else(|| malformed("terminal history window query is invalid"))
 }
 
 #[cfg(unix)]
@@ -3824,6 +3899,30 @@ mod tests {
             .expect("cleanup EOF server task")
             .expect("cleanup EOF succeeds");
         sessions.shutdown().expect("checkpoint fixture shuts down");
+    }
+
+    #[test]
+    fn history_window_query_enforces_product_viewport_limits_at_dispatch() {
+        let mut request = v1::TerminalHistoryWindowRequest {
+            attachment_id: None,
+            anchor: Some(v1::TerminalHistoryWindowAnchor {
+                epoch: 1,
+                revision: 1,
+                max_offset_from_bottom: 10,
+                viewport_rows: 4,
+                viewport_columns: 20,
+            }),
+            target_offset_from_bottom: 2,
+            older_margin_rows: 4,
+            newer_margin_rows: 4,
+        };
+        assert!(terminal_history_window_query(&request).is_ok());
+        request
+            .anchor
+            .as_mut()
+            .expect("history-window anchor")
+            .viewport_rows = u32::from(ResourceLimits::default().max_viewport_rows) + 1;
+        assert!(terminal_history_window_query(&request).is_err());
     }
 
     #[tokio::test]

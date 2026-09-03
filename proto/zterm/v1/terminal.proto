@@ -205,6 +205,41 @@ message TerminalViewportFrame {
   uint64 current_revision = 7;
 }
 
+message TerminalHistoryWindowAnchor {
+  uint64 epoch = 1;
+  uint64 revision = 2;
+  uint64 max_offset_from_bottom = 3;
+  uint32 viewport_rows = 4;
+  uint32 viewport_columns = 5;
+}
+
+message TerminalHistoryWindowRequest {
+  AttachmentId attachment_id = 1;
+  TerminalHistoryWindowAnchor anchor = 2;
+  uint64 target_offset_from_bottom = 3;
+  uint32 older_margin_rows = 4;
+  uint32 newer_margin_rows = 5;
+}
+
+enum TerminalHistoryWindowOutcome {
+  TERMINAL_HISTORY_WINDOW_OUTCOME_UNSPECIFIED = 0;
+  TERMINAL_HISTORY_WINDOW_OUTCOME_FRAME = 1;
+  TERMINAL_HISTORY_WINDOW_OUTCOME_CHANGED = 2;
+  TERMINAL_HISTORY_WINDOW_OUTCOME_GAP = 3;
+}
+
+message TerminalHistoryWindowFrame {
+  AttachmentId attachment_id = 1;
+  TerminalHistoryWindowOutcome outcome = 2;
+  TerminalViewportDisposition disposition = 3;
+  TerminalHistoryWindowAnchor anchor = 4;
+  uint64 target_offset_from_bottom = 5;
+  sint64 first_row_from_live_top = 6;
+  repeated bytes ansi_rows = 7;
+  uint64 current_epoch = 8;
+  uint64 current_revision = 9;
+}
+
 enum TerminalConnectionPath {
   TERMINAL_CONNECTION_PATH_UNSPECIFIED = 0;
   TERMINAL_CONNECTION_PATH_UNKNOWN = 1;

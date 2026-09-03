@@ -8,6 +8,7 @@ use prost::Message;
 use zeroize::{Zeroize, Zeroizing};
 use zterm_core::terminal::{
     ActiveScreen, TerminalDelta, TerminalHistoryCursor, TerminalHistoryPage, TerminalHistoryResult,
+    TerminalHistoryWindowAnchor, TerminalHistoryWindowFrame, TerminalHistoryWindowResult,
     TerminalModes, TerminalMouseEncoding, TerminalMouseMode, TerminalScrollMetrics, TerminalSize,
     TerminalSnapshot, TerminalViewportDisposition, TerminalViewportFrame, TerminalViewportResult,
 };
@@ -66,6 +67,27 @@ impl fmt::Debug for v1::TerminalViewportFrame {
             .field("metrics", &self.metrics)
             .field("row_count", &self.rows.len())
             .field("ansi_bytes", &self.rows.iter().map(Vec::len).sum::<usize>())
+            .field("current_epoch", &self.current_epoch)
+            .field("current_revision", &self.current_revision)
+            .finish()
+    }
+}
+
+impl fmt::Debug for v1::TerminalHistoryWindowFrame {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalHistoryWindowFrame")
+            .field("attachment_id_present", &self.attachment_id.is_some())
+            .field("outcome", &self.outcome)
+            .field("disposition", &self.disposition)
+            .field("anchor", &self.anchor)
+            .field("target_offset_from_bottom", &self.target_offset_from_bottom)
+            .field("first_row_from_live_top", &self.first_row_from_live_top)
+            .field("row_count", &self.ansi_rows.len())
+            .field(
+                "ansi_bytes",
+                &self.ansi_rows.iter().map(Vec::len).sum::<usize>(),
+            )
             .field("current_epoch", &self.current_epoch)
             .field("current_revision", &self.current_revision)
             .finish()
@@ -450,6 +472,10 @@ pub enum WireKind {
     TerminalViewportRequest = 315,
     /// Returns one complete attachment-local viewport outcome.
     TerminalViewportFrame = 316,
+    /// Requests one stateless bounded contiguous history window.
+    TerminalHistoryWindowRequest = 317,
+    /// Returns one correlated history-window outcome.
+    TerminalHistoryWindowFrame = 318,
 }
 
 impl WireKind {
@@ -462,6 +488,7 @@ impl WireKind {
                 | Self::TerminalDelta
                 | Self::TerminalHistoryPage
                 | Self::TerminalViewportFrame
+                | Self::TerminalHistoryWindowFrame
         )
     }
 
@@ -551,6 +578,8 @@ impl TryFrom<u32> for WireKind {
             314 => Self::TerminalConnectionStatusEvent,
             315 => Self::TerminalViewportRequest,
             316 => Self::TerminalViewportFrame,
+            317 => Self::TerminalHistoryWindowRequest,
+            318 => Self::TerminalHistoryWindowFrame,
             unknown => return Err(ProtocolError::UnknownKind(unknown)),
         };
         Ok(kind)
@@ -1088,6 +1117,18 @@ impl From<TerminalScrollMetrics> for v1::TerminalScrollMetrics {
     }
 }
 
+impl From<TerminalHistoryWindowAnchor> for v1::TerminalHistoryWindowAnchor {
+    fn from(value: TerminalHistoryWindowAnchor) -> Self {
+        Self {
+            epoch: value.epoch.get(),
+            revision: value.revision.get(),
+            max_offset_from_bottom: value.max_offset_from_bottom,
+            viewport_rows: u32::from(value.viewport.rows),
+            viewport_columns: u32::from(value.viewport.columns),
+        }
+    }
+}
+
 /// Projects one bounded history result into a content-redacted wire message.
 #[must_use]
 pub fn terminal_history_page_message(
@@ -1176,6 +1217,64 @@ pub fn terminal_viewport_frame_message(
             current_epoch: epoch.get(),
             current_revision: revision.get(),
         },
+    }
+}
+
+/// Projects one stateless history-window result into a content-redacted wire message.
+#[must_use]
+pub fn terminal_history_window_frame_message(
+    attachment_id: AttachmentId,
+    result: TerminalHistoryWindowResult,
+) -> v1::TerminalHistoryWindowFrame {
+    match result {
+        TerminalHistoryWindowResult::Frame(TerminalHistoryWindowFrame {
+            disposition,
+            anchor,
+            target_offset_from_bottom,
+            first_row_from_live_top,
+            ansi_rows,
+        }) => v1::TerminalHistoryWindowFrame {
+            attachment_id: Some(attachment_id.into()),
+            outcome: v1::TerminalHistoryWindowOutcome::Frame as i32,
+            disposition: match disposition {
+                TerminalViewportDisposition::Exact => v1::TerminalViewportDisposition::Exact as i32,
+                TerminalViewportDisposition::Rebased => {
+                    v1::TerminalViewportDisposition::Rebased as i32
+                }
+            },
+            anchor: Some(anchor.into()),
+            target_offset_from_bottom,
+            first_row_from_live_top,
+            ansi_rows,
+            current_epoch: anchor.epoch.get(),
+            current_revision: anchor.revision.get(),
+        },
+        TerminalHistoryWindowResult::HistoryChanged { epoch, revision } => {
+            v1::TerminalHistoryWindowFrame {
+                attachment_id: Some(attachment_id.into()),
+                outcome: v1::TerminalHistoryWindowOutcome::Changed as i32,
+                disposition: v1::TerminalViewportDisposition::Unspecified as i32,
+                anchor: None,
+                target_offset_from_bottom: 0,
+                first_row_from_live_top: 0,
+                ansi_rows: Vec::new(),
+                current_epoch: epoch.get(),
+                current_revision: revision.get(),
+            }
+        }
+        TerminalHistoryWindowResult::HistoryGap { epoch, revision } => {
+            v1::TerminalHistoryWindowFrame {
+                attachment_id: Some(attachment_id.into()),
+                outcome: v1::TerminalHistoryWindowOutcome::Gap as i32,
+                disposition: v1::TerminalViewportDisposition::Unspecified as i32,
+                anchor: None,
+                target_offset_from_bottom: 0,
+                first_row_from_live_top: 0,
+                ansi_rows: Vec::new(),
+                current_epoch: epoch.get(),
+                current_revision: revision.get(),
+            }
+        }
     }
 }
 
@@ -2283,6 +2382,14 @@ mod tests {
                 WireKind::TerminalViewportFrame,
                 v1::MessageKind::TerminalViewportFrame as u32,
             ),
+            (
+                WireKind::TerminalHistoryWindowRequest,
+                v1::MessageKind::TerminalHistoryWindowRequest as u32,
+            ),
+            (
+                WireKind::TerminalHistoryWindowFrame,
+                v1::MessageKind::TerminalHistoryWindowFrame as u32,
+            ),
         ];
 
         for (kind, proto_number) in kinds {
@@ -2458,7 +2565,7 @@ mod tests {
         assert_message_round_trip(
             WireKind::TerminalViewportFrame,
             v1::TerminalViewportFrame {
-                attachment_id,
+                attachment_id: attachment_id.clone(),
                 outcome: v1::TerminalViewportOutcome::Frame as i32,
                 disposition: v1::TerminalViewportDisposition::Exact as i32,
                 metrics: Some(v1::TerminalScrollMetrics {
@@ -2469,6 +2576,42 @@ mod tests {
                     viewport_rows: 2,
                 }),
                 rows: vec![b"older".to_vec(), b"newer".to_vec()],
+                current_epoch: 3,
+                current_revision: 17,
+            },
+        );
+        let window_anchor = v1::TerminalHistoryWindowAnchor {
+            epoch: 3,
+            revision: 17,
+            max_offset_from_bottom: 9,
+            viewport_rows: 2,
+            viewport_columns: 80,
+        };
+        assert_message_round_trip(
+            WireKind::TerminalHistoryWindowRequest,
+            v1::TerminalHistoryWindowRequest {
+                attachment_id: attachment_id.clone(),
+                anchor: Some(window_anchor),
+                target_offset_from_bottom: 3,
+                older_margin_rows: 2,
+                newer_margin_rows: 2,
+            },
+        );
+        assert_message_round_trip(
+            WireKind::TerminalHistoryWindowFrame,
+            v1::TerminalHistoryWindowFrame {
+                attachment_id,
+                outcome: v1::TerminalHistoryWindowOutcome::Frame as i32,
+                disposition: v1::TerminalViewportDisposition::Exact as i32,
+                anchor: Some(window_anchor),
+                target_offset_from_bottom: 3,
+                first_row_from_live_top: -5,
+                ansi_rows: vec![
+                    b"oldest".to_vec(),
+                    b"older".to_vec(),
+                    b"visible".to_vec(),
+                    b"newer".to_vec(),
+                ],
                 current_epoch: 3,
                 current_revision: 17,
             },
@@ -2505,6 +2648,8 @@ mod tests {
         assert!(!WireKind::TerminalHistoryPage.is_control());
         assert!(WireKind::TerminalViewportRequest.is_control());
         assert!(!WireKind::TerminalViewportFrame.is_control());
+        assert!(WireKind::TerminalHistoryWindowRequest.is_control());
+        assert!(!WireKind::TerminalHistoryWindowFrame.is_control());
         assert!(WireKind::TerminalConnectionStatusEvent.is_control());
 
         let content = vec![0_u8; MAX_CONTROL_PAYLOAD_BYTES + 1];
@@ -2540,6 +2685,25 @@ mod tests {
             encode_payload(WireKind::TerminalViewportRequest, 9, 0, viewport_content),
             Err(ProtocolError::ControlPayloadTooLarge(_))
         ));
+        let window_content = vec![0_u8; MAX_CONTROL_PAYLOAD_BYTES + 1];
+        assert!(
+            encode_payload(
+                WireKind::TerminalHistoryWindowFrame,
+                10,
+                0,
+                window_content.clone(),
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            encode_payload(
+                WireKind::TerminalHistoryWindowRequest,
+                10,
+                0,
+                window_content,
+            ),
+            Err(ProtocolError::ControlPayloadTooLarge(_))
+        ));
 
         let malformed = encode_payload(WireKind::TerminalHistoryPage, 8, 0, vec![0x80])
             .expect("malformed concrete protobuf still has a valid outer frame");
@@ -2573,6 +2737,31 @@ mod tests {
         assert!(!debug.contains(std::str::from_utf8(SENTINEL).expect("ASCII sentinel")));
         assert!(debug.contains("row_count: 1"));
         assert!(debug.contains(&format!("ansi_bytes: {}", SENTINEL.len())));
+
+        const WINDOW_SENTINEL: &[u8] = b"WINDOW_ROW_SENTINEL_742f";
+        let window = v1::TerminalHistoryWindowFrame {
+            attachment_id: Some(AttachmentId::from_array([0x47; 16]).into()),
+            outcome: v1::TerminalHistoryWindowOutcome::Frame as i32,
+            disposition: v1::TerminalViewportDisposition::Exact as i32,
+            anchor: Some(v1::TerminalHistoryWindowAnchor {
+                epoch: 1,
+                revision: 2,
+                max_offset_from_bottom: 1,
+                viewport_rows: 1,
+                viewport_columns: 8,
+            }),
+            target_offset_from_bottom: 1,
+            first_row_from_live_top: -1,
+            ansi_rows: vec![WINDOW_SENTINEL.to_vec()],
+            current_epoch: 1,
+            current_revision: 2,
+        };
+        let debug = format!("{window:?}");
+        assert!(
+            !debug.contains(std::str::from_utf8(WINDOW_SENTINEL).expect("ASCII window sentinel"))
+        );
+        assert!(debug.contains("row_count: 1"));
+        assert!(debug.contains(&format!("ansi_bytes: {}", WINDOW_SENTINEL.len())));
 
         const VIEWPORT_SENTINEL: &[u8] = b"VIEWPORT_ROW_SENTINEL_5b2e";
         let viewport = v1::TerminalViewportFrame {

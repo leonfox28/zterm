@@ -5,9 +5,11 @@ use alacritty_terminal::index::Line;
 use zterm_core::Revision;
 use zterm_core::terminal::{
     ActiveScreen, MAX_HISTORY_PAGE_ROWS, TerminalDelta, TerminalDeltaResult, TerminalHistoryCursor,
-    TerminalHistoryDirection, TerminalHistoryPage, TerminalHistoryResult, TerminalScrollAction,
-    TerminalScrollMetrics, TerminalSize, TerminalSnapshot, TerminalState, TerminalUpdate,
-    TerminalViewportDisposition, TerminalViewportFrame, TerminalViewportResult,
+    TerminalHistoryDirection, TerminalHistoryPage, TerminalHistoryResult,
+    TerminalHistoryWindowAnchor, TerminalHistoryWindowFrame, TerminalHistoryWindowQuery,
+    TerminalHistoryWindowResult, TerminalScrollAction, TerminalScrollMetrics, TerminalSize,
+    TerminalSnapshot, TerminalState, TerminalUpdate, TerminalViewportDisposition,
+    TerminalViewportFrame, TerminalViewportResult,
 };
 
 use crate::ansi::{encode_delta, encode_full, encode_history_row};
@@ -375,6 +377,72 @@ impl TerminalModel {
         })
     }
 
+    /// Projects one stateless bounded contiguous history-and-live row window.
+    ///
+    /// The query is expressed in a client-owned anchor. Projection takes place
+    /// against one immutable model revision and never changes the shared grid's
+    /// display offset, revision, checkpoint, or attachment state.
+    #[must_use]
+    pub fn history_window(&self, query: TerminalHistoryWindowQuery) -> TerminalHistoryWindowResult {
+        let current = TerminalHistoryWindowAnchor {
+            epoch: self.history_epoch,
+            revision: self.revision,
+            max_offset_from_bottom: u64::try_from(self.retained_history_rows).unwrap_or(u64::MAX),
+            viewport: self.size(),
+        };
+        if !query.is_valid() || query.anchor.revision > self.revision {
+            return TerminalHistoryWindowResult::HistoryGap {
+                epoch: current.epoch,
+                revision: current.revision,
+            };
+        }
+        if self.engine.active_screen() != ActiveScreen::Main {
+            return TerminalHistoryWindowResult::HistoryChanged {
+                epoch: current.epoch,
+                revision: current.revision,
+            };
+        }
+
+        let Some(shape) = query.response_shape(current) else {
+            return TerminalHistoryWindowResult::HistoryGap {
+                epoch: current.epoch,
+                revision: current.revision,
+            };
+        };
+        let Ok(row_count) = i64::try_from(shape.row_count) else {
+            return TerminalHistoryWindowResult::HistoryGap {
+                epoch: current.epoch,
+                revision: current.revision,
+            };
+        };
+        let Some(end_row_exclusive) = shape.first_row_from_live_top.checked_add(row_count) else {
+            return TerminalHistoryWindowResult::HistoryGap {
+                epoch: current.epoch,
+                revision: current.revision,
+            };
+        };
+        let Some(lines) = (shape.first_row_from_live_top..end_row_exclusive)
+            .map(|line| i32::try_from(line).ok())
+            .collect::<Option<Vec<_>>>()
+        else {
+            return TerminalHistoryWindowResult::HistoryGap {
+                epoch: current.epoch,
+                revision: current.revision,
+            };
+        };
+        let ansi_rows = lines
+            .into_iter()
+            .map(|line| encode_history_row(&project_row(&self.engine, Line(line))))
+            .collect();
+        TerminalHistoryWindowResult::Frame(TerminalHistoryWindowFrame {
+            disposition: shape.disposition,
+            anchor: current,
+            target_offset_from_bottom: shape.target_offset_from_bottom,
+            first_row_from_live_top: shape.first_row_from_live_top,
+            ansi_rows,
+        })
+    }
+
     /// Returns one bounded, revision-aware page from retained main history.
     pub fn history_page(
         &self,
@@ -528,6 +596,7 @@ fn validate_allocation(size: TerminalSize, scrollback_rows: usize) -> Result<(),
 mod tests {
     use super::*;
     use crate::ansi::uses_only_allowlisted_ansi;
+    use zterm_core::terminal::MAX_HISTORY_WINDOW_ROWS;
 
     #[test]
     fn revision_overflow_never_mutates_terminal_state() {
@@ -870,6 +939,195 @@ mod tests {
         assert!(matches!(
             model.scroll_viewport(None, TerminalScrollAction::ScrollByLines(1)),
             TerminalViewportResult::HistoryChanged { .. }
+        ));
+    }
+
+    #[test]
+    fn history_window_projects_mixed_rows_and_clips_both_edges_without_mutation() {
+        let mut model =
+            TerminalModel::new(TerminalSize::new(4, 12), 8).expect("bounded history terminal");
+        model
+            .ingest(b"one\r\n\x1b[31m\xe7\x95\x8c\x1b[0m\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven")
+            .expect("seed history and live rows");
+        let before_state = model.state();
+        let before_checkpoint = model.checkpoint();
+        let anchor = TerminalHistoryWindowAnchor {
+            epoch: model.history_epoch,
+            revision: model.revision(),
+            max_offset_from_bottom: 3,
+            viewport: model.size(),
+        };
+        let query = TerminalHistoryWindowQuery {
+            anchor,
+            target_offset_from_bottom: 1,
+            older_margin_rows: 8,
+            newer_margin_rows: 0,
+        };
+        let TerminalHistoryWindowResult::Frame(frame) = model.history_window(query) else {
+            panic!("valid main history must produce a window");
+        };
+        assert!(frame.is_valid_for(query));
+        assert_eq!(frame.disposition, TerminalViewportDisposition::Exact);
+        assert_eq!(frame.first_row_from_live_top, -3);
+        assert_eq!(frame.ansi_rows.len(), 6);
+        assert!(
+            frame
+                .ansi_rows
+                .iter()
+                .any(|row| row.windows(3).any(|bytes| bytes == b"\xe7\x95\x8c"))
+        );
+        assert_eq!(
+            frame
+                .ansi_rows
+                .iter()
+                .flat_map(|row| row.windows("界".len()))
+                .filter(|bytes| *bytes == "界".as_bytes())
+                .count(),
+            1,
+            "the wide-cell continuation must not duplicate the glyph"
+        );
+        assert!(
+            frame
+                .ansi_rows
+                .iter()
+                .any(|row| { String::from_utf8_lossy(row).contains("\x1b[0;38;5;1;49m") })
+        );
+        assert!(
+            frame
+                .ansi_rows
+                .iter()
+                .all(|row| uses_only_allowlisted_ansi(row, false))
+        );
+        assert!(String::from_utf8_lossy(&frame.ansi_rows[2]).contains("three"));
+        assert!(String::from_utf8_lossy(&frame.ansi_rows[3]).contains("four"));
+        assert_eq!(model.state(), before_state);
+        assert_eq!(model.revision(), before_checkpoint.revision());
+
+        let TerminalHistoryWindowResult::Frame(oldest) =
+            model.history_window(TerminalHistoryWindowQuery {
+                anchor,
+                target_offset_from_bottom: 3,
+                older_margin_rows: 0,
+                newer_margin_rows: 8,
+            })
+        else {
+            panic!("oldest target must remain projectable");
+        };
+        assert_eq!(oldest.first_row_from_live_top, -3);
+        assert_eq!(oldest.ansi_rows.len(), 7);
+        let TerminalHistoryWindowResult::Frame(live) =
+            model.history_window(TerminalHistoryWindowQuery {
+                anchor,
+                target_offset_from_bottom: 0,
+                older_margin_rows: 8,
+                newer_margin_rows: 0,
+            })
+        else {
+            panic!("zero target must include one complete live screen");
+        };
+        assert_eq!(live.target_offset_from_bottom, 0);
+        assert_eq!(live.ansi_rows.len(), 7);
+        assert_eq!(model.state(), before_state);
+        let after_checkpoint = model.checkpoint();
+        assert_eq!(after_checkpoint.revision(), before_checkpoint.revision());
+        assert_eq!(
+            after_checkpoint.retained_cell_capacity(),
+            before_checkpoint.retained_cell_capacity()
+        );
+    }
+
+    #[test]
+    fn history_window_enforces_the_three_screen_row_cap() {
+        let mut model =
+            TerminalModel::new(TerminalSize::new(80, 4), 200).expect("maximum-height model");
+        let mut input = Vec::new();
+        for _ in 0..280 {
+            input.extend_from_slice(b"x\r\n");
+        }
+        input.push(b'x');
+        model.ingest(&input).expect("seed maximum bounded history");
+        let anchor = TerminalHistoryWindowAnchor {
+            epoch: model.history_epoch,
+            revision: model.revision(),
+            max_offset_from_bottom: u64::try_from(model.retained_history_rows)
+                .expect("bounded history extent"),
+            viewport: model.size(),
+        };
+        let TerminalHistoryWindowResult::Frame(frame) =
+            model.history_window(TerminalHistoryWindowQuery {
+                anchor,
+                target_offset_from_bottom: 80,
+                older_margin_rows: 80,
+                newer_margin_rows: 80,
+            })
+        else {
+            panic!("three-screen query must produce a bounded frame");
+        };
+        assert_eq!(frame.ansi_rows.len(), MAX_HISTORY_WINDOW_ROWS);
+    }
+
+    #[test]
+    fn history_window_pins_append_rebases_identity_and_rejects_invalid_or_alternate() {
+        let mut model =
+            TerminalModel::new(TerminalSize::new(2, 12), 8).expect("bounded history terminal");
+        model.ingest(b"one\r\ntwo\r\nthree").expect("seed history");
+        let anchor = TerminalHistoryWindowAnchor {
+            epoch: model.history_epoch,
+            revision: model.revision(),
+            max_offset_from_bottom: 1,
+            viewport: model.size(),
+        };
+        model.ingest(b"\r\nfour").expect("append one row");
+        let TerminalHistoryWindowResult::Frame(pinned) =
+            model.history_window(TerminalHistoryWindowQuery {
+                anchor,
+                target_offset_from_bottom: 1,
+                older_margin_rows: 2,
+                newer_margin_rows: 2,
+            })
+        else {
+            panic!("same epoch append must produce a window");
+        };
+        assert_eq!(pinned.disposition, TerminalViewportDisposition::Exact);
+        assert_eq!(pinned.target_offset_from_bottom, 2);
+        assert!(String::from_utf8_lossy(&pinned.ansi_rows[0]).contains("one"));
+
+        model
+            .resize(TerminalSize::new(3, 12))
+            .expect("resize changes identity");
+        let TerminalHistoryWindowResult::Frame(rebased) =
+            model.history_window(TerminalHistoryWindowQuery {
+                anchor,
+                target_offset_from_bottom: 1,
+                older_margin_rows: 2,
+                newer_margin_rows: 2,
+            })
+        else {
+            panic!("resize must return a complete replacement window");
+        };
+        assert_eq!(rebased.disposition, TerminalViewportDisposition::Rebased);
+        assert_eq!(rebased.anchor.viewport.rows, 3);
+
+        let mut future = anchor;
+        future.revision = Revision::new(model.revision().get().saturating_add(1));
+        assert!(matches!(
+            model.history_window(TerminalHistoryWindowQuery {
+                anchor: future,
+                target_offset_from_bottom: 1,
+                older_margin_rows: 0,
+                newer_margin_rows: 0,
+            }),
+            TerminalHistoryWindowResult::HistoryGap { .. }
+        ));
+        model.ingest(b"\x1b[?1049h").expect("enter alternate");
+        assert!(matches!(
+            model.history_window(TerminalHistoryWindowQuery {
+                anchor: rebased.anchor,
+                target_offset_from_bottom: 0,
+                older_margin_rows: 0,
+                newer_margin_rows: 0,
+            }),
+            TerminalHistoryWindowResult::HistoryChanged { .. }
         ));
     }
 

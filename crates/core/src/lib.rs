@@ -7,6 +7,7 @@ pub mod pairing;
 pub mod release;
 pub mod terminal;
 pub mod transport;
+pub mod viewport_cache;
 
 pub use authorization::{AuthGeneration, AuthorizationSnapshot, AuthorizationStatus};
 pub use device::{

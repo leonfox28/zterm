@@ -755,8 +755,8 @@ async fn run_local_terminal_child(
         } else {
             // The fixture PTY echoes each command once and its shell prints it
             // twice. Seven fillers plus the bottom-marker command therefore
-            // leave exactly 24 rows after the last target occurrence: one
-            // three-line wheel action must bring that target back into view.
+            // leave exactly 24 rows after the last target occurrence: three
+            // one-line host wheel reports must bring that target back into view.
             for index in 0..7 {
                 write!(master_writer, "ZTERM_SCROLL_FILL_{index:02}\r")
                     .expect("write retained scroll filler");
@@ -817,8 +817,8 @@ async fn run_local_terminal_child(
         let baseline = scroll_target_count.load(Ordering::Acquire);
         assert!(baseline > 0, "the retained target must first render live");
         master_writer
-            .write_all(b"\x1b[<64;10;10M")
-            .expect("write one host wheel-up event");
+            .write_all(b"\x1b[<64;10;10M\x1b[<64;10;10M\x1b[<64;10;10M")
+            .expect("write three one-line host wheel-up reports");
         let scroll_deadline = std::time::Instant::now() + TERMINAL_TEST_TIMEOUT;
         while scroll_target_count.load(Ordering::Acquire) <= baseline
             && std::time::Instant::now() < scroll_deadline
