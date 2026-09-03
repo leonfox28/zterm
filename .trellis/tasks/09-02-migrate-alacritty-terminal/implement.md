@@ -340,7 +340,8 @@ Rollback point: new wire is capability-gated; old history paging and snapshot/de
   live alternate+alternate-scroll; otherwise host main history. Never inspect process names, TERM,
   tmux state or screen text.
 - [x] Keep one report on child mouse branches and change alternate-scroll from three cursor sequences
-  to one. Keep the host CLI wheel constant at three lines and PageUp/PageDown at rows minus one.
+  to one. v0.1.11 kept the host CLI wheel constant at three lines and PageUp/PageDown at rows minus
+  one; Phase 7.1 intentionally supersedes only that host-owned wheel constant.
 - [x] Preserve `ResumePending`: ordinary input is bounded, latest live replacement and any geometry
   sync are flushed first, and the retained bytes are then sent exactly once. Background child mode
   changes cannot steal a pinned viewport.
@@ -507,3 +508,156 @@ python3 .trellis/scripts/task.py start .trellis/tasks/09-02-migrate-alacritty-te
 
 - [x] 已向用户展示本次 scroll/gutter/wire 最终计划摘要。
 - [x] 用户在该最终摘要之后再次明确批准开始修改产品代码（2026-09-02）。
+
+## Phase 7 — Atomic Presentation and Client-owned Viewport Cache
+
+### Step 7.0 — Freeze the reported failures and compatibility surface
+
+- [x] Record `origin/main` / v0.1.11 as the implementation baseline and preserve the task-owned
+  research additions plus unrelated worktree changes.
+- [x] Add failing CLI byte-stream tests for one host report currently requesting three lines,
+  request-time blank repaint, `EL2` before history content, missing outer DEC 2026 and drag release
+  losing a throttled final target.
+- [x] Freeze kinds through 316 and capabilities through bit 19. Add mixed-version fixtures proving
+  315/316 and 312/313 remain unchanged before allocating 317/318 and bit 20.
+
+Rollback point: tests/task research only; v0.1.11 behavior remains the product path.
+
+### Step 7.1 — Fix desktop input and presentation first
+
+- [x] Change only the host-owned CLI wheel amount to one line per complete SGR report. Preserve
+  child mouse and alternate-scroll one-event semantics and PageUp/PageDown overlap.
+- [x] Introduce one buffered host-presentation helper: DEC 2026 begin, complete content/chrome/capture
+  and final cursor state, DEC 2026 end, one `write_all`, one `flush`. Add sync-end to every guard
+  cleanup path.
+- [x] Remove request-time unchanged/loading/returning repaints. Keep the last complete presentation
+  until a replacement is ready; write history content before clearing its remaining line tail.
+- [x] Add 33 ms drag pacing, target-change suppression and release-final delivery without replacing
+  existing one-in-flight/latest-target coalescing.
+
+Rollback point: presentation changes can revert independently; protocol still uses existing paths.
+
+### Step 7.2 — Add the read-only window model and generic cache reducer
+
+- [x] Add core anchor/request/frame/result values, `MAX_HISTORY_WINDOW_ROWS = 240`, structural
+  validation and content-redacted Debug. Add a generic row cache/reducer free of ANSI, async,
+  clocks and platform UI.
+- [x] Add a terminal-model read-only projection for `[start,end)` using the approved live-top
+  coordinate formula. Reuse the existing row projector/allowlisted encoder; do not call
+  `scroll_display` or modify model/checkpoint/revision.
+- [x] Implement same-epoch append anchoring, complete Rebased replacement, alternate Changed and
+  invalid/future Gap. Test 0/1/mid/oldest targets, margins/caps, Unicode/wide/style and unchanged
+  state across independent callers.
+- [x] Unit-test cache hit rendering decisions, checked slice math, edge prefetch, one pending/latest
+  target, stale response handling, append translation and all invalidation paths.
+
+Rollback point: domain/model/cache code is not yet reachable over wire.
+
+### Step 7.3 — Carry the additive window through local and remote paths
+
+- [x] Allocate bit 20 and kinds 317/318 in core/proto/wire without changing any existing number.
+  Add protobuf conversion/validation for anchor, signed coordinate, margins, row count, 1/8 MiB
+  bounds and redacted Debug.
+- [x] Thread the pure read through TerminalDriver, Session authorization/sync fence, session wire,
+  local attachment driver, remote bridge and operations writer. It must not update
+  `ActorAttachment.scroll` or remote resume state.
+- [x] Enforce one outstanding window request and latest queued target. On stream loss, return one
+  correlated content-free Gap, clear pending state, then reconnect.
+- [x] Negotiate bit20 -> bit19 -> pager fallback. New code never sends 317/318 to a capability-less
+  peer; old clients retain exact v0.1.11 behavior.
+
+Rollback point: bit20 gates the complete path; legacy semantic viewport and paging remain usable.
+
+### Step 7.4 — Make desktop the first cached-window client
+
+- [x] Integrate the generic cache reducer into `ViewportController`. Opportunity-prefetch a bounded
+  live window after activation; render wheel/Page/drag locally whenever the requested full slice is
+  cached.
+- [x] Request a window only for initial miss, edge low-water, absolute jump, stale identity or
+  response that does not cover latest target. Preserve the currently displayed complete frame while
+  pending and never render an intermediate target merely because its response arrived first.
+- [x] Keep local offset/scrollbar metrics authoritative for presentation while cached. Translate
+  coordinates on same-epoch append and invalidate on resize/reflow/extent decrease/live reset/true
+  reconnect/takeover. Keep legacy 315/316 and pager controllers isolated behind capability fallback.
+- [x] Add deterministic CLI/controller and local/remote fixtures proving cache hits emit no network
+  request, prefetch is bounded, thumb release reaches the final target and nested TUI ownership is
+  unchanged.
+
+Rollback point: disable bit20/client selection to return to v0.1.11 semantic viewport behavior.
+
+### Step 7.5 — Close quality, platform and knowledge gates
+
+- [x] Run targeted core/terminal/proto/daemon/CLI tests, format, workspace Clippy/tests/docs,
+  cargo-deny, source policy and one final `just check`; do not run performance/RSS benchmarks.
+- [x] Dispatch an independent `trellis-check` across model -> Session -> proto -> local/remote -> CLI
+  and fix every verified contract failure before delivery.
+- [x] Update terminal-model, terminal-driver, core-wire-domain, session-service, local-daemon-IPC,
+  transport-auth, and cross-platform specs with the final implemented window/cache/presentation
+  contracts.
+- [x] Record macOS local evidence available from this host and leave Linux plus real direct/relay
+  evidence explicitly hosted/external when it cannot be executed here. Do not claim Android UI or
+  semantic-cell wire completion.
+
+Implementation evidence (2026-09-03, macOS host):
+
+- Baseline: `origin/main` and `HEAD` were
+  `be46c8f736148dab38a4854362b551bafe8a52fd` (v0.1.11) on
+  `fix/local-viewport-cache`; task research/planning changes were preserved.
+- `cargo +1.98.0 test -p zterm-core viewport_cache --all-features`: 10 passed.
+- `cargo +1.98.0 test -p zterm-terminal history_window --all-features`: 3 passed.
+- `cargo +1.98.0 test -p zterm-proto --all-features`: 26 passed.
+- `cargo +1.98.0 test -p zterm-daemon --all-features --quiet`: passed (201 library tests plus
+  every emitted integration group; platform/explicit-only skips remained reported as skips).
+- `cargo +1.98.0 test -p zterm-cli terminal_ui --all-features -- --nocapture`: 40 passed,
+  3 isolated helper tests ignored; `cargo +1.98.0 test -p zterm-cli --test daemon_autospawn
+  --all-features -- --nocapture` exited successfully and exercised the real-PTY one-line wheel path.
+- `cargo +1.98.0 fmt --all -- --check`, touched-package all-target/all-feature Clippy with
+  `-D warnings`, and `sh tests/source-policy.sh` passed.
+- Linux cross-UID, real direct/relay and the explicit terminal black-box gate were not available in
+  this macOS implementation pass. Android UI, semantic-cell wire, performance and RSS claims remain
+  out of scope. Full workspace tests/docs, cargo-deny, the single final `just check`, independent
+  `trellis-check`, and final spec updates were completed in the closing review documented below.
+
+Independent review evidence (2026-09-03, macOS host):
+
+- The reviewer fixed request-bound response validation, stale-anchor monotonicity, complete-frame
+  retention during resize/resume/content-free outcomes, resize-triggered window refill, styled row
+  tail clearing, stream-loss/unsupported fallback distinction, and the complete bit20 -> bit19 ->
+  pager fallback. Focused cache/model/local/remote/CLI/ANSI regressions passed.
+- `cargo +1.98.0 fmt --all -- --check`, `cargo +1.98.0 check --workspace --all-targets
+  --all-features`, and `cargo +1.98.0 clippy --workspace --all-targets --all-features -- -D warnings`
+  passed on the final reviewed tree. `sh tests/source-policy.sh` and `git diff --check` passed; no
+  product Rust `unsafe` was added.
+- The one authorized `just check` invocation reached workspace tests and exited 101 because an
+  existing `scroll_viewport_projects_full_rows_and_clamps_at_both_ends` fixture had accidentally
+  replaced the asserted `one` row with the new styled-wide Unicode fixture. The reviewer restored
+  that legacy fixture while retaining focused Unicode/wide/style coverage on `history_window` and,
+  per the instruction to run the authoritative command exactly once, did not invoke `just check`
+  again.
+- After that fixture correction,
+  `cargo +1.98.0 test -p zterm-terminal --lib --all-features` passed 23/23 and
+  `cargo +1.98.0 test --workspace --all-features` passed. Workspace documentation, both cargo-deny
+  manifests, relay-probe format/Clippy, relay shell syntax/publication/upstream checks, and the
+  Docker-capable relay static check all passed when run as the remaining individual gate
+  components.
+- Hosted gaps remain explicit: Linux cross-UID was skipped on macOS, real Iroh loopback is Linux-CI
+  owned, the terminal black-box gate is explicit-only, and real Linux plus local/direct/relay smoke
+  was not run in this review. Android UI/semantic cells and performance/RSS work remain out of
+  scope; no benchmark was run. Final `.trellis/spec/` synchronization remains assigned to the main
+  session.
+
+### Phase 7 completion gate
+
+- [x] One host report moves one row; child-owned paths still receive one event.
+- [x] Every desktop repaint is complete, non-blank, synchronized when supported and cleanup-safe.
+- [x] One bounded pure-read window and generic cache reducer pass owner-level tests.
+- [x] Cache-covered desktop navigation performs no network request; miss/prefetch remains one-in-flight
+  and latest-target correct.
+- [x] 317/318 + bit20 and bit20 -> bit19 -> pager compatibility pass all local/remote tests.
+- [x] Product Rust remains unsafe-forbidden, one Session remains one PTY/model, and no benchmark or
+  Android-completion claim is introduced.
+
+### Phase 7 authorization
+
+- [x] 用户已批准 desktop/mobile 共用 client-owned viewport cache，并明确要求按该方案实施
+  （2026-09-03）。

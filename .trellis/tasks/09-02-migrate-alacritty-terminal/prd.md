@@ -339,8 +339,9 @@ the local macOS arm64 implementation environment.
   `TERM`、tmux marker 或 Herdr/Pi 专用分支。
 - child mouse-reporting 分支按声明 encoding 只写一个 mouse report；alternate-scroll 分支
   只写一个 application/normal cursor-key sequence。两者都保持 Zterm offset 为 `0`。
-- Zterm-owned CLI wheel 每个完整 SGR report 固定映射 3 行；PageUp/PageDown 为
-  `viewport_rows - 1`，至少 1 行。本次不增加配置项。
+- Zterm-owned CLI wheel 每个完整 SGR report 固定映射 1 行；PageUp/PageDown 为
+  `viewport_rows - 1`，至少 1 行。本次不增加配置项。该最终输入契约由 2026-09-03
+  smooth-viewport follow-up 修正，取代 v0.1.11 的 3 行常量，但不改变 315/316 action wire 语义。
 - 唯一例外是用户直接操作可见的 Zterm gutter：main screen 的 scrollbar column 位于 child
   PTY rectangle 之外，其 wheel/press/drag/release 由 Zterm chrome 拥有，永不伪造为 child
   最后一列事件。其他 child rectangle 内的事件遵循上述 mode ownership。
@@ -380,7 +381,7 @@ the local macOS arm64 implementation environment.
   同一 metrics/actions 绘制不占 PTY cell 的 native overlay；Android renderer、touch physics、
   本地 PTY 和 device validation 不在本次实现。
 - Android 的后续 gesture adapter 应按 pixel delta / cell height 并保存 fractional remainder
-  产生 `ScrollByLines`；不能继承 CLI“每个 SGR report 3 行”的输入设备假设。
+  产生 `ScrollByLines`；不能继承 CLI 按离散 SGR report 计行的输入设备假设。
 
 ### R15. Verification and Release Boundary
 
@@ -401,7 +402,7 @@ the local macOS arm64 implementation environment.
 
 - [ ] 普通 shell 在 snapshot、任意 delta 和 resync 后均能收到 wheel；退出后 outer terminal
   raw/mouse state 完整恢复。
-- [ ] 首次 wheel-up 精确移动 3 行；连续 wheel、PageUp/PageDown、top/bottom 和 ordinary-input
+- [ ] 首次 wheel-up 精确移动 1 行；连续 wheel、PageUp/PageDown、top/bottom 和 ordinary-input
   resume 均符合 R11/R12，且一个 attachment 不改变另一个 attachment 或 authoritative model。
 - [ ] Herdr/Pi-style mouse modes 收到恰好一个 report；alternate-scroll 收到恰好一个 cursor key；
   child 退出 mode 后 wheel ownership 自动回到 Zterm。
@@ -430,3 +431,124 @@ the local macOS arm64 implementation environment.
 本 follow-up 的用户 UX 决策已经收敛。原迁移批准不覆盖这次新增的 wire、gutter 和 geometry
 范围；只有在 PRD、design、implement manifests 全部校验完成并展示最终摘要后，用户再次明确
 批准，才开始修改产品代码。
+
+## Smooth Client-owned Viewport Follow-up (Approved 2026-09-03)
+
+### Decision State
+
+- v0.1.11 真实使用暴露两个独立问题：外层 Ghostty 的一个离散 wheel tick 默认可产生三个
+  SGR reports，而 CLI 又把每个 report 乘以三行，导致一次物理滚动约九行；历史帧和滚动条
+  又通过 clear-before-draw 的全屏 repaint 显示给 host，滚轮和拖动均可见闪烁。
+- 用户批准吸收 Herdr 可迁移的 presentation 原则：保留旧帧直到完整新帧就绪、内容与 chrome
+  同帧提交、outer-host DEC 2026 synchronized output、无 clear-before-content、drag pacing、
+  one-in-flight/latest-wins 和 release 最终位置。
+- 用户进一步批准桌面与后续 Android 统一为 client-owned viewport/cache：daemon 继续唯一持有
+  Alacritty 与完整 scrollback，客户端持有有界连续窗口、当前 offset 和交互动画；网络只用于
+  初始预取、低水位补窗、绝对跳转、cache miss 和 identity rebase，不再位于每个 wheel/motion
+  的关键路径。
+- 既有 kind 315/316 的“一次 action -> 一屏 frame”语义和 312/313 history pager 保持不变，
+  供 mixed-version fallback 使用。新窗口是 additive capability，不靠旧 peer 接收未知 kind
+  来探测。
+- 本阶段只实现 desktop CLI 的 canonical-ANSI row adapter 和 renderer-neutral cache reducer。
+  Android UI、pixel/fling physics 及 semantic-cell wire encoding 仍属于下一任务；不得为了未来
+  consumer 在本阶段预建半套移动 renderer 或第二个 terminal model。
+
+### R16. Correct and Atomic Desktop Presentation
+
+- 一个由 Zterm 拥有的完整 SGR wheel report 映射一行，而不是三行。外层 terminal 自己产生
+  多少完整 reports 就移动多少行；child mouse 和 alternate-scroll 分支仍恰好转发一个事件。
+- 每次 outer-host presentation 必须构成一个 byte transaction：DEC 2026 begin、必要的 cursor
+  hide、child/history 内容、status/scrollbar、`HOST_INPUT_CAPTURE`、最终 cursor/mode 状态、
+  DEC 2026 end，然后恰好一次 `write_all` 和一次 `flush`。cleanup 必须无条件发送 DEC 2026 end，
+  防止 partial write/错误/panic 将支持该 mode 的 host 留在同步状态。
+- viewport/window 请求发出时不得清除或重画未变化的旧画面，不显示空白 loading/returning
+  中间帧。只有一份完整可呈现的新 frame 才替换当前画面。
+- history row 不得 `EL2` 后再写内容。先覆盖目标内容，再清理行尾；不支持 DEC 2026 的 host
+  仍不能看到先整行变空的阶段。scrollbar/status 与内容不得分开 flush。
+- drag motion 仅在 target 改变且距上次发送至少 33 ms 时触发远端补窗；release 必须提交最新
+  最终 target。现有 one-in-flight/latest target 合并继续保留。
+
+### R17. Additive Read-only History Window
+
+- `zterm-core` 新增 renderer-neutral window anchor/request/frame/result DTO。anchor 至少包含
+  epoch、revision、max offset 和完整 viewport size；frame 包含 resolved target、当前 anchor、
+  相对当前 live top 的首行坐标，以及 oldest-to-newest 的独立 canonical rows。
+- 坐标以响应 revision 的 live screen top 为 `0`，history 为负数，live screen 为 `[0, R)`。
+  target offset `O` 的完整 viewport 是 `[-O, R-O)`；retained 总范围是 `[-H, R)`。
+- 请求携带 target `O` 与 older/newer margins。返回窗口为
+  `start=max(-H,-O-older)`、`end=min(R,R-O+newer)`，并包含 `[start,end)` 的每一行。
+  `MAX_HISTORY_WINDOW_ROWS = 240`，margins 总和不得超过 `2R`，最终 content 仍受 8 MiB gate。
+- 该读取在一个 model lock/revision 下从 Alacritty grid 投影，不调用 `scroll_display`，不改变
+  revision、checkpoint、PTY、attachment legacy scroll baseline 或其他客户端。
+- 同 epoch/size 且 extent 单调增长时，将 anchor 坐标中的 target 增加 `H'-H` 以固定内容；
+  epoch/size 改变或 extent 收缩时返回完整 `Rebased` window；alternate 返回 `Changed`；结构非法
+  或 future anchor 返回 `Gap`。任何结果都不得拼接无法证明同 identity 的行。
+
+### R18. Renderer-neutral Bounded Client Cache
+
+- `zterm-core` 提供无 async、ANSI、手势和平台依赖的 generic row cache/reducer；CLI 仅适配
+  `Vec<u8>` canonical ANSI row，未来 Android 可复用相同 anchor/range/state transition。
+- client 是 presentation offset 的权威 owner。完整 slice 已被 cache 覆盖时，wheel/Page/drag
+  只更新本地 desired offset 并立即 render；不得发送 315 或新 window request。
+- Active 且有 main history 时可机会式预取；首个 miss 拉取至多三屏。距任一可滚动 cache edge
+  小于 `R/2` 时后台预取相邻窗口。每个 view 同时最多一个 window request；pending 时只保留
+  latest desired target，不积累 pages/events。
+- cache miss、跳转或 pending response 未覆盖最新 target 时保留最后完整画面。response 覆盖
+  latest target 才允许替换；否则不呈现该中间 target，并立即为 latest target 请求一次窗口。
+- same-epoch append 按 extent 增量平移 cache 坐标和 pinned offset。resize/reflow、epoch 变化、
+  extent 收缩、true reconnect、takeover 和 explicit live reset 清除或完整替换 cache；不得把
+  cached rows 存入 `RemoteResumeCheckpoint`、Session model、磁盘或全量 transcript。
+- 一个客户端最多持有 `MAX_HISTORY_WINDOW_ROWS` 行；这是交互工作集上限，不是恢复已取消的
+  per-session/aggregate terminal-memory admission。
+
+### R19. Wire Compatibility and Mobile Seam
+
+- proto v1 使用 next free kinds 317/318 和 capability bit 20 增加纯读 history-window request/frame；
+  kind 315/316、bit 19 与其 validators 均保持原语义和编号。
+- request 是 control，response 是 content；attachment/request correlation、deadline、8 MiB limit、
+  redacted Debug 和 local/remote authorization 沿用现有 terminal read paths。旧 remote peer 无
+  bit 20 时，新 CLI 回退至 315/316，再回退到 312/313，不发送 317/318。
+- 首版 row payload 是当前 allowlisted、独立的 canonical ANSI rows。window metadata、cache reducer
+  和失效语义不得依赖 ANSI；Android 后续通过独立 capability/encoding 增加 semantic cells，
+  不修改本阶段稳定的坐标/anchor/cache contract。
+- daemon 新 window path 是无 presentation state 的纯读请求。旧 315/316 所需的
+  `ActorAttachment.scroll` 只为 mixed-version fallback 保留，不能成为新 cache 的真相源。
+
+### R20. Verification and Scope Boundary
+
+- core/model tests覆盖 window 公式、0/live、1、mid、oldest、clamp、same-epoch append、rebase、
+  invalid/future anchor、alternate、Unicode/wide/style、240-row cap 和 model immutability。
+- proto/session/local/remote tests覆盖 kind/capability 稳定、bounds、redaction、correlation、
+  authorization、one outstanding/latest target、epoch loss、reconnect 和两级 fallback。
+- CLI tests覆盖一个 host report 一行、child one-report、初始预取、本地连续滚动不发请求、
+  edge prefetch、jump miss、stale response、drag 33 ms/release、无中间 blank、DEC 2026/cleanup、
+  no-clear-before-content 以及 status/gutter/capture 单事务。
+- 不新增或运行 throughput、latency、CPU、RSS benchmark。macOS/Linux local/direct/relay 的真实
+  连接证据仍由各自环境提供；本地 macOS 不能替代 Linux 或 hosted release evidence。
+
+### Follow-up Acceptance Criteria
+
+- [ ] 外层 Ghostty 的一次默认离散 wheel tick 不再被 Zterm 二次乘三；每个 host-owned report
+  精确移动一行，nested TUI 路径仍只有一个 owner/一个事件。
+- [ ] history/scrollbar/status 的所有替换均无 blank/returning 中间帧，使用安全 cleanup 的
+  DEC 2026 transaction、一次 write/flush 和 content-before-tail-clear。
+- [ ] 新 window API 在一个 revision 下返回最多 240 个连续 rows；append/rebase/gap/alternate
+  与所有 bounds/correlation/redaction 条件有直接测试。
+- [ ] 桌面在 cache 覆盖范围内滚轮、Page 和 drag 不产生网络 viewport request；edge/jump 只
+  产生一个 in-flight request 并最终呈现 latest target。
+- [ ] 新旧 daemon/client 组合按 bit 20 -> bit 19 -> history paging 顺序安全降级，未知 kind
+  永不发送给未协商 peer。
+- [ ] core/proto 仍无 host engine 依赖，产品代码继续禁止 unsafe，Android UI/semantic renderer
+  未被本阶段虚假宣称完成。
+
+### Explicitly Out of Scope
+
+- Android UI、touch velocity/fling、pixel renderer、font shaping、glyph atlas 和 device validation。
+- semantic-cell live snapshot/delta 或 history-window wire；其 encoding 在 Android 任务中独立协商。
+- 完整 scrollback 镜像、持久化 transcript、第二个 client terminal parser/model、Ratatui 引入。
+- Herdr 的全 cell diff、全局固定 60 Hz scheduler、Kitty graphics 拼接或应用名特判。
+
+### Authorization
+
+- [x] 用户在讨论 desktop/mobile 统一缓存、兼容边界和分阶段实现后明确回复“好 按你说的做”
+  （2026-09-03）。该回复授权本 follow-up 的 planning amendment 与产品代码实施。

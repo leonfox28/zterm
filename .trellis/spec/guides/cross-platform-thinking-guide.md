@@ -78,6 +78,15 @@ matrix explicit:
   cleanup disables it on every exit path. Correctness must not depend on whether
   the outer application is Ghostty, kitty, Alacritty, Terminal.app, or another
   conforming terminal.
+- Continuous interaction uses the renderer-neutral `ViewportCache<Row>` in
+  core: wheel, Page, mouse drag, and future touch gestures update a local
+  desired offset and present a complete cached slice immediately. Network
+  window reads are bounded miss/low-water prefetch, never the per-gesture
+  animation loop; one in-flight request coalesces to the latest target.
+- DEC 2026 synchronized presentation, ANSI rows, SGR mouse reports, the
+  33-millisecond desktop drag request pace, and the one-column text gutter are
+  Unix CLI adapter policy. They are not core cache semantics and must not leak
+  into Android/iOS code or the current 317/318 wire contract.
 - Native macOS and Linux each require local, direct-Iroh, and Relay smoke
   evidence for shell scrolling, main/alternate transition, child mouse
   ownership, resize, detach, and reconnect. Pure fake-stream/unit tests and a
@@ -86,11 +95,13 @@ matrix explicit:
 - Record the host, path, commit, command/fixture, and result. An ignored Linux
   test on macOS, a macOS local PTY fixture, or old release evidence must remain
   visibly pending for the path it did not execute.
-- Android remains a remote renderer/controller consumer of core/proto semantic
-  metrics and frames. It must not link the host Alacritty model, local PTY, or
-  Unix CLI chrome. Begin Android implementation only after the macOS/Linux
-  local/direct/relay matrix above is recorded, so mobile work does not hide a
-  host transport or nested-TUI regression.
+- Android remains a remote renderer/controller consumer. It may reuse the
+  anchor/range/cache reducer and independently tune pixel/touch physics, but
+  it needs a separately negotiated semantic-cell row adapter rather than
+  parsing the desktop path's canonical ANSI rows. It must not link the host
+  Alacritty model, local PTY, or Unix CLI chrome. Begin Android implementation
+  only after the macOS/Linux local/direct/relay matrix above is recorded, so
+  mobile work does not hide a host transport or nested-TUI regression.
 
 ## Incident: Windows Rust Formatting Failure
 

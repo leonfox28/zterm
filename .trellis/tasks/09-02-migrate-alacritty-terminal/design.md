@@ -55,7 +55,7 @@ portable-pty reader ── fixed no-drop queue ── TerminalDriver model threa
 | Performance | No benchmark, comparison, SLO, RSS requalification or performance claim |
 | Memory admission | Remove the aggregate 128 MiB terminal-memory gate; retain count/dimension and untrusted-input caps |
 | Scroll owner | Per attachment; never Alacritty's shared `display_offset` |
-| CLI scroll amount | Three lines per complete host-owned SGR wheel report; one event on child-owned paths |
+| CLI scroll amount | One line per complete host-owned SGR wheel report; one event on child-owned paths |
 | Scrollbar | Stable one-column main-screen gutter above width four; alternate screen reclaims it |
 | Mobile seam | Core/proto metrics + line/offset actions; no CLI glyph/pixel policy in wire |
 
@@ -670,7 +670,8 @@ heuristic. Herdr/Pi-style SGR mouse declarations naturally select the one-report
 
 CLI constants are:
 
-- one host-owned SGR wheel report: three lines;
+- one host-owned SGR wheel report: one line (the 2026-09-03 smooth-viewport follow-up supersedes
+  the v0.1.11 three-line input constant without changing the 315/316 wire action contract);
 - PageUp/PageDown: `max(viewport_rows - 1, 1)` lines;
 - one child-owned wheel report: one encoded report with no multiplier;
 - alternate-scroll: one normal/application cursor sequence with no multiplier.
@@ -750,8 +751,9 @@ oscillation rather than described as impossible.
 
 - A malformed/out-of-order viewport frame is a protocol error under the existing terminal driver
   correlation rules; it is never rendered.
-- A `Changed/Gap` response leaves a bounded notice and uses the existing live-resume path on ordinary
-  input. `Rebased` is a complete replacement, so no old/new epoch rows coexist.
+- A `Changed/Gap` response is content-free, so it leaves the last complete host presentation intact
+  and uses the existing live-resume path on ordinary input. `Rebased` is a complete replacement, so
+  no old/new epoch rows coexist.
 - Transport reconnect and controller takeover discard the attachment-local scroll state and return
   to live synchronization. Presentation offset is not part of remote resume identity.
 - A capability-less peer uses the existing history-page fallback. Capability negotiation, not an
@@ -772,3 +774,175 @@ background mode changes while pinned, width 4/5, remote status rows, drag bursts
 resize synchronization. Release evidence requires real macOS and Linux local/direct/relay smoke
 before beginning Android work. These are functional checks; no throughput, latency, CPU or RSS
 benchmark is added or run.
+
+## 25. Smooth Desktop and Future-Mobile Viewport Architecture
+
+The new path separates authoritative terminal storage from interactive presentation:
+
+```text
+Alacritty Term in daemon
+        │ read-only contiguous window at one revision
+        ▼
+TerminalHistoryWindowFrame (anchor + coordinates + bounded rows)
+        │
+        ▼
+ViewportCache<Row> in client core
+        ├─ desktop row adapter -> atomic ANSI presentation
+        └─ future Android row adapter -> native renderer
+```
+
+The daemon remains the only owner of the grid, history, revision, reflow and eviction. The client
+owns desired/presented offset, a bounded row window, prefetch state and gesture pacing. The new path
+is stateless at the Session boundary: authorization and correlation are retained, but the request
+does not update `ActorAttachment.scroll`. Legacy 315/316 continues to use that field only for peers
+without the new capability.
+
+The desktop presenter still needs its own atomic output boundary. Local cache removes network RTT
+from an interaction, but it does not prevent a host terminal from displaying partial ANSI writes.
+Every desktop replacement is therefore buffered as:
+
+```text
+CSI ?2026h -> hide cursor as needed -> content -> status/gutter
+           -> HOST_INPUT_CAPTURE -> final cursor/modes -> CSI ?2026l
+           -> one write_all -> one flush
+```
+
+No request transition renders a loading/returning frame. History rows are written before `EL` clears
+their remaining tail; no row is cleared with `EL2` before its replacement content. Cleanup emits
+`CSI ?2026l` even after a partial/error path. Child-originated DEC 2026 remains rejected by the daemon
+ingress policy; this host presentation mode is a separate outer-terminal state machine.
+
+## 26. History Window Domain and Coordinate Math
+
+Core values are equivalent to:
+
+```rust
+struct TerminalHistoryWindowAnchor {
+    epoch: Revision,
+    revision: Revision,
+    max_offset_from_bottom: u64,
+    viewport: TerminalSize,
+}
+
+struct TerminalHistoryWindowRequest {
+    anchor: TerminalHistoryWindowAnchor,
+    target_offset_from_bottom: u64,
+    older_margin_rows: u16,
+    newer_margin_rows: u16,
+}
+
+struct TerminalHistoryWindowFrame {
+    disposition: ExactOrRebased,
+    anchor: TerminalHistoryWindowAnchor,
+    target_offset_from_bottom: u64,
+    first_row_from_live_top: i64,
+    rows: Vec<Row>,
+}
+```
+
+The exact names may follow existing conventions, but the coordinates are fixed. For response height
+`R` and retained history `H`, the current live top is coordinate `0`, history is `[-H,0)`, and the
+live screen is `[0,R)`. A viewport at offset `O` requires `[-O,R-O)`. With requested margins `A`
+(older) and `B` (newer), the server returns:
+
+```text
+start = max(-H, -O - A)
+end   = min( R,  R - O + B)
+rows  = every logical row in [start, end), top to bottom
+```
+
+The client may render `O` exactly when `[-O,R-O)` is fully contained in the cached range. Its slice
+starts at checked index `(-O - start)` and has exactly `R` rows. The response is invalid unless row
+count equals `end - start`, every coordinate is representable, and total rows are at most
+`MAX_HISTORY_WINDOW_ROWS = 240`. Request margins satisfy `A + B <= 2R`, so one response is at most
+three maximum-height screens; the existing 8 MiB content cap remains independently authoritative.
+
+On a valid same-epoch/same-size request with `H_current >= H_anchor`, the server resolves a target
+expressed in anchor coordinates as:
+
+```text
+O_current = min(H_current, O_requested + (H_current - H_anchor))
+```
+
+This pins content across rows appended below the view. An epoch/size change or extent decrease
+clamps the target into current bounds and returns a complete `Rebased` frame. A structurally invalid
+or future anchor returns `Gap`; alternate screen returns `Changed`. The model never mutates while
+projecting any outcome.
+
+## 27. Client Cache Reducer and Fetch Policy
+
+`zterm-core` owns a generic `ViewportCache<Row>`-style reducer with no transport, async runtime,
+ANSI, clock, mouse or pixel types. It owns:
+
+- current anchor and contiguous `[first_row, first_row + rows.len())` coordinates;
+- desired and last-presented offsets;
+- whether a complete visible slice exists;
+- one in-flight request description and one latest queued target;
+- deterministic install/rebase/invalidate and prefetch-decision transitions.
+
+The desktop layer supplies canonical ANSI rows and wall-clock drag pacing. A future Android layer can
+supply semantic rows and pixel gesture physics without changing the range/anchor reducer.
+
+Fetch policy for height `R` is bounded and directional:
+
+- opportunistically fetch around live after activation when valid main history exists;
+- a first miss requests up to two screens on the likely travel side and the current screen, never
+  more than 240 total rows;
+- a middle target normally requests one screen of margin on each side;
+- within `max(R/2, 1)` rows of a scrollable cache edge, issue one background prefetch;
+- while a request is pending, local moves inside the cache continue immediately and only the latest
+  uncovered target is retained;
+- a response is displayed only if it contains the complete latest desired viewport. Otherwise its
+  safe rows may replace/merge the cache, the existing displayed frame remains, and one request for
+  the latest target follows.
+
+Same-epoch live metrics whose history extent grows translate cached coordinates downward by the
+extent delta and increase pinned offsets by the same amount. A prefetched-live cache is invalidated
+by a live revision it cannot update safely. A pinned frozen cache may survive ordinary same-epoch
+live changes, but resize/reflow, epoch change, extent decrease, explicit resume, true reconnect and
+takeover invalidate it. No cached row enters a resume checkpoint or server attachment state.
+
+## 28. Additive Wire and Fallback
+
+Wire allocation is append-only:
+
+```text
+Capabilities::TERMINAL_HISTORY_WINDOW = 1 << 20
+WireKind::TerminalHistoryWindowRequest = 317   (control)
+WireKind::TerminalHistoryWindowFrame   = 318   (content)
+```
+
+The request carries attachment ID, anchor, target offset and margins. The frame carries attachment
+ID, Frame/Changed/Gap outcome, Exact/Rebased disposition, current anchor, resolved target,
+`first_row_from_live_top`, canonical rows, and current epoch/revision for content-free outcomes.
+Debug output contains only structure, counts and total bytes.
+
+New/new peers use 317/318. If a remote peer lacks bit 20, the local bridge exposes legacy semantic
+viewport bit 19 when available and the CLI uses 315/316; without bit 19 it retains the 312/313 pager.
+No peer receives an unnegotiated kind. One window request may be outstanding per view; stream loss
+completes it once with a correlated content-free Gap before `Reconnecting`, exactly like the existing
+read-only viewport/history controls.
+
+The initial payload remains independently encoded canonical ANSI rows because that path already has
+bounded projection, redaction and desktop consumers. Android adds a separately negotiated semantic
+row encoding in its own task. It reuses these coordinates, anchors, reducer transitions and bounds;
+the current task does not add a parser, renderer, or unused cell wire.
+
+## 29. Presentation and Cache Verification
+
+Tests are layered by owner:
+
+- model: coordinate formula, exact/rebased/gap/alternate, append pinning, sizes and unchanged state;
+- core cache: local moves without effects, slice formula, prefetch threshold, stale/latest response,
+  append translation, invalidation and fixed maximum rows;
+- proto/wire: 317/318 and bit 20 stability, conversion, bounds, redaction and old-peer exclusion;
+- Session/local/remote: authorization, sync fence, correlation, one outstanding/latest queued,
+  reconnect Gap and bit20 -> bit19 -> pager fallback;
+- CLI: one-line host wheel, child one-report, drag 33 ms plus final release, local cache hit, edge
+  prefetch/jump miss, no request repaint, DEC 2026 byte order, one write/flush and cleanup reset;
+- real PTY: quiet-shell first scroll, sustained wheel, thumb drag, nested-TUI mode enter/exit and
+  detach restoration on the owning macOS/Linux local/direct/relay environments.
+
+No benchmark or fixed latency assertion is part of acceptance. The observable contract is that a
+cache hit renders locally without a viewport request and that an unavailable target never exposes a
+partial/blank frame.
