@@ -731,3 +731,89 @@ Hosted PR follow-up evidence (2026-09-03):
 - Real Ghostty observation remains the user-owned acceptance step; no claim is
   made from byte-level tests that every outer-terminal implementation paints
   synchronized updates identically.
+
+## Phase 8 — Herdr-style Host Viewport Presentation Cadence (Planning)
+
+### 1. Isolate timing state
+
+- [x] Add a small desktop-CLI-owned pacer with a 16 ms minimum interval, one dirty flag, and at most
+  one pending deadline. Keep it free of protocol, Alacritty, row, and terminal-writer ownership.
+- [x] Provide deterministic mark-presented, mark-dirty, due, deadline, and cancel transitions that
+  can be tested with supplied `Instant` values; do not introduce an always-running interval.
+
+### 2. Separate state/request work from presentation
+
+- [x] Refactor host-owned viewport effect handling so wheel/gutter/Page navigation updates desired
+  state immediately and history-window request/prefetch effects remain immediate, while eligible
+  cached rendering can be marked dirty instead of flushed per report.
+- [x] Reduce every `HostInputEvent` from one stdin delivery before making the batch's presentation
+  decision. Preserve one-row-per-wheel-report and exact checked final offset.
+- [x] Leave child-owned mouse and alternate-scroll byte forwarding completely outside the pacer.
+  Preserve the existing 33 ms scrollbar-drag request pacing and force the final release position to
+  be presented when complete.
+
+### 3. Drive and invalidate the pending frame
+
+- [x] Add one guarded viewport-deadline branch to the active terminal `tokio::select!`; on expiry,
+  present only the latest complete host-owned history slice in the existing DEC 2026 transaction.
+- [x] Treat an immediate render containing the current viewport as satisfying pending work.
+- [x] Cancel pending presentation before return-live/resume, authoritative snapshot/resync,
+  resize/reflow, true reconnect, replacement transport state, detach, and cleanup. Do not cancel a
+  compatible pinned-history frame solely because a background live delta advanced.
+
+### 4. Regression tests
+
+- [x] Prove three same-direction reports delivered together move exactly three rows and emit one
+  history/chrome transaction; prove multiple deliveries inside 16 ms emit at most the latest due
+  frame and retain the final offset.
+- [x] Cover a burst crossing the cadence boundary, reverse direction, top/live clamp, cache miss with
+  immediate request, and a deadline firing after the view has been invalidated.
+- [x] Prove child-owned Herdr/PiAgent-style mouse modes still forward every report immediately and
+  receive no host history repaint; prove final thumb release is not stranded.
+- [x] Re-run existing resume/gutter/DEC-2026 byte-order, reconnect, resize, local-cache, fallback, and
+  cleanup tests so cadence cannot reintroduce the fixed blank-gutter frame.
+
+### 5. Validation and user smoke
+
+- [x] Run focused CLI tests, full `zterm-cli` tests, format, all-target/all-feature CLI Clippy with
+  `-D warnings`, source policy, and `git diff --check`.
+- [x] Run the repository-prescribed broader gate once required by the active task, followed by an
+  independent `trellis-check` review and spec synchronization.
+- [x] Build the reviewed debug binary at `target/debug/zterm`.
+- [ ] Complete real Ghostty verification: slow wheel, rapid wheel, trackpad, reverse direction,
+  scrollbar drag/release, return-live, and nested Herdr/PiAgent fullscreen mode.
+
+### Phase 8 completion gate
+
+- [x] Desktop host-owned cached viewport presentation is event-driven and no faster than the chosen
+  16 ms cadence, without a global PTY-output scheduler.
+- [x] Every input report still affects the exact final offset; only intermediate presentation is
+  coalesced, and requests remain immediate/latest-target correct.
+- [x] Child-owned input, one-Session/one-PTY ownership, wire compatibility, Alacritty model, Android
+  scope, and product-code unsafe prohibition are unchanged.
+- [x] No stale timed frame can repaint after an authoritative state transition or cleanup.
+
+### Phase 8 authorization
+
+- [x] Final planning summary presented and subsequently approved by the user on 2026-09-03.
+
+### Phase 8 implementation and review evidence (2026-09-03, macOS arm64)
+
+- The CLI now reduces every host-owned event from one stdin delivery before a presentation
+  decision, uses one event-driven/non-sliding 16 ms deadline, and keeps requests immediate. Normal
+  PTY deltas and child-owned mouse/alternate-scroll do not enter the pacer.
+- Independent review found that `ViewportCache` can advance its locally presentable offset before a
+  paced stdout frame commits. The fix adds a CLI-only last-successfully-presented metrics baseline,
+  advances it only after the complete outer transaction succeeds, and retains that baseline across
+  cache miss/resume instead of preserving an unseen target. Review also fixed a sliding cold
+  deadline and added same-epoch background-growth coverage.
+- `cargo +1.98.0 test -p zterm-cli --all-features` passed 62 library tests with 3 intentional
+  isolated-process helpers ignored; main and integration tests passed. CLI all-target/all-feature
+  check and Clippy with `-D warnings`, format, source policy, and `git diff --check` passed.
+- The single repository-level `just check` passed: source/version/dependency/release policy,
+  workspace all-target/all-feature Clippy, secret scans, all workspace tests and docs, cargo-deny,
+  and Relay static/upstream checks. Expected macOS skips remain Linux cross-UID, explicit-only
+  terminal blackbox, and Linux-only real Iroh loopback; no performance/RSS benchmark was run.
+- Real Ghostty perceived-cadence smoke remains the user-owned acceptance step. A burst that crosses
+  a 16 ms boundary may intentionally produce two normally spaced frames; final offset must remain
+  exact and no back-to-back per-report flush may return.

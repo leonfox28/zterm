@@ -60,6 +60,16 @@ ChromeLayout::new(physical: TerminalSize, remote: bool, screen: ActiveScreen)
 ScrollbarGeometry::new(track_rows: u16, metrics: TerminalScrollMetrics)
     -> Option<ScrollbarGeometry>
 
+const MIN_VIEWPORT_PRESENT_INTERVAL: Duration = Duration::from_millis(16);
+
+ViewportPresentationPacer::mark_dirty(&mut self, now: Instant)
+ViewportPresentationPacer::deadline(&self) -> Option<Instant>
+ViewportPresentationPacer::due(&self, now: Instant) -> bool
+ViewportPresentationPacer::mark_presented(&mut self, now: Instant)
+ViewportPresentationPacer::cancel(&mut self)
+
+ViewportController::observe_presentation(&mut self)
+
 ViewportState::ResumePending {
     retained_input: Vec<u8>,
     snapshot_applied: bool,
@@ -297,25 +307,38 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   2026, then disables capture/restores the user's terminal on normal exit,
   signal, error, and panic.
 - The primary history path is a client-owned `ViewportCache<Vec<u8>>` fed by
-  bounded 317/318 windows. A full cached slice renders wheel/Page/drag locally
-  without a request. Misses, absolute jumps, and half-screen low-water edges
-  retain one complete pending query and coalesce later movement to the latest
-  desired target; drag network requests are paced at 33 ms and release always
-  delivers the final deferred target. Request start, loading, resume, resize,
-  and content-free Changed/Gap never paint an intermediate blank or partial
-  history frame. The last complete presentation stays visible until one full
-  replacement is locally available.
+  bounded 317/318 windows. A full cached slice applies wheel/Page/drag to the
+  desired offset locally without a request. All host events decoded from one
+  stdin delivery are reduced before presentation; one CLI-owned dirty bit and
+  one non-sliding deadline present only the latest complete slice, with a
+  16-millisecond minimum interval between eligible host-owned viewport frames.
+  This is event-driven and has no idle ticker; it never paces ordinary live PTY
+  deltas, child-owned mouse, or alternate-scroll input. Misses, absolute jumps,
+  and half-screen low-water edges retain one complete pending query and coalesce
+  later movement to the latest desired target; request/prefetch effects remain
+  immediate, drag network requests are paced at 33 ms, and release always
+  delivers and presents the final complete target. Request start, loading,
+  resume, resize, and content-free Changed/Gap never paint an intermediate
+  blank or partial history frame. The last complete presentation stays visible
+  until one full replacement is locally available.
 - Received viewport state and presented viewport state are separate authorities.
   A coalesced legacy viewport frame that immediately triggers the next request
   has not been painted and must not replace the retained frame or scrollbar
-  metrics. When a painted history view enters `ResumePending`, it snapshots the
-  last valid presented metrics. A `SyncRequired` chrome repair continues to use
-  those metrics; after the authoritative replacement snapshot is observed, that
-  same atomic snapshot transaction uses the new valid live metrics at offset
-  zero. It must never render an empty gutter between those two complete states.
-  A resize clears retained metrics whose `viewport_rows` no longer match, and a
+  metrics. The window-cache reducer may advance a locally presentable desired
+  offset before its paced frame reaches stdout; that reducer value is likewise
+  not presentation authority. `ViewportController` therefore retains separate
+  last-successfully-presented metrics and advances them only after the complete
+  outer DEC-2026 transaction succeeds. When a painted history view enters
+  `ResumePending`, it snapshots that baseline rather than the cache target. A
+  `SyncRequired` chrome repair continues to use those metrics; after the
+  authoritative replacement snapshot is observed, that same atomic snapshot
+  transaction uses the new valid live metrics at offset zero. It must never
+  render an unseen target or empty gutter between those two complete states. A
+  resize clears retained metrics whose `viewport_rows` no longer match, and a
   true reconnect clears both live and retained metrics because the new stream
-  epoch cannot authenticate their identity.
+  epoch cannot authenticate their identity. Resume, snapshot/resync, resize,
+  reconnect, transport replacement, detach, cleanup, or another immediate frame
+  cancels/satisfies pending cadence work before a stale timer may repaint.
 - A window response is installable only when it is the exact shape of the
   saved query and contains the latest desired full-height slice. Same-epoch
   append translates a pinned offset by history growth. Epoch/size change,
@@ -451,6 +474,11 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
 | child declares mouse reporting / alternate+alternate-scroll | forward exactly one mouse report / one cursor-key sequence; do not move Zterm history |
 | composed render path omits DEC 2026 closure/host capture or flushes before chrome/capture | renderer contract failure; snapshot/delta/history/chrome tests must compare exact byte order, one write, and one flush |
 | cache miss/loading/resume/resize/content-free outcome has no complete new frame | issue/retain only the bounded request and keep the prior complete presentation; never blank or partially repaint content |
+| one stdin delivery contains multiple host-owned wheel reports | apply every one-line report to the desired offset, then emit at most one latest complete history/chrome transaction for that delivery; never flush once per report |
+| repeated host-owned updates arrive before the 16 ms deadline | keep one dirty bit and the original deadline, send request/prefetch effects immediately, and present only the latest complete target when due; do not slide the deadline or build a frame queue |
+| a paced desired target has not reached stdout when resume, cache miss, resize, reconnect, or authoritative replacement begins | retain only the last-successfully-presented metrics/pixels and cancel the stale deadline; never preserve or repaint the unseen desired target |
+| child mouse/alternate-scroll is active while host cadence work exists | forward each child-owned event immediately and cancel/ignore any now-unpresentable host frame; never delay PTY input behind the viewport deadline |
+| compatible same-epoch live history grows while a complete pinned frame is pending | translate the cached target and keep the valid pending presentation; do not discard it merely because the background revision advanced |
 | `ResumePending` receives `SyncRequired` before its replacement snapshot | keep the last painted, valid scrollbar geometry; do not turn missing replacement metrics into a blank gutter frame |
 | replacement snapshot is observed while resuming | use its validated live metrics in the same snapshot/chrome transaction; do not wait for a later `Active` repaint to restore the thumb |
 | a coalesced legacy viewport response immediately schedules a newer target | advance the request baseline but retain the last painted frame/metrics; an unpainted response is not presentation authority |
@@ -495,6 +523,13 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
 - **Good:** satisfy wheel/drag from a complete local cached slice, prefetch only
   at a bounded low-water edge, and atomically replace the prior frame when a
   validated request-shaped window becomes ready.
+- **Good:** reduce every host-owned report in one stdin delivery, send any
+  request immediately, and use one 16 ms event-driven deadline to present only
+  the latest complete cached target. Advance presented metrics only after that
+  atomic write succeeds.
+- **Bad:** flush each decoded wheel report independently, slide a pending
+  deadline on every new report, or copy the cache's desired/presentable offset
+  into resume chrome before the corresponding frame was actually written.
 - **Good:** preserve the painted history thumb through `ResumePending` and
   `SyncRequired`, then replace it directly with the validated live-bottom thumb
   inside the authoritative snapshot transaction.
@@ -582,7 +617,13 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
 - `terminal_ui` pure tests cover remote rows-minus-one/one-row geometry,
   oversized physical-to-bounded child projection for initial attach and resize,
   stable main gutter/alternate reclaim, all scrollbar positions and drag
-  clamping, exact DEC-2026-composed output/capture/write/flush order, complete
+  clamping, same-delivery wheel-burst reduction, non-sliding 16 ms deadlines,
+  cross-delivery latest-frame coalescing, reverse/clamp final offsets, cache-miss
+  immediate requests, final drag release, child-owned bypass, compatible
+  background-delta translation, and stale-deadline cancellation. Timing tests
+  supply explicit `Instant` values and assert transaction counts rather than
+  relying on an OS scheduler. They also cover exact DEC-2026-composed
+  output/capture/write/flush order, complete
   reverse-video Unicode-safe status output, mode-derived one-report wheel/Page
   routing, cached hit/no-request, edge prefetch, 33 ms drag/release-final,
   resize refill, request/Changed/Gap frame retention, and exact-once input
@@ -642,11 +683,18 @@ match (pinned, gutter_hit, modes.mouse, screen, modes.alternate_scroll) {
 }
 
 let update = viewport_cache.set_target(target);
-if update.render_local {
-    present_complete_cached_frame_atomically();
-}
 if let Some(query) = update.request {
     save_complete_query_then_send(query).await?;
+}
+if update.render_local {
+    viewport_pacer.mark_dirty(now); // state is current; no frame is queued
+}
+
+// After every event in this stdin delivery has updated the target:
+if viewport_pacer.due(now) {
+    present_latest_complete_cached_frame_atomically()?;
+    viewport.observe_presentation(); // only after the outer write succeeds
+    viewport_pacer.mark_presented(now);
 }
 ```
 
@@ -668,6 +716,15 @@ state = ResumePending {
     presented_scroll_metrics: last_painted_metrics,
     ..
 };
+```
+
+```rust
+// Wrong: this target is locally renderable, but the 16 ms frame is still pending.
+last_presented_metrics = viewport_cache.desired_metrics();
+
+// Correct: keep desired and actually presented state independent.
+present_latest_complete_cached_frame_atomically()?;
+viewport.observe_presentation();
 ```
 
 ```rust
@@ -726,6 +783,10 @@ assert_eq!(error.kind(), DomainErrorKind::DeadlineExceeded);
 - Flushing child ANSI before status/gutter/capture composition, or permitting a
   child mode transition to leave outer `1003/1006` capture disabled; omitting
   the outer DEC 2026 end from normal or cleanup paths.
+- Flushing one outer history frame per decoded wheel report, using an
+  always-running/global PTY render ticker, sliding a pending cadence deadline on
+  every input, or treating a locally presentable cache target as actually
+  presented before its atomic outer write succeeds.
 - Removing or rebinding a socket without the held daemon lock and exact
   device/inode/change-time ownership token.
 - Reporting successful stop before every registry-owned child/thread/reservation

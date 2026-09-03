@@ -552,3 +552,58 @@ the local macOS arm64 implementation environment.
 
 - [x] 用户在讨论 desktop/mobile 统一缓存、兼容边界和分阶段实现后明确回复“好 按你说的做”
   （2026-09-03）。该回复授权本 follow-up 的 planning amendment 与产品代码实施。
+
+## Wheel Burst Presentation Pacing Amendment (Planning, 2026-09-03)
+
+### Goal and confirmed facts
+
+- 实机已确认一个 Ghostty wheel burst 的总位移为三行，修复后的“一份完整 SGR report = 一行”
+  语义正确；不得重新乘以三。
+- 当前 CLI 对 burst 中每份 host-owned report 都立即更新缓存并各自 `write_all`/flush 一帧，
+  因而 host 有时只显示最终三行状态，有时显示一行/两行的中间状态。总 offset 正确，但视觉
+  cadence 不稳定。
+- SGR mouse report 不携带物理 gesture/notch ID，不能无启发式地证明哪三份报告属于一次动作。
+- Herdr 的可迁移机制是 16 ms render/presentation cadence、dirty 合并、latest complete frame 和
+  单 render slot；不是它的默认三行 input multiplier。
+
+### In scope and requirements
+
+- 仅对 Zterm-owned cached viewport repaint 增加有界 cadence；每份 report 仍立即、checked 地
+  累计 desired offset，最多每 16 ms 呈现一次最新完整 slice。
+- child-owned mouse/alternate-scroll、网络 prefetch/request、普通键盘输入和 authoritative
+  snapshot/resync 不等待 wheel cadence。后者必须取消或吸收 pending repaint，避免旧历史帧
+  在状态切换后补画。
+- 不引入全局 PTY-output 60 Hz scheduler，不改变 wire、daemon、Alacritty model、每-report
+  行数、PageUp、scrollbar drag 的 33 ms 网络 pacing 或 Android semantic-cell scope。
+
+### Acceptance criteria
+
+- 一个同方向三-report cached burst 总位移仍精确为三行，且 16 ms 窗口内最多一次 history/
+  scrollbar transaction；不出现三次背靠背 flush。
+- burst 跨 cadence 边界时每个可见 frame 间隔受控且最终 offset 不丢失；反向 wheel、边界 clamp
+  和 cache miss/prefetch 保持 latest-target 正确。
+- child-owned三份 report 仍逐份原样/等价转发，不经 host repaint cadence；嵌套 Herdr/PiAgent
+  行为不变。
+- return-live、normal input、snapshot/resync、resize、reconnect、detach 和 cleanup 不会在取消后
+  补画过期 viewport；DEC 2026、host capture 与单事务约束保持不变。
+
+### Key decision and accepted trade-offs
+
+- 用户于 2026-09-03 选择与 Herdr 相同的 event-driven、16 ms minimum presentation
+  interval：dirty 状态合并为 latest complete frame，空闲时不运行固定 tick。
+- 16 ms 是 desktop Zterm-owned cached viewport 的最大呈现频率，不是与显示器 vsync 对齐的
+  精确 60 Hz。输入到可见结果会增加最多约一帧的等待；120/144 Hz 屏幕也不会因此获得
+  120/144 个 Zterm history frame。
+- 该策略不识别物理滚轮 gesture。常见的同一 stdin batch 内三份 report 必须先累计再呈现，
+  但跨过 cadence boundary 或被外层终端拆成多个 batch 时仍可能显示两步；两步之间不得再是
+  无界的背靠背 flush，最终 offset 必须精确。
+- 快速滚动时允许跳过不可见的中间 offset，只呈现最新完整状态；不得丢失 report、反向移动或
+  最终位置。未来 Android 复用 latest-frame/coalescing 原则，但应跟随 native display vsync，
+  不把 desktop 的 16 ms 常量写进跨平台 core。
+- trailing debounce 被否决：它更容易把三份 report 固定成一次跳转，但会让每次滚动起步都等待
+  quiet window，并使连续触控板输入更黏滞。
+
+### Authorization
+
+- [x] 最终 planning summary 已提交；用户随后于 2026-09-03 明确回复“批准实施”。本次授权只
+  覆盖上述 desktop host-owned viewport cadence，不扩大到全局 PTY scheduler 或 Android。

@@ -355,6 +355,13 @@ attachment-local presentation, and transport/controller synchronization.
 - [ ] Distinguish received, desired, and actually presented state. A coalesced
       response that immediately schedules a newer target is not allowed to
       replace presentation metrics until its complete frame is painted.
+- [ ] When presentation is paced, update desired state and issue independent
+      requests immediately, but advance the presented baseline only after the
+      outer write succeeds. One dirty bit/deadline should reference current
+      state rather than retain intermediate frame payloads.
+- [ ] Test cadence cancellation at every authority change. Resume, cache miss,
+      snapshot/resync, resize, reconnect, detach, and cleanup must not let a
+      stale timer promote an unseen desired offset into painted chrome.
 - [ ] Trace transition bugs through every externally emitted frame, not only
       endpoint state. For terminal return-to-live, cover `History ->
       ResumePending -> SyncRequired -> Snapshot -> Active` and assert that

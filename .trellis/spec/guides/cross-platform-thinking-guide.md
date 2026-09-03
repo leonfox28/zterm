@@ -80,9 +80,11 @@ matrix explicit:
   conforming terminal.
 - Continuous interaction uses the renderer-neutral `ViewportCache<Row>` in
   core: wheel, Page, mouse drag, and future touch gestures update a local
-  desired offset and present a complete cached slice immediately. Network
-  window reads are bounded miss/low-water prefetch, never the per-gesture
-  animation loop; one in-flight request coalesces to the latest target.
+  desired offset immediately. The desktop CLI presents only the latest complete
+  cached slice through an event-driven 16 ms minimum interval; Android should
+  use native display vsync rather than inherit that constant. Network window
+  reads are bounded miss/low-water prefetch, never the per-gesture animation
+  loop; one in-flight request coalesces to the latest target.
 - DEC 2026 synchronized presentation, ANSI rows, SGR mouse reports, the
   33-millisecond desktop drag request pace, and the one-column text gutter are
   Unix CLI adapter policy. They are not core cache semantics and must not leak

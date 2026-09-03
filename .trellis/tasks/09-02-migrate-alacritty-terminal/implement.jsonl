@@ -12,7 +12,7 @@
 {"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/herdr-reference-architecture.md", "reason": "只借鉴 Herdr 的 authoritative state、per-client projection、backpressure 与 TERM 隔离原则，不复制其 unsafe/FFI 实现。"}
 {"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/nested-tui-scroll-routing.md", "reason": "落实 Herdr/Pi main/fullscreen 的标准 mode 驱动 wheel ownership、每 report 单一 owner、host capture 分层与禁止应用名特判。"}
 {"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/rust-vt-and-c-language-evaluation.md", "reason": "保留选择官方 Rust terminal core、拒绝社区 Ghostty wrapper与 C rewrite的决策背景，避免实现时恢复已否决路线。"}
-{"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/herdr-flicker-rendering.md", "reason": "落实 Herdr 可迁移的 DEC 2026、同帧 chrome、content diff/pacing 与 latest-wins 原则，同时避免照搬 Ratatui、Ghostty wrapper和全局 renderer。"}
+{"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/herdr-flicker-rendering.md", "reason": "落实 Herdr 可迁移的 DEC 2026、同帧 chrome、16ms event-driven latest-frame cadence 与 wheel-burst 合帧原则，同时避免照搬三行 multiplier、Ratatui、Ghostty wrapper和全局 renderer。"}
 {"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/local-viewport-cache.md", "reason": "提供 desktop/mobile 共用的纯读连续窗口、live-top坐标、generic cache reducer、prefetch、失效和mixed-version最小实现边界。"}
 {"file": ".trellis/spec/backend/local-daemon-ipc.md", "reason": "窗口请求必须穿过真实 local/remote duplex、保持 one-outstanding/correlation/input fence，并由 CLI 完成无闪烁原子呈现。"}
 {"file": ".trellis/spec/backend/transport-auth.md", "reason": "远端窗口能力、request correlation 与 stream-loss Gap sentinel 必须按每个 Iroh attachment epoch 协商和清理。"}

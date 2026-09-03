@@ -71,6 +71,7 @@ mod unix {
     const CONTROL_PREFIX_TIMEOUT: Duration = Duration::from_secs(1);
     const DETACH_TIMEOUT: Duration = Duration::from_secs(2);
     const DRAG_REQUEST_INTERVAL: Duration = Duration::from_millis(33);
+    const MIN_VIEWPORT_PRESENT_INTERVAL: Duration = Duration::from_millis(16);
     const HOST_SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
     const HOST_SYNC_END: &[u8] = b"\x1b[?2026l";
     const HOST_INPUT_CAPTURE: &[u8] = b"\x1b[?1003h\x1b[?1006h";
@@ -288,6 +289,9 @@ mod unix {
             &mut status_renderer,
             transport_state,
         )?;
+        viewport.observe_presentation();
+        let mut viewport_pacer = ViewportPresentationPacer::default();
+        viewport_pacer.mark_presented(Instant::now());
         if let Some(cancellation) = current_terminal_cancellation(cancellation_receiver) {
             drop(prepared);
             stdin_pump.shutdown()?;
@@ -339,6 +343,20 @@ mod unix {
         let mut deferred_active = false;
 
         let loop_result = 'terminal: loop {
+            let now = Instant::now();
+            if viewport_pacer.due(now) {
+                if let Err(error) = present_cached_viewport_stdout(
+                    &mut viewport,
+                    &mut status_renderer,
+                    transport_state,
+                    &mut viewport_pacer,
+                    now,
+                    false,
+                ) {
+                    break Err(error);
+                }
+                continue;
+            }
             if prefix
                 .deadline()
                 .is_some_and(|deadline| Instant::now() >= deadline)
@@ -352,11 +370,13 @@ mod unix {
                         let effect = viewport.retain_or_resume(bytes)?;
                         if apply_viewport_effect(
                             effect,
-                            &viewport,
+                            &mut viewport,
                             &writer,
                             renderer.revision(),
                             &mut status_renderer,
                             transport_state,
+                            &mut viewport_pacer,
+                            false,
                         )
                         .await?
                         {
@@ -367,8 +387,10 @@ mod unix {
                 continue;
             }
             let prefix_deadline = prefix.deadline();
+            let viewport_deadline = viewport_pacer.deadline();
             tokio::select! {
                 cancellation = receive_terminal_cancellation(cancellation_receiver) => {
+                    viewport_pacer.cancel();
                     break Err(cancellation.error(Some(session_id)));
                 }
                 signal = resize_signal.recv() => {
@@ -389,6 +411,7 @@ mod unix {
                         viewport.effective_screen(renderer.active_screen()),
                     );
                     let latest = layout.child;
+                    viewport_pacer.cancel();
                     viewport.set_layout(layout);
                     status_renderer.resize(latest_physical);
                     if let Err(error) = render_view_stdout(
@@ -398,6 +421,8 @@ mod unix {
                     ) {
                         break Err(error);
                     }
+                    viewport.observe_presentation();
+                    viewport_pacer.mark_presented(Instant::now());
                     if let Some(size) = resize_coalescer.observe(latest, transport_state) {
                         if let Err(error) = writer.resize(size).await {
                             break Err(error.into());
@@ -414,6 +439,7 @@ mod unix {
                             &mut status_renderer,
                             &mut resize_coalescer,
                             &writer,
+                            &mut viewport_pacer,
                         ).await {
                             Ok(state) => transport_state = state,
                             Err(error) => break 'terminal Err(error),
@@ -434,15 +460,30 @@ mod unix {
                             let effect = viewport.retain_or_resume(bytes)?;
                             if apply_viewport_effect(
                                 effect,
-                                &viewport,
+                                &mut viewport,
                                 &writer,
                                 renderer.revision(),
                                 &mut status_renderer,
                                 transport_state,
+                                &mut viewport_pacer,
+                                false,
                             ).await? {
                                 sync_requested = true;
                             }
                         }
+                    }
+                }
+                () = wait_for_viewport_deadline(viewport_deadline), if viewport_deadline.is_some() => {
+                    let now = Instant::now();
+                    if let Err(error) = present_cached_viewport_stdout(
+                        &mut viewport,
+                        &mut status_renderer,
+                        transport_state,
+                        &mut viewport_pacer,
+                        now,
+                        false,
+                    ) {
+                        break Err(error);
                     }
                 }
                 event = events.read_event() => {
@@ -475,6 +516,7 @@ mod unix {
                                 &mut status_renderer,
                                 &mut resize_coalescer,
                                 &writer,
+                                &mut viewport_pacer,
                             ).await {
                                 Ok(applied) => transport_state = applied,
                                 Err(error) => break 'terminal Err(error),
@@ -489,8 +531,11 @@ mod unix {
                             ) {
                                 break Err(error);
                             }
+                            viewport.observe_presentation();
+                            viewport_pacer.mark_presented(Instant::now());
                         }
                         TerminalViewEvent::Snapshot(snapshot) => {
+                            viewport_pacer.cancel();
                             let pinned_history = viewport.is_history();
                             let preserving_resume_input = viewport.is_resume_pending();
                             if transport_state != TerminalViewTransportState::Synchronizing
@@ -539,6 +584,8 @@ mod unix {
                             if let Err(error) = rendered {
                                 break Err(error);
                             }
+                            viewport.observe_presentation();
+                            viewport_pacer.mark_presented(Instant::now());
                             prefix.clear_pending();
                             sync_requested = false;
                             if let Err(error) = writer.snapshot_applied(snapshot.revision()).await {
@@ -552,6 +599,9 @@ mod unix {
                         }
                         TerminalViewEvent::Delta(delta) => {
                             let rendered_live = viewport.is_live();
+                            if rendered_live {
+                                viewport_pacer.cancel();
+                            }
                             let delta_result = if rendered_live {
                                 if renderer.revision() != delta.from_revision() {
                                     Ok(DeltaRender::Gap)
@@ -579,6 +629,8 @@ mod unix {
                                     viewport.observe_live_metrics(delta.scroll_metrics());
                                     sync_requested = false;
                                     if rendered_live {
+                                        viewport.observe_presentation();
+                                        viewport_pacer.mark_presented(Instant::now());
                                         let mode_resize = resize_coalescer
                                             .observe(viewport.content_size(), transport_state);
                                         if let Some(size) = mode_resize {
@@ -597,11 +649,17 @@ mod unix {
                                                 &mut status_renderer,
                                                 &mut resize_coalescer,
                                                 &writer,
+                                                &mut viewport_pacer,
                                             ).await {
                                                 Ok(state) => transport_state = state,
                                                 Err(error) => break 'terminal Err(error),
                                             }
                                         }
+                                    } else {
+                                        cancel_unpresentable_cached_viewport(
+                                            &viewport,
+                                            &mut viewport_pacer,
+                                        );
                                     }
                                     if transport_state == TerminalViewTransportState::Synchronizing
                                         && let Err(error) = writer
@@ -612,6 +670,7 @@ mod unix {
                                     }
                                 }
                                 Ok(DeltaRender::Gap) => {
+                                    viewport_pacer.cancel();
                                     if rendered_live {
                                         viewport.begin_resume(Vec::new())?;
                                     }
@@ -646,6 +705,7 @@ mod unix {
                             }
                         }
                         TerminalViewEvent::History(result) => {
+                            viewport_pacer.cancel();
                             viewport.apply_history(result)?;
                             if let Err(error) = render_history_stdout(
                                 &viewport,
@@ -654,16 +714,20 @@ mod unix {
                             ) {
                                 break Err(error);
                             }
+                            viewport.observe_presentation();
+                            viewport_pacer.mark_presented(Instant::now());
                         }
                         TerminalViewEvent::Viewport(result) => {
                             let effect = viewport.apply_viewport(result)?;
                             if apply_viewport_effect(
                                 effect,
-                                &viewport,
+                                &mut viewport,
                                 &writer,
                                 renderer.revision(),
                                 &mut status_renderer,
                                 transport_state,
+                                &mut viewport_pacer,
+                                false,
                             )
                             .await?
                             {
@@ -674,11 +738,13 @@ mod unix {
                             let effect = viewport.apply_history_window(result)?;
                             if apply_viewport_effect(
                                 effect,
-                                &viewport,
+                                &mut viewport,
                                 &writer,
                                 renderer.revision(),
                                 &mut status_renderer,
                                 transport_state,
+                                &mut viewport_pacer,
+                                false,
                             )
                             .await?
                             {
@@ -686,6 +752,7 @@ mod unix {
                             }
                         }
                         TerminalViewEvent::SyncRequired { .. } => {
+                            viewport_pacer.cancel();
                             viewport.observe_sync_required();
                             if transport_state != TerminalViewTransportState::Synchronizing {
                                 transport_state = TerminalViewTransportState::Synchronizing;
@@ -696,6 +763,8 @@ mod unix {
                                 ) {
                                     break 'terminal Err(error);
                                 }
+                                viewport.observe_presentation();
+                                viewport_pacer.mark_presented(Instant::now());
                             }
                             // The marker and its authoritative replacement snapshot are emitted
                             // together. Treat that replacement as already in flight instead of
@@ -703,12 +772,14 @@ mod unix {
                             sync_requested = true;
                         }
                         TerminalViewEvent::LeaseLost { .. } => {
+                            viewport_pacer.cancel();
                             break Err(terminal_daemon_error(
                                 DomainErrorKind::LeaseLost,
                                 "another attachment took over this terminal controller",
                             ));
                         }
                         TerminalViewEvent::SessionEnded(ended) => {
+                            viewport_pacer.cancel();
                             break terminal_end_completion(ended.reason);
                         }
                     }
@@ -722,6 +793,7 @@ mod unix {
                                 Ok(events) => events,
                                 Err(error) => break 'terminal Err(error),
                             };
+                            let mut force_viewport_presentation = false;
                             for host_event in host_events {
                                 match host_event {
                                     HostInputEvent::Bytes(bytes) => {
@@ -739,11 +811,13 @@ mod unix {
                                                     let effect = viewport.retain_or_resume(bytes)?;
                                                     if apply_viewport_effect(
                                                         effect,
-                                                        &viewport,
+                                                        &mut viewport,
                                                         &writer,
                                                         renderer.revision(),
                                                         &mut status_renderer,
                                                         transport_state,
+                                                        &mut viewport_pacer,
+                                                        true,
                                                     ).await? {
                                                         sync_requested = true;
                                                     }
@@ -765,11 +839,13 @@ mod unix {
                                             let effect = viewport.retain_or_resume(bytes)?;
                                             if apply_viewport_effect(
                                                 effect,
-                                                &viewport,
+                                                &mut viewport,
                                                 &writer,
                                                 renderer.revision(),
                                                 &mut status_renderer,
                                                 transport_state,
+                                                &mut viewport_pacer,
+                                                true,
                                             ).await? {
                                                 sync_requested = true;
                                             }
@@ -795,11 +871,13 @@ mod unix {
                                             );
                                             if apply_viewport_effect(
                                                 effect,
-                                                &viewport,
+                                                &mut viewport,
                                                 &writer,
                                                 renderer.revision(),
                                                 &mut status_renderer,
                                                 transport_state,
+                                                &mut viewport_pacer,
+                                                true,
                                             ).await? {
                                                 sync_requested = true;
                                             }
@@ -815,13 +893,16 @@ mod unix {
                                             &mouse,
                                             live_history_navigation_allowed(transport_state),
                                         ) {
+                                            force_viewport_presentation |= mouse.release;
                                             if apply_viewport_effect(
                                                 effect,
-                                                &viewport,
+                                                &mut viewport,
                                                 &writer,
                                                 renderer.revision(),
                                                 &mut status_renderer,
                                                 transport_state,
+                                                &mut viewport_pacer,
+                                                true,
                                             ).await? {
                                                 sync_requested = true;
                                             }
@@ -834,11 +915,13 @@ mod unix {
                                             let effect = viewport.navigate(mouse.wheel_is_up(), 1);
                                             if apply_viewport_effect(
                                                 effect,
-                                                &viewport,
+                                                &mut viewport,
                                                 &writer,
                                                 renderer.revision(),
                                                 &mut status_renderer,
                                                 transport_state,
+                                                &mut viewport_pacer,
+                                                true,
                                             ).await? {
                                                 sync_requested = true;
                                             }
@@ -873,11 +956,13 @@ mod unix {
                                                 let effect = viewport.navigate(mouse.wheel_is_up(), 1);
                                                 if apply_viewport_effect(
                                                     effect,
-                                                    &viewport,
+                                                    &mut viewport,
                                                     &writer,
                                                     renderer.revision(),
                                                     &mut status_renderer,
                                                     transport_state,
+                                                    &mut viewport_pacer,
+                                                    true,
                                                 ).await? {
                                                     sync_requested = true;
                                                 }
@@ -891,6 +976,7 @@ mod unix {
                                 }
                             }
                             if prefix.detached() {
+                                viewport_pacer.cancel();
                                 break Ok(TerminalCompletion::Detached);
                             }
                             if deferred_active && !input_codec.paste_in_progress() {
@@ -906,15 +992,27 @@ mod unix {
                                     &mut status_renderer,
                                     &mut resize_coalescer,
                                     &writer,
+                                    &mut viewport_pacer,
                                 ).await {
                                     Ok(applied) => transport_state = applied,
                                     Err(error) => break 'terminal Err(error),
                                 }
                                 deferred_active = false;
                             }
+                            if let Err(error) = present_cached_viewport_stdout(
+                                &mut viewport,
+                                &mut status_renderer,
+                                transport_state,
+                                &mut viewport_pacer,
+                                Instant::now(),
+                                force_viewport_presentation,
+                            ) {
+                                break 'terminal Err(error);
+                            }
                         }
                         Some(StdinEvent::Bytes { .. }) => {}
                         Some(StdinEvent::Eof) | None => {
+                            viewport_pacer.cancel();
                             if let Some(bytes) = take_pending_active_input(
                                 &mut prefix,
                                 transport_state,
@@ -1126,7 +1224,9 @@ mod unix {
         status_renderer: &mut StatusRenderer,
         resize_coalescer: &mut ResizeCoalescer,
         writer: &zterm_daemon::operations::TerminalViewCommandWriter,
+        viewport_pacer: &mut ViewportPresentationPacer,
     ) -> Result<TerminalViewTransportState, CliError> {
+        viewport_pacer.cancel();
         let (next, pending_resize) = resize_coalescer.enter_transport_state(next);
         if next == TerminalViewTransportState::Reconnecting {
             viewport.reset_presentation_for_reconnect();
@@ -1145,6 +1245,8 @@ mod unix {
             render_transport_state_stdout(next)?;
         }
         render_view_stdout(viewport, status_renderer, next)?;
+        viewport.observe_presentation();
+        viewport_pacer.mark_presented(Instant::now());
         if let Some(size) = pending_resize {
             writer.resize(size).await?;
         }
@@ -2090,6 +2192,14 @@ mod unix {
         tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
     }
 
+    async fn wait_for_viewport_deadline(deadline: Option<Instant>) {
+        let Some(deadline) = deadline else {
+            std::future::pending::<()>().await;
+            return;
+        };
+        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+    }
+
     struct ResizeCoalescer {
         pending: Option<TerminalSize>,
         last_submitted: TerminalSize,
@@ -2269,6 +2379,49 @@ mod unix {
         Resume,
     }
 
+    #[derive(Default)]
+    struct ViewportPresentationPacer {
+        last_presented: Option<Instant>,
+        dirty: bool,
+        pending_deadline: Option<Instant>,
+    }
+
+    impl ViewportPresentationPacer {
+        fn mark_dirty(&mut self, now: Instant) {
+            if self.dirty {
+                return;
+            }
+            self.dirty = true;
+            let earliest = self
+                .last_presented
+                .and_then(|last| last.checked_add(MIN_VIEWPORT_PRESENT_INTERVAL));
+            self.pending_deadline =
+                Some(earliest.filter(|deadline| *deadline > now).unwrap_or(now));
+        }
+
+        const fn deadline(&self) -> Option<Instant> {
+            self.pending_deadline
+        }
+
+        fn due(&self, now: Instant) -> bool {
+            self.dirty
+                && self
+                    .pending_deadline
+                    .is_some_and(|deadline| now >= deadline)
+        }
+
+        fn mark_presented(&mut self, now: Instant) {
+            self.last_presented = Some(now);
+            self.dirty = false;
+            self.pending_deadline = None;
+        }
+
+        fn cancel(&mut self) {
+            self.dirty = false;
+            self.pending_deadline = None;
+        }
+    }
+
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum HistoryProtocol {
         Window,
@@ -2305,6 +2458,10 @@ mod unix {
         drag_grab_row: Option<u16>,
         drag_last_request: Option<Instant>,
         drag_deferred_target: Option<u64>,
+        // Seeded for the initial live frame; unlike the cache's latest locally
+        // presentable target, it subsequently advances only after a complete
+        // outer-terminal transaction succeeds.
+        last_presented_scroll_metrics: Option<TerminalScrollMetrics>,
         stale_gutter_column: Cell<Option<u16>>,
         discard_viewport_response: bool,
         discard_window_response: bool,
@@ -2325,6 +2482,7 @@ mod unix {
                 drag_grab_row: None,
                 drag_last_request: None,
                 drag_deferred_target: None,
+                last_presented_scroll_metrics: None,
                 stale_gutter_column: Cell::new(None),
                 discard_viewport_response: false,
                 discard_window_response: false,
@@ -2342,6 +2500,7 @@ mod unix {
                 drag_grab_row: None,
                 drag_last_request: None,
                 drag_deferred_target: None,
+                last_presented_scroll_metrics: live_metrics,
                 stale_gutter_column: Cell::new(None),
                 discard_viewport_response: false,
                 discard_window_response: false,
@@ -2364,6 +2523,13 @@ mod unix {
             matches!(&self.state, ViewportState::History(_))
         }
 
+        fn has_complete_cached_viewport(&self) -> bool {
+            matches!(
+                &self.state,
+                ViewportState::History(history) if history.protocol == HistoryProtocol::Window
+            ) && self.window_cache.visible_rows().is_some()
+        }
+
         const fn is_resume_pending(&self) -> bool {
             matches!(&self.state, ViewportState::ResumePending { .. })
         }
@@ -2381,6 +2547,7 @@ mod unix {
                 );
             }
             if changed {
+                self.last_presented_scroll_metrics = None;
                 if let ViewportState::ResumePending {
                     presented_scroll_metrics,
                     ..
@@ -3023,21 +3190,19 @@ mod unix {
                         .or(self.live_metrics)
                 }
                 ViewportState::History(history) if history.protocol == HistoryProtocol::Window => {
-                    self.window_cache
-                        .anchor()
-                        .map(|anchor| TerminalScrollMetrics {
-                            epoch: anchor.epoch,
-                            revision: anchor.revision,
-                            offset_from_bottom: if self.window_cache.visible_rows().is_some() {
-                                self.window_cache.desired_offset_from_bottom()
-                            } else {
-                                self.window_cache
-                                    .presented_offset_from_bottom()
-                                    .unwrap_or(self.window_cache.desired_offset_from_bottom())
-                            },
-                            max_offset_from_bottom: anchor.max_offset_from_bottom,
-                            viewport_rows: anchor.viewport.rows,
-                        })
+                    if self.window_cache.visible_rows().is_some() {
+                        self.window_cache
+                            .anchor()
+                            .map(|anchor| TerminalScrollMetrics {
+                                epoch: anchor.epoch,
+                                revision: anchor.revision,
+                                offset_from_bottom: self.window_cache.desired_offset_from_bottom(),
+                                max_offset_from_bottom: anchor.max_offset_from_bottom,
+                                viewport_rows: anchor.viewport.rows,
+                            })
+                    } else {
+                        self.last_presented_scroll_metrics
+                    }
                 }
                 ViewportState::History(_) => None,
                 ViewportState::ResumePending {
@@ -3054,6 +3219,10 @@ mod unix {
                 }
             }
             .filter(|metrics| metrics.is_valid())
+        }
+
+        fn observe_presentation(&mut self) {
+            self.last_presented_scroll_metrics = self.scroll_metrics();
         }
 
         fn observe_live_metrics(&mut self, metrics: Option<TerminalScrollMetrics>) {
@@ -3090,7 +3259,7 @@ mod unix {
         }
 
         fn start_resume(&mut self, retained_input: Vec<u8>) -> ViewportEffect {
-            let presented_scroll_metrics = self.scroll_metrics();
+            let presented_scroll_metrics = self.last_presented_scroll_metrics;
             self.discard_viewport_response |= matches!(
                 &self.state,
                 ViewportState::History(history)
@@ -3147,6 +3316,7 @@ mod unix {
             // previously live extent. Keep the old pixels in place, but do
             // not project their metrics into reconnecting chrome.
             self.live_metrics = None;
+            self.last_presented_scroll_metrics = None;
             if let ViewportState::ResumePending {
                 snapshot_applied,
                 presented_scroll_metrics,
@@ -3181,10 +3351,7 @@ mod unix {
                 return None;
             };
             if history.protocol == HistoryProtocol::Window {
-                let rows = self
-                    .window_cache
-                    .visible_rows()
-                    .or_else(|| self.window_cache.presented_rows())?;
+                let rows = self.window_cache.visible_rows()?;
                 return Some((rows, usize::from(self.content_size.rows), history.notice));
             }
             if history.protocol == HistoryProtocol::Viewport {
@@ -3790,6 +3957,71 @@ mod unix {
         render_history_with_chrome(&mut output, viewport, status, transport_state)
     }
 
+    fn present_cached_viewport_with_writer(
+        writer: &mut impl Write,
+        viewport: &mut ViewportController,
+        status: &mut StatusRenderer,
+        transport_state: TerminalViewTransportState,
+        pacer: &mut ViewportPresentationPacer,
+        now: Instant,
+        force: bool,
+    ) -> Result<bool, CliError> {
+        if !force && !pacer.due(now) {
+            return Ok(false);
+        }
+        if !viewport.has_complete_cached_viewport() {
+            pacer.cancel();
+            return Ok(false);
+        }
+        render_history_with_chrome(writer, viewport, status, transport_state)?;
+        viewport.observe_presentation();
+        pacer.mark_presented(now);
+        Ok(true)
+    }
+
+    fn mark_cached_viewport_dirty(
+        viewport: &ViewportController,
+        pacer: &mut ViewportPresentationPacer,
+        now: Instant,
+    ) -> bool {
+        if !viewport.has_complete_cached_viewport() {
+            pacer.cancel();
+            return false;
+        }
+        pacer.mark_dirty(now);
+        true
+    }
+
+    fn cancel_unpresentable_cached_viewport(
+        viewport: &ViewportController,
+        pacer: &mut ViewportPresentationPacer,
+    ) {
+        if !viewport.has_complete_cached_viewport() {
+            pacer.cancel();
+        }
+    }
+
+    fn present_cached_viewport_stdout(
+        viewport: &mut ViewportController,
+        status: &mut StatusRenderer,
+        transport_state: TerminalViewTransportState,
+        pacer: &mut ViewportPresentationPacer,
+        now: Instant,
+        force: bool,
+    ) -> Result<bool, CliError> {
+        let stdout = io::stdout();
+        let mut output = stdout.lock();
+        present_cached_viewport_with_writer(
+            &mut output,
+            viewport,
+            status,
+            transport_state,
+            pacer,
+            now,
+            force,
+        )
+    }
+
     fn write_scrollbar(writer: &mut impl Write, viewport: &ViewportController) -> io::Result<()> {
         let stale_column = viewport.stale_gutter_column.replace(None);
         if let Some(column) = stale_column {
@@ -3893,40 +4125,81 @@ mod unix {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn apply_viewport_effect(
         effect: ViewportEffect,
-        viewport: &ViewportController,
+        viewport: &mut ViewportController,
         writer: &zterm_daemon::operations::TerminalViewCommandWriter,
         revision: Revision,
         status: &mut StatusRenderer,
         transport_state: TerminalViewTransportState,
+        pacer: &mut ViewportPresentationPacer,
+        defer_cached_presentation: bool,
     ) -> Result<bool, CliError> {
         match effect {
-            ViewportEffect::None => Ok(false),
+            ViewportEffect::None => {
+                cancel_unpresentable_cached_viewport(viewport, pacer);
+                Ok(false)
+            }
             ViewportEffect::Render => {
-                render_view_stdout(viewport, status, transport_state)?;
+                let now = Instant::now();
+                if mark_cached_viewport_dirty(viewport, pacer, now) {
+                    if !defer_cached_presentation {
+                        let _ = present_cached_viewport_stdout(
+                            viewport,
+                            status,
+                            transport_state,
+                            pacer,
+                            now,
+                            false,
+                        )?;
+                    }
+                } else {
+                    pacer.cancel();
+                    render_view_stdout(viewport, status, transport_state)?;
+                    viewport.observe_presentation();
+                    pacer.mark_presented(now);
+                }
                 Ok(false)
             }
             ViewportEffect::Request(request) => {
+                pacer.cancel();
                 writer
                     .request_history(request.direction, request.cursor, MAX_HISTORY_PAGE_ROWS)
                     .await?;
                 Ok(false)
             }
             ViewportEffect::RequestViewport(action) => {
+                pacer.cancel();
                 writer.request_viewport(action).await?;
                 Ok(false)
             }
             ViewportEffect::RequestHistoryWindow(query) => {
+                cancel_unpresentable_cached_viewport(viewport, pacer);
                 writer.request_history_window(query).await?;
                 Ok(false)
             }
             ViewportEffect::RenderAndRequestHistoryWindow(query) => {
-                render_view_stdout(viewport, status, transport_state)?;
                 writer.request_history_window(query).await?;
+                let now = Instant::now();
+                if mark_cached_viewport_dirty(viewport, pacer, now) {
+                    if !defer_cached_presentation {
+                        let _ = present_cached_viewport_stdout(
+                            viewport,
+                            status,
+                            transport_state,
+                            pacer,
+                            now,
+                            false,
+                        )?;
+                    }
+                } else {
+                    pacer.cancel();
+                }
                 Ok(false)
             }
             ViewportEffect::Resume => {
+                pacer.cancel();
                 writer.request_sync(revision).await?;
                 Ok(true)
             }
@@ -4025,6 +4298,70 @@ mod unix {
         use nix::unistd::Pid;
 
         use super::*;
+
+        #[derive(Default)]
+        struct ViewportFrameWriter {
+            bytes: Vec<u8>,
+            writes: usize,
+            flushes: usize,
+        }
+
+        impl Write for ViewportFrameWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.writes += 1;
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                self.flushes += 1;
+                Ok(())
+            }
+        }
+
+        fn cached_window_viewport() -> (ViewportController, TerminalSize) {
+            let physical = TerminalSize::new(4, 10);
+            let layout = ChromeLayout::new(physical, false, ActiveScreen::Main);
+            let live = TerminalScrollMetrics {
+                epoch: Revision::new(2),
+                revision: Revision::new(7),
+                offset_from_bottom: 0,
+                max_offset_from_bottom: 10,
+                viewport_rows: layout.child.rows,
+            };
+            let mut viewport = ViewportController::with_layout(layout, Some(live));
+            let ViewportEffect::RequestHistoryWindow(query) = viewport.navigate(true, 1) else {
+                panic!("initial cached-window fixture must request history");
+            };
+            let shape = query
+                .response_shape(query.anchor)
+                .expect("fixture query has a valid response shape");
+            let rows = (0..shape.row_count)
+                .map(|index| {
+                    shape
+                        .first_row_from_live_top
+                        .saturating_add(i64::try_from(index).expect("fixture row fits i64"))
+                        .to_string()
+                        .into_bytes()
+                })
+                .collect();
+            assert!(matches!(
+                viewport
+                    .apply_history_window(TerminalHistoryWindowResult::Frame(
+                        zterm_core::terminal::TerminalHistoryWindowFrame {
+                            disposition: shape.disposition,
+                            anchor: query.anchor,
+                            target_offset_from_bottom: shape.target_offset_from_bottom,
+                            first_row_from_live_top: shape.first_row_from_live_top,
+                            ansi_rows: rows,
+                        },
+                    ))
+                    .expect("install fixture history window"),
+                ViewportEffect::Render
+            ));
+            viewport.observe_presentation();
+            (viewport, physical)
+        }
 
         #[test]
         fn prefix_parser_detaches_escapes_and_preserves_unknown_sequences() {
@@ -4213,6 +4550,7 @@ mod unix {
                     drag_grab_row: None,
                     drag_last_request: None,
                     drag_deferred_target: None,
+                    last_presented_scroll_metrics: None,
                     stale_gutter_column: Cell::new(None),
                     discard_viewport_response: false,
                     discard_window_response: false,
@@ -4545,6 +4883,405 @@ mod unix {
                 route_mouse_to_child(wheel, ActiveScreen::Alternate, alternate_scroll),
                 Some(b"\x1bOA".to_vec())
             );
+
+            let child_burst = codec
+                .feed(b"\x1b[<64;5;4M\x1b[<64;5;4M\x1b[<64;5;4M")
+                .expect("three child-owned reports decode independently");
+            let forwarded = child_burst
+                .iter()
+                .map(|event| {
+                    let HostInputEvent::Mouse(mouse) = event else {
+                        panic!("child burst contains only mouse reports");
+                    };
+                    route_mouse_to_child(mouse, ActiveScreen::Main, child_mouse)
+                        .expect("child mouse mode owns every report")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(forwarded, vec![wheel_raw.to_vec(); 3]);
+        }
+
+        #[test]
+        fn viewport_pacer_is_event_driven_and_keeps_one_deadline() {
+            let start = Instant::now();
+            let mut pacer = ViewportPresentationPacer::default();
+            assert_eq!(pacer.deadline(), None);
+
+            pacer.mark_dirty(start);
+            assert_eq!(pacer.deadline(), Some(start));
+            pacer.mark_dirty(start + Duration::from_millis(8));
+            assert_eq!(
+                pacer.deadline(),
+                Some(start),
+                "a cold dirty deadline must not slide before its first presentation"
+            );
+            assert!(pacer.due(start));
+            pacer.mark_presented(start);
+            assert_eq!(pacer.deadline(), None);
+
+            pacer.mark_dirty(start + Duration::from_millis(1));
+            assert_eq!(
+                pacer.deadline(),
+                Some(start + MIN_VIEWPORT_PRESENT_INTERVAL)
+            );
+            pacer.mark_dirty(start + Duration::from_millis(8));
+            assert_eq!(
+                pacer.deadline(),
+                Some(start + MIN_VIEWPORT_PRESENT_INTERVAL),
+                "additional dirtiness must not create or slide a second deadline"
+            );
+            assert!(!pacer.due(start + Duration::from_millis(15)));
+            assert!(pacer.due(start + MIN_VIEWPORT_PRESENT_INTERVAL));
+
+            pacer.cancel();
+            assert_eq!(pacer.deadline(), None);
+            assert!(!pacer.due(start + Duration::from_secs(1)));
+        }
+
+        #[test]
+        fn one_stdin_wheel_burst_presents_only_the_final_cached_offset() {
+            let (mut viewport, physical) = cached_window_viewport();
+            let mut codec = HostInputCodec::new();
+            let events = codec
+                .feed(b"\x1b[<64;5;3M\x1b[<64;5;3M\x1b[<64;5;3M")
+                .expect("one stdin delivery decodes all wheel reports");
+            assert_eq!(events.len(), 3);
+
+            let now = Instant::now();
+            let mut pacer = ViewportPresentationPacer::default();
+            for event in events {
+                let HostInputEvent::Mouse(mouse) = event else {
+                    panic!("wheel burst must contain only mouse reports");
+                };
+                assert_eq!(
+                    route_mouse_to_child(&mouse, ActiveScreen::Main, TerminalModes::default(),),
+                    None
+                );
+                assert!(matches!(
+                    viewport.navigate(mouse.wheel_is_up(), 1),
+                    ViewportEffect::Render | ViewportEffect::RenderAndRequestHistoryWindow(_)
+                ));
+                assert!(mark_cached_viewport_dirty(&viewport, &mut pacer, now));
+            }
+            assert_eq!(viewport.window_cache.desired_offset_from_bottom(), 4);
+
+            let mut output = ViewportFrameWriter::default();
+            let mut status = StatusRenderer::new(None, physical);
+            assert!(
+                present_cached_viewport_with_writer(
+                    &mut output,
+                    &mut viewport,
+                    &mut status,
+                    TerminalViewTransportState::Active,
+                    &mut pacer,
+                    now,
+                    false,
+                )
+                .expect("present one coalesced wheel frame")
+            );
+            assert_eq!(output.writes, 1);
+            assert_eq!(output.flushes, 1);
+            assert_eq!(
+                output
+                    .bytes
+                    .windows(HOST_SYNC_BEGIN.len())
+                    .filter(|window| *window == HOST_SYNC_BEGIN)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                viewport
+                    .scroll_metrics()
+                    .map(|metrics| metrics.offset_from_bottom),
+                Some(4)
+            );
+            assert!(matches!(
+                viewport.start_resume(Vec::new()),
+                ViewportEffect::Resume
+            ));
+            assert_eq!(
+                viewport
+                    .scroll_metrics()
+                    .map(|metrics| metrics.offset_from_bottom),
+                Some(4),
+                "a successfully emitted paced frame becomes the resume presentation baseline"
+            );
+        }
+
+        #[test]
+        fn cross_delivery_pacing_keeps_latest_reverse_offset_and_cancels_a_miss() {
+            let (mut viewport, physical) = cached_window_viewport();
+            let start = Instant::now();
+            let mut pacer = ViewportPresentationPacer::default();
+            pacer.mark_presented(start);
+            let mut output = ViewportFrameWriter::default();
+            let mut status = StatusRenderer::new(None, physical);
+
+            for (older, elapsed) in [(true, 1), (true, 4), (false, 8)] {
+                assert!(matches!(
+                    viewport.navigate(older, 1),
+                    ViewportEffect::Render | ViewportEffect::RenderAndRequestHistoryWindow(_)
+                ));
+                let now = start + Duration::from_millis(elapsed);
+                assert!(mark_cached_viewport_dirty(&viewport, &mut pacer, now));
+                assert!(
+                    !present_cached_viewport_with_writer(
+                        &mut output,
+                        &mut viewport,
+                        &mut status,
+                        TerminalViewTransportState::Active,
+                        &mut pacer,
+                        now,
+                        false,
+                    )
+                    .expect("pre-deadline deliveries remain queued")
+                );
+            }
+            assert_eq!(viewport.window_cache.desired_offset_from_bottom(), 2);
+            assert!(
+                present_cached_viewport_with_writer(
+                    &mut output,
+                    &mut viewport,
+                    &mut status,
+                    TerminalViewTransportState::Active,
+                    &mut pacer,
+                    start + MIN_VIEWPORT_PRESENT_INTERVAL,
+                    false,
+                )
+                .expect("deadline presents the latest reverse-direction target")
+            );
+            assert_eq!(output.writes, 1);
+            assert_eq!(output.flushes, 1);
+
+            assert!(matches!(
+                viewport.navigate(true, 1),
+                ViewportEffect::Render | ViewportEffect::RenderAndRequestHistoryWindow(_)
+            ));
+            assert!(mark_cached_viewport_dirty(
+                &viewport,
+                &mut pacer,
+                start + Duration::from_millis(17),
+            ));
+            assert!(
+                !present_cached_viewport_with_writer(
+                    &mut output,
+                    &mut viewport,
+                    &mut status,
+                    TerminalViewTransportState::Active,
+                    &mut pacer,
+                    start + Duration::from_millis(31),
+                    false,
+                )
+                .expect("a new delivery after one frame waits for the next cadence boundary")
+            );
+            assert!(
+                present_cached_viewport_with_writer(
+                    &mut output,
+                    &mut viewport,
+                    &mut status,
+                    TerminalViewTransportState::Active,
+                    &mut pacer,
+                    start + Duration::from_millis(32),
+                    false,
+                )
+                .expect("a burst crossing the boundary produces one later paced frame")
+            );
+            assert_eq!((output.writes, output.flushes), (2, 2));
+            assert_eq!(viewport.window_cache.desired_offset_from_bottom(), 3);
+
+            assert!(matches!(
+                viewport.navigate(true, 1),
+                ViewportEffect::Render | ViewportEffect::RenderAndRequestHistoryWindow(_)
+            ));
+            assert!(mark_cached_viewport_dirty(
+                &viewport,
+                &mut pacer,
+                start + Duration::from_millis(33),
+            ));
+            viewport.window_cache.defer_pending_request();
+            assert!(matches!(
+                viewport.scroll_to_offset(10),
+                ViewportEffect::RequestHistoryWindow(query)
+                    if query.target_offset_from_bottom == 10
+            ));
+            cancel_unpresentable_cached_viewport(&viewport, &mut pacer);
+            assert_eq!(pacer.deadline(), None);
+            assert_eq!(
+                viewport
+                    .scroll_metrics()
+                    .map(|metrics| metrics.offset_from_bottom),
+                Some(3),
+                "a miss must retain the last emitted offset, not an unpainted cache hit"
+            );
+            let mut miss_repaint = Vec::new();
+            write_history(&mut miss_repaint, &viewport)
+                .expect("a miss leaves the existing physical content untouched");
+            assert!(miss_repaint.is_empty());
+            assert!(
+                !present_cached_viewport_with_writer(
+                    &mut output,
+                    &mut viewport,
+                    &mut status,
+                    TerminalViewTransportState::Active,
+                    &mut pacer,
+                    start + Duration::from_secs(1),
+                    false,
+                )
+                .expect("a cache miss cannot repaint the previous target")
+            );
+            assert_eq!(output.writes, 2);
+        }
+
+        #[test]
+        fn drag_release_forces_the_latest_complete_cached_frame() {
+            let (mut viewport, physical) = cached_window_viewport();
+            let start = Instant::now();
+            let mut pacer = ViewportPresentationPacer::default();
+            pacer.mark_presented(start);
+            assert!(matches!(
+                viewport.navigate(true, 1),
+                ViewportEffect::Render | ViewportEffect::RenderAndRequestHistoryWindow(_)
+            ));
+            assert!(mark_cached_viewport_dirty(
+                &viewport,
+                &mut pacer,
+                start + Duration::from_millis(1),
+            ));
+
+            viewport.drag_grab_row = Some(0);
+            let release = SgrMouse {
+                code: 0,
+                column: 1,
+                row: 1,
+                release: true,
+                raw: b"\x1b[<0;1;1m".to_vec(),
+            };
+            assert!(matches!(
+                viewport.handle_gutter_mouse_at(&release, true, start + Duration::from_millis(2),),
+                Some(ViewportEffect::None)
+            ));
+
+            let mut output = ViewportFrameWriter::default();
+            let mut status = StatusRenderer::new(None, physical);
+            assert!(
+                present_cached_viewport_with_writer(
+                    &mut output,
+                    &mut viewport,
+                    &mut status,
+                    TerminalViewTransportState::Active,
+                    &mut pacer,
+                    start + Duration::from_millis(2),
+                    true,
+                )
+                .expect("release bypasses the remaining presentation interval")
+            );
+            assert_eq!((output.writes, output.flushes), (1, 1));
+        }
+
+        #[test]
+        fn compatible_background_delta_keeps_a_pending_cached_presentation() {
+            let (mut viewport, physical) = cached_window_viewport();
+            let start = Instant::now();
+            let mut pacer = ViewportPresentationPacer::default();
+            pacer.mark_presented(start);
+            assert!(matches!(
+                viewport.navigate(true, 1),
+                ViewportEffect::Render | ViewportEffect::RenderAndRequestHistoryWindow(_)
+            ));
+            assert!(mark_cached_viewport_dirty(
+                &viewport,
+                &mut pacer,
+                start + Duration::from_millis(1),
+            ));
+            let deadline = pacer.deadline();
+
+            let previous = viewport.live_metrics.expect("fixture live metrics");
+            viewport.observe_live_metrics(Some(TerminalScrollMetrics {
+                revision: Revision::new(previous.revision.get() + 1),
+                max_offset_from_bottom: previous.max_offset_from_bottom + 1,
+                ..previous
+            }));
+            cancel_unpresentable_cached_viewport(&viewport, &mut pacer);
+            assert_eq!(pacer.deadline(), deadline);
+            assert_eq!(
+                viewport.window_cache.desired_offset_from_bottom(),
+                3,
+                "same-epoch growth translates the pending target to keep its content pinned"
+            );
+
+            let mut output = ViewportFrameWriter::default();
+            let mut status = StatusRenderer::new(None, physical);
+            assert!(
+                present_cached_viewport_with_writer(
+                    &mut output,
+                    &mut viewport,
+                    &mut status,
+                    TerminalViewTransportState::Active,
+                    &mut pacer,
+                    start + MIN_VIEWPORT_PRESENT_INTERVAL,
+                    false,
+                )
+                .expect("compatible background output keeps the latest complete frame due")
+            );
+            assert_eq!((output.writes, output.flushes), (1, 1));
+        }
+
+        #[test]
+        fn cancelled_viewport_deadline_cannot_repaint_after_resume_or_resize() {
+            let (mut viewport, physical) = cached_window_viewport();
+            let start = Instant::now();
+            let mut pacer = ViewportPresentationPacer::default();
+            pacer.mark_presented(start);
+            assert!(matches!(
+                viewport.navigate(true, 1),
+                ViewportEffect::Render | ViewportEffect::RenderAndRequestHistoryWindow(_)
+            ));
+            assert!(mark_cached_viewport_dirty(
+                &viewport,
+                &mut pacer,
+                start + Duration::from_millis(1),
+            ));
+            assert_eq!(
+                viewport
+                    .scroll_metrics()
+                    .map(|metrics| metrics.offset_from_bottom),
+                Some(2),
+                "the desired cached target advances before presentation"
+            );
+
+            assert!(matches!(
+                viewport.start_resume(Vec::new()),
+                ViewportEffect::Resume
+            ));
+            assert_eq!(
+                viewport
+                    .scroll_metrics()
+                    .map(|metrics| metrics.offset_from_bottom),
+                Some(1),
+                "resume must preserve the last actually presented scrollbar, not the pending target"
+            );
+            pacer.cancel();
+            let mut output = ViewportFrameWriter::default();
+            let mut status = StatusRenderer::new(None, physical);
+            assert!(
+                !present_cached_viewport_with_writer(
+                    &mut output,
+                    &mut viewport,
+                    &mut status,
+                    TerminalViewTransportState::Synchronizing,
+                    &mut pacer,
+                    start + MIN_VIEWPORT_PRESENT_INTERVAL,
+                    false,
+                )
+                .expect("resume invalidates the pending history frame")
+            );
+            assert_eq!((output.writes, output.flushes), (0, 0));
+
+            let (mut resized, _) = cached_window_viewport();
+            let mut resize_pacer = ViewportPresentationPacer::default();
+            resize_pacer.mark_dirty(start);
+            resized.resize(TerminalSize::new(5, 9));
+            cancel_unpresentable_cached_viewport(&resized, &mut resize_pacer);
+            assert_eq!(resize_pacer.deadline(), None);
         }
 
         #[test]
@@ -4644,6 +5381,7 @@ mod unix {
                     .expect("complete legacy viewport frame"),
                 ViewportEffect::Render
             ));
+            viewport.observe_presentation();
             assert!(matches!(
                 viewport.navigate(true, 1),
                 ViewportEffect::RequestViewport(TerminalScrollAction::ScrollByLines(1))
@@ -4904,6 +5642,7 @@ mod unix {
                 TerminalViewTransportState::Active,
             )
             .expect("present the complete cached history frame");
+            viewport.observe_presentation();
             assert!(contains_bytes(&history_output, b"row"));
 
             assert!(matches!(

@@ -946,3 +946,48 @@ Tests are layered by owner:
 No benchmark or fixed latency assertion is part of acceptance. The observable contract is that a
 cache hit renders locally without a viewport request and that an unavailable target never exposes a
 partial/blank frame.
+
+## 30. Host-owned Viewport Presentation Cadence
+
+The desktop CLI adopts Herdr's event-driven latest-frame pattern only for Zterm-owned cached
+viewport presentation. `MIN_VIEWPORT_PRESENT_INTERVAL` is 16 ms. This is a minimum interval between
+eligible presentations, not a periodic 60 Hz task and not a claim of compositor/vsync alignment.
+When idle, no timer remains active and no frame is emitted. The constant belongs to the desktop CLI;
+the generic cache reducer and future Android renderer remain clock- and refresh-rate-neutral.
+
+Each decoded host wheel report still applies one checked row to the desired offset immediately.
+All reports decoded from one stdin delivery are reduced before presentation is considered, so the
+usual Ghostty three-report delivery can produce one latest frame without treating byte chunking as a
+gesture contract. If multiple deliveries arrive inside the 16 ms interval, the CLI keeps one dirty
+bit and one deadline; when eligible it presents the newest complete cached slice exactly once.
+Reports split across the interval may produce two frames, but never an unbounded series of
+back-to-back writes. Intermediate offsets may be skipped visually; accumulated offset and final
+direction may not be skipped.
+
+The pacer owns presentation timing only. It does not own input semantics, cache coordinates, remote
+requests, or render bytes. A host interaction first mutates the existing `ViewportController`, then
+executes any history-window request/prefetch immediately, and finally marks the current complete
+slice dirty. Child-owned mouse reports and alternate-scroll translations bypass the pacer and are
+written to the PTY one-for-one. The existing 33 ms drag request pacing stays independent; a final
+thumb release must flush the latest complete local position rather than leave it waiting behind a
+timer.
+
+One pending deadline is added to the active terminal `tokio::select!`. The deadline carries no frame
+or scroll offset: the controller remains the single source of latest desired state. On expiry, the
+CLI renders only if the view is still host-owned history and a complete slice is available. Any
+immediate render that already contains the latest viewport marks the dirty state presented and
+cancels the deadline. Return-live/resume, authoritative snapshot or resync, resize/reflow, true
+reconnect, transport-state replacement, detach, and cleanup cancel pending work before a stale
+history frame can be emitted. A live delta observed behind a still-pinned compatible history view
+does not cancel a valid pending local presentation merely because the model revision advanced.
+
+Presentation remains one DEC 2026 transaction through the existing rendering path. There is no
+global PTY-output frame scheduler, no extra framebuffer, no physical wheel-gesture heuristic, and no
+change to the Alacritty model, protocol, daemon, one-Session/one-PTY ownership, or unsafe policy.
+
+Verification uses a controllable clock/pure pacer where possible and byte-level CLI integration
+tests for side effects. It covers same-delivery three-report reduction, cross-delivery coalescing,
+deadline expiry, opposite directions, clamp/cache miss and immediate prefetch, final drag release,
+child-owned forwarding, and cancellation by every authoritative transition. Real Ghostty smoke
+confirms perceived pacing, while tests assert exact offsets and transaction counts rather than an
+OS scheduler's wall-clock precision.
