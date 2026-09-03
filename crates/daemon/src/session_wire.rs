@@ -2919,7 +2919,7 @@ mod tests {
         let sessions = unix_script_wire_service(
             own,
             temporary.path().to_path_buf(),
-            "i=0; while [ \"$i\" -lt 12 ]; do printf 'history-%02d\\r\\n' \"$i\"; i=$((i + 1)); done; exec /bin/cat",
+            "i=0; while [ \"$i\" -lt 12 ]; do printf 'history-%02d\\r\\n' \"$i\"; i=$((i + 1)); done; printf 'history-ready'; exec /bin/cat",
         );
         let local = sessions.local_principal(AttachmentId::from_array([0x1b; 16]));
         let lease = sessions
@@ -2944,7 +2944,7 @@ mod tests {
             )
             .expect("same-UID attachment prepares");
         activate_attachment(&local_attachment);
-        wait_for_attachment_text(&local_attachment, b"history-11").await;
+        wait_for_attachment_text(&local_attachment, b"history-ready").await;
         let local_page = local_attachment
             .attachment
             .history_page_until(

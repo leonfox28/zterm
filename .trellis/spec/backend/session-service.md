@@ -330,6 +330,12 @@ they must not duplicate registry, replay, session-reservation, or controller log
   prove that the shell has executed its setup commands. Only after readiness may
   the test inject publication failure and require `deadline_exceeded` instead
   of the original registration error.
+- A `session_wire` fixture which compares history at two later attachment
+  boundaries must emit a unique child marker after every terminal byte whose
+  effect is asserted, including the final CRLF, and wait until that marker is
+  observed before taking the first page. Seeing the preceding row text does not
+  prove that a separately drained trailing control sequence has reached the
+  terminal model.
 
 ## 7. Wrong vs Correct
 
@@ -371,6 +377,21 @@ inject_publication_failure(child);
 let child = spawn("trap '' HUP; emit_ready; while :; do :; done")?;
 wait_for_child_ready()?;
 inject_publication_failure(child);
+```
+
+Terminal-output fixture ordering must also fence the final state-changing
+bytes:
+
+```rust
+// Wrong: the text can be visible before its trailing CRLF is drained.
+spawn("print_history_with_final_crlf; cat")?;
+wait_for_terminal_text("history-11")?;
+let first_page = read_history_page()?;
+
+// Correct: the marker is emitted only after the final asserted CRLF.
+spawn("print_history_with_final_crlf; printf history-ready; cat")?;
+wait_for_terminal_text("history-ready")?;
+let first_page = read_history_page()?;
 ```
 
 ## Forbidden patterns

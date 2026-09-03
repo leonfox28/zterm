@@ -643,8 +643,24 @@ Independent review evidence (2026-09-03, macOS host):
 - Hosted gaps remain explicit: Linux cross-UID was skipped on macOS, real Iroh loopback is Linux-CI
   owned, the terminal black-box gate is explicit-only, and real Linux plus local/direct/relay smoke
   was not run in this review. Android UI/semantic cells and performance/RSS work remain out of
-  scope; no benchmark was run. Final `.trellis/spec/` synchronization remains assigned to the main
-  session.
+  scope; no benchmark was run. Final `.trellis/spec/` synchronization was completed by the main
+  session before the feature commits.
+
+Hosted PR follow-up evidence (2026-09-03):
+
+- PR #7's first matrix run passed dependency policy, portable policy, relay bundle, Linux x64,
+  Windows shared-boundary, and macOS arm64. Linux arm64 exposed a `session_wire` fixture boundary:
+  visible `history-11` did not prove its trailing CRLF had reached the model before the first local
+  history page. A child marker emitted after the final CRLF now fences the comparison; the exact
+  test passed 10/10 and daemon library tests passed 202/202 locally.
+- The same run's macOS Intel job exposed a pre-existing identity-reset fixture boundary: a just-
+  dropped Darwin Unix listener could briefly complete a connection and return EOF/`cancelled`
+  before the intended shared deadline wait. The fixture now waits under an independent one-second
+  bound for connect refusal before starting the unchanged 40-millisecond production deadline and
+  still requires exactly `deadline_exceeded`. The exact test passed 50/50, daemon library tests
+  passed 202/202, and daemon Clippy/fmt/diff checks passed locally.
+- Neither correction changes product logic or weakens an assertion. Linux arm64 and macOS Intel
+  remain pending until the pushed follow-up commit passes the hosted matrix.
 
 ### Phase 7 completion gate
 

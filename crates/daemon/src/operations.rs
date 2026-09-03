@@ -3443,6 +3443,29 @@ mod tests {
         fs::set_permissions(paths.socket(), fs::Permissions::from_mode(0o600))
             .expect("socket mode");
         drop(stale);
+        // A just-closed Darwin listener can briefly accept a connection whose
+        // peer then observes EOF. Settle that fixture-only state before the
+        // reset starts its single production stop deadline.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match tokio::net::UnixStream::connect(paths.socket()).await {
+                    Ok(stream) => {
+                        drop(stream);
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => {
+                        assert_ne!(
+                            error.kind(),
+                            std::io::ErrorKind::PermissionDenied,
+                            "owned stale socket fixture must not reject its owner for permissions"
+                        );
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("closed stale socket listener must stop accepting connections");
         let socket_error = runtime
             .reset_identity_with_stop_timeout(None, true, Duration::from_millis(40))
             .await

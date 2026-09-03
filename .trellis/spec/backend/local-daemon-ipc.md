@@ -450,6 +450,7 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
 | ordinary attach finds a controller | `session_occupied`; do not input, resize, detach, or replace it |
 | daemon stop/restart or identity reset would end Sessions without `--force` | refuse before stop; report only the safe Session count/impact |
 | close/revoke/reset is noninteractive without `--yes` | refuse before mutation |
+| identity-reset deadline fixture starts while a dropped listener can still transiently connect | invalid fixture evidence; settle the stale socket under a separate setup bound before starting the production stop deadline |
 | stop cleanup or response flush fails | keep listener/socket and ownership available for status/retry |
 | fatal accept while a child remains owned | exact-token rebind under held daemon lock; resume service |
 | socket path was replaced after bind | never unlink or overwrite the replacement |
@@ -496,6 +497,15 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
 - Multi-process tests prove concurrent launch singleflight, live/stale socket
   behavior, detach, bounded stop, restart identity preservation, and no
   spontaneous post-crash restart.
+- The `operations` identity-reset deadline fixture drops its stale Unix
+  listener and, under a separate one-second setup bound, waits until an owner
+  connection is refused before invoking the reset with its 40-millisecond
+  production deadline. Darwin may briefly complete a connection to a
+  just-closed listener and then return EOF; that transport-settling interval is
+  fixture setup, not evidence about the one shared readiness/socket/lock
+  deadline. Keep the strict `deadline_exceeded` assertion. Do not replace this
+  barrier with a sleep or paused Tokio time: the production deadline uses
+  `std::time::Instant`.
 - A pure synchronous lifecycle unit builds the same current-thread runtime,
   spawns through `spawn_inside_runtime`, and joins the task with that runtime.
   Removing the `enter()` guard must reproduce Tokio's no-reactor failure. The
@@ -624,6 +634,24 @@ then immediately inject a one-shot input or detach. Keep exact reader-fence
 ordering in pure tests; a process fixture may use bounded idempotent readiness
 probes and must keep resize/signal restoration in a separate deterministic
 phase when their synchronization can race input.
+
+The same rule applies before measuring stale-socket shutdown:
+
+```rust
+// Wrong: on Darwin this may still connect once and fail as an unrelated EOF.
+drop(stale_listener);
+let error = reset_identity_with_stop_timeout(Duration::from_millis(40))
+    .await
+    .expect_err("stale socket blocks reset");
+
+// Correct: settle fixture teardown independently, then test the one deadline.
+drop(stale_listener);
+wait_until_connect_is_refused(Duration::from_secs(1)).await?;
+let error = reset_identity_with_stop_timeout(Duration::from_millis(40))
+    .await
+    .expect_err("stale socket blocks reset");
+assert_eq!(error.kind(), DomainErrorKind::DeadlineExceeded);
+```
 
 ## Forbidden patterns
 

@@ -148,6 +148,33 @@ matrix explicit:
   code such as a signal trap, the child must emit readiness after that setup;
   `spawn()` returning or a parent-side sleep is not a readiness barrier.
 
+## Incident: Boundary Completion Was Inferred From Earlier Observations
+
+- **Root cause categories**: implicit assumption plus test-evidence mismatch.
+  One history fixture treated visible final-row text as proof that its trailing
+  CRLF had reached the model; one identity-reset fixture treated
+  `drop(UnixListener)` as proof that a Darwin socket could no longer complete a
+  connection. Both assertions began before the state-changing boundary was
+  actually observed.
+- **Evidence**: Linux arm64 captured the first history page one line earlier
+  than a later remote read, while macOS Intel returned connection EOF as
+  `cancelled` before entering the intended shared stop-deadline wait. The same
+  production paths and strict assertions passed repeated local runs once the
+  fixtures fenced their real completion boundary.
+- **Rejected fix**: pausing Tokio time did not establish the socket boundary
+  and did not control production code based on `std::time::Instant`; it changed
+  the scheduler without proving the prerequisite state.
+- **Prevention**: emit a child-authored marker after all PTY bytes under
+  assertion, and wait for an explicit failed owner connection after dropping a
+  stale listener. Give fixture setup its own bound, then start the production
+  deadline and retain the original exact result assertion. Never substitute a
+  fixed sleep, a prior visible payload, object destruction, or an unrelated
+  virtual clock for an observed cross-process/OS completion boundary.
+- **Expansion**: review PTY, socket, signal, file-lock, and process fixtures for
+  assertions that begin after an API call returned but before the downstream
+  state is observable. Hosted native runners remain the acceptance evidence
+  for kernel-specific teardown behavior.
+
 ## Incident: Ubuntu Tool Availability Was Assumed on macOS
 
 - **Root cause categories**: implicit assumption plus test coverage gap. A
