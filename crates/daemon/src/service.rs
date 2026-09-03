@@ -1195,7 +1195,8 @@ fn protocol_proto() -> v1::ProtocolVersion {
             | Capabilities::SESSION_SERVICE
             | Capabilities::TERMINAL_SERVICE
             | Capabilities::HISTORY_PAGING
-            | Capabilities::TERMINAL_VIEWPORT,
+            | Capabilities::TERMINAL_VIEWPORT
+            | Capabilities::TERMINAL_HISTORY_WINDOW,
     }
 }
 

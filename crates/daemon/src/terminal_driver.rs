@@ -12,8 +12,8 @@ use tokio::sync::watch;
 use zterm_core::Revision;
 use zterm_core::terminal::{
     TerminalDeltaResult, TerminalHistoryCursor, TerminalHistoryDirection, TerminalHistoryResult,
-    TerminalScrollAction, TerminalScrollMetrics, TerminalSize, TerminalSnapshot,
-    TerminalViewportResult,
+    TerminalHistoryWindowQuery, TerminalHistoryWindowResult, TerminalScrollAction,
+    TerminalScrollMetrics, TerminalSize, TerminalSnapshot, TerminalViewportResult,
 };
 use zterm_platform::pty::{
     PtyChild, PtyChildInterrupt, PtyChildState, PtyError, PtyExitStatus, PtyIo, PtySession, PtySize,
@@ -600,6 +600,15 @@ impl TerminalAttachment {
     ) -> Result<TerminalViewportResult, TerminalDriverError> {
         self.shared.check_failure()?;
         Ok(lock(&self.shared.model, "terminal model")?.scroll_viewport(previous, action))
+    }
+
+    /// Projects one stateless contiguous history window under one model lock.
+    pub fn history_window(
+        &self,
+        query: TerminalHistoryWindowQuery,
+    ) -> Result<TerminalHistoryWindowResult, TerminalDriverError> {
+        self.shared.check_failure()?;
+        Ok(lock(&self.shared.model, "terminal model")?.history_window(query))
     }
 }
 

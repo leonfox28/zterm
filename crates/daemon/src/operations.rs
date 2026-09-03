@@ -8,13 +8,13 @@ use std::time::{Duration, Instant};
 
 use zterm_core::terminal::{
     ActiveScreen, TerminalHistoryCursor, TerminalHistoryDirection, TerminalHistoryResult,
-    TerminalModes, TerminalScrollAction, TerminalScrollMetrics, TerminalSize,
-    TerminalViewportResult,
+    TerminalHistoryWindowQuery, TerminalHistoryWindowResult, TerminalModes, TerminalScrollAction,
+    TerminalScrollMetrics, TerminalSize, TerminalViewportResult,
 };
 #[cfg(unix)]
 use zterm_core::terminal::{
-    TerminalHistoryPage, TerminalMouseEncoding, TerminalMouseMode, TerminalViewportDisposition,
-    TerminalViewportFrame,
+    TerminalHistoryPage, TerminalHistoryWindowAnchor, TerminalHistoryWindowFrame,
+    TerminalMouseEncoding, TerminalMouseMode, TerminalViewportDisposition, TerminalViewportFrame,
 };
 use zterm_core::{
     AttachmentId, AuthGeneration, AuthorizationStatus, DeviceAlias, DeviceId, DeviceSummary,
@@ -476,6 +476,8 @@ pub enum TerminalViewEvent {
     History(TerminalHistoryResult),
     /// One correlated complete attachment-local semantic viewport outcome.
     Viewport(TerminalViewportResult),
+    /// One correlated stateless bounded history-window outcome.
+    HistoryWindow(TerminalHistoryWindowResult),
     /// The following snapshot replaces the current live rendering baseline.
     SyncRequired {
         /// Latest host revision declared by the synchronization marker.
@@ -505,6 +507,10 @@ impl fmt::Debug for TerminalViewEvent {
             Self::Delta(delta) => formatter.debug_tuple("Delta").field(delta).finish(),
             Self::History(history) => formatter.debug_tuple("History").field(history).finish(),
             Self::Viewport(viewport) => formatter.debug_tuple("Viewport").field(viewport).finish(),
+            Self::HistoryWindow(window) => formatter
+                .debug_tuple("HistoryWindow")
+                .field(window)
+                .finish(),
             Self::SyncRequired { latest_revision } => formatter
                 .debug_struct("SyncRequired")
                 .field("latest_revision", latest_revision)
@@ -779,6 +785,23 @@ impl TerminalViewCommandWriter {
         }
     }
 
+    /// Requests one stateless bounded history window.
+    pub async fn request_history_window(
+        &self,
+        query: TerminalHistoryWindowQuery,
+    ) -> Result<(), DaemonError> {
+        #[cfg(unix)]
+        {
+            self.submit(|response| TerminalDriverCommand::RequestHistoryWindow { query, response })
+                .await
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = query;
+            Err(unsupported_command_platform())
+        }
+    }
+
     /// Detaches this view while leaving the Session and PTY running.
     pub async fn detach(&self) -> Result<(), DaemonError> {
         #[cfg(unix)]
@@ -848,6 +871,10 @@ enum TerminalDriverCommand {
     },
     RequestViewport {
         action: TerminalScrollAction,
+        response: tokio::sync::oneshot::Sender<Result<(), DaemonError>>,
+    },
+    RequestHistoryWindow {
+        query: TerminalHistoryWindowQuery,
         response: tokio::sync::oneshot::Sender<Result<(), DaemonError>>,
     },
     Detach {
@@ -1171,6 +1198,11 @@ async fn handle_terminal_driver_command(
             response,
             TerminalDriverCommandResult::Continue,
         ),
+        TerminalDriverCommand::RequestHistoryWindow { query, response } => (
+            client.request_history_window(query).await,
+            response,
+            TerminalDriverCommandResult::Continue,
+        ),
         TerminalDriverCommand::Detach { response } => (
             client.detach().await,
             response,
@@ -1232,6 +1264,9 @@ fn terminal_event_from_local(
             .map(Some),
         LocalAttachmentEvent::ViewportFrame(frame) => terminal_viewport_from_wire(frame)
             .map(TerminalViewEvent::Viewport)
+            .map(Some),
+        LocalAttachmentEvent::HistoryWindowFrame(frame) => terminal_history_window_from_wire(frame)
+            .map(TerminalViewEvent::HistoryWindow)
             .map(Some),
         LocalAttachmentEvent::ConnectionStatus(status) => {
             let device = remote_alias.ok_or_else(|| {
@@ -1442,6 +1477,69 @@ fn terminal_viewport_from_wire(
         }),
         zterm_proto::v1::TerminalViewportOutcome::Unspecified => Err(terminal_protocol_error(
             "terminal viewport outcome was unspecified",
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn terminal_history_window_from_wire(
+    frame: zterm_proto::v1::TerminalHistoryWindowFrame,
+) -> Result<TerminalHistoryWindowResult, DaemonError> {
+    let outcome = zterm_proto::v1::TerminalHistoryWindowOutcome::try_from(frame.outcome)
+        .map_err(|_| terminal_protocol_error("unknown terminal history window outcome"))?;
+    match outcome {
+        zterm_proto::v1::TerminalHistoryWindowOutcome::Frame => {
+            let anchor = frame.anchor.ok_or_else(|| {
+                terminal_protocol_error("terminal history window frame omitted anchor")
+            })?;
+            let viewport = terminal_size_from_wire(anchor.viewport_rows, anchor.viewport_columns)?;
+            let anchor = TerminalHistoryWindowAnchor {
+                epoch: Revision::new(anchor.epoch),
+                revision: Revision::new(anchor.revision),
+                max_offset_from_bottom: anchor.max_offset_from_bottom,
+                viewport,
+            };
+            let disposition =
+                match zterm_proto::v1::TerminalViewportDisposition::try_from(frame.disposition)
+                    .map_err(|_| {
+                        terminal_protocol_error("unknown terminal history window disposition")
+                    })? {
+                    zterm_proto::v1::TerminalViewportDisposition::Exact => {
+                        TerminalViewportDisposition::Exact
+                    }
+                    zterm_proto::v1::TerminalViewportDisposition::Rebased => {
+                        TerminalViewportDisposition::Rebased
+                    }
+                    zterm_proto::v1::TerminalViewportDisposition::Unspecified => {
+                        return Err(terminal_protocol_error(
+                            "terminal history window disposition was unspecified",
+                        ));
+                    }
+                };
+            Ok(TerminalHistoryWindowResult::Frame(
+                TerminalHistoryWindowFrame {
+                    disposition,
+                    anchor,
+                    target_offset_from_bottom: frame.target_offset_from_bottom,
+                    first_row_from_live_top: frame.first_row_from_live_top,
+                    ansi_rows: frame.ansi_rows,
+                },
+            ))
+        }
+        zterm_proto::v1::TerminalHistoryWindowOutcome::Changed => {
+            Ok(TerminalHistoryWindowResult::HistoryChanged {
+                epoch: Revision::new(frame.current_epoch),
+                revision: Revision::new(frame.current_revision),
+            })
+        }
+        zterm_proto::v1::TerminalHistoryWindowOutcome::Gap => {
+            Ok(TerminalHistoryWindowResult::HistoryGap {
+                epoch: Revision::new(frame.current_epoch),
+                revision: Revision::new(frame.current_revision),
+            })
+        }
+        zterm_proto::v1::TerminalHistoryWindowOutcome::Unspecified => Err(terminal_protocol_error(
+            "terminal history window outcome was unspecified",
         )),
     }
 }
@@ -3345,6 +3443,29 @@ mod tests {
         fs::set_permissions(paths.socket(), fs::Permissions::from_mode(0o600))
             .expect("socket mode");
         drop(stale);
+        // A just-closed Darwin listener can briefly accept a connection whose
+        // peer then observes EOF. Settle that fixture-only state before the
+        // reset starts its single production stop deadline.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match tokio::net::UnixStream::connect(paths.socket()).await {
+                    Ok(stream) => {
+                        drop(stream);
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => {
+                        assert_ne!(
+                            error.kind(),
+                            std::io::ErrorKind::PermissionDenied,
+                            "owned stale socket fixture must not reject its owner for permissions"
+                        );
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("closed stale socket listener must stop accepting connections");
         let socket_error = runtime
             .reset_identity_with_stop_timeout(None, true, Duration::from_millis(40))
             .await

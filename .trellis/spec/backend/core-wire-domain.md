@@ -41,6 +41,17 @@ TerminalScrollMetrics { epoch, revision, offset_from_bottom,
 TerminalScrollAction::{ScrollByLines(i32), ScrollToOffset(u64)}
 TerminalViewportResult::{Frame, Live, HistoryChanged, HistoryGap}
 Capabilities::TERMINAL_VIEWPORT == 1 << 19
+
+TerminalHistoryWindowAnchor { epoch, revision, max_offset_from_bottom, viewport }
+TerminalHistoryWindowQuery { anchor, target_offset_from_bottom,
+    older_margin_rows, newer_margin_rows }
+TerminalHistoryWindowResult::{Frame, HistoryChanged, HistoryGap}
+Capabilities::TERMINAL_HISTORY_WINDOW == 1 << 20
+MAX_HISTORY_WINDOW_ROWS == 240
+
+ViewportCache<Row>::set_target(offset) -> ViewportCacheUpdate
+ViewportCache<Row>::install_window(window)
+    -> Result<ViewportCacheInstall, CachedViewportWindow<Row>>
 ```
 
 ## 3. Contracts
@@ -76,6 +87,21 @@ Capabilities::TERMINAL_VIEWPORT == 1 << 19
   Snapshot/delta metrics are optional for mixed versions and absent on
   alternate screen. Frame Debug reports structural counts and ANSI byte length,
   never row content.
+- `Capabilities::TERMINAL_HISTORY_WINDOW` is active only for the stateless
+  contiguous-window path. A request carries one immutable anchor, absolute
+  target, and bounded older/newer margins. A Frame carries Exact/Rebased,
+  current anchor, resolved target, signed live-top coordinate, and the exact
+  request-shaped row count; Changed/Gap are content-free. Frame Debug exposes
+  only coordinates, counts, and total bytes.
+- `TerminalHistoryWindowQuery::response_shape` is shared by model, local IPC,
+  remote bridge, and client cache validation. A response may advance but never
+  predate its request; range, disposition, translated target, viewport size,
+  and row count must all match that originating query.
+- `ViewportCache<Row>` is renderer-neutral and contains no ANSI, async runtime,
+  clock, mouse, or platform type. It retains one immutable bounded row window,
+  latest monotonic anchor, desired/presented offsets, and the complete one
+  outstanding query. Cache hits render locally; low-water/miss produces at
+  most one request while later gestures coalesce to the latest desired target.
 - `DomainErrorKind::code` and `from_code` are the single stable error-category
   bridge used by wire and JSON projections; adapters do not invent aliases.
 - `OperationWindow` is fixed to one daemon-issued `OperationLease` and retains
@@ -123,13 +149,16 @@ Capabilities::TERMINAL_VIEWPORT == 1 << 19
   decoding. `TerminalHistoryRequest` is control; `TerminalHistoryPage` is a
   bounded content frame under the ordinary 8 MiB limit.
   `TerminalViewportRequest` is control and `TerminalViewportFrame` is content
-  under the same limits. Unknown protobuf fields are compatible; unknown kind
-  and wire major are explicit errors.
+  under the same limits. `TerminalHistoryWindowRequest` is control and
+  `TerminalHistoryWindowFrame` is content under those same 1/8 MiB limits.
+  Unknown protobuf fields are compatible; unknown kind and wire major are
+  explicit errors.
 - Kind/capability allocation is append-only: history remains 312/313, local
-  status remains 314, viewport is 315/316, `AGENT_EVENTS` remains bit 18, and
-  viewport is bit 19. A peer without bit 19 receives no 315/316 frame; adapters
-  keep the unchanged 312/313 pager as the explicit fallback instead of
-  advertising or simulating semantic metrics.
+  status remains 314, viewport remains 315/316, history window is 317/318,
+  `AGENT_EVENTS` remains bit 18, viewport remains bit 19, and history window is
+  bit 20. A peer without bit 20 receives no 317/318 frame; adapters fall back
+  to negotiated 315/316 and then unchanged 312/313. No fallback advertises or
+  simulates a capability the peer omitted.
 - `TerminalConnectionStatusEvent` carries only attachment ID, unknown/direct/
   relay, and optional bounded integer RTT. It is never a normal-ALPN service
   kind and contains no DeviceId, address, relay URL, candidate, or ticket.
@@ -155,6 +184,10 @@ Capabilities::TERMINAL_VIEWPORT == 1 << 19
 | viewport Frame row count differs from `viewport_rows`, exceeds the current model height/80 rows, or exceeds 8 MiB | reject before render; keep the attachment/session bounded |
 | viewport request exceeds the 1 MiB control limit | reject before concrete decode or Session dispatch |
 | peer lacks `TERMINAL_VIEWPORT` | send no kind 315/316; use unchanged capability-gated history paging or no history feature |
+| history-window query has invalid anchor/size/target/margins or exceeds the product viewport | reject as malformed before Session dispatch; no model/cache mutation |
+| history-window Frame predates or contradicts its originating query, exceeds 240 rows, or has a mismatched exact range | reject before cache/render; keep the previous complete frame |
+| history-window Changed/Gap contains rows/anchor/disposition/coordinates, or nonzero revision predates the request | reject as malformed; content-free outcome only |
+| peer lacks `TERMINAL_HISTORY_WINDOW` | send no kind 317/318; fall back to negotiated bit 19 and then bit 17 pager |
 | connection status arrives on remote normal ALPN | reject; status is same-UID local IPC only |
 | wire major or kind is unsupported | explicit protocol/service error; listener remains healthy |
 
@@ -165,9 +198,12 @@ Capabilities::TERMINAL_VIEWPORT == 1 << 19
   single ambiguous-transport retry.
 - **Base:** readiness/status/list use no operation lease and do not alter replay
   state.
+- **Good viewport-cache case:** validate a window against its saved complete
+  query, present only a full-height cached slice, and retain the prior complete
+  presentation while a miss or edge prefetch is outstanding.
 - **Bad:** derive an epoch from wall-clock time, accept a client-invented high
-  ordinal, wrap a sequence, or rerun an outcome-unknown operation under a fresh
-  lease.
+  ordinal, wrap a sequence, accept an uncorrelated window shape, or rerun an
+  outcome-unknown operation under a fresh lease.
 
 ## 6. Tests Required
 
@@ -180,11 +216,15 @@ Capabilities::TERMINAL_VIEWPORT == 1 << 19
   panic-safe duplicate waiters, and outcome unknown below the retired floor.
 - Proto tests cover round trip, unknown fields, unknown kinds, major mismatch,
   non-canonical/malformed varints, truncated bodies, and both size limits.
-- Proto/daemon tests cover additive kinds 312–316, capability bits 17–19,
+- Proto/daemon tests cover additive kinds 312–318, capability bits 17–20,
   alternate-scroll field 7, optional snapshot/delta metrics, all history and
-  viewport outcomes, page/frame bounds, redacted Debug, exact request
-  correlation, mixed-version fallback, and rejection of status on the remote
-  service classifier.
+  viewport/window outcomes, page/frame/window bounds, redacted Debug, exact
+  request-shape correlation, mixed-version bit20 -> bit19 -> pager fallback,
+  and rejection of status on the remote service classifier.
+- Core cache tests cover hit-without-request, checked slice math, edge
+  prefetch, one complete pending query/latest target, stale response/anchor
+  rejection, append translation, resize/identity invalidation, and preservation
+  of the last presentable full slice while replacement is unavailable.
 - `local_ipc` proves malformed/unsupported requests terminate only their own
   unary connection and do not poison the listener. `terminal_recovery` owns
   the equivalent duplex attachment isolation evidence.
@@ -199,6 +239,7 @@ let id = OperationId::new(epoch, next_sequence());
 send(encode_again(id, request)).await?;
 
 send_kind_315_to_every_peer(viewport_request).await?;
+send_kind_317_without_saving_its_query(window_request).await?;
 ```
 
 This has no cross-process authority and can change request bytes between an
@@ -212,7 +253,9 @@ let id = checked_operation_id(lease)?;
 let encoded = encode_once(id, request)?;
 send_with_one_ambiguous_retry(&encoded, deadline).await?;
 
-if peer_capabilities.contains(Capabilities::TERMINAL_VIEWPORT) {
+if peer_capabilities.contains(Capabilities::TERMINAL_HISTORY_WINDOW) {
+    save_query_then_send_window(query).await
+} else if peer_capabilities.contains(Capabilities::TERMINAL_VIEWPORT) {
     send_viewport_request(action).await
 } else {
     request_legacy_history_page().await
@@ -231,6 +274,10 @@ the client preserves the exact retry identity and payload.
 - Reusing kind 315/316 or bit 19, emitting them without negotiated
   `TERMINAL_VIEWPORT`, accepting invalid metrics/row counts, or exposing
   viewport row content through Debug.
+- Reusing kind 317/318 or bit 20, emitting them without negotiated
+  `TERMINAL_HISTORY_WINDOW`, validating a Frame without its originating query,
+  treating transport loss as the 0/0 unsupported sentinel, or exposing window
+  row content through Debug.
 - Re-executing an operation whose result has fallen below the replay low-water
   mark.
 - Generating or accepting a client-invented lease ordinal/incarnation, wrapping

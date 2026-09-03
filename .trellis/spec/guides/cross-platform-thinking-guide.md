@@ -78,6 +78,15 @@ matrix explicit:
   cleanup disables it on every exit path. Correctness must not depend on whether
   the outer application is Ghostty, kitty, Alacritty, Terminal.app, or another
   conforming terminal.
+- Continuous interaction uses the renderer-neutral `ViewportCache<Row>` in
+  core: wheel, Page, mouse drag, and future touch gestures update a local
+  desired offset and present a complete cached slice immediately. Network
+  window reads are bounded miss/low-water prefetch, never the per-gesture
+  animation loop; one in-flight request coalesces to the latest target.
+- DEC 2026 synchronized presentation, ANSI rows, SGR mouse reports, the
+  33-millisecond desktop drag request pace, and the one-column text gutter are
+  Unix CLI adapter policy. They are not core cache semantics and must not leak
+  into Android/iOS code or the current 317/318 wire contract.
 - Native macOS and Linux each require local, direct-Iroh, and Relay smoke
   evidence for shell scrolling, main/alternate transition, child mouse
   ownership, resize, detach, and reconnect. Pure fake-stream/unit tests and a
@@ -86,11 +95,13 @@ matrix explicit:
 - Record the host, path, commit, command/fixture, and result. An ignored Linux
   test on macOS, a macOS local PTY fixture, or old release evidence must remain
   visibly pending for the path it did not execute.
-- Android remains a remote renderer/controller consumer of core/proto semantic
-  metrics and frames. It must not link the host Alacritty model, local PTY, or
-  Unix CLI chrome. Begin Android implementation only after the macOS/Linux
-  local/direct/relay matrix above is recorded, so mobile work does not hide a
-  host transport or nested-TUI regression.
+- Android remains a remote renderer/controller consumer. It may reuse the
+  anchor/range/cache reducer and independently tune pixel/touch physics, but
+  it needs a separately negotiated semantic-cell row adapter rather than
+  parsing the desktop path's canonical ANSI rows. It must not link the host
+  Alacritty model, local PTY, or Unix CLI chrome. Begin Android implementation
+  only after the macOS/Linux local/direct/relay matrix above is recorded, so
+  mobile work does not hide a host transport or nested-TUI regression.
 
 ## Incident: Windows Rust Formatting Failure
 
@@ -136,6 +147,33 @@ matrix explicit:
   as a proxy for concurrency. If the expected behavior depends on child startup
   code such as a signal trap, the child must emit readiness after that setup;
   `spawn()` returning or a parent-side sleep is not a readiness barrier.
+
+## Incident: Boundary Completion Was Inferred From Earlier Observations
+
+- **Root cause categories**: implicit assumption plus test-evidence mismatch.
+  One history fixture treated visible final-row text as proof that its trailing
+  CRLF had reached the model; one identity-reset fixture treated
+  `drop(UnixListener)` as proof that a Darwin socket could no longer complete a
+  connection. Both assertions began before the state-changing boundary was
+  actually observed.
+- **Evidence**: Linux arm64 captured the first history page one line earlier
+  than a later remote read, while macOS Intel returned connection EOF as
+  `cancelled` before entering the intended shared stop-deadline wait. The same
+  production paths and strict assertions passed repeated local runs once the
+  fixtures fenced their real completion boundary.
+- **Rejected fix**: pausing Tokio time did not establish the socket boundary
+  and did not control production code based on `std::time::Instant`; it changed
+  the scheduler without proving the prerequisite state.
+- **Prevention**: emit a child-authored marker after all PTY bytes under
+  assertion, and wait for an explicit failed owner connection after dropping a
+  stale listener. Give fixture setup its own bound, then start the production
+  deadline and retain the original exact result assertion. Never substitute a
+  fixed sleep, a prior visible payload, object destruction, or an unrelated
+  virtual clock for an observed cross-process/OS completion boundary.
+- **Expansion**: review PTY, socket, signal, file-lock, and process fixtures for
+  assertions that begin after an API call returned but before the downstream
+  state is observable. Hosted native runners remain the acceptance evidence
+  for kernel-specific teardown behavior.
 
 ## Incident: Ubuntu Tool Availability Was Assumed on macOS
 

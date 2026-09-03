@@ -23,6 +23,9 @@ pub const MAX_TITLE_BYTES: usize = 256;
 /// Maximum number of daemon-authored rows returned by one history page.
 pub const MAX_HISTORY_PAGE_ROWS: usize = 80;
 
+/// Maximum number of independently encoded rows in one history window.
+pub const MAX_HISTORY_WINDOW_ROWS: usize = 240;
+
 /// Terminal viewport size in character cells.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TerminalSize {
@@ -319,6 +322,198 @@ pub enum TerminalViewportResult {
         revision: Revision,
     },
     /// The supplied baseline was structurally invalid or from the future.
+    HistoryGap {
+        /// Current retained-history epoch.
+        epoch: Revision,
+        /// Current model revision.
+        revision: Revision,
+    },
+}
+
+/// Immutable coordinate-space identity for one main-screen history window.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerminalHistoryWindowAnchor {
+    /// Epoch which changes whenever retained row identity may have changed.
+    pub epoch: Revision,
+    /// Model revision observed while producing this anchor.
+    pub revision: Revision,
+    /// Largest retained logical row offset available in this epoch.
+    pub max_offset_from_bottom: u64,
+    /// Complete terminal size whose row coordinates this anchor describes.
+    pub viewport: TerminalSize,
+}
+
+impl TerminalHistoryWindowAnchor {
+    /// Returns whether this anchor is structurally usable.
+    #[must_use]
+    pub const fn is_valid(self) -> bool {
+        self.viewport.rows > 0
+            && self.viewport.columns > 0
+            && self.epoch.get() <= self.revision.get()
+    }
+}
+
+/// Stateless request for one bounded contiguous history-and-live row window.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerminalHistoryWindowQuery {
+    /// Client's last authoritative coordinate-space anchor.
+    pub anchor: TerminalHistoryWindowAnchor,
+    /// Absolute target offset expressed in the supplied anchor's coordinates.
+    pub target_offset_from_bottom: u64,
+    /// Additional rows requested toward older history.
+    pub older_margin_rows: u16,
+    /// Additional rows requested toward the live bottom.
+    pub newer_margin_rows: u16,
+}
+
+impl TerminalHistoryWindowQuery {
+    /// Returns whether the query obeys all transport-independent bounds.
+    #[must_use]
+    pub fn is_valid(self) -> bool {
+        let rows = u32::from(self.anchor.viewport.rows);
+        self.anchor.is_valid()
+            && self.target_offset_from_bottom <= self.anchor.max_offset_from_bottom
+            && u32::from(self.older_margin_rows)
+                .checked_add(u32::from(self.newer_margin_rows))
+                .is_some_and(|margins| margins <= rows.saturating_mul(2))
+    }
+
+    /// Resolves the only valid response shape for one immutable anchor.
+    ///
+    /// A response may advance from the request anchor, but it may never
+    /// predate it. The returned range includes the complete target viewport
+    /// plus the requested margins, clipped to retained-history and live-screen
+    /// bounds.
+    #[must_use]
+    pub fn response_shape(
+        self,
+        response_anchor: TerminalHistoryWindowAnchor,
+    ) -> Option<TerminalHistoryWindowResponseShape> {
+        if !self.is_valid()
+            || !response_anchor.is_valid()
+            || response_anchor.revision < self.anchor.revision
+        {
+            return None;
+        }
+
+        let exact = self.anchor.epoch == response_anchor.epoch
+            && self.anchor.viewport == response_anchor.viewport
+            && self.anchor.max_offset_from_bottom <= response_anchor.max_offset_from_bottom;
+        let disposition = if exact {
+            TerminalViewportDisposition::Exact
+        } else {
+            TerminalViewportDisposition::Rebased
+        };
+        let target_offset_from_bottom = if exact {
+            let growth = response_anchor
+                .max_offset_from_bottom
+                .checked_sub(self.anchor.max_offset_from_bottom)?;
+            self.target_offset_from_bottom
+                .checked_add(growth)?
+                .min(response_anchor.max_offset_from_bottom)
+        } else {
+            self.target_offset_from_bottom
+                .min(response_anchor.max_offset_from_bottom)
+        };
+
+        let history = i64::try_from(response_anchor.max_offset_from_bottom).ok()?;
+        let target = i64::try_from(target_offset_from_bottom).ok()?;
+        let visible_start = target.checked_neg()?;
+        let visible_end = visible_start.checked_add(i64::from(response_anchor.viewport.rows))?;
+        let first_row_from_live_top = visible_start
+            .checked_sub(i64::from(self.older_margin_rows))?
+            .max(history.checked_neg()?);
+        let end_row_exclusive = visible_end
+            .checked_add(i64::from(self.newer_margin_rows))?
+            .min(i64::from(response_anchor.viewport.rows));
+        let row_count =
+            usize::try_from(end_row_exclusive.checked_sub(first_row_from_live_top)?).ok()?;
+        if row_count < usize::from(response_anchor.viewport.rows)
+            || row_count > MAX_HISTORY_WINDOW_ROWS
+        {
+            return None;
+        }
+
+        Some(TerminalHistoryWindowResponseShape {
+            disposition,
+            target_offset_from_bottom,
+            first_row_from_live_top,
+            row_count,
+        })
+    }
+}
+
+/// Request-bound metadata for one valid contiguous history-window response.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerminalHistoryWindowResponseShape {
+    /// Whether retained row identity is exact or rebased.
+    pub disposition: TerminalViewportDisposition,
+    /// Target translated into the response anchor's coordinates.
+    pub target_offset_from_bottom: u64,
+    /// First returned row relative to the response live-screen top.
+    pub first_row_from_live_top: i64,
+    /// Exact number of contiguous rows required by the request margins.
+    pub row_count: usize,
+}
+
+/// One complete bounded row window produced from a single model revision.
+#[derive(Clone, Eq, PartialEq)]
+pub struct TerminalHistoryWindowFrame {
+    /// Whether the request retained or replaced its supplied row identity.
+    pub disposition: TerminalViewportDisposition,
+    /// Current authoritative coordinate-space anchor.
+    pub anchor: TerminalHistoryWindowAnchor,
+    /// Resolved target offset in the response anchor's coordinates.
+    pub target_offset_from_bottom: u64,
+    /// Coordinate of the first row relative to the current live-screen top.
+    pub first_row_from_live_top: i64,
+    /// Independently formatted canonical ANSI rows from top to bottom.
+    pub ansi_rows: Vec<Vec<u8>>,
+}
+
+impl TerminalHistoryWindowFrame {
+    /// Returns whether this frame is the exact bounded response to `query`.
+    #[must_use]
+    pub fn is_valid_for(&self, query: TerminalHistoryWindowQuery) -> bool {
+        query.response_shape(self.anchor).is_some_and(|shape| {
+            self.disposition == shape.disposition
+                && self.target_offset_from_bottom == shape.target_offset_from_bottom
+                && self.first_row_from_live_top == shape.first_row_from_live_top
+                && self.ansi_rows.len() == shape.row_count
+        })
+    }
+}
+
+impl fmt::Debug for TerminalHistoryWindowFrame {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalHistoryWindowFrame")
+            .field("disposition", &self.disposition)
+            .field("anchor", &self.anchor)
+            .field("target_offset_from_bottom", &self.target_offset_from_bottom)
+            .field("first_row_from_live_top", &self.first_row_from_live_top)
+            .field("row_count", &self.ansi_rows.len())
+            .field(
+                "ansi_bytes",
+                &self.ansi_rows.iter().map(Vec::len).sum::<usize>(),
+            )
+            .finish()
+    }
+}
+
+/// Result of one stateless main-screen history-window projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TerminalHistoryWindowResult {
+    /// A complete continuous window is available.
+    Frame(TerminalHistoryWindowFrame),
+    /// Main-screen history cannot currently be projected.
+    HistoryChanged {
+        /// Current retained-history epoch.
+        epoch: Revision,
+        /// Current model revision.
+        revision: Revision,
+    },
+    /// The supplied anchor or query was structurally invalid or from the future.
     HistoryGap {
         /// Current retained-history epoch.
         epoch: Revision,

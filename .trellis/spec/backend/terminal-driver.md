@@ -41,6 +41,8 @@ TerminalAttachment::scroll_viewport(
     previous: Option<TerminalScrollMetrics>,
     action: TerminalScrollAction,
 ) -> Result<TerminalViewportResult, TerminalDriverError>
+TerminalAttachment::history_window(query: TerminalHistoryWindowQuery)
+    -> Result<TerminalHistoryWindowResult, TerminalDriverError>
 ```
 
 ### 3. Contracts
@@ -72,6 +74,11 @@ blocking PtyReader
   action / full-frame calculation, and leaves the attachment checkpoint and
   Alacritty display offset unchanged. The caller supplies and owns the optional
   attachment baseline; the driver stores no scroll position.
+- Contiguous history-window projection is a stateless read-only attachment
+  operation. It checks health, acquires the model mutex once, and returns the
+  model-authored request-shaped Frame/Changed/Gap. The driver stores neither
+  the query nor a target/baseline, and it does not advance the checkpoint or
+  revision watch.
 - At startup the driver consumes `PtySession` into three owner-only parts: one
   reader, one `PtyIo` writer/master, and independent `PtyChild` control. A PTY
   write/flush or resize may hold only the I/O mutex; it cannot prevent the
@@ -131,11 +138,15 @@ No environment variable or network object participates in this data path.
 | revision wait races a recorded failure | return the recorded failure, not `Deadline` |
 | viewport projection observes a recorded model/driver failure | return that typed failure before returning a frame |
 | viewport baseline is invalid, stale, or alternate-screen | return the model-authored Gap/Changed/Rebased result; never mutate or synthesize rows in the driver |
+| history-window projection observes a recorded model/driver failure | return that typed failure before any Frame/Changed/Gap |
+| history-window query is invalid/future, rebased, or alternate-screen | return the model-authored Gap/Rebased/Changed result; never retain a query or synthesize/merge rows in the driver |
 
 ### 5. Good / Base / Bad Cases
 
 - Good: retain the driver in the host session registry, allow attachments to
   come and go, and resync a returning consumer from the latest model.
+- Good: serve independent window queries from one immutable model lock and let
+  each client cache own its desired/presented offsets.
 - Base: process output continuously with no attachments, then create the first
   attachment and return a full snapshot.
 - Bad: put a network sender behind the PTY reader, retain one delta per
@@ -159,6 +170,10 @@ No environment variable or network object participates in this data path.
   retained attachments, verify a full frame is read under one model lock, and
   prove neither live checkpoint/revision delivery nor the other attachment's
   position changes.
+- Contiguous window projection: issue independent request anchors/targets
+  through two retained attachments, verify exact range and Unicode/wide/style
+  rows under one model lock, and prove checkpoints, revision delivery, PTY
+  state, and both callers remain unchanged.
 - Bounded queue: assert `maximum_pending_chunks <= capacity` while processed
   chunks exceed one complete queue window.
 - Query/wait regression: a raw-mode child sends DSR and exits only after
@@ -202,6 +217,9 @@ latest_revision.publish(update.revision);
 
 let frame = attachment.scroll_viewport(previous, action)?;
 // `previous` remains owned by the Session attachment, never by the driver/model.
+
+let window = attachment.history_window(query)?;
+// `query` is not retained: cache/retry/coalescing belongs above the driver.
 ```
 
 For polling a child behind its owner-only mutex, first copy the nonblocking

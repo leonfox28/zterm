@@ -34,8 +34,14 @@ pub(crate) fn encode_delta(baseline: &ProjectedScreen, latest: &ProjectedScreen)
         }
         push_cup(&mut output, index, 0);
         output.extend_from_slice(RESET);
-        output.extend_from_slice(b"\x1b[2K");
         encode_row_content(&mut output, after);
+        // Preserve the old row until its replacement bytes have arrived. EL0
+        // then removes only a stale suffix and does not expose an empty row on
+        // outer terminals which do not implement synchronized presentation.
+        // Reset first so EL0 clears with the default background rather than
+        // inheriting the final encoded cell's style.
+        output.extend_from_slice(RESET);
+        output.extend_from_slice(b"\x1b[K");
     }
     restore_cursor_and_modes(&mut output, latest);
     output
@@ -244,7 +250,8 @@ fn allowlisted_csi(body: &[u8], final_byte: u8) -> bool {
                     && row.iter().all(u8::is_ascii_digit)
                     && column.iter().all(u8::is_ascii_digit))
         }
-        b'J' | b'K' => body == b"2",
+        b'J' => body == b"2",
+        b'K' => body.is_empty() || body == b"2",
         b'h' | b'l' => matches!(
             body,
             b"?1"
@@ -266,7 +273,12 @@ fn allowlisted_csi(body: &[u8], final_byte: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ALTERNATE_SCREEN_SELECTION_ANSI, MAIN_SCREEN_SELECTION_ANSI, uses_only_allowlisted_ansi,
+        ALTERNATE_SCREEN_SELECTION_ANSI, MAIN_SCREEN_SELECTION_ANSI, encode_delta,
+        uses_only_allowlisted_ansi,
+    };
+    use crate::projection::{ProjectedCell, ProjectedRow, ProjectedScreen};
+    use zterm_core::terminal::{
+        ActiveScreen, TerminalColor, TerminalCursor, TerminalModes, TerminalSize, TerminalStyle,
     };
 
     #[test]
@@ -287,5 +299,46 @@ mod tests {
         full.extend_from_slice(ALTERNATE_SCREEN_SELECTION_ANSI);
         full.extend_from_slice(b"\x1b[0m\x1b[2J\x1b[1;1Hplain");
         assert!(uses_only_allowlisted_ansi(&full, true));
+    }
+
+    #[test]
+    fn delta_resets_style_after_content_before_clearing_a_stale_suffix() {
+        fn screen(cells: Vec<ProjectedCell>) -> ProjectedScreen {
+            ProjectedScreen {
+                version: 1,
+                size: TerminalSize::new(1, 2),
+                active_screen: ActiveScreen::Main,
+                rows: vec![ProjectedRow {
+                    cells: cells.into_boxed_slice(),
+                    wrapped: false,
+                }]
+                .into_boxed_slice(),
+                cursor: TerminalCursor {
+                    row: 0,
+                    column: 0,
+                    visible: true,
+                    style: TerminalStyle::default(),
+                },
+                modes: TerminalModes::default(),
+            }
+        }
+
+        let styled = |background| ProjectedCell {
+            style: TerminalStyle {
+                background: TerminalColor::Indexed(background),
+                ..TerminalStyle::default()
+            },
+            ..ProjectedCell::default()
+        };
+        let baseline = screen(vec![styled(4), styled(4)]);
+        let latest = screen(vec![styled(1), ProjectedCell::default()]);
+
+        let delta = encode_delta(&baseline, &latest);
+        let clear = delta
+            .windows(b"\x1b[K".len())
+            .position(|bytes| bytes == b"\x1b[K")
+            .expect("changed row clears only its stale suffix");
+        assert!(delta[..clear].ends_with(b"\x1b[0m"));
+        assert!(!delta[..clear].ends_with(b"\x1b[2K"));
     }
 }

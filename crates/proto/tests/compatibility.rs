@@ -463,6 +463,8 @@ fn wire_kind_registry_is_unique_and_centrally_mapped() {
         WireKind::TerminalConnectionStatusEvent,
         WireKind::TerminalViewportRequest,
         WireKind::TerminalViewportFrame,
+        WireKind::TerminalHistoryWindowRequest,
+        WireKind::TerminalHistoryWindowFrame,
     ];
 
     let mut seen = BTreeSet::new();
@@ -486,9 +488,12 @@ fn wire_kind_registry_is_unique_and_centrally_mapped() {
     assert_eq!(WireKind::TerminalConnectionStatusEvent as u32, 314);
     assert_eq!(WireKind::TerminalViewportRequest as u32, 315);
     assert_eq!(WireKind::TerminalViewportFrame as u32, 316);
+    assert_eq!(WireKind::TerminalHistoryWindowRequest as u32, 317);
+    assert_eq!(WireKind::TerminalHistoryWindowFrame as u32, 318);
     assert_eq!(Capabilities::HISTORY_PAGING, 1_u64 << 17);
     assert_eq!(Capabilities::AGENT_EVENTS, 1_u64 << 18);
     assert_eq!(Capabilities::TERMINAL_VIEWPORT, 1_u64 << 19);
+    assert_eq!(Capabilities::TERMINAL_HISTORY_WINDOW, 1_u64 << 20);
 }
 
 #[test]

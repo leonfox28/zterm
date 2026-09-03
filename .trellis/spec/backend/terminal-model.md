@@ -4,7 +4,8 @@
 
 Apply this contract when changing terminal DTOs in `zterm-core`, the
 Alacritty-backed model in `zterm-terminal`, terminal query replies, side
-events, snapshots/checkpoints/deltas, history, or PTY-output safety bounds.
+events, snapshots/checkpoints/deltas, history windows, or PTY-output safety
+bounds.
 
 `zterm-terminal` owns the only terminal parser/grid/state engine. The daemon
 owns one model per Session; controllers consume Zterm-owned values and
@@ -42,6 +43,8 @@ TerminalModel::scroll_viewport(
     previous: Option<TerminalScrollMetrics>,
     action: TerminalScrollAction,
 ) -> TerminalViewportResult
+TerminalModel::history_window(query: TerminalHistoryWindowQuery)
+    -> TerminalHistoryWindowResult
 TerminalSnapshot::limit_ansi_payload(&mut self, maximum_bytes: usize) -> bool
 ```
 
@@ -165,7 +168,9 @@ released when the Session model is dropped.
   cursor/modes. Future revision, format/size/screen mismatch, every-row change,
   or delta ANSI not smaller than full ANSI returns `Resync`. A newer revision
   whose complete projected state is identical returns a revision-only delta
-  with empty ANSI.
+  with empty ANSI. Each changed row is emitted as `CUP -> RESET -> new content
+  -> RESET -> EL0`: replacement bytes arrive before a stale suffix is cleared,
+  and the clear cannot inherit the last cell's background.
 - A valid `TerminalScrollMetrics` has nonzero `viewport_rows`,
   `epoch <= revision`, and `offset_from_bottom <= max_offset_from_bottom`.
   Snapshot and delta expose live main-screen metrics with offset zero; the
@@ -195,6 +200,23 @@ released when the Session model is dropped.
   or Gap instead of splicing unverifiable rows.
 - History while the alternate screen is active returns Changed; alternate
   history is never invented.
+- A history-window anchor contains epoch, revision, retained maximum offset,
+  and the complete viewport size. With live top at coordinate zero, retained
+  history occupies `[-H, 0)`, the live screen occupies `[0, R)`, and offset
+  `O` requires the full viewport `[-O, R-O)`.
+- `TerminalHistoryWindowQuery::response_shape` is the single range authority.
+  It clips requested older/newer margins to retained/live bounds, requires
+  `older + newer <= 2R`, and yields the exact disposition, translated target,
+  first coordinate, and row count. The response contains at least `R` and at
+  most `MAX_HISTORY_WINDOW_ROWS = 240` independently encoded rows.
+- Same-epoch/same-size append translates the requested target by retained
+  extent growth so pinned content stays fixed. Epoch/size replacement or
+  extent decrease returns one complete `Rebased` window; a malformed/future
+  query returns `HistoryGap`, and alternate screen returns `HistoryChanged`.
+- Window projection reads one immutable model revision through the existing
+  bounded projector and allowlisted row encoder. It never calls
+  `scroll_display` and never mutates display offset, revision, checkpoint,
+  attachment state, or retained history.
 
 ## 9. Validation and Error Matrix
 
@@ -210,6 +232,9 @@ released when the Session model is dropped.
 | viewport metrics have zero rows, epoch after revision, offset past maximum, or a future revision | `HistoryGap`; no model mutation |
 | viewport baseline identity/height changed or retained extent decreased | closest bounded full frame with `Rebased`, or `Live` if clamped to zero |
 | viewport requested while alternate is active | `HistoryChanged`; no alternate history is invented |
+| history-window anchor/query is invalid, from the future, or has an unrepresentable exact range | `HistoryGap`; no row is returned and the model is unchanged |
+| history-window identity/size changed or retained extent decreased | one complete request-shaped `Rebased` frame, never mixed old/new rows |
+| history-window requested while alternate is active | `HistoryChanged`; no alternate history is invented |
 | event/title/control/combining cap reached | bounded summary/classification; no payload leak |
 | future/incompatible/inefficient checkpoint | one full `Resync` |
 | active screen alone exceeds requested frame budget | preserve screen, clear history, return `false` |
@@ -230,6 +255,10 @@ released when the Session model is dropped.
 - Viewport tests cover offsets 0/1/3/max/over-max, mixed history/live rows,
   same-epoch anchoring, epoch/height rebase, future/invalid metrics, alternate
   screen, wide/styled Unicode, and unchanged state/revision/checkpoint.
+- History-window tests cover live/middle/oldest clipping, exact request-shaped
+  ranges and the 240-row cap, same-epoch append pinning, complete rebase,
+  invalid/future/alternate outcomes, Unicode/wide/style preservation, and
+  unchanged model state/revision/checkpoint across independent callers.
 - Format, Clippy with warnings denied, workspace tests, docs, cargo-deny,
   source policy, and dependency-tree isolation are required.
 - The executable dependency-tree policy owns `CARGO_TERM_COLOR=never` and must
@@ -264,6 +293,9 @@ match model.delta_or_resync(&checkpoint) {
 
 let result = model.scroll_viewport(previous_attachment_metrics, action);
 // Read-only projection; the attachment owns the returned baseline.
+
+let result = model.history_window(query);
+// Read-only request-shaped rows; neither model nor attachment owns a scroll offset.
 ```
 
 Keep one host-authoritative model, expose only Zterm-owned contracts, bound

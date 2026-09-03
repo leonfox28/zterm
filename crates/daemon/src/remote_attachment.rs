@@ -15,7 +15,10 @@ use std::time::{Duration, Instant};
 
 use iroh::SecretKey;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf};
-use zterm_core::terminal::MAX_HISTORY_PAGE_ROWS;
+use zterm_core::terminal::{
+    MAX_HISTORY_PAGE_ROWS, TerminalHistoryWindowAnchor, TerminalHistoryWindowQuery, TerminalSize,
+    TerminalViewportDisposition,
+};
 use zterm_core::{
     AttachmentId, Capabilities, DeviceId, DomainErrorKind, ResourceLimits, ResumeViewId, Revision,
     SessionId,
@@ -189,6 +192,7 @@ impl RemoteAttachmentClient {
             force_full: false,
             ever_active: false,
             pending_control: BTreeMap::new(),
+            pending_history_window: BTreeMap::new(),
         };
         let demand = timeout_at(
             initial_deadline,
@@ -354,6 +358,7 @@ struct BridgeState {
     force_full: bool,
     ever_active: bool,
     pending_control: BTreeMap<u64, WireKind>,
+    pending_history_window: BTreeMap<u64, TerminalHistoryWindowQuery>,
 }
 
 struct RemoteEpoch {
@@ -905,6 +910,9 @@ where
 {
     let history_paging = epoch.observer.supports(Capabilities::HISTORY_PAGING);
     let terminal_viewport = epoch.observer.supports(Capabilities::TERMINAL_VIEWPORT);
+    let history_window = epoch
+        .observer
+        .supports(Capabilities::TERMINAL_HISTORY_WINDOW);
     let mut phase = EpochPhase::Synchronizing {
         expected: epoch.initial_revision,
         acknowledged: false,
@@ -945,6 +953,23 @@ where
                 }
                 if frame.kind == WireKind::TerminalViewportRequest && !terminal_viewport {
                     if let Err(error) = write_unsupported_viewport_gap(
+                        frame,
+                        state,
+                        local_writer,
+                        Instant::now() + operation_timeout,
+                    ).await {
+                        write_error_best_effort(
+                            local_writer,
+                            request_id,
+                            &error,
+                            Instant::now() + operation_timeout,
+                        ).await;
+                        return Ok(EpochEnd::Terminal);
+                    }
+                    continue;
+                }
+                if frame.kind == WireKind::TerminalHistoryWindowRequest && !history_window {
+                    if let Err(error) = write_unsupported_history_window_gap(
                         frame,
                         state,
                         local_writer,
@@ -1198,6 +1223,19 @@ where
             let request: v1::TerminalViewportRequest = decode(&frame)?;
             require_local_attachment(request.attachment_id.clone(), state.local_view_id)?;
             validate_viewport_request(&request)?;
+            write_service_error(
+                local_writer,
+                request_id,
+                &transport_unavailable("remote attachment is not active"),
+                Instant::now() + operation_timeout,
+            )
+            .await?;
+            Ok(false)
+        }
+        WireKind::TerminalHistoryWindowRequest => {
+            let request: v1::TerminalHistoryWindowRequest = decode(&frame)?;
+            require_local_attachment(request.attachment_id.clone(), state.local_view_id)?;
+            let _ = validate_history_window_request(&request)?;
             write_service_error(
                 local_writer,
                 request_id,
@@ -1612,6 +1650,51 @@ where
                 Ok(None)
             }
         }
+        WireKind::TerminalHistoryWindowRequest => {
+            let mut request: v1::TerminalHistoryWindowRequest = decode(&frame)?;
+            require_local_attachment(request.attachment_id.clone(), state.local_view_id)?;
+            let query = validate_history_window_request(&request)?;
+            if !visual_read_ready(phase) {
+                write_service_error(
+                    local_writer,
+                    frame.request_id,
+                    &DaemonError::new(
+                        DomainErrorKind::NotSynchronized,
+                        "history windows require an active remote attachment",
+                    ),
+                    Instant::now() + operation_timeout,
+                )
+                .await?;
+                return Ok(None);
+            }
+            request.attachment_id = Some(remote_attachment_id.into());
+            retain_pending(
+                &mut state.pending_control,
+                frame.request_id,
+                WireKind::TerminalHistoryWindowFrame,
+            )?;
+            if state
+                .pending_history_window
+                .insert(frame.request_id, query)
+                .is_some()
+            {
+                return Err(malformed(
+                    "attachment history-window request_id was already pending",
+                ));
+            }
+            if let Err(error) = forward_remote(
+                frame,
+                request,
+                remote_writer,
+                Instant::now() + operation_timeout,
+            )
+            .await
+            {
+                Ok(Some(EpochEnd::Reconnect(error)))
+            } else {
+                Ok(None)
+            }
+        }
         WireKind::SessionOperationLeaseRequest => {
             let request: v1::SessionOperationLeaseRequest = decode(&frame)?;
             require_exact_target(request.target.clone(), state.target)?;
@@ -1747,6 +1830,7 @@ where
                 ));
             }
             state.pending_control.remove(&frame.request_id);
+            state.pending_history_window.remove(&frame.request_id);
             true
         } else {
             false
@@ -1989,6 +2073,38 @@ where
             state.pending_control.remove(&frame.request_id);
             Ok(None)
         }
+        WireKind::TerminalHistoryWindowFrame => {
+            let expected = state
+                .pending_control
+                .get(&frame.request_id)
+                .copied()
+                .ok_or_else(|| malformed("unsolicited remote terminal history window frame"))?;
+            if expected != WireKind::TerminalHistoryWindowFrame {
+                return Err(malformed(
+                    "remote attachment control response kind mismatch",
+                ));
+            }
+            let mut window: v1::TerminalHistoryWindowFrame = decode(&frame)?;
+            require_remote_attachment(window.attachment_id.clone(), remote_attachment_id)?;
+            let query = state
+                .pending_history_window
+                .get(&frame.request_id)
+                .copied()
+                .ok_or_else(|| malformed("remote history-window query correlation mismatch"))?;
+            validate_history_window_frame(&window, query)?;
+            window.attachment_id = Some(state.local_view_id.into());
+            let bytes = encode_message(
+                WireKind::TerminalHistoryWindowFrame,
+                frame.request_id,
+                frame.deadline_ms,
+                &window,
+            )
+            .map_err(protocol_error)?;
+            write_local(local_writer, &bytes, Instant::now() + operation_timeout).await?;
+            state.pending_control.remove(&frame.request_id);
+            state.pending_history_window.remove(&frame.request_id);
+            Ok(None)
+        }
         WireKind::SessionOperationLeaseResponse | WireKind::SessionMutateResponse => {
             let expected = state
                 .pending_control
@@ -2124,14 +2240,16 @@ fn retain_pending(
             "attachment control request_id must be unique and non-zero",
         ));
     }
-    if response_kind == WireKind::TerminalViewportFrame
-        && pending
-            .values()
-            .any(|pending_kind| *pending_kind == WireKind::TerminalViewportFrame)
+    if matches!(
+        response_kind,
+        WireKind::TerminalViewportFrame | WireKind::TerminalHistoryWindowFrame
+    ) && pending
+        .values()
+        .any(|pending_kind| *pending_kind == response_kind)
     {
         return Err(DaemonError::new(
             DomainErrorKind::ResourceExhausted,
-            "a terminal viewport response is already pending",
+            "a terminal viewport read response is already pending",
         ));
     }
     if pending.len() >= MAX_PENDING_CONTROL_REQUESTS {
@@ -2154,6 +2272,7 @@ where
     Writer: AsyncWrite + Unpin,
 {
     let pending = std::mem::take(&mut state.pending_control);
+    let mut pending_history_window = std::mem::take(&mut state.pending_history_window);
     let deadline = Instant::now() + operation_timeout;
     for (request_id, response_kind) in pending {
         if response_kind == WireKind::TerminalHistoryPage {
@@ -2171,6 +2290,28 @@ where
             write_viewport_gap(writer, state.local_view_id, request_id, 0, deadline).await?;
             continue;
         }
+        if response_kind == WireKind::TerminalHistoryWindowFrame {
+            let query = pending_history_window.remove(&request_id).ok_or_else(|| {
+                malformed("pending remote history window omitted its request description")
+            })?;
+            let current_revision = state
+                .known_revision
+                .map_or(query.anchor.revision.get(), Revision::get)
+                .max(query.anchor.revision.get())
+                .max(1);
+            let current_epoch = query.anchor.epoch.get().min(current_revision);
+            write_history_window_gap(
+                writer,
+                state.local_view_id,
+                request_id,
+                0,
+                current_epoch,
+                current_revision,
+                deadline,
+            )
+            .await?;
+            continue;
+        }
         let error = match response_kind {
             WireKind::SessionOperationLeaseResponse => transport_error.clone(),
             WireKind::SessionMutateResponse => DaemonError::new(
@@ -2184,6 +2325,11 @@ where
             }
         };
         write_service_error(writer, request_id, &error, deadline).await?;
+    }
+    if !pending_history_window.is_empty() {
+        return Err(malformed(
+            "remote history-window correlation outlived its control request",
+        ));
     }
     Ok(())
 }
@@ -2474,6 +2620,52 @@ fn validate_viewport_request(request: &v1::TerminalViewportRequest) -> Result<()
     }
 }
 
+fn validate_history_window_request(
+    request: &v1::TerminalHistoryWindowRequest,
+) -> Result<TerminalHistoryWindowQuery, DaemonError> {
+    let anchor = request
+        .anchor
+        .as_ref()
+        .ok_or_else(|| malformed("terminal history window omitted anchor"))?;
+    validate_product_viewport(v1::TerminalViewport {
+        rows: anchor.viewport_rows,
+        columns: anchor.viewport_columns,
+    })?;
+    let margins = request
+        .older_margin_rows
+        .checked_add(request.newer_margin_rows)
+        .ok_or_else(|| malformed("terminal history window margins overflowed"))?;
+    if anchor.epoch > anchor.revision
+        || request.target_offset_from_bottom > anchor.max_offset_from_bottom
+        || margins > anchor.viewport_rows.saturating_mul(2)
+    {
+        return Err(malformed("terminal history window query is inconsistent"));
+    }
+    let query = TerminalHistoryWindowQuery {
+        anchor: TerminalHistoryWindowAnchor {
+            epoch: Revision::new(anchor.epoch),
+            revision: Revision::new(anchor.revision),
+            max_offset_from_bottom: anchor.max_offset_from_bottom,
+            viewport: TerminalSize::new(
+                u16::try_from(anchor.viewport_rows)
+                    .map_err(|_| malformed("terminal history window rows are not representable"))?,
+                u16::try_from(anchor.viewport_columns).map_err(|_| {
+                    malformed("terminal history window columns are not representable")
+                })?,
+            ),
+        },
+        target_offset_from_bottom: request.target_offset_from_bottom,
+        older_margin_rows: u16::try_from(request.older_margin_rows)
+            .map_err(|_| malformed("terminal history window older margin is not representable"))?,
+        newer_margin_rows: u16::try_from(request.newer_margin_rows)
+            .map_err(|_| malformed("terminal history window newer margin is not representable"))?,
+    };
+    query
+        .is_valid()
+        .then_some(query)
+        .ok_or_else(|| malformed("terminal history window query is inconsistent"))
+}
+
 fn validate_history_page(page: &v1::TerminalHistoryPage) -> Result<(), DaemonError> {
     let outcome = v1::TerminalHistoryOutcome::try_from(page.outcome)
         .map_err(|_| malformed("terminal history outcome is invalid"))?;
@@ -2557,6 +2749,80 @@ fn validate_viewport_frame(
         }
         v1::TerminalViewportOutcome::Unspecified => {
             return Err(malformed("terminal viewport outcome is invalid"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_history_window_frame(
+    frame: &v1::TerminalHistoryWindowFrame,
+    query: TerminalHistoryWindowQuery,
+) -> Result<(), DaemonError> {
+    let outcome = v1::TerminalHistoryWindowOutcome::try_from(frame.outcome)
+        .map_err(|_| malformed("terminal history window outcome is invalid"))?;
+    match outcome {
+        v1::TerminalHistoryWindowOutcome::Frame => {
+            let anchor = frame
+                .anchor
+                .as_ref()
+                .ok_or_else(|| malformed("terminal history window frame omitted anchor"))?;
+            validate_product_viewport(v1::TerminalViewport {
+                rows: anchor.viewport_rows,
+                columns: anchor.viewport_columns,
+            })?;
+            let disposition = match v1::TerminalViewportDisposition::try_from(frame.disposition)
+                .map_err(|_| malformed("terminal history window disposition is invalid"))?
+            {
+                v1::TerminalViewportDisposition::Exact => TerminalViewportDisposition::Exact,
+                v1::TerminalViewportDisposition::Rebased => TerminalViewportDisposition::Rebased,
+                v1::TerminalViewportDisposition::Unspecified => {
+                    return Err(malformed("terminal history window disposition is invalid"));
+                }
+            };
+            let response_anchor = TerminalHistoryWindowAnchor {
+                epoch: Revision::new(anchor.epoch),
+                revision: Revision::new(anchor.revision),
+                max_offset_from_bottom: anchor.max_offset_from_bottom,
+                viewport: TerminalSize::new(
+                    u16::try_from(anchor.viewport_rows).map_err(|_| {
+                        malformed("terminal history window rows are not representable")
+                    })?,
+                    u16::try_from(anchor.viewport_columns).map_err(|_| {
+                        malformed("terminal history window columns are not representable")
+                    })?,
+                ),
+            };
+            let shape = query.response_shape(response_anchor).ok_or_else(|| {
+                malformed("terminal history window predates or contradicts its request")
+            })?;
+            if anchor.epoch > anchor.revision
+                || anchor.epoch != frame.current_epoch
+                || anchor.revision != frame.current_revision
+                || disposition != shape.disposition
+                || frame.target_offset_from_bottom != shape.target_offset_from_bottom
+                || frame.first_row_from_live_top != shape.first_row_from_live_top
+                || frame.ansi_rows.len() != shape.row_count
+            {
+                return Err(malformed("terminal history window frame is inconsistent"));
+            }
+        }
+        v1::TerminalHistoryWindowOutcome::Changed | v1::TerminalHistoryWindowOutcome::Gap => {
+            if frame.anchor.is_some()
+                || !frame.ansi_rows.is_empty()
+                || frame.disposition != v1::TerminalViewportDisposition::Unspecified as i32
+                || frame.target_offset_from_bottom != 0
+                || frame.first_row_from_live_top != 0
+                || frame.current_epoch > frame.current_revision
+                || ((frame.current_epoch, frame.current_revision) != (0, 0)
+                    && frame.current_revision < query.anchor.revision.get())
+            {
+                return Err(malformed(
+                    "terminal history window reset retained frame content",
+                ));
+            }
+        }
+        v1::TerminalHistoryWindowOutcome::Unspecified => {
+            return Err(malformed("terminal history window outcome is invalid"));
         }
     }
     Ok(())
@@ -2707,6 +2973,63 @@ where
         request_id,
         deadline_ms,
         &viewport,
+    )
+    .map_err(protocol_error)?;
+    write_local(writer, &bytes, deadline).await
+}
+
+async fn write_unsupported_history_window_gap<Writer>(
+    frame: DecodedFrame,
+    state: &BridgeState,
+    writer: &mut Writer,
+    deadline: Instant,
+) -> Result<(), DaemonError>
+where
+    Writer: AsyncWrite + Unpin,
+{
+    let request: v1::TerminalHistoryWindowRequest = decode(&frame)?;
+    require_local_attachment(request.attachment_id.clone(), state.local_view_id)?;
+    let _ = validate_history_window_request(&request)?;
+    write_history_window_gap(
+        writer,
+        state.local_view_id,
+        frame.request_id,
+        frame.deadline_ms,
+        0,
+        0,
+        deadline,
+    )
+    .await
+}
+
+async fn write_history_window_gap<Writer>(
+    writer: &mut Writer,
+    attachment_id: AttachmentId,
+    request_id: u64,
+    deadline_ms: u32,
+    current_epoch: u64,
+    current_revision: u64,
+    deadline: Instant,
+) -> Result<(), DaemonError>
+where
+    Writer: AsyncWrite + Unpin,
+{
+    let window = v1::TerminalHistoryWindowFrame {
+        attachment_id: Some(attachment_id.into()),
+        outcome: v1::TerminalHistoryWindowOutcome::Gap as i32,
+        disposition: v1::TerminalViewportDisposition::Unspecified as i32,
+        anchor: None,
+        target_offset_from_bottom: 0,
+        first_row_from_live_top: 0,
+        ansi_rows: Vec::new(),
+        current_epoch,
+        current_revision,
+    };
+    let bytes = encode_message(
+        WireKind::TerminalHistoryWindowFrame,
+        request_id,
+        deadline_ms,
+        &window,
     )
     .map_err(protocol_error)?;
     write_local(writer, &bytes, deadline).await
@@ -2938,6 +3261,7 @@ mod tests {
     struct FakeEpochObserver {
         history_paging: bool,
         terminal_viewport: bool,
+        terminal_history_window: bool,
         path_observations: Mutex<VecDeque<SelectedPathObservation>>,
     }
 
@@ -2949,14 +3273,16 @@ mod tests {
             Self {
                 history_paging,
                 terminal_viewport: false,
+                terminal_history_window: false,
                 path_observations: Mutex::new(observations.into_iter().collect()),
             }
         }
 
-        fn with_terminal_viewport() -> Self {
+        fn with_terminal_history_window() -> Self {
             Self {
                 history_paging: true,
                 terminal_viewport: true,
+                terminal_history_window: true,
                 path_observations: Mutex::new(VecDeque::new()),
             }
         }
@@ -2981,6 +3307,8 @@ mod tests {
         fn supports(&self, capability: u64) -> bool {
             (capability == Capabilities::HISTORY_PAGING && self.history_paging)
                 || (capability == Capabilities::TERMINAL_VIEWPORT && self.terminal_viewport)
+                || (capability == Capabilities::TERMINAL_HISTORY_WINDOW
+                    && self.terminal_history_window)
         }
     }
 
@@ -3031,6 +3359,11 @@ mod tests {
         assert_eq!(error.kind(), DomainErrorKind::ResourceExhausted);
         retain_pending(&mut pending, 3, WireKind::TerminalHistoryPage)
             .expect("an unrelated bounded control may remain outstanding");
+        retain_pending(&mut pending, 4, WireKind::TerminalHistoryWindowFrame)
+            .expect("window and legacy viewport reads have independent correlation");
+        let error = retain_pending(&mut pending, 5, WireKind::TerminalHistoryWindowFrame)
+            .expect_err("a second history window response cannot be outstanding");
+        assert_eq!(error.kind(), DomainErrorKind::ResourceExhausted);
     }
 
     #[test]
@@ -3067,6 +3400,47 @@ mod tests {
         frame.current_epoch = 0;
         frame.current_revision = 0;
         assert!(validate_viewport_frame(&frame, 24).is_ok());
+    }
+
+    #[test]
+    fn remote_history_window_frames_validate_contiguous_complete_ranges() {
+        let query = TerminalHistoryWindowQuery {
+            anchor: TerminalHistoryWindowAnchor {
+                epoch: Revision::new(2),
+                revision: Revision::new(5),
+                max_offset_from_bottom: 10,
+                viewport: TerminalSize::new(4, 20),
+            },
+            target_offset_from_bottom: 3,
+            older_margin_rows: 4,
+            newer_margin_rows: 3,
+        };
+        let mut frame = v1::TerminalHistoryWindowFrame {
+            attachment_id: None,
+            outcome: v1::TerminalHistoryWindowOutcome::Frame as i32,
+            disposition: v1::TerminalViewportDisposition::Exact as i32,
+            anchor: Some(v1::TerminalHistoryWindowAnchor {
+                epoch: 2,
+                revision: 5,
+                max_offset_from_bottom: 10,
+                viewport_rows: 4,
+                viewport_columns: 20,
+            }),
+            target_offset_from_bottom: 3,
+            first_row_from_live_top: -7,
+            ansi_rows: vec![b"row".to_vec(); 11],
+            current_epoch: 2,
+            current_revision: 5,
+        };
+        assert!(validate_history_window_frame(&frame, query).is_ok());
+        frame.ansi_rows.truncate(3);
+        assert!(validate_history_window_frame(&frame, query).is_err());
+        frame.ansi_rows.resize(11, b"row".to_vec());
+        frame.current_revision = 6;
+        assert!(validate_history_window_frame(&frame, query).is_err());
+        frame.current_revision = 5;
+        frame.anchor.as_mut().expect("anchor").revision = 4;
+        assert!(validate_history_window_frame(&frame, query).is_err());
     }
 
     #[tokio::test]
@@ -3180,8 +3554,41 @@ mod tests {
 
         write_message(
             &mut local_write,
-            WireKind::TerminalInput,
+            WireKind::TerminalHistoryWindowRequest,
             5,
+            &v1::TerminalHistoryWindowRequest {
+                attachment_id: Some(local_id.into()),
+                anchor: Some(v1::TerminalHistoryWindowAnchor {
+                    epoch: 1,
+                    revision: revision.get(),
+                    max_offset_from_bottom: 10,
+                    viewport_rows: 24,
+                    viewport_columns: 80,
+                }),
+                target_offset_from_bottom: 1,
+                older_margin_rows: 24,
+                newer_margin_rows: 24,
+            },
+        )
+        .await;
+        let gap = next_non_status_frame(&mut local_read, local_id).await;
+        assert_eq!(gap.kind, WireKind::TerminalHistoryWindowFrame);
+        assert_eq!(gap.request_id, 5);
+        let gap: v1::TerminalHistoryWindowFrame = gap
+            .decode_message(WireKind::TerminalHistoryWindowFrame)
+            .expect("unsupported-window gap frame");
+        assert_eq!(
+            v1::TerminalHistoryWindowOutcome::try_from(gap.outcome)
+                .expect("known history window outcome"),
+            v1::TerminalHistoryWindowOutcome::Gap
+        );
+        assert!(gap.anchor.is_none());
+        assert!(gap.ansi_rows.is_empty());
+
+        write_message(
+            &mut local_write,
+            WireKind::TerminalInput,
+            6,
             &v1::TerminalInput {
                 operation_id: None,
                 attachment_id: Some(local_id.into()),
@@ -3207,7 +3614,7 @@ mod tests {
         write_message(
             &mut local_write,
             WireKind::TerminalDetach,
-            6,
+            7,
             &v1::TerminalDetach {
                 attachment_id: Some(local_id.into()),
             },
@@ -3226,7 +3633,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn negotiated_viewport_request_and_complete_frame_cross_the_remote_bridge_once() {
+    async fn negotiated_viewport_and_window_frames_cross_the_remote_bridge_once() {
         let target = device(0x41);
         let session_id = session(0x42);
         let local_id = attachment(0x43);
@@ -3238,7 +3645,7 @@ mod tests {
         let epoch = RemoteEpoch {
             reader: FramedReader::fresh(remote_read),
             writer: remote_write,
-            observer: Arc::new(FakeEpochObserver::with_terminal_viewport()),
+            observer: Arc::new(FakeEpochObserver::with_terminal_history_window()),
             attachment_id: remote_id,
             initial_revision: revision,
         };
@@ -3342,8 +3749,73 @@ mod tests {
 
         write_message(
             &mut local_write,
-            WireKind::TerminalDetach,
+            WireKind::TerminalHistoryWindowRequest,
             4,
+            &v1::TerminalHistoryWindowRequest {
+                attachment_id: Some(local_id.into()),
+                anchor: Some(v1::TerminalHistoryWindowAnchor {
+                    epoch: 2,
+                    revision: 5,
+                    max_offset_from_bottom: 10,
+                    viewport_rows: 24,
+                    viewport_columns: 80,
+                }),
+                target_offset_from_bottom: 3,
+                older_margin_rows: 24,
+                newer_margin_rows: 24,
+            },
+        )
+        .await;
+        let request = next_frame(&mut remote_read).await;
+        assert_eq!(request.kind, WireKind::TerminalHistoryWindowRequest);
+        assert_eq!(request.request_id, 4);
+        let request: v1::TerminalHistoryWindowRequest = request
+            .decode_message(WireKind::TerminalHistoryWindowRequest)
+            .expect("forwarded history window request");
+        assert_eq!(
+            required_attachment_id(request.attachment_id).expect("remote attachment ID"),
+            remote_id
+        );
+
+        write_message(
+            &mut remote_write,
+            WireKind::TerminalHistoryWindowFrame,
+            4,
+            &v1::TerminalHistoryWindowFrame {
+                attachment_id: Some(remote_id.into()),
+                outcome: v1::TerminalHistoryWindowOutcome::Frame as i32,
+                disposition: v1::TerminalViewportDisposition::Exact as i32,
+                anchor: Some(v1::TerminalHistoryWindowAnchor {
+                    epoch: 2,
+                    revision: 5,
+                    max_offset_from_bottom: 10,
+                    viewport_rows: 24,
+                    viewport_columns: 80,
+                }),
+                target_offset_from_bottom: 3,
+                first_row_from_live_top: -10,
+                ansi_rows: vec![b"row".to_vec(); 34],
+                current_epoch: 2,
+                current_revision: 5,
+            },
+        )
+        .await;
+        let frame = next_non_status_frame(&mut local_read, local_id).await;
+        assert_eq!(frame.kind, WireKind::TerminalHistoryWindowFrame);
+        assert_eq!(frame.request_id, 4);
+        let frame: v1::TerminalHistoryWindowFrame = frame
+            .decode_message(WireKind::TerminalHistoryWindowFrame)
+            .expect("forwarded history window frame");
+        assert_eq!(
+            required_attachment_id(frame.attachment_id).expect("local attachment ID"),
+            local_id
+        );
+        assert_eq!(frame.ansi_rows.len(), 34);
+
+        write_message(
+            &mut local_write,
+            WireKind::TerminalDetach,
+            5,
             &v1::TerminalDetach {
                 attachment_id: Some(local_id.into()),
             },
@@ -4891,7 +5363,7 @@ mod tests {
         let transport = FakeTransport::scripted([
             FakeOpen::Observed(
                 Box::new(bridge_stream),
-                Arc::new(FakeEpochObserver::with_terminal_viewport()),
+                Arc::new(FakeEpochObserver::with_terminal_history_window()),
             ),
             FakeOpen::Pending(reconnect_started_tx),
         ]);
@@ -4922,6 +5394,10 @@ mod tests {
             assert_eq!(
                 next_frame(&mut reader).await.kind,
                 WireKind::TerminalViewportRequest
+            );
+            assert_eq!(
+                next_frame(&mut reader).await.kind,
+                WireKind::TerminalHistoryWindowRequest
             );
             assert_eq!(
                 next_frame(&mut reader).await.kind,
@@ -4996,8 +5472,27 @@ mod tests {
         .await;
         write_message(
             &mut local_write,
-            WireKind::SessionOperationLeaseRequest,
+            WireKind::TerminalHistoryWindowRequest,
             20,
+            &v1::TerminalHistoryWindowRequest {
+                attachment_id: Some(local_id.into()),
+                anchor: Some(v1::TerminalHistoryWindowAnchor {
+                    epoch: 1,
+                    revision: 3,
+                    max_offset_from_bottom: 10,
+                    viewport_rows: 24,
+                    viewport_columns: 80,
+                }),
+                target_offset_from_bottom: 1,
+                older_margin_rows: 24,
+                newer_margin_rows: 24,
+            },
+        )
+        .await;
+        write_message(
+            &mut local_write,
+            WireKind::SessionOperationLeaseRequest,
+            21,
             &v1::SessionOperationLeaseRequest {
                 target: Some(device_target(target)),
             },
@@ -5006,7 +5501,7 @@ mod tests {
         write_message(
             &mut local_write,
             WireKind::SessionTakeoverRequest,
-            21,
+            22,
             &v1::SessionTakeoverRequest {
                 operation_id: Some(fixture_operation_id().into()),
                 target: Some(device_target(target)),
@@ -5048,14 +5543,31 @@ mod tests {
             (0, 0)
         );
 
+        let window_gap = next_non_status_frame(&mut local_read, local_id).await;
+        assert_eq!(window_gap.kind, WireKind::TerminalHistoryWindowFrame);
+        assert_eq!(window_gap.request_id, 20);
+        let window_gap: v1::TerminalHistoryWindowFrame = window_gap
+            .decode_message(WireKind::TerminalHistoryWindowFrame)
+            .expect("epoch-loss history window gap");
+        assert_eq!(
+            v1::TerminalHistoryWindowOutcome::try_from(window_gap.outcome)
+                .expect("known history window outcome"),
+            v1::TerminalHistoryWindowOutcome::Gap
+        );
+        assert_eq!(
+            (window_gap.current_epoch, window_gap.current_revision),
+            (1, 3),
+            "stream loss must not reuse the 0/0 unsupported-capability sentinel"
+        );
+
         let lease_error = next_non_status_frame(&mut local_read, local_id).await;
-        assert_eq!(lease_error.request_id, 20);
+        assert_eq!(lease_error.request_id, 21);
         assert_eq!(
             service_error_kind(&lease_error),
             DomainErrorKind::TransportUnavailable
         );
         let takeover_error = next_non_status_frame(&mut local_read, local_id).await;
-        assert_eq!(takeover_error.request_id, 21);
+        assert_eq!(takeover_error.request_id, 22);
         assert_eq!(
             service_error_kind(&takeover_error),
             DomainErrorKind::OperationOutcomeUnknown
@@ -5072,7 +5584,7 @@ mod tests {
         write_message(
             &mut local_write,
             WireKind::TerminalDetach,
-            22,
+            23,
             &v1::TerminalDetach {
                 attachment_id: Some(local_id.into()),
             },
@@ -6814,6 +7326,7 @@ mod tests {
             force_full: false,
             ever_active: true,
             pending_control: BTreeMap::new(),
+            pending_history_window: BTreeMap::new(),
         }
     }
 
