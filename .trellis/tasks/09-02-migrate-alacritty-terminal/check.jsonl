@@ -13,6 +13,10 @@
 {"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/nested-tui-scroll-routing.md", "reason": "复核Herdr/Pi-style child mode每个wheel只到一层、pinned history不被后台mode抢占、退出mode自动恢复host ownership且无应用特判。"}
 {"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/rust-vt-and-c-language-evaluation.md", "reason": "复核最终依赖确为官方Rust crate，未重新引入社区wrapper、Ghostty FFI、Zig/C工具链或Zterm-owned unsafe。"}
 {"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/herdr-flicker-rendering.md", "reason": "复核 outer presentation 是否真正做到无 request-time blank、DEC 2026 完整事务、同批 wheel 合帧、16ms latest-frame cadence、child绕过、drag pacing和latest最终位置。"}
-{"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/local-viewport-cache.md", "reason": "复核窗口公式、generic cache、bounded prefetch、identity invalidation与bit20到legacy fallback没有漂移。"}
+{"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/local-viewport-cache.md", "reason": "复核窗口公式、generic semantic-row cache、bounded prefetch、identity invalidation和one-in-flight/latest-wins；旧bit/capability/fallback内容仅是历史背景，不得恢复。"}
 {"file": ".trellis/spec/backend/local-daemon-ipc.md", "reason": "复核新增只读窗口在local/remote bridge上的correlation、同步栅栏、断线Gap与CLI原子输出组合。"}
-{"file": ".trellis/spec/backend/transport-auth.md", "reason": "复核 bit20 按 stream epoch 协商、窗口响应绑定完整请求，并区分 unsupported 0/0 与 transport-loss 非零 Gap。"}
+{"file": ".trellis/spec/backend/transport-auth.md", "reason": "复核wire-v2只使用317/318语义窗口，响应绑定完整请求，stream-loss产生关联非零Gap，且不存在capability协商、0/0 sentinel或旧路径fallback。"}
+{"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/nested-tui-right-margin-rendering.md", "reason": "复核 full-width row 不再发送 inclusive erase、short row 显式清除精确 suffix、Ghostty-like oracle 与 CLI final-writer 测试成立，且没有 Herdr/进程/glyph 特判或 mode/wire 扩张。"}
+{"file": ".trellis/spec/guides/root-cause-and-architecture-thinking-guide.md", "reason": "复核根因分类、scope 与验收覆盖整个等价故障类；若证据只是局部违反既有契约，则不得借机扩大重构。"}
+{"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/semantic-presentation-migration.md", "reason": "保留曾评估mixed-version方案的决策背景；实际复核必须以direct-cutover研究为准，确认single presenter、failure recovery、Android seam并禁止compatibility adapter。"}
+{"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/semantic-presentation-direct-cutover.md", "reason": "复核 wire-major/ALPN 在旧节点进入 attachment 前明确拒绝，canonical semantic path 唯一，legacy ANSI/encoding/capability/pager/viewport/downgrade 与 secondary writer 均已删除且没有误删当前生命周期/安全机制。"}

@@ -6,13 +6,7 @@
 
 use std::fmt;
 
-use crate::Revision;
-
-/// Exact selector prefixed to daemon-authored ANSI for the main screen.
-pub const MAIN_SCREEN_SELECTION_ANSI: &[u8] = b"\x1b[?1049l";
-
-/// Exact selector prefixed to daemon-authored ANSI for the alternate screen.
-pub const ALTERNATE_SCREEN_SELECTION_ANSI: &[u8] = b"\x1b[?1049h";
+use crate::{ResourceLimits, Revision};
 
 /// Maximum number of side events returned by one terminal update.
 pub const MAX_SIDE_EVENTS_PER_UPDATE: usize = 32;
@@ -20,11 +14,11 @@ pub const MAX_SIDE_EVENTS_PER_UPDATE: usize = 32;
 /// Maximum number of source bytes retained for a title or icon-name event.
 pub const MAX_TITLE_BYTES: usize = 256;
 
-/// Maximum number of daemon-authored rows returned by one history page.
-pub const MAX_HISTORY_PAGE_ROWS: usize = 80;
-
 /// Maximum number of independently encoded rows in one history window.
 pub const MAX_HISTORY_WINDOW_ROWS: usize = 240;
+
+/// Maximum UTF-8 bytes carried by one semantic terminal cell.
+pub const MAX_CELL_TEXT_BYTES: usize = 22;
 
 /// Terminal viewport size in character cells.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -169,73 +163,337 @@ pub struct TerminalModes {
     pub mouse_encoding: TerminalMouseEncoding,
 }
 
-/// Direction of one bounded history request.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TerminalHistoryDirection {
-    /// Return the newest retained history rows.
-    Newest,
-    /// Return rows immediately older than the supplied cursor.
-    Older,
-    /// Return rows immediately newer than the supplied cursor.
-    Newer,
-}
-
-/// Stable position of one daemon-authored history page.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TerminalHistoryCursor {
-    /// Epoch which changes whenever retained row identity may have changed.
-    pub epoch: Revision,
-    /// Model revision observed while producing this page.
-    pub revision: Revision,
-    /// Zero-based page start measured from the oldest retained history row.
-    pub start_row: u64,
-    /// Number of rows in this page.
-    pub row_count: u32,
-    /// Oldest retained row bound, currently always zero.
-    pub oldest_row: u64,
-    /// Exclusive newest retained row bound.
-    pub newest_row: u64,
-}
-
-/// One bounded daemon-formatted history page.
+/// One exact row in a semantic terminal surface.
 #[derive(Clone, Eq, PartialEq)]
-pub struct TerminalHistoryPage {
-    /// Stable cursor and retained bounds for this page.
-    pub cursor: TerminalHistoryCursor,
-    /// Independently formatted ANSI rows in oldest-to-newest order.
-    pub rows: Vec<Vec<u8>>,
+pub struct TerminalSurfaceRow {
+    /// Exact cells from the first through the final terminal column.
+    pub cells: Vec<TerminalCell>,
+    /// Whether this row wraps logically into the following row.
+    pub wrapped: bool,
 }
 
-impl fmt::Debug for TerminalHistoryPage {
+impl fmt::Debug for TerminalSurfaceRow {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("TerminalHistoryPage")
-            .field("cursor", &self.cursor)
-            .field("row_count", &self.rows.len())
-            .field("ansi_bytes", &self.rows.iter().map(Vec::len).sum::<usize>())
+            .debug_struct("TerminalSurfaceRow")
+            .field("cell_count", &self.cells.len())
+            .field("wrapped", &self.wrapped)
             .finish()
     }
 }
 
-/// Result of resolving a revision-bound history request.
+/// Complete semantic state of one active terminal screen.
+#[derive(Clone, Eq, PartialEq)]
+pub struct TerminalSurface {
+    /// Exact rectangular viewport size.
+    pub size: TerminalSize,
+    /// Currently active child screen.
+    pub active_screen: ActiveScreen,
+    /// Exact rows from top to bottom.
+    pub rows: Vec<TerminalSurfaceRow>,
+    /// Child cursor state.
+    pub cursor: TerminalCursor,
+    /// Child-declared input and presentation modes.
+    pub modes: TerminalModes,
+    /// Live main-screen history extent, absent on the alternate screen.
+    pub scroll_metrics: Option<TerminalScrollMetrics>,
+}
+
+impl fmt::Debug for TerminalSurface {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalSurface")
+            .field("size", &self.size)
+            .field("active_screen", &self.active_screen)
+            .field("row_count", &self.rows.len())
+            .field("cursor", &self.cursor)
+            .field("modes", &self.modes)
+            .field("scroll_metrics", &self.scroll_metrics)
+            .finish()
+    }
+}
+
+/// Full semantic reconnect state at one authoritative revision.
+#[derive(Clone, Eq, PartialEq)]
+pub struct TerminalSurfaceSnapshot {
+    /// Revision represented by `surface`.
+    pub revision: Revision,
+    /// Complete exact active-screen surface.
+    pub surface: TerminalSurface,
+}
+
+impl fmt::Debug for TerminalSurfaceSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalSurfaceSnapshot")
+            .field("revision", &self.revision)
+            .field("surface", &self.surface)
+            .finish()
+    }
+}
+
+/// Complete replacement of one semantic surface row.
+#[derive(Clone, Eq, PartialEq)]
+pub struct TerminalSurfaceRowPatch {
+    /// Zero-based row index in the active surface.
+    pub row: u16,
+    /// Exact replacement row.
+    pub replacement: TerminalSurfaceRow,
+}
+
+impl fmt::Debug for TerminalSurfaceRowPatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalSurfaceRowPatch")
+            .field("row", &self.row)
+            .field("replacement", &self.replacement)
+            .finish()
+    }
+}
+
+/// Merged semantic update from one attachment checkpoint to the latest revision.
+#[derive(Clone, Eq, PartialEq)]
+pub struct TerminalSurfaceDelta {
+    /// Checkpoint revision used as the baseline.
+    pub from_revision: Revision,
+    /// Latest model revision represented by this update.
+    pub to_revision: Revision,
+    /// Exact viewport size after the update.
+    pub size: TerminalSize,
+    /// Active screen after the update.
+    pub active_screen: ActiveScreen,
+    /// Sorted, unique complete row replacements.
+    pub row_patches: Vec<TerminalSurfaceRowPatch>,
+    /// Cursor state after the update.
+    pub cursor: TerminalCursor,
+    /// Child-declared modes after the update.
+    pub modes: TerminalModes,
+    /// Live main-screen history extent, absent on the alternate screen.
+    pub scroll_metrics: Option<TerminalScrollMetrics>,
+}
+
+impl fmt::Debug for TerminalSurfaceDelta {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalSurfaceDelta")
+            .field("from_revision", &self.from_revision)
+            .field("to_revision", &self.to_revision)
+            .field("size", &self.size)
+            .field("active_screen", &self.active_screen)
+            .field("row_patch_count", &self.row_patches.len())
+            .field("cursor", &self.cursor)
+            .field("modes", &self.modes)
+            .field("scroll_metrics", &self.scroll_metrics)
+            .finish()
+    }
+}
+
+/// Result of comparing a semantic checkpoint with the latest terminal state.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum TerminalHistoryResult {
-    /// The requested rows were produced from one consistent retained epoch.
-    Page(TerminalHistoryPage),
-    /// The terminal or retained-history epoch changed; callers must start over.
-    HistoryChanged {
-        /// Current history epoch.
-        epoch: Revision,
-        /// Current model revision.
-        revision: Revision,
-    },
-    /// The supplied cursor or range no longer names retained rows.
-    HistoryGap {
-        /// Current history epoch.
-        epoch: Revision,
-        /// Current model revision.
-        revision: Revision,
-    },
+pub enum TerminalSurfaceDeltaResult {
+    /// A compatible semantic update can be applied transactionally.
+    Delta(TerminalSurfaceDelta),
+    /// The checkpoint is incompatible and a complete surface replaces it.
+    Resync(TerminalSurfaceSnapshot),
+}
+
+/// Structural failure in an exact semantic terminal surface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalSurfaceError {
+    /// A dimension is zero or exceeds the product viewport bound.
+    InvalidSize,
+    /// The number of rows does not equal the declared height.
+    InvalidRowCount,
+    /// A row does not contain exactly the declared number of columns.
+    InvalidColumnCount,
+    /// Cell text is oversized or contains a control character.
+    InvalidCellText,
+    /// Wide-head and continuation cells are not an exact adjacent pair.
+    InvalidWidePair,
+    /// The cursor lies outside the declared surface.
+    InvalidCursor,
+    /// Main/alternate scroll metrics disagree with the surface revision or size.
+    InvalidScrollMetrics,
+    /// A delta does not advance exactly from an older revision.
+    InvalidRevision,
+    /// Delta row patches are not sorted, unique, and in bounds.
+    InvalidRowPatch,
+    /// A delta baseline does not match the retained complete surface.
+    IncompatibleBaseline,
+    /// A semantic history window does not match its originating query.
+    InvalidHistoryWindow,
+}
+
+impl fmt::Display for TerminalSurfaceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let detail = match self {
+            Self::InvalidSize => "terminal surface size is outside product bounds",
+            Self::InvalidRowCount => "terminal surface row count does not match its height",
+            Self::InvalidColumnCount => {
+                "terminal surface row width does not match its declared columns"
+            }
+            Self::InvalidCellText => "terminal surface cell text is invalid",
+            Self::InvalidWidePair => "terminal surface wide-cell pairing is invalid",
+            Self::InvalidCursor => "terminal surface cursor is outside its viewport",
+            Self::InvalidScrollMetrics => "terminal surface scroll metrics are inconsistent",
+            Self::InvalidRevision => "terminal surface delta revision does not advance",
+            Self::InvalidRowPatch => "terminal surface row patch is invalid",
+            Self::IncompatibleBaseline => "terminal surface delta baseline is incompatible",
+            Self::InvalidHistoryWindow => {
+                "semantic terminal history window does not match its request"
+            }
+        };
+        formatter.write_str(detail)
+    }
+}
+
+impl std::error::Error for TerminalSurfaceError {}
+
+impl TerminalSurface {
+    /// Validates a complete surface against its authoritative revision.
+    pub fn validate(&self, revision: Revision) -> Result<(), TerminalSurfaceError> {
+        validate_surface_size(self.size)?;
+        if self.rows.len() != usize::from(self.size.rows) {
+            return Err(TerminalSurfaceError::InvalidRowCount);
+        }
+        for row in &self.rows {
+            validate_surface_row(row, self.size.columns)?;
+        }
+        if self.cursor.row >= self.size.rows || self.cursor.column >= self.size.columns {
+            return Err(TerminalSurfaceError::InvalidCursor);
+        }
+        validate_surface_metrics(self.active_screen, self.size, revision, self.scroll_metrics)
+    }
+}
+
+impl TerminalSurfaceSnapshot {
+    /// Validates the complete semantic reconnect state.
+    pub fn validate(&self) -> Result<(), TerminalSurfaceError> {
+        self.surface.validate(self.revision)
+    }
+}
+
+impl TerminalSurfaceDelta {
+    /// Validates metadata and every complete row replacement.
+    pub fn validate(&self) -> Result<(), TerminalSurfaceError> {
+        if self.from_revision >= self.to_revision {
+            return Err(TerminalSurfaceError::InvalidRevision);
+        }
+        validate_surface_size(self.size)?;
+        if self.cursor.row >= self.size.rows || self.cursor.column >= self.size.columns {
+            return Err(TerminalSurfaceError::InvalidCursor);
+        }
+        validate_surface_metrics(
+            self.active_screen,
+            self.size,
+            self.to_revision,
+            self.scroll_metrics,
+        )?;
+        let mut previous = None;
+        for patch in &self.row_patches {
+            if patch.row >= self.size.rows || previous.is_some_and(|row| row >= patch.row) {
+                return Err(TerminalSurfaceError::InvalidRowPatch);
+            }
+            validate_surface_row(&patch.replacement, self.size.columns)?;
+            previous = Some(patch.row);
+        }
+        Ok(())
+    }
+
+    /// Applies this delta to one complete baseline, committing only on success.
+    pub fn apply_to(
+        &self,
+        baseline_revision: Revision,
+        baseline: &mut TerminalSurface,
+    ) -> Result<(), TerminalSurfaceError> {
+        self.validate()?;
+        if baseline_revision != self.from_revision
+            || baseline.size != self.size
+            || baseline.active_screen != self.active_screen
+        {
+            return Err(TerminalSurfaceError::IncompatibleBaseline);
+        }
+        let mut candidate = baseline.clone();
+        for patch in &self.row_patches {
+            candidate.rows[usize::from(patch.row)] = patch.replacement.clone();
+        }
+        candidate.cursor = self.cursor;
+        candidate.modes = self.modes;
+        candidate.scroll_metrics = self.scroll_metrics;
+        candidate.validate(self.to_revision)?;
+        *baseline = candidate;
+        Ok(())
+    }
+}
+
+fn validate_surface_size(size: TerminalSize) -> Result<(), TerminalSurfaceError> {
+    let limits = ResourceLimits::default();
+    if size.rows == 0
+        || size.columns == 0
+        || size.rows > limits.max_viewport_rows
+        || size.columns > limits.max_viewport_columns
+    {
+        return Err(TerminalSurfaceError::InvalidSize);
+    }
+    Ok(())
+}
+
+fn validate_surface_row(
+    row: &TerminalSurfaceRow,
+    columns: u16,
+) -> Result<(), TerminalSurfaceError> {
+    if row.cells.len() != usize::from(columns) {
+        return Err(TerminalSurfaceError::InvalidColumnCount);
+    }
+    for (column, cell) in row.cells.iter().enumerate() {
+        if cell.contents.len() > MAX_CELL_TEXT_BYTES || cell.contents.chars().any(char::is_control)
+        {
+            return Err(TerminalSurfaceError::InvalidCellText);
+        }
+        if cell.wide && cell.wide_continuation {
+            return Err(TerminalSurfaceError::InvalidWidePair);
+        }
+        if cell.wide {
+            if cell.contents.is_empty()
+                || row
+                    .cells
+                    .get(column + 1)
+                    .is_none_or(|next| !next.wide_continuation || next.wide)
+            {
+                return Err(TerminalSurfaceError::InvalidWidePair);
+            }
+        } else if cell.wide_continuation
+            && (!cell.contents.is_empty()
+                || column == 0
+                || row
+                    .cells
+                    .get(column - 1)
+                    .is_none_or(|previous| !previous.wide || previous.wide_continuation))
+        {
+            return Err(TerminalSurfaceError::InvalidWidePair);
+        }
+    }
+    Ok(())
+}
+
+fn validate_surface_metrics(
+    screen: ActiveScreen,
+    size: TerminalSize,
+    revision: Revision,
+    metrics: Option<TerminalScrollMetrics>,
+) -> Result<(), TerminalSurfaceError> {
+    match (screen, metrics) {
+        (ActiveScreen::Main, Some(metrics))
+            if metrics.is_valid()
+                && metrics.revision == revision
+                && metrics.offset_from_bottom == 0
+                && metrics.viewport_rows == size.rows =>
+        {
+            Ok(())
+        }
+        (ActiveScreen::Alternate, None) => Ok(()),
+        _ => Err(TerminalSurfaceError::InvalidScrollMetrics),
+    }
 }
 
 /// Renderer-neutral position and extent of one attachment-local viewport.
@@ -266,15 +524,6 @@ impl TerminalScrollMetrics {
     }
 }
 
-/// One semantic attachment-local scroll request.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TerminalScrollAction {
-    /// Move by logical rows; positive is older/up and negative is newer/down.
-    ScrollByLines(i32),
-    /// Jump to an absolute logical offset from the live bottom.
-    ScrollToOffset(u64),
-}
-
 /// Whether a complete history viewport preserved its previous row identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TerminalViewportDisposition {
@@ -282,52 +531,6 @@ pub enum TerminalViewportDisposition {
     Exact,
     /// Retained-history identity changed and the closest current frame replaced it.
     Rebased,
-}
-
-/// One complete, daemon-authored attachment viewport.
-#[derive(Clone, Eq, PartialEq)]
-pub struct TerminalViewportFrame {
-    /// Whether the frame is exact or replaces an invalidated history epoch.
-    pub disposition: TerminalViewportDisposition,
-    /// Position and extent represented by the rows.
-    pub metrics: TerminalScrollMetrics,
-    /// Independently formatted canonical ANSI rows from top to bottom.
-    pub rows: Vec<Vec<u8>>,
-}
-
-impl fmt::Debug for TerminalViewportFrame {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("TerminalViewportFrame")
-            .field("disposition", &self.disposition)
-            .field("metrics", &self.metrics)
-            .field("row_count", &self.rows.len())
-            .field("ansi_bytes", &self.rows.iter().map(Vec::len).sum::<usize>())
-            .finish()
-    }
-}
-
-/// Result of applying one semantic scroll action to an attachment baseline.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum TerminalViewportResult {
-    /// A complete non-live viewport is available.
-    Frame(TerminalViewportFrame),
-    /// The action reached the live bottom; callers must use the live sync path.
-    Live(TerminalScrollMetrics),
-    /// Main-screen row identity changed and no history frame can be asserted.
-    HistoryChanged {
-        /// Current retained-history epoch.
-        epoch: Revision,
-        /// Current model revision.
-        revision: Revision,
-    },
-    /// The supplied baseline was structurally invalid or from the future.
-    HistoryGap {
-        /// Current retained-history epoch.
-        epoch: Revision,
-        /// Current model revision.
-        revision: Revision,
-    },
 }
 
 /// Immutable coordinate-space identity for one main-screen history window.
@@ -456,9 +659,9 @@ pub struct TerminalHistoryWindowResponseShape {
     pub row_count: usize,
 }
 
-/// One complete bounded row window produced from a single model revision.
+/// One complete semantic history window produced from a single model revision.
 #[derive(Clone, Eq, PartialEq)]
-pub struct TerminalHistoryWindowFrame {
+pub struct TerminalSurfaceHistoryWindowFrame {
     /// Whether the request retained or replaced its supplied row identity.
     pub disposition: TerminalViewportDisposition,
     /// Current authoritative coordinate-space anchor.
@@ -467,45 +670,53 @@ pub struct TerminalHistoryWindowFrame {
     pub target_offset_from_bottom: u64,
     /// Coordinate of the first row relative to the current live-screen top.
     pub first_row_from_live_top: i64,
-    /// Independently formatted canonical ANSI rows from top to bottom.
-    pub ansi_rows: Vec<Vec<u8>>,
+    /// Exact semantic rows from top to bottom.
+    pub rows: Vec<TerminalSurfaceRow>,
 }
 
-impl TerminalHistoryWindowFrame {
-    /// Returns whether this frame is the exact bounded response to `query`.
-    #[must_use]
-    pub fn is_valid_for(&self, query: TerminalHistoryWindowQuery) -> bool {
-        query.response_shape(self.anchor).is_some_and(|shape| {
-            self.disposition == shape.disposition
-                && self.target_offset_from_bottom == shape.target_offset_from_bottom
-                && self.first_row_from_live_top == shape.first_row_from_live_top
-                && self.ansi_rows.len() == shape.row_count
-        })
+impl TerminalSurfaceHistoryWindowFrame {
+    /// Validates this frame as the exact semantic response to `query`.
+    pub fn validate_for(
+        &self,
+        query: TerminalHistoryWindowQuery,
+    ) -> Result<(), TerminalSurfaceError> {
+        validate_surface_size(self.anchor.viewport)?;
+        let Some(shape) = query.response_shape(self.anchor) else {
+            return Err(TerminalSurfaceError::InvalidHistoryWindow);
+        };
+        if self.disposition != shape.disposition
+            || self.target_offset_from_bottom != shape.target_offset_from_bottom
+            || self.first_row_from_live_top != shape.first_row_from_live_top
+            || self.rows.len() != shape.row_count
+            || self.rows.len() > MAX_HISTORY_WINDOW_ROWS
+        {
+            return Err(TerminalSurfaceError::InvalidHistoryWindow);
+        }
+        for row in &self.rows {
+            validate_surface_row(row, self.anchor.viewport.columns)?;
+        }
+        Ok(())
     }
 }
 
-impl fmt::Debug for TerminalHistoryWindowFrame {
+impl fmt::Debug for TerminalSurfaceHistoryWindowFrame {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("TerminalHistoryWindowFrame")
+            .debug_struct("TerminalSurfaceHistoryWindowFrame")
             .field("disposition", &self.disposition)
             .field("anchor", &self.anchor)
             .field("target_offset_from_bottom", &self.target_offset_from_bottom)
             .field("first_row_from_live_top", &self.first_row_from_live_top)
-            .field("row_count", &self.ansi_rows.len())
-            .field(
-                "ansi_bytes",
-                &self.ansi_rows.iter().map(Vec::len).sum::<usize>(),
-            )
+            .field("row_count", &self.rows.len())
             .finish()
     }
 }
 
-/// Result of one stateless main-screen history-window projection.
+/// Result of one stateless semantic main-screen history-window projection.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum TerminalHistoryWindowResult {
-    /// A complete continuous window is available.
-    Frame(TerminalHistoryWindowFrame),
+pub enum TerminalSurfaceHistoryWindowResult {
+    /// A complete continuous semantic window is available.
+    Frame(TerminalSurfaceHistoryWindowFrame),
     /// Main-screen history cannot currently be projected.
     HistoryChanged {
         /// Current retained-history epoch.
@@ -520,34 +731,6 @@ pub enum TerminalHistoryWindowResult {
         /// Current model revision.
         revision: Revision,
     },
-}
-
-/// Zterm-owned semantic projection used to compare terminal states.
-#[derive(Clone, Eq, PartialEq)]
-pub struct TerminalState {
-    /// Viewport size.
-    pub size: TerminalSize,
-    /// Currently visible screen.
-    pub active_screen: ActiveScreen,
-    /// Current cursor state.
-    pub cursor: TerminalCursor,
-    /// Input modes requested by the hosted application.
-    pub modes: TerminalModes,
-    /// Visible cells in row-major order.
-    pub cells: Vec<TerminalCell>,
-}
-
-impl fmt::Debug for TerminalState {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("TerminalState")
-            .field("size", &self.size)
-            .field("active_screen", &self.active_screen)
-            .field("cursor", &self.cursor)
-            .field("modes", &self.modes)
-            .field("cell_count", &self.cells.len())
-            .finish()
-    }
 }
 
 /// A side effect which zterm deliberately refuses to execute.
@@ -671,179 +854,182 @@ impl fmt::Debug for TerminalUpdate {
     }
 }
 
-/// Full reconnect state at a specific revision.
-#[derive(Clone, Eq, PartialEq)]
-pub struct TerminalSnapshot {
-    /// Revision represented by the snapshot.
-    pub revision: Revision,
-    /// Viewport size represented by the snapshot.
-    pub size: TerminalSize,
-    /// Screen selected by the snapshot.
-    pub active_screen: ActiveScreen,
-    /// ANSI bytes which restore the current visible screen and modes.
-    pub screen_ansi: Vec<u8>,
-    /// Bounded standard scrollback encoded as an ANSI-compatible text stream.
-    pub recent_history_ansi: Vec<u8>,
-    /// Input modes represented by the snapshot.
-    pub modes: TerminalModes,
-    /// Live main-screen scroll extent, absent when it cannot be asserted.
-    pub scroll_metrics: Option<TerminalScrollMetrics>,
-}
-
-impl fmt::Debug for TerminalSnapshot {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("TerminalSnapshot")
-            .field("revision", &self.revision)
-            .field("size", &self.size)
-            .field("active_screen", &self.active_screen)
-            .field("screen_ansi", &"[REDACTED]")
-            .field("screen_ansi_len", &self.screen_ansi.len())
-            .field("recent_history_ansi", &"[REDACTED]")
-            .field("recent_history_ansi_len", &self.recent_history_ansi.len())
-            .field("modes", &self.modes)
-            .field("scroll_metrics", &self.scroll_metrics)
-            .finish()
-    }
-}
-
-impl TerminalSnapshot {
-    /// Returns the number of ANSI payload bytes in this snapshot.
-    #[must_use]
-    pub fn ansi_payload_len(&self) -> usize {
-        self.screen_ansi.len() + self.recent_history_ansi.len()
-    }
-
-    /// Drops only oldest complete history lines until the ANSI payload fits.
-    pub fn limit_ansi_payload(&mut self, maximum_bytes: usize) -> bool {
-        if self.ansi_payload_len() <= maximum_bytes {
-            return true;
-        }
-        let Some(history_budget) = maximum_bytes.checked_sub(self.screen_ansi.len()) else {
-            self.recent_history_ansi.clear();
-            return false;
-        };
-        limit_recent_history(&mut self.recent_history_ansi, history_budget);
-        self.ansi_payload_len() <= maximum_bytes
-    }
-}
-
-/// A merged current-screen delta from one checkpoint to the latest revision.
-#[derive(Clone, Eq, PartialEq)]
-pub struct TerminalDelta {
-    /// Checkpoint revision used as the baseline.
-    pub from_revision: Revision,
-    /// Latest model revision represented by the delta.
-    pub to_revision: Revision,
-    /// Viewport size represented by the delta.
-    pub size: TerminalSize,
-    /// Screen selected after applying the delta.
-    pub active_screen: ActiveScreen,
-    /// ANSI bytes which update the current visible terminal state.
-    pub ansi: Vec<u8>,
-    /// Input modes represented after applying the delta.
-    pub modes: TerminalModes,
-    /// Live main-screen scroll extent, absent when it cannot be asserted.
-    pub scroll_metrics: Option<TerminalScrollMetrics>,
-}
-
-impl fmt::Debug for TerminalDelta {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("TerminalDelta")
-            .field("from_revision", &self.from_revision)
-            .field("to_revision", &self.to_revision)
-            .field("size", &self.size)
-            .field("active_screen", &self.active_screen)
-            .field("ansi", &"[REDACTED]")
-            .field("ansi_len", &self.ansi.len())
-            .field("modes", &self.modes)
-            .field("scroll_metrics", &self.scroll_metrics)
-            .finish()
-    }
-}
-
-impl TerminalDelta {
-    /// Returns the number of ANSI payload bytes in this delta.
-    #[must_use]
-    pub fn ansi_payload_len(&self) -> usize {
-        self.ansi.len()
-    }
-}
-
-/// Result of comparing a checkpoint with the latest terminal state.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum TerminalDeltaResult {
-    /// A smaller compatible delta can be applied to the checkpoint state.
-    Delta(TerminalDelta),
-    /// The checkpoint is incompatible or a full snapshot is no larger.
-    Resync(TerminalSnapshot),
-}
-
-fn limit_recent_history(history: &mut Vec<u8>, maximum_bytes: usize) {
-    const RESET: &[u8] = b"\x1b[m";
-    const LINE_END: &[u8] = b"\r\n";
-
-    if history.len() <= maximum_bytes {
-        return;
-    }
-    if maximum_bytes < RESET.len() + LINE_END.len() || !history.starts_with(RESET) {
-        history.clear();
-        return;
-    }
-
-    let suffix_budget = maximum_bytes - RESET.len();
-    let desired = history.len().saturating_sub(suffix_budget).max(RESET.len());
-    let starts_on_boundary = desired >= LINE_END.len()
-        && history.get(desired - LINE_END.len()..desired) == Some(LINE_END);
-    let start = if starts_on_boundary {
-        desired
-    } else {
-        let Some(boundary) = history.get(desired..).and_then(|suffix| {
-            suffix
-                .windows(LINE_END.len())
-                .position(|bytes| bytes == LINE_END)
-        }) else {
-            history.clear();
-            return;
-        };
-        desired + boundary + LINE_END.len()
-    };
-    if start >= history.len() {
-        history.clear();
-        return;
-    }
-
-    let retained = history.len() - start;
-    history.copy_within(start.., RESET.len());
-    history[..RESET.len()].copy_from_slice(RESET);
-    history.truncate(RESET.len() + retained);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn snapshot_wire_limit_preserves_screen_and_complete_recent_lines() {
-        let screen = b"authoritative-screen".to_vec();
-        let mut snapshot = TerminalSnapshot {
-            revision: Revision::new(9),
-            size: TerminalSize::new(2, 20),
+    fn semantic_surface(revision: Revision) -> TerminalSurface {
+        TerminalSurface {
+            size: TerminalSize::new(2, 3),
             active_screen: ActiveScreen::Main,
-            screen_ansi: screen.clone(),
-            recent_history_ansi: b"\x1b[mold-line\r\nrecent-one\r\nrecent-two\r\n".to_vec(),
+            rows: vec![
+                TerminalSurfaceRow {
+                    cells: vec![
+                        TerminalCell {
+                            contents: "界".to_owned(),
+                            wide: true,
+                            ..TerminalCell::default()
+                        },
+                        TerminalCell {
+                            wide_continuation: true,
+                            ..TerminalCell::default()
+                        },
+                        TerminalCell {
+                            contents: "x".to_owned(),
+                            ..TerminalCell::default()
+                        },
+                    ],
+                    wrapped: true,
+                },
+                TerminalSurfaceRow {
+                    cells: vec![TerminalCell::default(); 3],
+                    wrapped: false,
+                },
+            ],
+            cursor: TerminalCursor {
+                row: 1,
+                column: 2,
+                visible: true,
+                style: TerminalStyle::default(),
+            },
             modes: TerminalModes::default(),
-            scroll_metrics: None,
+            scroll_metrics: Some(TerminalScrollMetrics {
+                epoch: Revision::ZERO,
+                revision,
+                offset_from_bottom: 0,
+                max_offset_from_bottom: 7,
+                viewport_rows: 2,
+            }),
+        }
+    }
+
+    #[test]
+    fn semantic_surface_validation_is_exact_content_free_and_transactional() {
+        let revision = Revision::new(3);
+        let surface = semantic_surface(revision);
+        assert_eq!(surface.validate(revision), Ok(()));
+        let snapshot = TerminalSurfaceSnapshot {
+            revision,
+            surface: surface.clone(),
         };
-        let maximum = screen.len() + b"\x1b[mrecent-two\r\n".len();
-        assert!(snapshot.limit_ansi_payload(maximum));
-        assert_eq!(snapshot.screen_ansi, screen);
-        assert_eq!(snapshot.recent_history_ansi, b"\x1b[mrecent-two\r\n");
-        assert!(snapshot.ansi_payload_len() <= maximum);
-        assert!(!snapshot.limit_ansi_payload(screen.len() - 1));
-        assert_eq!(snapshot.screen_ansi, screen);
-        assert!(snapshot.recent_history_ansi.is_empty());
+        assert_eq!(snapshot.validate(), Ok(()));
+
+        let mut applied = surface.clone();
+        let delta = TerminalSurfaceDelta {
+            from_revision: revision,
+            to_revision: Revision::new(4),
+            size: surface.size,
+            active_screen: surface.active_screen,
+            row_patches: vec![TerminalSurfaceRowPatch {
+                row: 1,
+                replacement: TerminalSurfaceRow {
+                    cells: vec![
+                        TerminalCell {
+                            contents: "new".to_owned(),
+                            ..TerminalCell::default()
+                        },
+                        TerminalCell::default(),
+                        TerminalCell::default(),
+                    ],
+                    wrapped: false,
+                },
+            }],
+            cursor: surface.cursor,
+            modes: surface.modes,
+            scroll_metrics: Some(TerminalScrollMetrics {
+                revision: Revision::new(4),
+                ..surface.scroll_metrics.expect("metrics")
+            }),
+        };
+        assert_eq!(delta.apply_to(revision, &mut applied), Ok(()));
+        assert_eq!(applied.rows[1], delta.row_patches[0].replacement);
+
+        let before = applied.clone();
+        let mut malformed = delta.clone();
+        malformed.row_patches[0].replacement.cells[0].contents = "bad\ncell".to_owned();
+        assert_eq!(
+            malformed.apply_to(Revision::new(4), &mut applied),
+            Err(TerminalSurfaceError::InvalidCellText)
+        );
+        assert_eq!(
+            applied, before,
+            "a rejected patch must not partially commit"
+        );
+    }
+
+    #[test]
+    fn semantic_surface_rejects_shape_cursor_metrics_and_wide_pair_errors() {
+        let revision = Revision::new(5);
+        let mut surface = semantic_surface(revision);
+        surface.rows[0].cells.pop();
+        assert_eq!(
+            surface.validate(revision),
+            Err(TerminalSurfaceError::InvalidColumnCount)
+        );
+
+        let mut surface = semantic_surface(revision);
+        surface.rows[0].cells[1].wide_continuation = false;
+        assert_eq!(
+            surface.validate(revision),
+            Err(TerminalSurfaceError::InvalidWidePair)
+        );
+
+        let mut surface = semantic_surface(revision);
+        surface.cursor.column = surface.size.columns;
+        assert_eq!(
+            surface.validate(revision),
+            Err(TerminalSurfaceError::InvalidCursor)
+        );
+
+        let mut surface = semantic_surface(revision);
+        surface.scroll_metrics.as_mut().expect("metrics").revision = Revision::new(4);
+        assert_eq!(
+            surface.validate(revision),
+            Err(TerminalSurfaceError::InvalidScrollMetrics)
+        );
+    }
+
+    #[test]
+    fn semantic_history_window_is_request_bound_and_redacted() {
+        const SENTINEL: &str = "SEM_WINDOW_57c1";
+        let query = TerminalHistoryWindowQuery {
+            anchor: TerminalHistoryWindowAnchor {
+                epoch: Revision::new(1),
+                revision: Revision::new(2),
+                max_offset_from_bottom: 4,
+                viewport: TerminalSize::new(2, 3),
+            },
+            target_offset_from_bottom: 1,
+            older_margin_rows: 0,
+            newer_margin_rows: 0,
+        };
+        let frame = TerminalSurfaceHistoryWindowFrame {
+            disposition: TerminalViewportDisposition::Exact,
+            anchor: query.anchor,
+            target_offset_from_bottom: 1,
+            first_row_from_live_top: -1,
+            rows: vec![
+                TerminalSurfaceRow {
+                    cells: vec![
+                        TerminalCell {
+                            contents: SENTINEL.to_owned(),
+                            ..TerminalCell::default()
+                        },
+                        TerminalCell::default(),
+                        TerminalCell::default(),
+                    ],
+                    wrapped: false,
+                },
+                TerminalSurfaceRow {
+                    cells: vec![TerminalCell::default(); 3],
+                    wrapped: false,
+                },
+            ],
+        };
+        assert_eq!(frame.validate_for(query), Ok(()));
+        let debug = format!("{frame:?}");
+        assert!(!debug.contains(SENTINEL));
+        assert!(debug.contains("row_count: 2"));
     }
 
     #[test]
@@ -852,9 +1038,8 @@ mod tests {
         const TITLE_SENTINEL: &str = "TERM_TITLE_SENTINEL_154c";
         const ICON_SENTINEL: &str = "TERM_ICON_SENTINEL_861a";
         const REPLY_SENTINEL: &[u8] = b"TERM_REPLY_SENTINEL_23d9";
-        const SCREEN_SENTINEL: &[u8] = b"TERM_SCREEN_SENTINEL_3ba7";
-        const HISTORY_SENTINEL: &[u8] = b"TERM_HISTORY_SENTINEL_9ca2";
-        const DELTA_SENTINEL: &[u8] = b"TERM_DELTA_SENTINEL_c156";
+        const SURFACE_SENTINEL: &str = "TERM_SURFACE_SENTINEL_3ba7";
+        const DELTA_SENTINEL: &str = "TERM_DELTA_SENTINEL_c156";
 
         let cell = TerminalCell {
             contents: CELL_SENTINEL.to_owned(),
@@ -864,18 +1049,6 @@ mod tests {
                 bold: true,
                 ..TerminalStyle::default()
             },
-        };
-        let state = TerminalState {
-            size: TerminalSize::new(41, 137),
-            active_screen: ActiveScreen::Alternate,
-            cursor: TerminalCursor {
-                row: 3,
-                column: 5,
-                visible: true,
-                style: TerminalStyle::default(),
-            },
-            modes: TerminalModes::default(),
-            cells: vec![cell.clone()],
         };
         let update = TerminalUpdate {
             revision: Revision::new(43),
@@ -891,57 +1064,60 @@ mod tests {
                 },
             ],
         };
-        let snapshot = TerminalSnapshot {
+        let mut surface = semantic_surface(Revision::new(47));
+        surface.rows[1].cells[0].contents = SURFACE_SENTINEL.to_owned();
+        let snapshot = TerminalSurfaceSnapshot {
             revision: Revision::new(47),
-            size: TerminalSize::new(41, 137),
-            active_screen: ActiveScreen::Main,
-            screen_ansi: SCREEN_SENTINEL.to_vec(),
-            recent_history_ansi: HISTORY_SENTINEL.to_vec(),
-            modes: TerminalModes::default(),
-            scroll_metrics: Some(TerminalScrollMetrics {
-                epoch: Revision::new(43),
-                revision: Revision::new(47),
-                offset_from_bottom: 0,
-                max_offset_from_bottom: 5,
-                viewport_rows: 41,
-            }),
+            surface,
         };
-        let delta = TerminalDelta {
+        let delta = TerminalSurfaceDelta {
             from_revision: Revision::new(47),
             to_revision: Revision::new(53),
-            size: TerminalSize::new(41, 137),
+            size: TerminalSize::new(2, 3),
             active_screen: ActiveScreen::Main,
-            ansi: DELTA_SENTINEL.to_vec(),
+            row_patches: vec![TerminalSurfaceRowPatch {
+                row: 1,
+                replacement: TerminalSurfaceRow {
+                    cells: vec![
+                        TerminalCell {
+                            contents: DELTA_SENTINEL.to_owned(),
+                            ..TerminalCell::default()
+                        },
+                        TerminalCell::default(),
+                        TerminalCell::default(),
+                    ],
+                    wrapped: false,
+                },
+            }],
+            cursor: snapshot.surface.cursor,
             modes: TerminalModes::default(),
-            scroll_metrics: None,
+            scroll_metrics: Some(TerminalScrollMetrics {
+                revision: Revision::new(53),
+                ..snapshot.surface.scroll_metrics.expect("metrics")
+            }),
         };
 
         let rendered = format!(
-            "{cell:?} {state:?} {update:?} {snapshot:?} {delta:?} {:?} {:?}",
-            TerminalDeltaResult::Delta(delta.clone()),
-            TerminalDeltaResult::Resync(snapshot.clone()),
+            "{cell:?} {update:?} {snapshot:?} {delta:?} {:?} {:?}",
+            TerminalSurfaceDeltaResult::Delta(delta.clone()),
+            TerminalSurfaceDeltaResult::Resync(snapshot.clone()),
         );
-        for text in [CELL_SENTINEL, TITLE_SENTINEL, ICON_SENTINEL] {
-            assert!(!rendered.contains(text));
-        }
-        for bytes in [
-            REPLY_SENTINEL,
-            SCREEN_SENTINEL,
-            HISTORY_SENTINEL,
+        for text in [
+            CELL_SENTINEL,
+            TITLE_SENTINEL,
+            ICON_SENTINEL,
+            SURFACE_SENTINEL,
             DELTA_SENTINEL,
         ] {
-            assert!(!rendered.contains(std::str::from_utf8(bytes).expect("ASCII sentinel")));
-            assert!(!rendered.contains(&format!("{bytes:?}")));
+            assert!(!rendered.contains(text));
         }
+        assert!(!rendered.contains(std::str::from_utf8(REPLY_SENTINEL).expect("ASCII sentinel")));
+        assert!(!rendered.contains(&format!("{REPLY_SENTINEL:?}")));
         assert!(rendered.contains("[REDACTED]"));
-        assert!(rendered.contains("cell_count: 1"));
-        assert!(rendered.contains("rows: 41"));
-        assert!(rendered.contains("columns: 137"));
         assert!(rendered.contains(&format!("reply_len: {}", REPLY_SENTINEL.len())));
-        assert!(rendered.contains(&format!("ansi_len: {}", DELTA_SENTINEL.len())));
+        assert!(rendered.contains("row_patch_count: 1"));
 
         assert_eq!(cell, cell.clone());
-        assert_eq!(state, state.clone());
         assert_eq!(update, update.clone());
         assert_eq!(snapshot, snapshot.clone());
         assert_eq!(delta, delta.clone());

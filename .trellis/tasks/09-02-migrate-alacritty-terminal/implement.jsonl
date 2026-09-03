@@ -13,6 +13,10 @@
 {"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/nested-tui-scroll-routing.md", "reason": "落实 Herdr/Pi main/fullscreen 的标准 mode 驱动 wheel ownership、每 report 单一 owner、host capture 分层与禁止应用名特判。"}
 {"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/rust-vt-and-c-language-evaluation.md", "reason": "保留选择官方 Rust terminal core、拒绝社区 Ghostty wrapper与 C rewrite的决策背景，避免实现时恢复已否决路线。"}
 {"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/herdr-flicker-rendering.md", "reason": "落实 Herdr 可迁移的 DEC 2026、同帧 chrome、16ms event-driven latest-frame cadence 与 wheel-burst 合帧原则，同时避免照搬三行 multiplier、Ratatui、Ghostty wrapper和全局 renderer。"}
-{"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/local-viewport-cache.md", "reason": "提供 desktop/mobile 共用的纯读连续窗口、live-top坐标、generic cache reducer、prefetch、失效和mixed-version最小实现边界。"}
+{"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/local-viewport-cache.md", "reason": "提供desktop/mobile共用的纯读连续窗口、live-top坐标、generic semantic-row cache reducer、prefetch与失效；旧mixed-version内容仅是历史背景，不得实现。"}
 {"file": ".trellis/spec/backend/local-daemon-ipc.md", "reason": "窗口请求必须穿过真实 local/remote duplex、保持 one-outstanding/correlation/input fence，并由 CLI 完成无闪烁原子呈现。"}
-{"file": ".trellis/spec/backend/transport-auth.md", "reason": "远端窗口能力、request correlation 与 stream-loss Gap sentinel 必须按每个 Iroh attachment epoch 协商和清理。"}
+{"file": ".trellis/spec/backend/transport-auth.md", "reason": "wire-v2远端窗口request correlation与stream-loss非零Gap必须按每个Iroh attachment epoch清理；没有窗口能力协商、unsupported sentinel或fallback。"}
+{"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/nested-tui-right-margin-rendering.md", "reason": "提供用户确认、Herdr v0.8.2 probe、Ghostty 1.3.1 inclusive EL/pending-wrap 语义与 Zterm 无条件 trailing EL0 的证据，约束实现为通用 extent-aware suffix clear 而非应用特判。"}
+{"file": ".trellis/spec/guides/root-cause-and-architecture-thinking-guide.md", "reason": "实施前必须先按证据区分局部实现缺陷与架构/边界缺陷；本次以单一语义帧和唯一最终 presenter 修复 failure class，禁止应用特判式补丁。"}
+{"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/semantic-presentation-migration.md", "reason": "保留迁移根因、semantic domain和attachment/compositor/presenter ownership背景；wire negotiation与legacy fallback是已否决路线，实施以direct-cutover研究为准。"}
+{"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/semantic-presentation-direct-cutover.md", "reason": "用户撤销 mixed-version compatibility 后的权威实施上下文：wire-major/ALPN 协调升级、canonical semantic kinds、删除 ANSI/encoding/capability/pager/viewport fallback，并保留现有 Session/PTY/安全边界。"}

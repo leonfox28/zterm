@@ -3,13 +3,16 @@
 ## 1. Scope / Trigger
 
 Apply this contract when changing shared identifiers, terminal revisions and
-DTOs, capabilities, resource defaults, operation replay, protobuf messages, wire
-kinds, or frame encoding. `zterm-core` owns product domain values and
-`zterm-proto` owns their wire representation and validation.
+semantic DTOs, capabilities, operation replay, protobuf messages, wire kinds,
+or frame encoding. `zterm-core` owns transport-neutral product values;
+`zterm-proto` owns the single wire-major-two representation and structural
+validation.
 
 ## 2. Signatures
 
 ```rust
+pub const WIRE_MAJOR: u32 = 2;
+
 pub struct OperationLease {
     pub daemon_incarnation: DaemonIncarnation, // exactly 16 bytes
     pub ordinal: u64,                          // non-zero, daemon-issued
@@ -24,262 +27,212 @@ OperationWindow::new(lease: OperationLease, capacity: usize)
     -> Result<OperationWindow<R>, OperationWindowError>
 OperationWindow::execute(id: OperationId, operation: impl FnOnce() -> R)
     -> Result<OperationOutcome<R>, OperationWindowError>
+
+TerminalSurfaceSnapshot::validate(&self) -> Result<(), TerminalSurfaceError>
+TerminalSurfaceDelta::validate(&self) -> Result<(), TerminalSurfaceError>
+TerminalSurfaceDelta::apply_to(
+    &self,
+    current_revision: Revision,
+    surface: &mut TerminalSurface,
+) -> Result<Revision, TerminalSurfaceError>
+TerminalSurfaceHistoryWindowFrame::validate_for(
+    &self,
+    query: TerminalHistoryWindowQuery,
+) -> Result<(), TerminalSurfaceError>
+
+ViewportCache<TerminalSurfaceRow>::set_target(offset: u64)
+    -> ViewportCacheUpdate
+ViewportCache<TerminalSurfaceRow>::install_window(window)
+    -> Result<ViewportCacheInstall, CachedViewportWindow<TerminalSurfaceRow>>
 ```
 
-The mutation wire boundary is
-`SessionOperationLeaseRequest -> SessionOperationLeaseResponse { lease }`, then
-one request carrying `OperationId { lease_ordinal = 1, sequence = 2,
-daemon_incarnation = 3 }`. `WireKind` values are registered once in
-`crates/proto/src/lib.rs`; session lease kinds are 207/208 and the product ALPN
-is `zterm/1`. Terminal history uses additive kinds 312/313 and the same-UID-only
-connection-status event is kind 314. Continuous terminal viewport uses additive
-kinds 315/316 and capability bit 19:
+The mutation boundary is
+`SessionOperationLeaseRequest -> SessionOperationLeaseResponse { lease }`,
+followed by a request carrying one exact `OperationId`.
 
-```rust
-TerminalScrollMetrics { epoch, revision, offset_from_bottom,
-    max_offset_from_bottom, viewport_rows }
-TerminalScrollAction::{ScrollByLines(i32), ScrollToOffset(u64)}
-TerminalViewportResult::{Frame, Live, HistoryChanged, HistoryGap}
-Capabilities::TERMINAL_VIEWPORT == 1 << 19
+The terminal wire registry is canonical and non-negotiated:
 
-TerminalHistoryWindowAnchor { epoch, revision, max_offset_from_bottom, viewport }
-TerminalHistoryWindowQuery { anchor, target_offset_from_bottom,
-    older_margin_rows, newer_margin_rows }
-TerminalHistoryWindowResult::{Frame, HistoryChanged, HistoryGap}
-Capabilities::TERMINAL_HISTORY_WINDOW == 1 << 20
-MAX_HISTORY_WINDOW_ROWS == 240
-
-ViewportCache<Row>::set_target(offset) -> ViewportCacheUpdate
-ViewportCache<Row>::install_window(window)
-    -> Result<ViewportCacheInstall, CachedViewportWindow<Row>>
+```text
+300 TerminalAttachRequest
+301 TerminalSemanticSnapshot              content
+302 TerminalSemanticDelta                 content
+303 TerminalInput
+304 TerminalResize
+305 TerminalDetach
+306 TerminalSnapshotApplied
+307 TerminalSyncRequest
+308 TerminalSyncRequired
+309 TerminalLeaseLost
+310 TerminalSessionEnded
+311 TerminalTransportStateEvent            same-UID projection
+314 TerminalConnectionStatusEvent          same-UID projection
+317 TerminalHistoryWindowRequest           control
+318 TerminalSemanticHistoryWindowFrame     content
 ```
+
+The product ALPNs are `zterm/2` and `zterm-pair/2`. Protobuf source/package and
+the generated Rust module are exactly `proto/zterm/v2`, `zterm.v2`, and `v2`.
 
 ## 3. Contracts
 
-- `DeviceId` is 32 bytes; `SessionId` and `AttachmentId` are 16 bytes.
-- `Revision` is the only public terminal revision type. It is monotonic and
+### Shared identities and replay
+
+- `DeviceId` is 32 bytes; `SessionId`, `AttachmentId`, and daemon incarnation
+  are 16 bytes. `Revision` is the only public terminal revision type and is
   checked before mutation.
-- `zterm-core::terminal` owns transport-neutral terminal size, screen, cell,
-  style, cursor, mode, event, update, snapshot/delta, and history values.
-  `zterm-proto` encodes those values. Neither crate depends on
-  `zterm-terminal`, `alacritty_terminal`, or `vte`, and no upstream terminal
-  type crosses a public or wire boundary.
-- `SessionName` is the only validator for exact case-sensitive session names;
-  `SessionSelector` resolves either a validated name or a 16-byte ID, and
-  `SessionEndReason` distinguishes natural exit, explicit close, daemon stop,
-  and driver failure without retaining terminal content.
-- `AttachmentPrincipal` distinguishes an authenticated remote endpoint from a
-  same-UID local view. A local principal is created only after the platform
-  peer-credential gate succeeds.
-- Capability values retain unknown bits. Optional future capabilities never
-  become prerequisites for ordinary terminal service.
-- `Capabilities::HISTORY_PAGING` is active only for the complete bounded
-  request/page path. A history request carries attachment identity, direction,
-  optional epoch/revision cursor, and a maximum row count; its correlated page
-  has an explicit `Ok`, `Changed`, or `Gap` outcome. Page Debug reports only
-  structural counts, never formatted terminal rows.
-- `Capabilities::TERMINAL_VIEWPORT` is active only for the complete semantic
-  request/frame path. Request action is exactly one signed relative or absolute
-  variant. A correlated frame has an explicit Frame/Live/Changed/Gap outcome;
-  Frame carries Exact/Rebased plus metrics and exactly `viewport_rows`
-  independently encoded rows, Live carries valid zero-offset metrics without
-  rows/disposition, and Changed/Gap carry only the current epoch/revision.
-  Snapshot/delta metrics are optional for mixed versions and absent on
-  alternate screen. Frame Debug reports structural counts and ANSI byte length,
-  never row content.
-- `Capabilities::TERMINAL_HISTORY_WINDOW` is active only for the stateless
-  contiguous-window path. A request carries one immutable anchor, absolute
-  target, and bounded older/newer margins. A Frame carries Exact/Rebased,
-  current anchor, resolved target, signed live-top coordinate, and the exact
-  request-shaped row count; Changed/Gap are content-free. Frame Debug exposes
-  only coordinates, counts, and total bytes.
-- `TerminalHistoryWindowQuery::response_shape` is shared by model, local IPC,
-  remote bridge, and client cache validation. A response may advance but never
-  predate its request; range, disposition, translated target, viewport size,
-  and row count must all match that originating query.
-- `ViewportCache<Row>` is renderer-neutral and contains no ANSI, async runtime,
-  clock, mouse, or platform type. It retains one immutable bounded row window,
-  latest monotonic anchor, desired/presented offsets, and the complete one
-  outstanding query. Cache hits render locally; low-water/miss produces at
-  most one request while later gestures coalesce to the latest desired target.
-- `DomainErrorKind::code` and `from_code` are the single stable error-category
-  bridge used by wire and JSON projections; adapters do not invent aliases.
-- `OperationWindow` is fixed to one daemon-issued `OperationLease` and retains
-  exact results in a bounded non-zero sequence window. A retained duplicate
-  replays its result; a lease mismatch, zero sequence, or evicted sequence
-  returns outcome unknown and is never run. Sequence exhaustion is reported
-  before wraparound.
-- An `OperationLease` contains a random 16-byte daemon incarnation and a
-  daemon-monotonic non-zero ordinal for one stable principal/auth generation.
-  It is allocated by the daemon, never invented from wall clock, process ID, or
-  client randomness. Incarnation mismatch is rejected before inspecting or
-  changing ordinal/floor state; a restart therefore makes every old lease
-  outcome unknown without executing it.
-- Issued ordinals live in a bounded registry. Lost allocation responses may
-  leave empty leases, so they participate in the same completed-prefix
-  retirement as used leases. Retired, missing, invented, or high ordinals
-  return outcome unknown and are never recreated. Ordinal exhaustion is
-  explicit and cannot wrap.
-- M2 owns and tests the replay state machine; M4 integrates it around stateful
-  `SessionService` create/rename/close/takeover commits. Successful and typed
-  error results are replayed exactly. Each result is also bound to a fingerprint
-  of every semantic mutation argument, so reusing an ID for another payload is
-  outcome unknown. Local replay keys use the stable daemon device identity,
-  authorization generation zero, and issued lease ordinal, never the per-socket
-  view ID. M4 local IPC is admitted only after the same-UID peer gate;
-  authorization generation zero therefore means the current daemon owner's
-  trust boundary, not a remote ACL.
-- Readiness, status, and list allocate no lease and write no replay state. A
-  logical local client lazily caches a lease before its first mutation. A local
-  target may retry its same-UID mutation once with byte-identical bytes and
-  operation ID. For a remote target, the daemon-owned `RemoteUnaryClient` is the
-  sole mutation retry owner: the outer same-UID envelope is sent once after any
-  bytes are written, while the daemon may open at most two Iroh service streams
-  under one deadline with the same target, request bytes, lease, and operation
-  ID. `SessionOperationLeaseRequest` is stateful control rather than read-only:
-  after a post-write transport/protocol ambiguity it returns that typed failure
-  and opens no second remote stream, so one logical allocation cannot silently
-  issue two leases. There is no disk-backed lease or automatic fresh-process
-  recovery; only an API which explicitly exports an opaque retry token may
-  continue an ambiguous operation in another client object.
-- `proto/zterm/v1/*.proto` is the wire source of truth. One numeric kind
-  registry and one decoder own all message dispatch.
+- `OperationWindow` is fixed to one daemon-issued lease and retains exact
+  success or typed-error results in a bounded non-zero sequence window. A
+  retained duplicate replays; lease mismatch, zero/evicted sequence, payload
+  fingerprint mismatch, or exhaustion returns outcome unknown and never runs.
+- Lease ordinals are daemon-monotonic per stable principal/auth generation.
+  Restart/incarnation mismatch, missing/invented/high/retired ordinal, and a
+  retry at or below the completed floor are rejected before effects. Lost empty
+  lease responses participate in the same bounded retirement policy.
+- Readiness, status, and list allocate no lease. A mutation is encoded once and
+  any single ambiguity retry reuses byte-identical request bytes, deadline,
+  lease, operation ID, and semantic payload. Outcome unknown is never retried
+  under a fresh lease for that logical operation.
+
+### Semantic terminal domain
+
+- `zterm-core::terminal` owns size, screen, cell/style/cursor/modes, side
+  events, exact `TerminalSurface`, revision-bound snapshot, full-row semantic
+  delta patches, scroll metrics, history-window query/result, and redacted
+  Debug implementations.
+- A surface has exactly `size.rows` rows and every row has exactly
+  `size.columns` cells. Text is bounded, contains no controls, wide head and
+  continuation cells form exact adjacent pairs, the cursor is in bounds, and
+  scroll metrics are present only for a compatible main-screen surface.
+- A delta advances one exact baseline, has sorted unique in-bounds row patches,
+  and applies transactionally. Callers install the candidate only after the
+  complete delta validates; a mismatch retains the last complete surface and
+  requests resynchronization.
+- History-window requests contain an immutable epoch/revision/extent/viewport
+  anchor, absolute target, and bounded margins. `response_shape` is the single
+  authority for disposition, translated target, signed first row, and exact row
+  count. A Frame contains semantic rows only; Changed/Gap are content-free and
+  report `epoch <= revision` with `revision >= query.anchor.revision`.
+- `ViewportCache<TerminalSurfaceRow>` is renderer-neutral and contains no ANSI,
+  async runtime, mouse pixels, platform type, or terminal parser. It retains one
+  complete bounded window, desired/presented offsets, latest anchor, and one
+  complete outstanding query; later gestures coalesce to the latest target.
+- No public `TerminalState`, presentation-family wrapper, encoding preference,
+  legacy ANSI snapshot/delta/history DTO, or stateful server viewport action
+  exists.
+
+### Wire-major-two representation
+
+- Semantic snapshot, delta, and history-window frame are the only terminal
+  content representations. Terminal attach has no presentation preference.
+  Capabilities retains unknown bits, but no bit 17/19/20/21 presentation
+  negotiation or fallback exists; `TERMINAL_SERVICE` is the only terminal
+  service capability.
+- Kinds 312/313, 315/316, and 319/320/321 are retired and must not appear in the
+  v2 registry. Kind 318 means only semantic history-window response.
+- `proto/zterm/v2/*.proto` is the only compiled wire source. There is no v1
+  generated module, dual decoder, downgrade, compatibility adapter, or
+  mixed-version terminal branch. Independently persisted formats such as
+  `PairTicketV1` and `RelayRouteCacheV1` keep their own version names and do not
+  imply wire-v1 support.
 - Frames are `varint length + WireFrame`, capped at 8 MiB before body
-  allocation. Control payloads are capped at 1 MiB before concrete-message
-  decoding. `TerminalHistoryRequest` is control; `TerminalHistoryPage` is a
-  bounded content frame under the ordinary 8 MiB limit.
-  `TerminalViewportRequest` is control and `TerminalViewportFrame` is content
-  under the same limits. `TerminalHistoryWindowRequest` is control and
-  `TerminalHistoryWindowFrame` is content under those same 1/8 MiB limits.
-  Unknown protobuf fields are compatible; unknown kind and wire major are
-  explicit errors.
-- Kind/capability allocation is append-only: history remains 312/313, local
-  status remains 314, viewport remains 315/316, history window is 317/318,
-  `AGENT_EVENTS` remains bit 18, viewport remains bit 19, and history window is
-  bit 20. A peer without bit 20 receives no 317/318 frame; adapters fall back
-  to negotiated 315/316 and then unchanged 312/313. No fallback advertises or
-  simulates a capability the peer omitted.
-- `TerminalConnectionStatusEvent` carries only attachment ID, unknown/direct/
-  relay, and optional bounded integer RTT. It is never a normal-ALPN service
-  kind and contains no DeviceId, address, relay URL, candidate, or ticket.
-- The normal product ALPN is `zterm/1`; short-lived pairing uses
-  `zterm-pair/1`. Core defines transport-neutral values and never binds an Iroh
-  endpoint; daemon ownership and authorization sequencing follow the
-  [transport/auth contract](./transport-auth.md).
+  allocation. Concrete control payloads are capped at 1 MiB before decoding;
+  kinds 301, 302, and 318 use the content-frame limit. Unknown protobuf fields
+  remain compatible, while unknown kind or wire major is an explicit
+  connection-local error.
+- Model/driver/Session/local IPC/remote bridge pass semantic values only. A
+  bridge may structurally decode cells to validate shape, content bounds,
+  revision, correlation, and request identity, rewrite its private attachment
+  ID, then re-encode. It must not interpret application content, convert
+  representation, construct ANSI, or perform presentation.
+- `TerminalConnectionStatusEvent` is same-UID only and contains attachment ID,
+  unknown/direct/relay, and optional bounded integer RTT. It is invalid on the
+  remote normal ALPN and contains no address, relay URL, DeviceId, or ticket.
 
 ## 4. Validation & Error Matrix
 
 | Condition | Required result |
 | --- | --- |
-| identifier or incarnation has the wrong byte length | reject during domain conversion before dispatch |
+| identifier/incarnation has wrong byte length | reject during domain conversion before dispatch |
 | replay capacity is zero | `OperationWindowError::InvalidCapacity` |
-| lease incarnation/ordinal is missing, invented, retired, or from another daemon | outcome unknown; do not execute |
-| operation sequence is zero, evicted, or would wrap | outcome unknown/exhaustion; do not execute |
-| same operation ID carries a different semantic payload | outcome unknown; do not replay or execute |
-| frame prefix is malformed/non-canonical or body is truncated | protocol error scoped to that connection |
-| frame exceeds 8 MiB or control payload exceeds 1 MiB | reject before allocating/decoding the concrete body |
-| history direction/outcome is unspecified, row bound is invalid, or page cursor/count disagrees | reject as malformed before projection; do not expose row content |
-| viewport action/outcome/disposition is missing or inconsistent | reject as malformed before forwarding or rendering |
-| viewport metrics have zero rows, epoch after revision, or offset past maximum | reject as malformed; do not retain its rows or baseline |
-| viewport Frame row count differs from `viewport_rows`, exceeds the current model height/80 rows, or exceeds 8 MiB | reject before render; keep the attachment/session bounded |
-| viewport request exceeds the 1 MiB control limit | reject before concrete decode or Session dispatch |
-| peer lacks `TERMINAL_VIEWPORT` | send no kind 315/316; use unchanged capability-gated history paging or no history feature |
-| history-window query has invalid anchor/size/target/margins or exceeds the product viewport | reject as malformed before Session dispatch; no model/cache mutation |
-| history-window Frame predates or contradicts its originating query, exceeds 240 rows, or has a mismatched exact range | reject before cache/render; keep the previous complete frame |
-| history-window Changed/Gap contains rows/anchor/disposition/coordinates, or nonzero revision predates the request | reject as malformed; content-free outcome only |
-| peer lacks `TERMINAL_HISTORY_WINDOW` | send no kind 317/318; fall back to negotiated bit 19 and then bit 17 pager |
+| lease/sequence/fingerprint is missing, mismatched, retired, evicted, or exhausted | outcome unknown/exhaustion; do not execute |
+| frame prefix is malformed/non-canonical, body truncated, kind unknown, or wire major not 2 | connection-local protocol error; listener remains healthy |
+| frame exceeds 8 MiB or control payload exceeds 1 MiB | reject before concrete-message allocation/dispatch |
+| semantic surface has invalid size/row count/cell text/wide pair/cursor/metrics | reject transactionally; retain previous complete surface |
+| semantic delta does not advance exact baseline or has duplicate/out-of-range patches | reject; request full sync and do not partially apply |
+| history query has invalid anchor/size/target/margins | reject before Session/model/cache mutation |
+| history Frame contradicts its query, exceeds 240 rows, or has invalid semantic rows | reject before cache/presentation; retain prior complete window |
+| Changed/Gap contains rows/shape fields, has epoch after revision, or revision older than query anchor | reject as malformed; content-free outcome only |
 | connection status arrives on remote normal ALPN | reject; status is same-UID local IPC only |
-| wire major or kind is unsupported | explicit protocol/service error; listener remains healthy |
+| old v1 ALPN or wire major is used | explicit incompatibility; never enter terminal attachment or downgrade |
 
 ## 5. Good / Base / Bad Cases
 
-- **Good:** obtain a daemon lease lazily, encode one mutation once, and let
-  exactly one transport layer reuse its exact bytes and operation ID for the
-  single ambiguous-transport retry.
-- **Base:** readiness/status/list use no operation lease and do not alter replay
-  state.
-- **Good viewport-cache case:** validate a window against its saved complete
-  query, present only a full-height cached slice, and retain the prior complete
-  presentation while a miss or edge prefetch is outstanding.
-- **Bad:** derive an epoch from wall-clock time, accept a client-invented high
-  ordinal, wrap a sequence, accept an uncorrelated window shape, or rerun an
-  outcome-unknown operation under a fresh lease.
+- **Good:** encode a mutation once and let exactly one transport owner reuse its
+  exact bytes and operation ID for the one allowed ambiguity retry.
+- **Base:** latest v2 client and daemon exchange semantic snapshot/delta/history
+  with no presentation negotiation.
+- **Good:** validate a history response against its saved complete query, then
+  install only one complete semantic row window.
+- **Bad:** accept `(epoch, revision) = (0, 0)` as a generic unsupported sentinel,
+  infer a response without its query, send a retired kind, or recreate ANSI in
+  the daemon/bridge.
 
 ## 6. Tests Required
 
-- Core state-machine tests cover ID lengths, principals, unknown capability
-  retention, defaults, replay, eviction, errors, fixed-lease mismatch, zero
-  sequence, and no sequence wrap.
-- Daemon tests cover daemon-issued monotonic leases, lost empty-lease
-  retirement, admission past the active bound, in-flight retirement refusal,
-  restart/incarnation mismatch, invented/high ordinal rejection, exhaustion,
-  panic-safe duplicate waiters, and outcome unknown below the retired floor.
-- Proto tests cover round trip, unknown fields, unknown kinds, major mismatch,
-  non-canonical/malformed varints, truncated bodies, and both size limits.
-- Proto/daemon tests cover additive kinds 312–318, capability bits 17–20,
-  alternate-scroll field 7, optional snapshot/delta metrics, all history and
-  viewport/window outcomes, page/frame/window bounds, redacted Debug, exact
-  request-shape correlation, mixed-version bit20 -> bit19 -> pager fallback,
-  and rejection of status on the remote service classifier.
-- Core cache tests cover hit-without-request, checked slice math, edge
-  prefetch, one complete pending query/latest target, stale response/anchor
-  rejection, append translation, resize/identity invalidation, and preservation
-  of the last presentable full slice while replacement is unavailable.
-- `local_ipc` proves malformed/unsupported requests terminate only their own
-  unary connection and do not poison the listener. `terminal_recovery` owns
-  the equivalent duplex attachment isolation evidence.
+- Core tests cover ID lengths, principals, unknown capability retention,
+  replay/eviction/exhaustion, semantic surface/delta/history validation,
+  redacted Debug, and renderer-neutral cache transitions.
+- Proto tests cover v2 round trip, unknown fields/kinds, major mismatch,
+  non-canonical/malformed varints, truncated bodies, both size limits, exact
+  kind registry, semantic Unicode/wide/style rows, request-bound history, and
+  malformed Changed/Gap epoch/revision identity.
+- Daemon/local/remote tests trace kinds 301/302/317/318 through initial full,
+  merged delta, gap/resync, reconnect, takeover, final drain, correlation/ID
+  rewrite, and stream-loss Gap. No negotiation/fallback matrix remains.
+- `tests/source-policy.sh` rejects v1 protobuf, retired terminal kinds, legacy
+  presentation types, `TerminalState`, a second CLI parser, application-name
+  detection, and Zterm-owned unsafe Rust.
 
 ## 7. Wrong vs Correct
 
 ### Wrong
 
 ```rust
-let epoch = wall_clock_nanos();
-let id = OperationId::new(epoch, next_sequence());
-send(encode_again(id, request)).await?;
+if peer_capabilities.contains(LEGACY_VIEWPORT) {
+    send_kind_315(action).await?;
+} else {
+    request_ansi_history_page().await?;
+}
 
-send_kind_315_to_every_peer(viewport_request).await?;
-send_kind_317_without_saving_its_query(window_request).await?;
+bridge.write(encode_ansi(decoded_cells));
 ```
-
-This has no cross-process authority and can change request bytes between an
-ambiguous attempt and its retry.
 
 ### Correct
 
 ```rust
-let lease = client.daemon_issued_lease().await?;
-let id = checked_operation_id(lease)?;
-let encoded = encode_once(id, request)?;
-send_with_one_ambiguous_retry(&encoded, deadline).await?;
-
-if peer_capabilities.contains(Capabilities::TERMINAL_HISTORY_WINDOW) {
-    save_query_then_send_window(query).await
-} else if peer_capabilities.contains(Capabilities::TERMINAL_VIEWPORT) {
-    send_viewport_request(action).await
-} else {
-    request_legacy_history_page().await
+let query = cache.set_target(target).request;
+if let Some(query) = query {
+    save_query_then_send_kind_317(query).await?;
 }
+
+let frame = decode_validate_history_kind_318(saved_query, bytes)?;
+let rewritten = frame.with_attachment_id(local_view_id);
+forward_semantic(rewritten).await?;
 ```
 
-The daemon validates the incarnation and issued ordinal before effects, while
-the client preserves the exact retry identity and payload.
+The boundary may decode structurally, but only the platform presenter interprets
+the semantic surface for physical output.
 
 ## Forbidden patterns
 
-- Prost, SQLite, Iroh, or OS dependencies in `zterm-core`.
+- Prost, SQLite, Iroh, OS, or terminal-engine dependencies in `zterm-core`.
 - Raw `u64` revisions in public terminal APIs.
-- A second frame parser in the CLI or daemon.
-- A host terminal engine dependency or upstream terminal type in core/proto.
-- Reusing kind 315/316 or bit 19, emitting them without negotiated
-  `TERMINAL_VIEWPORT`, accepting invalid metrics/row counts, or exposing
-  viewport row content through Debug.
-- Reusing kind 317/318 or bit 20, emitting them without negotiated
-  `TERMINAL_HISTORY_WINDOW`, validating a Frame without its originating query,
-  treating transport loss as the 0/0 unsupported sentinel, or exposing window
-  row content through Debug.
-- Re-executing an operation whose result has fallen below the replay low-water
-  mark.
-- Generating or accepting a client-invented lease ordinal/incarnation, wrapping
-  an operation sequence, or automatically retrying an outcome-unknown mutation
-  under a fresh lease.
+- A second frame parser in the CLI/daemon or a host-engine type in core/proto.
+- Wire-v1 source/generated modules, presentation capability bits, family or
+  encoding negotiation, retired kinds, downgrade, or speculative fallback.
+- ANSI-bearing terminal DTOs or ANSI construction outside the sole desktop
+  presenter.
+- Validating a history response without its complete originating query or
+  treating stream loss as an uncorrelated/sentinel response.
+- Re-executing an operation below the replay low-water mark or under a new lease
+  after an outcome-unknown result.

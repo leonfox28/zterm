@@ -25,6 +25,7 @@ These guides help you **ask the right questions before coding**.
 | [Cross-Layer Thinking Guide](./cross-layer-thinking-guide.md) | Think through data flow across layers | Features spanning multiple layers |
 | [Cross-Platform Thinking Guide](./cross-platform-thinking-guide.md) | Verify checkout bytes and command behavior across operating systems | Source attributes, CI matrices, or platform tooling changes |
 | [Evidence-Driven Simplicity Guide](./evidence-driven-simplicity.md) | Require a real failure model and one validation owner before adding machinery | Validation, fallback, recovery, monitoring, deployment, or test expansion |
+| [Root-Cause and Architecture Thinking Guide](./root-cause-and-architecture-thinking-guide.md) | Classify a bug as a local contract violation or an architecture/boundary defect before choosing fix scope | Every bug diagnosis; especially recurring, cross-layer, state, ownership, or new-platform failures |
 
 ---
 
@@ -76,6 +77,17 @@ These guides help you **ask the right questions before coding**.
 - [ ] An artifact or metric has no current consumer
 
 → Read [Evidence-Driven Simplicity Guide](./evidence-driven-simplicity.md)
+
+### When Diagnosing or Fixing a Bug
+
+- [ ] The reported application or input is starting to define the solution
+- [ ] A small patch is available, but the owning invariant is still unclear
+- [ ] Multiple writers, baselines, state copies, or timing assumptions interact
+- [ ] The same class of bug has appeared in another state, feature, or platform
+- [ ] A fix may require a new architecture, but evidence may still show a local
+      implementation error
+
+→ Read [Root-Cause and Architecture Thinking Guide](./root-cause-and-architecture-thinking-guide.md)
 
 ### When to Think About Cross-Platform Issues
 

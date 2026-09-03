@@ -343,8 +343,10 @@ Treat these as separate state machines even though one event may affect all of
 them: physical outer-terminal capture, child-declared input modes,
 attachment-local presentation, and transport/controller synchronization.
 
-- [ ] Map one repaint as bytes -> Zterm chrome -> host capture -> one flush;
-      never assume child mode output preserves the physical capture state.
+- [ ] Trace one terminal update as semantic model rows -> driver -> Session ->
+      wire -> structural bridge -> `AttachmentSurface` -> `ComposedFrame` ->
+      sole platform presenter. Only that final presenter may encode physical
+      terminal ANSI, restore host capture, perform one write, and flush once.
 - [ ] For every screen/layout transition, assign ownership of status rows,
       gutters, overlays, and reclaimed cells before ordering writers. Stale
       cleanup is valid only while the current layout still assigns that region
@@ -353,9 +355,10 @@ attachment-local presentation, and transport/controller synchronization.
       layouts against the last successfully presented layout.
 - [ ] Route each wheel report from authoritative screen/modes and hit geometry,
       not process names or screen contents; assert exactly one owner.
-- [ ] Store scroll position at the attachment boundary and pass it as a typed
-      baseline into a read-only model projection; never mutate a shared engine
-      display offset for one client.
+- [ ] Store desired scroll position and cached semantic windows in the CLI
+      attachment view. Send stateless typed history-window queries to the model;
+      never store one client's target in Session/model state or mutate a shared
+      engine display offset.
 - [ ] Distinguish an in-epoch replacement snapshot from a true reconnect. State
       which presentation values survive each transition and which are reset.
 - [ ] Treat transport synchronization, connection-path observation, and visual
@@ -370,7 +373,7 @@ attachment-local presentation, and transport/controller synchronization.
       state rather than retain intermediate frame payloads.
 - [ ] Treat chrome geometry as presented state too. Frame construction and
       failed write/flush attempts must not advance its baseline; retries must
-      still perform the repair required from the last committed frame.
+      clear an unknown presenter baseline and perform a complete repaint.
 - [ ] Test cadence cancellation at every authority change. Resume, cache miss,
       snapshot/resync, resize, reconnect, detach, and cleanup must not let a
       stale timer promote an unseen desired offset into painted chrome.
@@ -385,8 +388,13 @@ attachment-local presentation, and transport/controller synchronization.
 - [ ] Complete pending read-only controls once with a correlated typed outcome
       before publishing reconnect; do not convert expected epoch loss into a
       fatal uncorrelated UI error.
-- [ ] Test the composition at model, Session, wire, bridge, CLI byte stream, and
-      real outer-PTY boundaries. A green unit test at only one layer is not
+- [ ] Test the composition at model, driver, Session, wire, bridge,
+      `AttachmentSurface`, compositor, presenter, and real outer-PTY boundaries.
+      Tests below the presenter assert typed revisions, correlations, semantic
+      rows, and state transitions—not raw ANSI substrings or arbitrary flush
+      counts. Presenter tests own exact transaction/write/flush behavior; real
+      PTY tests observe completed protocol/revision/presentation boundaries, not
+      application text markers. A green unit test at only one layer is not
       evidence that capture, correlation, and redraw ordering compose.
 
 ---

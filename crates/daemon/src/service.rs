@@ -18,7 +18,7 @@ use zterm_core::{
     DomainErrorKind,
 };
 #[cfg(unix)]
-use zterm_proto::{DecodedFrame, WireKind, encode_message, v1};
+use zterm_proto::{DecodedFrame, WireKind, encode_message, v2};
 
 #[cfg(unix)]
 use crate::authorization::AuthorizationRegistry;
@@ -452,7 +452,7 @@ impl DaemonService {
         deadline: Instant,
     ) -> ServiceReply {
         let request_id = frame.request_id;
-        let request = decode_request::<v1::LocalSessionUnaryRequest>(&frame);
+        let request = decode_request::<v2::LocalSessionUnaryRequest>(&frame);
         frame.payload.zeroize();
         let result = async {
             let mut request = request?;
@@ -511,7 +511,7 @@ impl DaemonService {
         };
         let result = match frame.kind {
             WireKind::LocalPairCreateRequest => {
-                let request = decode_request::<v1::LocalPairCreateRequest>(&frame);
+                let request = decode_request::<v2::LocalPairCreateRequest>(&frame);
                 frame.payload.zeroize();
                 match request {
                     Ok(request) => {
@@ -522,7 +522,7 @@ impl DaemonService {
                 }
             }
             WireKind::LocalPairAcceptRequest => {
-                let request = decode_request::<v1::LocalPairAcceptRequest>(&frame);
+                let request = decode_request::<v2::LocalPairAcceptRequest>(&frame);
                 frame.payload.zeroize();
                 match request {
                     Ok(request) => {
@@ -545,7 +545,7 @@ impl DaemonService {
         &self,
         request_id: u64,
         pairing: PairingService,
-        request: v1::LocalPairCreateRequest,
+        request: v2::LocalPairCreateRequest,
         deadline: Instant,
     ) -> Result<ServiceReply, DaemonError> {
         let (operation_id, fingerprint) = zterm_proto::validate_pair_operation(
@@ -558,7 +558,7 @@ impl DaemonService {
         let created =
             run_service_blocking_until(deadline, move || pairing.create_until(input, deadline))
                 .await?;
-        let mut message = v1::LocalPairCreateResponse {
+        let mut message = v2::LocalPairCreateResponse {
             ticket: created.ticket().expose().to_owned(),
         };
         let reply = ServiceReply::message(
@@ -576,7 +576,7 @@ impl DaemonService {
         &self,
         request_id: u64,
         pairing: PairingService,
-        mut request: v1::LocalPairAcceptRequest,
+        mut request: v2::LocalPairAcceptRequest,
         deadline: Instant,
     ) -> Result<ServiceReply, DaemonError> {
         // Generated protobuf strings do not zeroize on drop. Transfer the
@@ -618,7 +618,7 @@ impl DaemonService {
         ServiceReply::message(
             WireKind::LocalPairAcceptResponse,
             request_id,
-            &v1::LocalPairAcceptResponse {
+            &v2::LocalPairAcceptResponse {
                 device: Some((&device).into()),
             },
             false,
@@ -639,7 +639,7 @@ impl DaemonService {
         };
         let result = match frame.kind {
             WireKind::LocalDeviceListRequest => {
-                let request: Result<v1::LocalDeviceListRequest, _> = decode_request(&frame);
+                let request: Result<v2::LocalDeviceListRequest, _> = decode_request(&frame);
                 match request {
                     Ok(_) => self.device_list_reply(request_id, &devices, deadline).await,
                     Err(error) => Err(error),
@@ -672,7 +672,7 @@ impl DaemonService {
         ServiceReply::message(
             WireKind::LocalDeviceListResponse,
             request_id,
-            &v1::LocalDeviceListResponse {
+            &v2::LocalDeviceListResponse {
                 devices: devices.iter().map(Into::into).collect(),
             },
             false,
@@ -687,7 +687,7 @@ impl DaemonService {
         devices: &DeviceManagement,
         deadline: Instant,
     ) -> Result<ServiceReply, DaemonError> {
-        let request: v1::LocalDeviceRenameRequest = decode_request(&frame)?;
+        let request: v2::LocalDeviceRenameRequest = decode_request(&frame)?;
         let (device_id, alias) = request.try_into().map_err(device_wire_error)?;
         let directory = devices.directory.clone();
         run_service_blocking_until(deadline, move || {
@@ -698,7 +698,7 @@ impl DaemonService {
         ServiceReply::message(
             WireKind::LocalDeviceRenameResponse,
             request_id,
-            &v1::LocalDeviceRenameResponse {
+            &v2::LocalDeviceRenameResponse {
                 device: Some((&device).into()),
             },
             false,
@@ -713,7 +713,7 @@ impl DaemonService {
         devices: &DeviceManagement,
         deadline: Instant,
     ) -> Result<ServiceReply, DaemonError> {
-        let request: v1::LocalDeviceRevokeRequest = decode_request(&frame)?;
+        let request: v2::LocalDeviceRevokeRequest = decode_request(&frame)?;
         let device_id = request.try_into().map_err(device_wire_error)?;
 
         // The write permit is held across the complete ordered revoke. A
@@ -762,7 +762,7 @@ impl DaemonService {
         ServiceReply::message(
             WireKind::LocalDeviceRevokeResponse,
             request_id,
-            &v1::LocalDeviceRevokeResponse {
+            &v2::LocalDeviceRevokeResponse {
                 device: Some((&device).into()),
             },
             false,
@@ -816,11 +816,11 @@ impl DaemonService {
         let request_id = frame.request_id;
         match frame.kind {
             WireKind::LocalReadinessRequest => {
-                let _: v1::LocalReadinessRequest = decode_request(&frame)?;
+                let _: v2::LocalReadinessRequest = decode_request(&frame)?;
                 ServiceReply::message(
                     WireKind::LocalReadinessResponse,
                     request_id,
-                    &v1::LocalReadinessResponse {
+                    &v2::LocalReadinessResponse {
                         protocol: Some(protocol_proto()),
                         version: env!("CARGO_PKG_VERSION").to_owned(),
                         started_at_unix: self.started_at_unix,
@@ -829,14 +829,14 @@ impl DaemonService {
                 )
             }
             WireKind::LocalStatusRequest => {
-                let _: v1::LocalStatusRequest = decode_request(&frame)?;
+                let _: v2::LocalStatusRequest = decode_request(&frame)?;
                 let sessions = self.sessions.list()?;
                 let active_session_names = session_names(&sessions);
                 let network = self.network.snapshot();
                 ServiceReply::message(
                     WireKind::LocalStatusResponse,
                     request_id,
-                    &v1::LocalStatusResponse {
+                    &v2::LocalStatusResponse {
                         protocol: Some(protocol_proto()),
                         version: env!("CARGO_PKG_VERSION").to_owned(),
                         phase: zterm_core::PHASE_NAME.to_owned(),
@@ -871,7 +871,7 @@ impl DaemonService {
                 )
             }
             WireKind::LocalValidateSetupRequest => {
-                let request: v1::LocalValidateSetupRequest = decode_request(&frame)?;
+                let request: v2::LocalValidateSetupRequest = decode_request(&frame)?;
                 let requested = config_from_wire(&request)?;
                 if requested != self.setup.config {
                     return Err(DaemonError::new(
@@ -882,7 +882,7 @@ impl DaemonService {
                 ServiceReply::message(
                     WireKind::LocalValidateSetupResponse,
                     request_id,
-                    &v1::LocalValidateSetupResponse {
+                    &v2::LocalValidateSetupResponse {
                         device_id: Some(self.setup.device_id.into()),
                         endpoint_id: self.setup.endpoint_id.clone(),
                     },
@@ -890,12 +890,12 @@ impl DaemonService {
                 )
             }
             WireKind::LocalStopRequest => {
-                let _: v1::LocalStopRequest = decode_request(&frame)?;
+                let _: v2::LocalStopRequest = decode_request(&frame)?;
                 let sessions = self.sessions.shutdown_until(deadline)?;
                 ServiceReply::message(
                     WireKind::LocalStopResponse,
                     request_id,
-                    &v1::LocalStopResponse {
+                    &v2::LocalStopResponse {
                         active_session_count: u32::try_from(sessions.len()).unwrap_or(u32::MAX),
                         active_session_names: session_names(&sessions),
                         stopping: true,
@@ -904,12 +904,12 @@ impl DaemonService {
                 )
             }
             WireKind::LocalUpdatePreflightRequest => {
-                let _: v1::LocalUpdatePreflightRequest = decode_request(&frame)?;
+                let _: v2::LocalUpdatePreflightRequest = decode_request(&frame)?;
                 let sessions = self.sessions.list()?;
                 ServiceReply::message(
                     WireKind::LocalUpdatePreflightResponse,
                     request_id,
-                    &v1::LocalUpdatePreflightResponse {
+                    &v2::LocalUpdatePreflightResponse {
                         active_session_count: u32::try_from(sessions.len()).unwrap_or(u32::MAX),
                         active_session_names: session_names(&sessions),
                         interruption_required: !sessions.is_empty(),
@@ -918,7 +918,7 @@ impl DaemonService {
                 )
             }
             WireKind::LocalTargetResolveRequest => {
-                let request: v1::LocalTargetResolveRequest = decode_request(&frame)?;
+                let request: v2::LocalTargetResolveRequest = decode_request(&frame)?;
                 let target = if request.selector == zterm_core::RESERVED_DEVICE_ALIAS {
                     crate::device_directory::ResolvedSessionTarget::local()
                 } else {
@@ -935,7 +935,7 @@ impl DaemonService {
                 ServiceReply::message(
                     WireKind::LocalTargetResolveResponse,
                     request_id,
-                    &v1::LocalTargetResolveResponse {
+                    &v2::LocalTargetResolveResponse {
                         target: Some(resolved_target_wire(target)),
                     },
                     false,
@@ -1116,7 +1116,7 @@ impl ServiceReply {
     }
 
     pub(crate) fn error(request_id: u64, error: &DaemonError) -> Self {
-        let message = v1::ServiceError {
+        let message = v2::ServiceError {
             code: error.kind().code().to_owned(),
             message: error.detail().to_owned(),
         };
@@ -1150,12 +1150,12 @@ impl ServiceReply {
 #[cfg(unix)]
 fn resolved_target_wire(
     target: crate::device_directory::ResolvedSessionTarget,
-) -> v1::TargetSelector {
+) -> v2::TargetSelector {
     let target = match target.device_id() {
-        Some(device_id) => v1::target_selector::Target::Device(device_id.into()),
-        None => v1::target_selector::Target::Local(true),
+        Some(device_id) => v2::target_selector::Target::Device(device_id.into()),
+        None => v2::target_selector::Target::Local(true),
     };
-    v1::TargetSelector {
+    v2::TargetSelector {
         target: Some(target),
     }
 }
@@ -1173,7 +1173,9 @@ pub(crate) fn protocol_error(error: zterm_proto::ProtocolError) -> DaemonError {
         | ProtocolError::MalformedProtobuf(_)
         | ProtocolError::UnexpectedKind { .. }
         | ProtocolError::InvalidIdentifier(_)
-        | ProtocolError::InvalidTerminalSize { .. } => DomainErrorKind::MalformedFrame,
+        | ProtocolError::InvalidTerminalSize { .. }
+        | ProtocolError::InvalidTerminalSurface(_)
+        | ProtocolError::InvalidTerminalSemanticField(_) => DomainErrorKind::MalformedFrame,
     };
     DaemonError::new(kind, error.to_string())
 }
@@ -1187,16 +1189,13 @@ where
 }
 
 #[cfg(unix)]
-fn protocol_proto() -> v1::ProtocolVersion {
-    v1::ProtocolVersion {
+fn protocol_proto() -> v2::ProtocolVersion {
+    v2::ProtocolVersion {
         wire_major: zterm_proto::WIRE_MAJOR,
         state_schema: zterm_proto::STATE_SCHEMA_VERSION,
         capabilities: Capabilities::LOCAL_LIFECYCLE
             | Capabilities::SESSION_SERVICE
-            | Capabilities::TERMINAL_SERVICE
-            | Capabilities::HISTORY_PAGING
-            | Capabilities::TERMINAL_VIEWPORT
-            | Capabilities::TERMINAL_HISTORY_WINDOW,
+            | Capabilities::TERMINAL_SERVICE,
     }
 }
 
@@ -1210,7 +1209,7 @@ fn session_names(sessions: &[SessionSummary]) -> Vec<String> {
 
 #[cfg(unix)]
 fn config_from_wire(
-    request: &v1::LocalValidateSetupRequest,
+    request: &v2::LocalValidateSetupRequest,
 ) -> Result<ValidatedConfig, DaemonError> {
     let relay_url = (!request.relay_url.is_empty()).then_some(request.relay_url.as_str());
     validate_setup_profile(

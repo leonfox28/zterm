@@ -217,7 +217,7 @@ impl<Row> ViewportCache<Row> {
                     .min(anchor.max_offset_from_bottom)
             });
         } else if anchor.revision > previous.revision && self.desired_offset_from_bottom == 0 {
-            // ANSI live deltas cannot patch a row-addressable prefetch. Keep
+            // Live updates cannot patch a row-addressable prefetch. Keep
             // latest metrics separate from the immutable response snapshot and
             // force the next live gesture to refill instead of presenting stale
             // live rows as the new revision.

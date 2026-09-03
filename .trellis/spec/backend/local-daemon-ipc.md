@@ -54,14 +54,19 @@ LocalRuntime::reset_identity(&self, expected_device_id: Option<DeviceId>, force:
 run_terminal(request: TerminalRequest, runtime: &LocalRuntime)
     -> Result<(), CliError>
 
-TerminalViewCommandWriter::request_viewport(action: TerminalScrollAction)
-    -> Result<(), DaemonError>
 TerminalViewCommandWriter::request_history_window(query: TerminalHistoryWindowQuery)
     -> Result<(), DaemonError>
+AttachmentSurface::from_snapshot(snapshot: &TerminalSurfaceSnapshot)
+    -> Result<AttachmentSurface, CliError>
+AttachmentSurface::candidate_after_delta(delta: &TerminalSurfaceDelta)
+    -> Result<Option<AttachmentSurface>, CliError>
 ChromeLayout::new(physical: TerminalSize, remote: bool, screen: ActiveScreen)
     -> ChromeLayout
 ScrollbarGeometry::new(track_rows: u16, metrics: TerminalScrollMetrics)
     -> Option<ScrollbarGeometry>
+ComposedFrame::compose(...) -> Result<ComposedFrame, CliError>
+DesktopPresenter::present(writer: &mut impl Write, desired: ComposedFrame)
+    -> Result<bool, CliError>
 
 const MIN_VIEWPORT_PRESENT_INTERVAL: Duration = Duration::from_millis(16);
 
@@ -188,10 +193,14 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   each remote stream receives a fresh host attachment ID. It emits local-only
   `Preparing`, `Synchronizing`, `Active`, and `Reconnecting` events, rewrites
   attachment IDs at the boundary, drops input while reconnecting/freshly
-  synchronizing, and retains only the latest validated viewport. Within one
+  synchronizing, and retains only the latest validated semantic surface/window.
+  The bridge may structurally decode a terminal frame to validate bounds,
+  revision, correlation, and request identity, rewrite its private attachment
+  ID, then re-encode it. It never interprets cells, converts representation,
+  composes chrome, or constructs ANSI. Within one
   already-active stream epoch, replacement snapshot synchronization records
-  `controller_was_active` and may forward the same controller's input/history/
-  viewport operations through the server's narrow visual-sync fence. A new
+  `controller_was_active` and may forward the same controller's input/history
+  operations through the server's narrow visual-sync fence. A new
   epoch, initial attach, or takeover cannot inherit that privilege. Every open,
   initial exchange, full-sync
   exchange, remote write, local write, detach, and control forward is bounded by
@@ -200,35 +209,24 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   replacement attach for the frozen SessionId races the old host reader's EOF
   and receives `SessionOccupied`, the bridge closes that rejected epoch and
   waits a fixed cancellable 250 ms while continuing the same input-drop and
-  latest-viewport rules. A first-ever `SessionOccupied` remains terminal.
-- Remote history uses one correlated `TerminalHistoryRequest/Page` on the same
-  authenticated attachment stream. The local client permits one outstanding
-  page, revalidates attachment identity/outcome/cursor/row bounds, and the
-  bridge consumes one existing pending-control slot. Epoch loss resolves the
-  request once and never replays it on a replacement stream. If the currently
-  promoted peer did not advertise `HISTORY_PAGING`, the bridge returns an empty
-  correlated `Gap` locally, sends no unknown kind remotely, and keeps the live
-  attachment active.
-- Remote semantic scrolling uses the same pattern with
-  `TerminalViewportRequest/Frame`, at most one outstanding request, and the
-  negotiated `TERMINAL_VIEWPORT` bit. Relative wheel actions saturating-add
-  while a response is pending; an absolute drag target replaces the queued
-  action. Returning live supersedes queued scroll. A capability-less peer is
-  never sent kind 315/316 and remains on the unchanged legacy history pager.
-  Losing a stream epoch resolves pending semantic viewport and legacy history
-  once with a correlated content-free Gap (`current_epoch=0`,
-  `current_revision=0`), then emits `Reconnecting`; it does not turn a normal
-  reconnect into a fatal UI service error or replay the request.
-- Remote contiguous-window reads use negotiated
-  `TERMINAL_HISTORY_WINDOW`/317/318 and retain the complete originating query
-  beside the one pending correlation. Both local and remote adapters validate
-  the returned anchor, viewport, disposition, translated target, signed start,
-  and exact row count against that query before exposing any row. A peer
-  without bit 20 receives no 317/318 and the CLI falls back to bit 19, then the
-  312/313 pager. The local unsupported sentinel is the content-free window
-  `Gap(0,0)`; stream-epoch loss instead emits a correlated nonzero Gap at least
-  as new as the request before `Reconnecting`, so reconnect cannot permanently
-  disable the negotiated capability.
+  latest-history-target rules. A first-ever `SessionOccupied` remains terminal.
+- Remote history has exactly one renderer-neutral operation:
+  `TerminalHistoryWindowRequest` kind 317 followed by one correlated
+  `TerminalSemanticHistoryWindowFrame` kind 318 on the authenticated attachment
+  stream. One request retains its complete anchor/target/margins beside the
+  pending correlation. Both local and remote adapters validate attachment ID,
+  anchor, viewport, disposition, translated target, signed start, semantic
+  rows, and exact row count before exposing a complete window. There is no
+  capability negotiation, pager, stateful server viewport, unsupported
+  sentinel, or fallback representation in wire major 2.
+- Wheel, Page, gutter drag, and future touch gestures update the CLI-owned
+  `ViewportCache<TerminalSurfaceRow>`. Relative targets saturating-coalesce and
+  the latest absolute target wins while at most one history-window request is
+  in flight; returning live supersedes queued history work. Stream-epoch loss
+  completes the pending query once as a correlated content-free nonzero `Gap`
+  whose revision is not older than the saved query, then emits `Reconnecting`.
+  The query is never replayed on another epoch and the daemon/Session stores no
+  attachment scroll target.
 - `TerminalConnectionStatusEvent` is same-UID/local-only. The bridge emits an
   initial/reattachment unknown sample and changed selected-path/RTT samples no
   faster than once per second; operations combine them with the attach-time
@@ -300,7 +298,7 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   any right-margin clamp after a width shrink. When Alternate or a width of at
   most four removes the gutter, the reclaimed column is child-owned: the
   authoritative child snapshot or physical resize replaces/clips the old
-  pixels, and chrome must not clear that column after child bytes. Multiple
+  pixels, and chrome must not clear that column after child content. Multiple
   unpresented layout changes always compare the final desired gutter with the
   last committed gutter. Alternate-to-Main may draw the newly reserved gutter
   after child content because ownership has transferred back to Zterm.
@@ -321,15 +319,18 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   belongs to Zterm, and alternate without either child mode receives no
   invented scroll input. This mode-driven rule is what makes nested Herdr,
   PiAgent, tmux, and other TUIs coexist without process-name detection.
-- Snapshot, applied delta, resync replacement, viewport/history, status, and
-  scrollbar repaint are one buffered output transaction: outer DEC 2026 begin,
-  child/history bytes first, then status/gutter chrome, then
-  `HOST_INPUT_CAPTURE`, DEC 2026 end, one `write_all`, and exactly one flush.
-  Child mode sequences may change semantic routing but cannot leave physical
-  outer capture disabled. A partial write makes a best-effort DEC 2026 end
-  before returning the original error. Raw-mode cleanup begins by ending DEC
-  2026, then disables capture/restores the user's terminal on normal exit,
-  signal, error, and panic.
+- Snapshot, applied delta, resync replacement, history, status, and scrollbar
+  changes first converge as one semantic `ComposedFrame`. The sole
+  `DesktopPresenter` then emits one buffered outer transaction: DEC 2026 begin,
+  terminal/history cells and chrome, cursor/mode policy, `HOST_INPUT_CAPTURE`,
+  DEC 2026 end, one `write_all`, and exactly one flush. No daemon/model/bridge
+  path constructs presentation ANSI. Child modes may change semantic input
+  routing but cannot leave physical outer capture disabled. A partial write or
+  flush failure clears the presenter's committed baseline, makes a best-effort
+  DEC 2026 end while preserving the original error, and forces the next retry
+  to perform a full clear plus complete repaint. Raw-mode cleanup begins by
+  ending DEC 2026, then disables capture/restores the user's terminal on normal
+  exit, signal, error, and panic.
 - Transport synchronization and connection-path validity are independent.
   Same-stream `SyncRequired`/`Synchronizing` during return-to-live preserves the
   last observed direct/relay path and RTT. It emits no standalone transition
@@ -341,12 +342,14 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   result. A true `Reconnecting` transition is the connection-observation epoch
   boundary: clear path/RTT before any replacement-stream synchronization and
   show unknown until a new validated status observation arrives.
-- The primary history path is a client-owned `ViewportCache<Vec<u8>>` fed by
-  bounded 317/318 windows. A full cached slice applies wheel/Page/drag to the
+- The only history path is a client-owned
+  `ViewportCache<TerminalSurfaceRow>` fed by bounded 317/318 semantic windows.
+  A full cached slice applies wheel/Page/drag to the
   desired offset locally without a request. All host events decoded from one
   stdin delivery are reduced before presentation; one CLI-owned dirty bit and
   one non-sliding deadline present only the latest complete slice, with a
-  16-millisecond minimum interval between eligible host-owned viewport frames.
+  16-millisecond minimum interval between eligible host-owned history
+  presentations.
   This is event-driven and has no idle ticker; it never paces ordinary live PTY
   deltas, child-owned mouse, or alternate-scroll input. Misses, absolute jumps,
   and half-screen low-water edges retain one complete pending query and coalesce
@@ -356,10 +359,10 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   resume, resize, and content-free Changed/Gap never paint an intermediate
   blank or partial history frame. The last complete presentation stays visible
   until one full replacement is locally available.
-- Received viewport state and presented viewport state are separate authorities.
-  A coalesced legacy viewport frame that immediately triggers the next request
-  has not been painted and must not replace the retained frame or scrollbar
-  metrics. The window-cache reducer may advance a locally presentable desired
+- Received history/cache state and presented state are separate authorities.
+  A coalesced window result that immediately triggers a newer request has not
+  been painted and must not replace the retained frame or scrollbar metrics.
+  The window-cache reducer may advance a locally presentable desired
   offset before its paced frame reaches stdout; that reducer value is likewise
   not presentation authority. `ViewportController` therefore retains separate
   last-successfully-presented metrics and advances them only after the complete
@@ -382,7 +385,8 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   the authoritative resized snapshot supplies the new anchor. The daemon and
   Session retain no client cache or window target.
 - The UI history state is exhaustively `Live`, `History`, or `ResumePending`.
-  Pinned views drain live revisions without applying their ANSI; returning
+  Pinned views drain live revisions without replacing the visible semantic
+  history surface; returning
   live requests one full sync and retains at most the fixed input bound, then
   forwards retained key/paste bytes exactly once only after snapshot
   acknowledgement and `Active`. The sole host-input codec aggregates a complete
@@ -394,7 +398,7 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   then performs the authoritative reader join/flush/new-epoch fence before
   forwarding the complete retained unit exactly once.
 - `TerminalSyncRequired`/replacement snapshot is a background visual sync, not
-  a transport reconnect: an already-pinned semantic or legacy history frame,
+  a transport reconnect: an already-pinned complete semantic history frame,
   drag state, and server scroll baseline stay intact, and the CLI does not send
   a redundant sync request. A true `Reconnecting` transition invalidates the
   logical cache, drag/queued actions, and live metrics, but leaves the last
@@ -498,13 +502,8 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
 | remote mutation outer envelope was partially/fully written but has no fully validated correlated response | `operation_outcome_unknown`; do not reconnect or replay the envelope |
 | read-only remote outer envelope has a post-write failure | retry once with identical envelope bytes and the same deadline |
 | remote attachment stream is lost with a pending lease / takeover | original typed transport failure / `operation_outcome_unknown`; remove the pending cell and never replay it |
-| remote attachment stream is lost with a pending legacy history/viewport response | resolve its original correlation once as content-free Gap(0/0), then reconnect; remove the pending cell and never replay it |
-| remote attachment stream is lost with a pending history-window response | resolve its original correlation once as a content-free nonzero Gap not older than the saved query, then reconnect; remove the pending query and never replay or disable bit 20 |
-| history page is uncorrelated, oversized, or cursor-inconsistent | malformed frame scoped to the view; never render or retain its rows |
-| viewport frame is uncorrelated, has invalid metrics/outcome/disposition, or row count differs from current height | malformed frame scoped to the view; never render or retain its rows/baseline |
-| peer lacks `TERMINAL_VIEWPORT` | send no viewport kind; retain legacy history paging and a blank, non-fake gutter |
-| history-window frame is uncorrelated, predates/contradicts its request, exceeds 240 rows, or does not contain the exact requested range | malformed frame scoped to the view; never install/render its rows |
-| peer lacks `TERMINAL_HISTORY_WINDOW` | send no 317/318; use negotiated 315/316, then 312/313 pager without clearing the last complete frame |
+| remote attachment stream is lost with a pending history-window response | resolve its original correlation once as a content-free nonzero Gap not older than the saved query, then reconnect; remove the pending query and never replay it |
+| history-window frame is uncorrelated, predates/contradicts its request, exceeds 240 rows, contains invalid semantic rows, or does not contain the exact requested range | malformed frame scoped to the view; retain the prior complete cache/presentation and never partially install rows |
 | live wheel occurs during fresh synchronization | swallow Zterm gutter/history navigation and do not forward it to the child; an already-pinned view may continue only across background replacement sync |
 | child declares mouse reporting / alternate+alternate-scroll | forward exactly one mouse report / one cursor-key sequence; do not move Zterm history |
 | composed render path omits DEC 2026 closure/host capture or flushes before chrome/capture | renderer contract failure; snapshot/delta/history/chrome tests must compare exact byte order, one write, and one flush |
@@ -522,7 +521,7 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
 | same-epoch return-to-live enters `SyncRequired`/`Synchronizing` with a known path/RTT | emit no intermediate presentation and retain the last complete status row until the replacement snapshot atomically paints the same observation |
 | `Active` follows the authoritative resume snapshot with no newer visual state | complete the input fence, buffered-input forwarding, and pending-resize transition without a redundant stdout transaction |
 | transport enters true `Reconnecting` | clear the prior path/RTT observation before rendering or synchronizing the replacement stream; show unknown until that stream supplies a validated status |
-| a coalesced legacy viewport response immediately schedules a newer target | advance the request baseline but retain the last painted frame/metrics; an unpainted response is not presentation authority |
+| a coalesced semantic window immediately schedules a newer target | advance cache/request state but retain the last painted frame/metrics; an unpainted result is not presentation authority |
 | resume geometry changes or the attachment truly reconnects | clear mismatched retained metrics / clear both live and retained metrics; never project stale thumb geometry onto a new size or stream epoch |
 | command write closure races a buffered typed lifecycle event | publish the typed event; suppress raw `Broken pipe`/OS text and do not retry the command |
 | terminal driver command sender/response owner closes after its final typed event/error entered the event queue | suppress the command-channel fallback and let the queued event win; if no event is confirmed within the same bounded window, return normalized `daemon_stopped` |
@@ -559,8 +558,9 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   production terminal entry; exercise resize plus signal restoration separately
   from prefix detach, while pure tests own the exact Active input fence.
 - **Good:** let terminal modes select wheel ownership, retain one attachment's
-  semantic viewport across a background replacement snapshot, and compose
-  child bytes, chrome, host capture, and one flush as a single repaint.
+  semantic history view across a background replacement snapshot, and compose
+  terminal rows, chrome, cursor/modes, and host capture before the sole
+  presenter performs one write and one flush.
 - **Good:** when Main transfers the rightmost column to an Alternate child,
   leave the child's authoritative snapshot as the final writer of that column;
   advance the presented-gutter baseline only after the transaction succeeds.
@@ -662,11 +662,10 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   `run_daemon` listener loop rebinds while a HUP-resistant child remains owned,
   then accepts a truthful stop retry.
 - `remote_attachment` proves stable-local/fresh-remote ID mapping, bounded
-  reconnect cancellation and writes, snapshot-first input gating, viewport
-  coalescing, semantic capability fallback, replacement-sync forwarding only
-  for an already-active controller, typed Gap completion on epoch loss,
-  request-bound history-window validation, nonzero reconnect correlation
-  distinct from the 0/0 unsupported sentinel, bit20 -> bit19 -> pager fallback,
+  reconnect cancellation and writes, snapshot-first input gating, semantic
+  history-window coalescing, replacement-sync forwarding only for an
+  already-active controller, typed nonzero Gap completion on epoch loss,
+  request-bound history-window validation,
   paused-time half-open occupancy retry, first-ever occupancy termination,
   correlated control completion, other terminal error projection, and
   state-event ordering over pure fake streams. The local attachment client
@@ -694,9 +693,9 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   regression asserts the exact transaction count and requires every emitted
   in-epoch frame to contain the stable path/RTT status row. A separate true-
   reconnect regression resets that observation and proves it cannot reappear
-  during replacement-stream synchronization. Coalesced-but-unpainted legacy
-  frames, pager/no-metrics, invalid replacement metrics, resize, and true
-  reconnect are separate regressions. Gutter-ownership regressions first
+  during replacement-stream synchronization. Coalesced-but-unpainted semantic
+  windows, invalid replacement metrics, resize, and true reconnect are separate
+  regressions. Gutter-ownership regressions first
   present a real Main gutter, then compare exact transactions for
   Main-to-Alternate child rightmost-column preservation, Main grow/shrink,
   multiple unpresented layouts, width-at-most-four removal, and failed
@@ -877,14 +876,16 @@ assert_eq!(error.kind(), DomainErrorKind::DeadlineExceeded);
 - Routing wheel input from process names, TERM, screen text, or special cases
   for tmux/Herdr/PiAgent instead of authoritative terminal modes.
 - Storing semantic scroll position in the shared model/resume checkpoint,
-  sending viewport kinds to a capability-less peer, or treating an in-epoch
-  replacement snapshot as a new transport reconnect.
+  recreating a stateful server viewport, or treating an in-epoch replacement
+  snapshot as a new transport reconnect.
 - Rendering loading/returning/Gap as replacement content, accepting a window
-  without its saved query shape, sending 317/318 without bit 20, or coupling
-  the renderer-neutral cache reducer to ANSI, Tokio, mouse pixels, or clocks.
-- Flushing child ANSI before status/gutter/capture composition, or permitting a
-  child mode transition to leave outer `1003/1006` capture disabled; omitting
-  the outer DEC 2026 end from normal or cleanup paths.
+  without its saved query shape, or coupling the renderer-neutral cache reducer
+  to ANSI, Tokio, mouse pixels, or clocks.
+- Constructing or flushing ANSI terminal content before semantic
+  status/gutter/cursor/capture composition, allowing any writer other than
+  `DesktopPresenter` during an active attachment, permitting a child mode
+  transition to leave outer `1003/1006` capture disabled, or omitting the outer
+  DEC 2026 end from normal or cleanup paths.
 - Clearing a former gutter after a full-width child snapshot has reclaimed the
   column, deriving stale cleanup from an unpresented layout, or advancing the
   presented-gutter baseline before the atomic write and flush succeed.

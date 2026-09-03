@@ -20,12 +20,12 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Quality Guidelines](./quality-guidelines.md) | Code standards, forbidden patterns | To fill |
 | [Logging Guidelines](./logging-guidelines.md) | Structured logging, log levels | To fill |
 | [Relay Infrastructure and Deployment Contract](./relay-deployment.md) | Official N0 default plus optional self-hosted Relay contracts | Active |
-| [Host-Authoritative Terminal Model Contract](./terminal-model.md) | Host-only Alacritty boundary, ingress caps, terminal state, safe replies, snapshots, and deltas | Active |
+| [Host-Authoritative Terminal Model Contract](./terminal-model.md) | Host-only Alacritty boundary, ingress caps, semantic projection, safe replies, snapshots, deltas, and history windows | Active |
 | [PTY Lifecycle Contract](./pty-lifecycle.md) | Account login shell, PTY ownership, validation, and termination authority | Active |
 | [Retained Terminal Driver Contract](./terminal-driver.md) | Bounded PTY drain, latest-only attachments, and transport-independent lifetime | Active |
-| [Core and Wire Domain Contract](./core-wire-domain.md) | Shared IDs, revisions, operation replay, protobuf framing, and protocol limits | Active |
+| [Core and Wire Domain Contract](./core-wire-domain.md) | Shared IDs, revisions, operation replay, semantic wire-v2 DTOs, framing, and protocol limits | Active |
 | [Effective-User State Contract](./effective-user-state.md) | Per-user paths, configuration, identity, SQLite, and safe file operations | Active |
-| [Local Daemon and IPC Contract](./local-daemon-ipc.md) | Same-UID Unix IPC, single-instance lifecycle, detached spawn, and CLI side effects | Active |
+| [Local Daemon and IPC Contract](./local-daemon-ipc.md) | Same-UID Unix IPC, remote semantic bridging, attachment-local cache/composition, and sole desktop presentation | Active |
 | [Persistent Session Service Contract](./session-service.md) | Daemon-lifetime sessions, attachments, controller leases, and count/dimension admission | Active |
 | [Iroh Transport, Pairing, and Device Authorization Contract](./transport-auth.md) | Endpoint ownership, route fallback, pairing, directional authorization, revoke, security, and platform evidence boundaries | Active |
 | [Signed Distribution and Executable Lifecycle Contract](./distribution-lifecycle.md) | Native Release trust, installer, explicit update/rollback, uninstall, and protected draft workflow | Active |

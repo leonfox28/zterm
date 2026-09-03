@@ -31,18 +31,14 @@ TerminalDriver::finalize_explicit(self) -> Result<PtyExitStatus, TerminalDriverE
 TerminalDriver::interrupt_handle(&self) -> owner-only TerminalDriverInterrupt
 
 TerminalAttachment::wait_for_revision_after(revision: Revision, timeout) -> Result<Revision, TerminalDriverError>
-TerminalAttachment::sync_latest(&mut self) -> Result<TerminalDeltaResult, TerminalDriverError>
+TerminalAttachment::sync_latest(&mut self) -> Result<TerminalSurfaceDeltaResult, TerminalDriverError>
+TerminalAttachment::sync_changed(&mut self)
+    -> Result<Option<TerminalSurfaceDeltaResult>, TerminalDriverError>
 TerminalAttachment::discard_checkpoint(&mut self)
-TerminalAttachment::latest_snapshot(&self) -> Result<TerminalSnapshot, TerminalDriverError>
-TerminalAttachment::history_page(direction, cursor, maximum_rows)
-    -> Result<TerminalHistoryResult, TerminalDriverError>
-TerminalAttachment::scroll_viewport(
-    &self,
-    previous: Option<TerminalScrollMetrics>,
-    action: TerminalScrollAction,
-) -> Result<TerminalViewportResult, TerminalDriverError>
+TerminalAttachment::latest_snapshot(&self)
+    -> Result<TerminalSurfaceSnapshot, TerminalDriverError>
 TerminalAttachment::history_window(query: TerminalHistoryWindowQuery)
-    -> Result<TerminalHistoryWindowResult, TerminalDriverError>
+    -> Result<TerminalSurfaceHistoryWindowResult, TerminalDriverError>
 ```
 
 ### 3. Contracts
@@ -66,19 +62,17 @@ blocking PtyReader
   mark cannot exceed configured capacity.
 - Attachments hold shared terminal-state access and one opaque checkpoint only.
   They never hold a PTY session, reader, writer, child, or close capability.
-- History paging is a read-only attachment operation delegated to the one
-  authoritative model. It neither advances the attachment checkpoint nor
-  changes controller lease, PTY lifetime, revision delivery, or resize state.
-- Continuous viewport projection is likewise read-only. It checks terminal
-  health, acquires the authoritative model mutex once for the whole extent /
-  action / full-frame calculation, and leaves the attachment checkpoint and
-  Alacritty display offset unchanged. The caller supplies and owns the optional
-  attachment baseline; the driver stores no scroll position.
 - Contiguous history-window projection is a stateless read-only attachment
   operation. It checks health, acquires the model mutex once, and returns the
   model-authored request-shaped Frame/Changed/Gap. The driver stores neither
   the query nor a target/baseline, and it does not advance the checkpoint or
   revision watch.
+- `sync_latest` is the mandatory initial/reconnect synchronization API: a
+  missing, future, or incompatible checkpoint produces a complete semantic
+  snapshot. `sync_changed` is the steady-state API: an exact-equal checkpoint
+  returns `None`, while a behind checkpoint returns one merged semantic delta
+  or resync. Session next/final update paths must use `sync_changed` so a
+  snapshot acknowledgement cannot create an `ack -> resync -> ack` loop.
 - At startup the driver consumes `PtySession` into three owner-only parts: one
   reader, one `PtyIo` writer/master, and independent `PtyChild` control. A PTY
   write/flush or resize may hold only the I/O mutex; it cannot prevent the
@@ -136,10 +130,10 @@ No environment variable or network object participates in this data path.
 | mutex/condvar is poisoned | `Synchronization` |
 | revision/idle wait expires with no recorded failure | `Deadline` |
 | revision wait races a recorded failure | return the recorded failure, not `Deadline` |
-| viewport projection observes a recorded model/driver failure | return that typed failure before returning a frame |
-| viewport baseline is invalid, stale, or alternate-screen | return the model-authored Gap/Changed/Rebased result; never mutate or synthesize rows in the driver |
 | history-window projection observes a recorded model/driver failure | return that typed failure before any Frame/Changed/Gap |
 | history-window query is invalid/future, rebased, or alternate-screen | return the model-authored Gap/Rebased/Changed result; never retain a query or synthesize/merge rows in the driver |
+| `sync_changed` sees checkpoint revision equal to the model | `Ok(None)`; do not replace the checkpoint or publish a frame |
+| `sync_changed` sees a behind/incompatible checkpoint | one semantic Delta/Resync and replace the checkpoint at that exact latest state |
 
 ### 5. Good / Base / Bad Cases
 
@@ -163,17 +157,14 @@ No environment variable or network object participates in this data path.
 - Slow attachment: pause beyond multiple bounded queue windows, discard the old
   checkpoint, resync once, and compare replayed semantic state with a separate
   latest authoritative snapshot.
-- History projection: request a bounded page through a retained attachment and
-  prove its live checkpoint/revision delivery and controller ownership are
-  unchanged.
-- Continuous viewport projection: apply independent baselines through two
-  retained attachments, verify a full frame is read under one model lock, and
-  prove neither live checkpoint/revision delivery nor the other attachment's
-  position changes.
 - Contiguous window projection: issue independent request anchors/targets
   through two retained attachments, verify exact range and Unicode/wide/style
   rows under one model lock, and prove checkpoints, revision delivery, PTY
   state, and both callers remain unchanged.
+- Synchronization: prove initial attach returns Resync, equal revision returns
+  `None`, behind revision returns Delta/Resync, screen/geometry divergence
+  returns Resync, and snapshot acknowledgement followed by `next_update` emits
+  no empty resync loop.
 - Bounded queue: assert `maximum_pending_chunks <= capacity` while processed
   chunks exceed one complete queue window.
 - Query/wait regression: a raw-mode child sends DSR and exits only after
@@ -215,11 +206,13 @@ byte_queue.push(bytes); // bounded, blocking, no-drop
 let update = terminal_model.ingest(bytes)?;
 latest_revision.publish(update.revision);
 
-let frame = attachment.scroll_viewport(previous, action)?;
-// `previous` remains owned by the Session attachment, never by the driver/model.
-
 let window = attachment.history_window(query)?;
 // `query` is not retained: cache/retry/coalescing belongs above the driver.
+
+match attachment.sync_changed()? {
+    None => return Ok(()),
+    Some(update) => publish_semantic(update)?,
+}
 ```
 
 For polling a child behind its owner-only mutex, first copy the nonblocking

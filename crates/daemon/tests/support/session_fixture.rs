@@ -6,7 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
-use zterm_core::terminal::{TerminalSize, TerminalSnapshot};
+use zterm_core::terminal::{TerminalSize, TerminalSurfaceSnapshot};
 use zterm_core::{
     AttachmentId, AttachmentPrincipal, DeviceId, DomainErrorKind, OperationId, OperationLease,
     ResourceLimits, Revision, SessionName,
@@ -14,7 +14,6 @@ use zterm_core::{
 use zterm_daemon::error::DaemonError;
 use zterm_daemon::session::{PreparedAttachment, SessionAttachment, SessionService};
 use zterm_platform::pty::{ExplicitPtyCommand, PtyHost, PtySize};
-use zterm_terminal::TerminalModel;
 
 pub const DEADLINE: Duration = Duration::from_secs(10);
 
@@ -96,7 +95,7 @@ pub fn activate(prepared: &PreparedAttachment) -> Result<(), String> {
     Ok(())
 }
 
-pub fn latest_snapshot(attachment: &SessionAttachment) -> Result<TerminalSnapshot, String> {
+pub fn latest_snapshot(attachment: &SessionAttachment) -> Result<TerminalSurfaceSnapshot, String> {
     let snapshot = attachment.sync_latest(Revision::ZERO).map_err(display)?;
     let replacement = attachment
         .snapshot_applied(snapshot.revision)
@@ -142,17 +141,10 @@ pub fn wait_for_session_count(service: &SessionService, expected: usize) -> Resu
     }
 }
 
-pub fn snapshot_text(snapshot: &TerminalSnapshot) -> Result<String, String> {
-    let mut client = TerminalModel::new(snapshot.size, 2_000).map_err(display)?;
-    client
-        .ingest(&snapshot.recent_history_ansi)
-        .map_err(display)?;
-    client.ingest(&snapshot.screen_ansi).map_err(display)?;
-    let state = client.state();
-    let columns = usize::from(state.size.columns);
+pub fn snapshot_text(snapshot: &TerminalSurfaceSnapshot) -> Result<String, String> {
     let mut output = String::new();
-    for row in state.cells.chunks(columns) {
-        for cell in row {
+    for row in &snapshot.surface.rows {
+        for cell in &row.cells {
             output.push_str(&cell.contents);
         }
         output.push('\n');

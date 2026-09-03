@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
-use zterm_core::terminal::{ActiveScreen, TerminalDeltaResult, TerminalSize};
+use zterm_core::terminal::{ActiveScreen, TerminalSize, TerminalSurfaceDeltaResult};
 #[cfg(unix)]
 use zterm_daemon::terminal_driver::{TerminalDriver, TerminalDriverConfig};
 #[cfg(unix)]
@@ -229,8 +229,8 @@ fn exercise(driver: &TerminalDriver, options: &Options) -> Result<(), String> {
 
     let mut reattached = driver.attach();
     let mut snapshot = match reattached.sync_latest().map_err(display_error)? {
-        TerminalDeltaResult::Resync(snapshot) => snapshot,
-        TerminalDeltaResult::Delta(_) => {
+        TerminalSurfaceDeltaResult::Resync(snapshot) => snapshot,
+        TerminalSurfaceDeltaResult::Delta(_) => {
             return Err("new attachment did not receive a snapshot".into());
         }
     };
@@ -245,13 +245,16 @@ fn exercise(driver: &TerminalDriver, options: &Options) -> Result<(), String> {
     if snapshot.revision <= initial_revision || snapshot.revision < resized_revision {
         return Err("black-box terminal did not advance while detached".into());
     }
-    if snapshot.size != RESIZED {
-        return Err(format!("snapshot retained wrong size: {:?}", snapshot.size));
+    if snapshot.surface.size != RESIZED {
+        return Err(format!(
+            "snapshot retained wrong size: {:?}",
+            snapshot.surface.size
+        ));
     }
-    if snapshot.active_screen != options.expected_screen {
+    if snapshot.surface.active_screen != options.expected_screen {
         return Err(format!(
             "latest snapshot used {:?}, expected {:?}",
-            snapshot.active_screen, options.expected_screen
+            snapshot.surface.active_screen, options.expected_screen
         ));
     }
     drop(reattached);
@@ -304,9 +307,9 @@ fn exercise(driver: &TerminalDriver, options: &Options) -> Result<(), String> {
 fn wait_for_snapshot_marker(
     driver: &TerminalDriver,
     attachment: &mut zterm_daemon::terminal_driver::TerminalAttachment,
-    mut snapshot: zterm_core::terminal::TerminalSnapshot,
+    mut snapshot: zterm_core::terminal::TerminalSurfaceSnapshot,
     marker: &str,
-) -> Result<zterm_core::terminal::TerminalSnapshot, String> {
+) -> Result<zterm_core::terminal::TerminalSurfaceSnapshot, String> {
     let deadline = Instant::now() + DEADLINE;
     loop {
         if snapshot_text(&snapshot)?.contains(marker) {
@@ -331,8 +334,8 @@ fn wait_for_snapshot_marker(
 fn wait_for_startup_ready(
     driver: &TerminalDriver,
     attachment: &mut zterm_daemon::terminal_driver::TerminalAttachment,
-    mut snapshot: zterm_core::terminal::TerminalSnapshot,
-) -> Result<zterm_core::terminal::TerminalSnapshot, String> {
+    mut snapshot: zterm_core::terminal::TerminalSurfaceSnapshot,
+) -> Result<zterm_core::terminal::TerminalSurfaceSnapshot, String> {
     let ready_at = Instant::now() + Duration::from_secs(3);
     loop {
         if let PtyChildState::Exited(status) = driver.try_wait().map_err(display_error)? {
@@ -378,11 +381,11 @@ fn wait_for_screen(
     driver: &TerminalDriver,
     attachment: &mut zterm_daemon::terminal_driver::TerminalAttachment,
     expected_screen: ActiveScreen,
-) -> Result<zterm_core::terminal::TerminalSnapshot, String> {
+) -> Result<zterm_core::terminal::TerminalSurfaceSnapshot, String> {
     let deadline = Instant::now() + DEADLINE;
     loop {
         let snapshot = attachment.latest_snapshot().map_err(display_error)?;
-        if snapshot.active_screen == expected_screen && snapshot.revision.get() > 0 {
+        if snapshot.surface.active_screen == expected_screen && snapshot.revision.get() > 0 {
             return Ok(snapshot);
         }
         if let PtyChildState::Exited(status) = driver.try_wait().map_err(display_error)? {
@@ -475,19 +478,12 @@ fn wait_for_natural_exit_until(
 }
 
 #[cfg(unix)]
-fn snapshot_text(snapshot: &zterm_core::terminal::TerminalSnapshot) -> Result<String, String> {
-    let mut client = TerminalModel::new(snapshot.size, SCROLLBACK_ROWS).map_err(display_error)?;
-    client
-        .ingest(&snapshot.recent_history_ansi)
-        .map_err(display_error)?;
-    client
-        .ingest(&snapshot.screen_ansi)
-        .map_err(display_error)?;
-    let state = client.state();
-    let columns = usize::from(state.size.columns);
+fn snapshot_text(
+    snapshot: &zterm_core::terminal::TerminalSurfaceSnapshot,
+) -> Result<String, String> {
     let mut text = String::new();
-    for row in state.cells.chunks(columns) {
-        for cell in row {
+    for row in &snapshot.surface.rows {
+        for cell in &row.cells {
             text.push_str(&cell.contents);
         }
         text.push('\n');

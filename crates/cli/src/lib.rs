@@ -1709,7 +1709,7 @@ mod tests {
         let device_id = DeviceId::from_array([0x63; 32]);
         let view = StatusView::from_observed(ObservedState::Running(DaemonStatus {
             protocol: ProtocolStatus {
-                wire_major: 1,
+                wire_major: zterm_core::WIRE_MAJOR,
                 state_schema: 1,
                 capabilities: zterm_core::Capabilities::LOCAL_LIFECYCLE,
             },

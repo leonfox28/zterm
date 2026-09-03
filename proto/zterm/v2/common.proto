@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package zterm.v1;
+package zterm.v2;
 
 message DeviceId { bytes value = 1; }
 message SessionId { bytes value = 1; }

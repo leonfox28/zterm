@@ -12,11 +12,37 @@ use zterm_terminal::{
 
 fn visible_text(model: &TerminalModel) -> String {
     model
-        .state()
-        .cells
+        .snapshot()
+        .surface
+        .rows
         .into_iter()
+        .flat_map(|row| row.cells)
         .map(|cell| cell.contents)
         .collect()
+}
+
+fn assert_same_presented_surface(left: &TerminalModel, right: &TerminalModel) {
+    let left = left.snapshot().surface;
+    let right = right.snapshot().surface;
+    assert_eq!(left.size, right.size);
+    assert_eq!(left.active_screen, right.active_screen);
+    assert_eq!(left.rows, right.rows);
+    assert_eq!(left.cursor, right.cursor);
+    assert_eq!(left.modes, right.modes);
+    assert_eq!(
+        left.scroll_metrics.map(|metrics| (
+            metrics.epoch,
+            metrics.offset_from_bottom,
+            metrics.max_offset_from_bottom,
+            metrics.viewport_rows,
+        )),
+        right.scroll_metrics.map(|metrics| (
+            metrics.epoch,
+            metrics.offset_from_bottom,
+            metrics.max_offset_from_bottom,
+            metrics.viewport_rows,
+        )),
+    );
 }
 
 #[test]
@@ -46,12 +72,12 @@ fn control_strings_are_bounded_chunk_invariant_and_content_redacted() {
         );
     }
 
-    assert_eq!(whole.state(), chunked.state());
+    assert_same_presented_surface(&whole, &chunked);
     assert_eq!(whole_update.events, events);
     assert!(visible_text(&whole).contains("beforelinkedafter"));
     let surfaces = format!(
         "{:?}{:?}{:?}",
-        whole.state(),
+        whole.snapshot(),
         whole.snapshot(),
         whole_update.events,
     );
@@ -97,7 +123,7 @@ fn cancelled_controls_filtered_attributes_and_malformed_utf8_stay_contained() {
         events.extend(update.events);
     }
 
-    assert_eq!(whole.state(), chunked.state());
+    assert_same_presented_surface(&whole, &chunked);
     assert_eq!(whole_update.replies, replies);
     assert_eq!(whole_update.events, events);
     assert!(whole_update.events.iter().any(|event| matches!(
@@ -108,7 +134,7 @@ fn cancelled_controls_filtered_attributes_and_malformed_utf8_stay_contained() {
         event,
         TerminalSideEvent::UnsupportedSequence(UnsupportedSequenceKind::Csi)
     )));
-    let surfaces = format!("{:?}{:?}", whole.state(), whole.snapshot());
+    let surfaces = format!("{:?}", whole.snapshot());
     assert!(!surfaces.contains(SECRET));
     assert!(visible_text(&whole).contains("linkedaftercolorless"));
 }
@@ -121,9 +147,11 @@ fn combining_text_is_capped_before_it_can_grow_engine_cells() {
         .ingest(flood.as_bytes())
         .expect("combining flood is contained");
     let cell = model
-        .state()
-        .cells
+        .snapshot()
+        .surface
+        .rows
         .into_iter()
+        .flat_map(|row| row.cells)
         .find(|cell| cell.contents.starts_with('e'))
         .expect("base cell remains visible");
     assert!(cell.contents.len() <= MAX_CELL_TEXT_BYTES);
@@ -242,7 +270,7 @@ fn nested_escape_and_c1_introducers_cannot_bypass_ingress_policy() {
         );
     }
 
-    assert_eq!(chunked.state(), model.state());
+    assert_same_presented_surface(&chunked, &model);
     assert_eq!(chunked_events, sync.events);
     assert!(visible_text(&model).contains("visible-immediately"));
     assert_eq!(
@@ -290,7 +318,7 @@ fn embedded_controls_do_not_obscure_filtered_sequence_identity() {
         );
     }
 
-    assert_eq!(chunked.state(), whole.state());
+    assert_same_presented_surface(&chunked, &whole);
     assert_eq!(events, whole_update.events);
     assert!(visible_text(&whole).contains("visible-now"));
     assert!(visible_text(&whole).contains("after-title"));
@@ -315,9 +343,17 @@ fn underline_color_filter_uses_sgr_parameters_without_blocking_rgb_components() 
         .ingest(b"\x1b[38;2;58;59;60mRGB")
         .expect("ordinary RGB color remains supported");
     assert!(rgb_update.events.is_empty());
-    assert!(ordinary_rgb.state().cells.iter().any(|cell| {
-        cell.contents == "R" && cell.style.foreground == TerminalColor::Rgb(58, 59, 60)
-    }));
+    assert!(
+        ordinary_rgb
+            .snapshot()
+            .surface
+            .rows
+            .iter()
+            .flat_map(|row| &row.cells)
+            .any(|cell| {
+                cell.contents == "R" && cell.style.foreground == TerminalColor::Rgb(58, 59, 60)
+            })
+    );
 
     let mut underline = TerminalModel::new(TerminalSize::new(2, 16), 0).expect("underline model");
     let underline_update = underline

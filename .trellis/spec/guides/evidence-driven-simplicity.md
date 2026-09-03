@@ -4,6 +4,11 @@ Use this guide before adding validation, fallback, recovery, monitoring, or
 deployment machinery. The goal is not minimum line count; it is the shortest
 mechanism that satisfies an observed contract.
 
+For bug fixes, first classify whether that contract already exists or the
+architecture lacks an adequate owner/invariant. Follow
+[Root-Cause and Architecture Thinking Guide](./root-cause-and-architecture-thinking-guide.md);
+“simplicity” must not turn a symptom-level patch into the final design.
+
 ## Before adding complexity
 
 - [ ] Name the concrete failure mode in one sentence.

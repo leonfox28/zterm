@@ -1,31 +1,7 @@
-//! Snapshot, checkpoint, delta, and resource-boundary regression tests.
+//! Semantic snapshot, checkpoint, delta, and resource-boundary regressions.
 
-use zterm_core::terminal::{ActiveScreen, TerminalDeltaResult, TerminalSize};
+use zterm_core::terminal::{ActiveScreen, TerminalColor, TerminalSize, TerminalSurfaceDeltaResult};
 use zterm_terminal::{TerminalError, TerminalModel};
-
-fn apply_snapshot(snapshot: &zterm_core::terminal::TerminalSnapshot) -> TerminalModel {
-    let mut client = TerminalModel::new(snapshot.size, 64).expect("snapshot size is valid");
-    if !snapshot.recent_history_ansi.is_empty() {
-        client
-            .ingest(&snapshot.recent_history_ansi)
-            .expect("history replay succeeds");
-    }
-    client
-        .ingest(&snapshot.screen_ansi)
-        .expect("screen replay succeeds");
-    client
-}
-
-fn apply_result(client: &mut TerminalModel, result: &TerminalDeltaResult) {
-    match result {
-        TerminalDeltaResult::Delta(delta) => {
-            client.ingest(&delta.ansi).expect("delta replay succeeds");
-        }
-        TerminalDeltaResult::Resync(snapshot) => {
-            *client = apply_snapshot(snapshot);
-        }
-    }
-}
 
 fn ingest_chunked(model: &mut TerminalModel, bytes: &[u8], widths: &[usize]) {
     let mut offset = 0;
@@ -42,7 +18,7 @@ fn ingest_chunked(model: &mut TerminalModel, bytes: &[u8], widths: &[usize]) {
 }
 
 #[test]
-fn snapshot_then_merged_delta_matches_latest_semantic_state() {
+fn snapshot_then_merged_delta_matches_latest_semantic_surface() {
     for widths in [&[usize::MAX][..], &[1][..], &[4][..], &[1, 7, 3, 9, 2][..]] {
         let mut source =
             TerminalModel::new(TerminalSize::new(12, 60), 64).expect("source size is valid");
@@ -58,212 +34,113 @@ fn snapshot_then_merged_delta_matches_latest_semantic_state() {
             .as_bytes(),
             widths,
         );
-        let snapshot = source.snapshot();
         let checkpoint = source.checkpoint();
-        let mut client = apply_snapshot(&snapshot);
-        assert_eq!(client.state(), source.state(), "snapshot widths={widths:?}");
+        let mut applied = source.snapshot();
+        applied.validate().expect("initial snapshot is valid");
 
         ingest_chunked(
             &mut source,
             b"\x1b[4;8Hdelta-one\x1b[6;12Hdelta-two\x1b[?1004l",
             widths,
         );
-        let result = source.delta_or_resync(&checkpoint);
-        let TerminalDeltaResult::Delta(delta) = &result else {
-            panic!("small merged update should be a delta, widths={widths:?}");
+        let TerminalSurfaceDeltaResult::Delta(delta) = source.delta_or_resync(&checkpoint) else {
+            panic!("compatible geometry must produce semantic row patches");
         };
-        assert_eq!(delta.from_revision, snapshot.revision);
-        assert_eq!(delta.to_revision, source.revision());
-        apply_result(&mut client, &result);
-        assert_eq!(client.state(), source.state(), "delta widths={widths:?}");
+        delta
+            .apply_to(applied.revision, &mut applied.surface)
+            .expect("semantic delta applies transactionally");
+        applied.revision = delta.to_revision;
+        assert_eq!(applied, source.snapshot(), "chunk widths={widths:?}");
     }
 }
 
 #[test]
-fn alternate_screen_transitions_restore_latest_state() {
-    let mut source =
-        TerminalModel::new(TerminalSize::new(10, 50), 32).expect("source size is valid");
-    source.ingest(b"main-screen").expect("main screen ingests");
-    let main_snapshot = source.snapshot();
-    let main_checkpoint = source.checkpoint();
-    let mut client = apply_snapshot(&main_snapshot);
+fn semantic_projection_preserves_rightmost_wide_and_styled_blank_cells() {
+    let mut model = TerminalModel::new(TerminalSize::new(3, 8), 8).expect("model");
+    model
+        .ingest("\x1b[1;8H\x1b[31m#\x1b[2;6H界\x1b[3;8H\x1b[44m \x1b[0m".as_bytes())
+        .expect("paint edge cases");
+    let snapshot = model.snapshot();
+    let rightmost = &snapshot.surface.rows[0].cells[7];
+    assert_eq!(rightmost.contents, "#");
+    assert_eq!(rightmost.style.foreground, TerminalColor::Indexed(1));
+    assert!(snapshot.surface.rows[1].cells[5].wide);
+    assert!(snapshot.surface.rows[1].cells[6].wide_continuation);
+    let styled_blank = &snapshot.surface.rows[2].cells[7];
+    assert_eq!(styled_blank.contents, " ");
+    assert_eq!(styled_blank.style.background, TerminalColor::Indexed(4));
 
+    let checkpoint = model.checkpoint();
+    model
+        .ingest(b"\x1b[1;8H\x1b[32m@")
+        .expect("replace final column");
+    let TerminalSurfaceDeltaResult::Delta(delta) = model.delta_or_resync(&checkpoint) else {
+        panic!("same geometry must produce a delta");
+    };
+    assert_eq!(delta.row_patches.len(), 1);
+    assert_eq!(delta.row_patches[0].replacement.cells[7].contents, "@");
+}
+
+#[test]
+fn screen_and_size_transitions_require_complete_semantic_resync() {
+    let mut source = TerminalModel::new(TerminalSize::new(6, 32), 32).expect("source");
+    source.ingest(b"main-screen").expect("main screen");
+    let main_checkpoint = source.checkpoint();
     source
         .ingest(b"\x1b[?1049h\x1b[2J\x1b[Halternate-screen")
-        .expect("alternate screen ingests");
-    let alternate_result = source.delta_or_resync(&main_checkpoint);
-    apply_result(&mut client, &alternate_result);
-    assert_eq!(client.state(), source.state());
-    assert_eq!(client.state().active_screen, ActiveScreen::Alternate);
-
-    let alternate_snapshot = source.snapshot();
-    let alternate_client = apply_snapshot(&alternate_snapshot);
-    assert_eq!(alternate_client.state(), source.state());
+        .expect("alternate screen");
+    let TerminalSurfaceDeltaResult::Resync(alternate) = source.delta_or_resync(&main_checkpoint)
+    else {
+        panic!("screen change must resync");
+    };
+    assert_eq!(alternate.surface.active_screen, ActiveScreen::Alternate);
 
     let alternate_checkpoint = source.checkpoint();
-    source
-        .ingest(b"\x1b[?1049l\x1b[Hmain-screen-restored")
-        .expect("main screen restores");
-    let main_result = source.delta_or_resync(&alternate_checkpoint);
-    apply_result(&mut client, &main_result);
-    assert_eq!(client.state(), source.state());
-    assert_eq!(client.state().active_screen, ActiveScreen::Main);
-}
-
-#[test]
-fn checkpoint_retains_only_visible_grids_across_history_styles_and_screen_transitions() {
-    let size = TerminalSize::new(6, 32);
-    let mut source = TerminalModel::new(size, 2_000).expect("source size is valid");
-    for line in 0..2_200 {
-        source
-            .ingest(format!("history-{line:04} 界e\u{301}\r\n").as_bytes())
-            .expect("history ingests");
-    }
-    source
-        .ingest(b"\x1b[2J\x1b[H\x1b[1;3;38;2;9;8;7mstyled-main\x1b[0m")
-        .expect("styled main state ingests");
-    assert!(!source.snapshot().recent_history_ansi.is_empty());
-
-    let main_snapshot = source.snapshot();
-    let main_checkpoint = source.checkpoint();
-    assert_eq!(
-        main_checkpoint.retained_cell_capacity(),
-        usize::from(size.rows) * usize::from(size.columns)
-    );
-    assert_eq!(main_checkpoint.retained_scrollback_rows(), 0);
-    let mut client = apply_snapshot(&main_snapshot);
-
-    source
-        .ingest(b"\x1b[?1049h\x1b[2J\x1b[H\x1b[4;48;5;25mALT-\xe7\x95\x8c-e\xcc\x81\x1b[0m")
-        .expect("styled alternate state ingests");
-    apply_result(&mut client, &source.delta_or_resync(&main_checkpoint));
-    assert_eq!(client.state(), source.state());
-    assert_eq!(client.state().active_screen, ActiveScreen::Alternate);
-
-    let alternate_checkpoint = source.checkpoint();
-    assert_eq!(alternate_checkpoint.retained_scrollback_rows(), 0);
-    source
-        .ingest(b"\x1b[?1049l\x1b[3;7H\x1b[7mrestored-main\x1b[0m")
-        .expect("main screen restores");
-    apply_result(&mut client, &source.delta_or_resync(&alternate_checkpoint));
-    assert_eq!(client.state(), source.state());
-    assert_eq!(client.state().active_screen, ActiveScreen::Main);
+    source.ingest(b"\x1b[?1049l").expect("restore main");
+    assert!(matches!(
+        source.delta_or_resync(&alternate_checkpoint),
+        TerminalSurfaceDeltaResult::Resync(_)
+    ));
 
     let before_resize = source.checkpoint();
-    let resized = TerminalSize::new(8, 40);
-    source.resize(resized).expect("resize succeeds");
-    let resize_result = source.delta_or_resync(&before_resize);
-    assert!(matches!(resize_result, TerminalDeltaResult::Resync(_)));
-    apply_result(&mut client, &resize_result);
-    assert_eq!(client.state(), source.state());
-    assert_eq!(source.checkpoint().retained_scrollback_rows(), 0);
-}
-
-#[test]
-fn incompatible_or_larger_delta_chooses_full_resync() {
-    let size = TerminalSize::new(4, 24);
-    let mut resized = TerminalModel::new(size, 8).expect("source size is valid");
-    resized.ingest(b"baseline").expect("baseline ingests");
-    let before_resize = resized.checkpoint();
-    resized
-        .resize(TerminalSize::new(5, 30))
+    source
+        .resize(TerminalSize::new(8, 40))
         .expect("resize succeeds");
     assert!(matches!(
-        resized.delta_or_resync(&before_resize),
-        TerminalDeltaResult::Resync(_)
+        source.delta_or_resync(&before_resize),
+        TerminalSurfaceDeltaResult::Resync(_)
     ));
-
-    let mut future_source = TerminalModel::new(size, 8).expect("future source is valid");
-    future_source.ingest(b"one").expect("first ingest succeeds");
-    future_source
-        .ingest(b"two")
-        .expect("second ingest succeeds");
-    let future_checkpoint = future_source.checkpoint();
-    let mut older_source = TerminalModel::new(size, 8).expect("older source is valid");
-    older_source.ingest(b"one").expect("older ingest succeeds");
-    assert!(matches!(
-        older_source.delta_or_resync(&future_checkpoint),
-        TerminalDeltaResult::Resync(_)
-    ));
-
-    let large_size = TerminalSize::new(20, 24);
-    let mut dense_baseline = TerminalModel::new(large_size, 8).expect("dense baseline is valid");
-    for row in 1..=large_size.rows {
-        dense_baseline
-            .ingest(format!("\x1b[{row};1HXXXXXXXXXXXXXXXXXXXXXXXX").as_bytes())
-            .expect("dense row ingests");
-    }
-    let dense_checkpoint = dense_baseline.checkpoint();
-    let mut blank_latest = TerminalModel::new(large_size, 8).expect("blank latest is valid");
-    for _ in 0..dense_baseline.revision().get() {
-        blank_latest.ingest(b"\x1b[2J").expect("clear ingests");
-    }
-    let result = blank_latest.delta_or_resync(&dense_checkpoint);
-    let TerminalDeltaResult::Resync(snapshot) = result else {
-        let TerminalDeltaResult::Delta(delta) = result else {
-            unreachable!("all terminal delta results are covered");
-        };
-        panic!(
-            "a delta no smaller than the blank snapshot must resync: delta={}, snapshot={}",
-            delta.ansi_payload_len(),
-            blank_latest.snapshot().ansi_payload_len(),
-        );
-    };
-    assert_eq!(snapshot.revision, blank_latest.revision());
 }
 
 #[test]
-fn history_and_revision_rules_are_bounded_and_typed() {
-    let size = TerminalSize::new(3, 12);
-    let mut model = TerminalModel::new(size, 4).expect("bounded model is valid");
-    assert_eq!(model.revision().get(), 0);
-    let empty = model.ingest(b"").expect("empty ingest is a no-op");
-    assert_eq!(empty.revision.get(), 0);
-
-    for line in 0..12 {
+fn checkpoint_is_visible_only_and_revision_only_updates_are_preserved() {
+    let size = TerminalSize::new(6, 32);
+    let mut model = TerminalModel::new(size, 2_000).expect("model");
+    for line in 0..2_100 {
         model
-            .ingest(format!("line-{line:02}\r\n").as_bytes())
-            .expect("history line ingests");
+            .ingest(format!("history-{line:04}\r\n").as_bytes())
+            .expect("history line");
     }
-    let revision_before_resize = model.revision();
-    model
-        .resize(size)
-        .expect("same-size resize is still ordered");
+    let checkpoint = model.checkpoint();
     assert_eq!(
-        model.revision(),
-        revision_before_resize
-            .checked_next()
-            .expect("test revision has room")
+        checkpoint.retained_cell_capacity(),
+        usize::from(size.rows) * usize::from(size.columns)
     );
+    assert_eq!(checkpoint.retained_scrollback_rows(), 0);
 
-    let unchanged_checkpoint = model.checkpoint();
-    let revision_before_second_resize = model.revision();
-    model
-        .resize(size)
-        .expect("a second same-size resize is still ordered");
-    let TerminalDeltaResult::Delta(unchanged) = model.delta_or_resync(&unchanged_checkpoint) else {
-        panic!("same-size resize with identical projected state remains a revision-only delta");
+    model.resize(size).expect("same-size resize is ordered");
+    let TerminalSurfaceDeltaResult::Delta(delta) = model.delta_or_resync(&checkpoint) else {
+        panic!("same surface should retain the revision edge");
     };
-    assert_eq!(unchanged.from_revision, revision_before_second_resize);
-    assert_eq!(unchanged.to_revision, model.revision());
-    assert!(
-        unchanged.ansi.is_empty(),
-        "revision-only updates must not manufacture visible ANSI"
-    );
+    assert!(delta.row_patches.is_empty());
+    assert_eq!(delta.to_revision, model.revision());
+}
 
-    let snapshot = model.snapshot();
-    assert!(!snapshot.recent_history_ansi.is_empty());
-    assert!(snapshot.recent_history_ansi.len() <= 4 * usize::from(size.columns) + 64);
-    let client = apply_snapshot(&snapshot);
-    assert_eq!(client.state(), model.state());
-
+#[test]
+fn invalid_dimensions_are_rejected_before_mutation() {
     assert_eq!(
         TerminalModel::new(TerminalSize::new(0, 12), 4).err(),
         Some(TerminalError::InvalidSize(TerminalSize::new(0, 12)))
-    );
-    assert_eq!(
-        model.resize(TerminalSize::new(3, 0)),
-        Err(TerminalError::InvalidSize(TerminalSize::new(3, 0)))
     );
     assert_eq!(
         TerminalModel::new(TerminalSize::new(1, 2), usize::MAX).err(),

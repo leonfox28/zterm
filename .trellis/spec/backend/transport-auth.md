@@ -16,8 +16,8 @@ identity state.
 ## 2. Signatures
 
 ```rust
-pub const ZTERM_ALPN: &[u8] = b"zterm/1";
-pub const ZTERM_PAIR_ALPN: &[u8] = b"zterm-pair/1";
+pub const ZTERM_ALPN: &[u8] = b"zterm/2";
+pub const ZTERM_PAIR_ALPN: &[u8] = b"zterm-pair/2";
 
 NetworkStartup::prepare(
     identity: DeviceIdentity,
@@ -89,8 +89,9 @@ LocalDeviceClient::{list, rename, revoke}(...) // Unix: IPC; non-Unix: Unsupport
 ```
 
 Wire kinds 12-21 are same-UID local pair/device requests and responses. Pairing
-uses kinds 100-103 on `zterm-pair/1`; normal Hello/Welcome use 104-105 on
-`zterm/1`. `RelayRouteCacheV1` persists relay URLs only. `DeviceSummary` keeps
+uses kinds 100-103 on `zterm-pair/2`; normal Hello/Welcome use 104-105 on
+`zterm/2`. `RelayRouteCacheV1` persists relay URLs only; that independent
+storage-format name does not retain wire-v1 compatibility. `DeviceSummary` keeps
 outbound-known and inbound-authorization directions explicit.
 
 ## 3. Contracts
@@ -152,7 +153,7 @@ outbound-known and inbound-authorization directions explicit.
   desired view and opens a fresh bounded service stream for each reconnect
   epoch. The stable local view ID is never sent as the host attachment ID.
   Initial attach write/flush, snapshot-or-delta exchange, inconsistent-delta
-  `TerminalSyncRequired` plus same-attachment full-snapshot fallback, and all
+  `TerminalSyncRequired` plus same-attachment full-snapshot recovery, and all
   outbound controls use absolute attempt/operation deadlines. A stalled peer
   therefore cannot retain the demand indefinitely, while active remote reads
   remain long-lived. The bridge freezes the first SessionId and never recreates
@@ -160,45 +161,39 @@ outbound-known and inbound-authorization directions explicit.
   reached `Active`, an initial `SessionOccupied` on a replacement stream may mean
   the old authenticated host reader has not observed EOF yet. Only for that
   frozen SessionId, the bridge drops the rejected epoch, remains `Reconnecting`,
-  drains input and coalesces viewport through one fixed 250 ms cancellable delay,
+  drains input and coalesces the latest history target through one fixed 250 ms
+  cancellable delay,
   then retries with `create_main = false`. First-ever occupancy and every other
   typed initial attach error remain terminal.
 - Every opened attachment epoch owns an address-free observer for the exact
-  candidate that opened its service stream. Its `HISTORY_PAGING`,
-  `TERMINAL_VIEWPORT`, and `TERMINAL_HISTORY_WINDOW` gates and
-  selected Iroh path sample must use only that observer; a later deterministic
+  candidate that opened its service stream. Its selected Iroh path sample must
+  use only that observer; a later deterministic
   primary replacement cannot change an already-open epoch, and only a fresh
   reconnect epoch may observe the replacement candidate. RTT is rounded to the
   nearest millisecond and clamped to `u32`; addresses, candidate keys, DeviceIds,
   and relay URLs never cross or appear in Debug at this observation boundary.
   The attachment bridge samples changed values at most once per second and
   clears the local-only projection to unknown on reconnect.
-- History paging is ordinary authenticated remote attachment control guarded by
-  the negotiated `HISTORY_PAGING` capability. One request occupies an existing
-  bounded pending-control cell, is correlated to one page, and is resolved—not
-  replayed—when its stream epoch ends. Connection-status events are never valid
-  normal-ALPN service kinds.
-- Continuous scrolling is ordinary authenticated attachment control guarded by
-  negotiated `TERMINAL_VIEWPORT`. One semantic request occupies one bounded
-  pending cell and is correlated to one validated complete frame. Relative
-  requests saturating-coalesce and the latest absolute drag target wins; no
-  request is replayed into a later epoch. A peer without the bit receives no
-  kind 315/316 and continues through `HISTORY_PAGING` unchanged.
-- Contiguous history-window reads are ordinary authenticated attachment control
-  guarded by negotiated `TERMINAL_HISTORY_WINDOW`. One request retains its
-  complete anchor/target/margins beside the bounded pending correlation so the
-  returned 317/318 frame can be validated against its exact request shape. A
-  peer without bit 20 receives no 317/318 and falls back to negotiated bit 19,
-  then `HISTORY_PAGING`; no window request is replayed into a later epoch.
+- Semantic history-window reads are the only remote scrolling control in wire
+  major 2. Kind 317 retains its complete anchor/target/margins beside one bounded
+  pending correlation; kind 318 is structurally decoded and validated against
+  that exact query before forwarding. Relative wheel/Page targets
+  saturating-coalesce in the CLI cache and the latest absolute drag target wins;
+  no query is replayed into a later epoch. There is no terminal-presentation
+  capability negotiation, pager, stateful remote viewport, sentinel response,
+  downgrade, or representation fallback. Connection-status events remain
+  local-only and are never valid normal-ALPN service kinds.
+- A `RemoteAttachmentBridge` may structurally decode semantic cells to enforce
+  shape/content bounds, revision, correlation, and request identity, rewrite the
+  private attachment ID, and re-encode. It must not interpret application
+  content, translate representation, compose UI, construct ANSI, or present.
 - `controller_was_active` is scoped to one remote stream epoch. A host-initiated
   `TerminalSyncRequired -> Snapshot` inside that epoch preserves it, allowing
-  only the same previously-active controller's input/history/viewport/window to cross
+  only the same previously-active controller's input/history-window controls to cross
   the replacement sync window. A new transport epoch, initial attach, or
-  takeover initializes it false. Epoch loss completes pending legacy history
-  and viewport requests once as correlated content-free Gap(0/0); a pending
-  history window instead receives a content-free nonzero Gap not older than its
-  saved query, reserving 0/0 for unsupported bit-20 fallback. The bridge then
-  emits `Reconnecting`; none of these reads is replayed, and
+  takeover initializes it false. Epoch loss completes a pending history window
+  once as a correlated content-free nonzero Gap not older than its saved query.
+  The bridge then emits `Reconnecting`; the read is not replayed, and
   mutation/lease/takeover errors retain their existing typed or outcome-unknown
   semantics.
 - Apply normal QUIC limits immediately after connect/accept and before
@@ -347,16 +342,14 @@ outbound-known and inbound-authorization directions explicit.
 | remote operation-lease allocation loses a validated response after write | return the typed transport/protocol failure after one service stream; do not allocate again |
 | first/second remote mutation service stream loses a validated response | retry once with identical bytes / return `operation_outcome_unknown`; never allocate a fresh lease for that operation |
 | remote unary fully validated expected response or correlated known service error | terminal response; do not retry |
-| post-`Active` frozen-session attachment receives initial `session_occupied` before old host reader EOF | drop the rejected epoch, remain reconnecting, drain/drop input and coalesce viewport for 250 ms, then retry the same SessionId with `create_main = false`; first-ever occupancy is terminal |
+| post-`Active` frozen-session attachment receives initial `session_occupied` before old host reader EOF | drop the rejected epoch, remain reconnecting, drain/drop input and coalesce the latest history target for 250 ms, then retry the same SessionId with `create_main = false`; first-ever occupancy is terminal |
 | remote Session context is self, generation zero/stale, or targets local/wrong DeviceId | generic `unauthorized`; no Session/PTY effect |
 | malformed, trailing, oversized, stalled, or panicking remote service stream | close/fail only that stream; retain primary connection, Session, PTY, and other streams |
 | reconnect delta baseline is inconsistent | consume and validate `TerminalSyncRequired`, then require a same-attachment snapshot at its declared revision |
 | selected path changes direct/relay or disappears | emit a redacted changed local observation no faster than 1 Hz; reconnect displays unknown |
-| legacy history or viewport request loses its remote stream | resolve once with a correlated content-free Gap(0/0), then reconnect; do not retry on another stream epoch |
-| history-window request loses its remote stream | resolve once with a correlated content-free nonzero Gap not older than the saved query, then reconnect; do not replay or disable bit 20 |
-| viewport request/frame is used without capability, correlation, valid metrics, or exact current row count | reject/send no unknown kind; never retain unverified rows or baseline |
-| history-window request/frame is used without capability, saved query correlation, product bounds, or exact request shape | reject/send no unknown kind; never expose or retain its rows |
-| input/history/viewport/window arrives during replacement sync | forward only if `controller_was_active` is true for this exact stream epoch and controller; initial/new-epoch/takeover stays fenced |
+| history-window request loses its remote stream | resolve once with a correlated content-free nonzero Gap not older than the saved query, then reconnect; do not replay it |
+| history-window request/frame lacks saved-query correlation, product bounds, semantic validity, or exact request shape | reject; never expose or retain its rows |
+| input/history-window control arrives during replacement sync | forward only if `controller_was_active` is true for this exact stream epoch and controller; initial/new-epoch/takeover stays fenced |
 | active epoch changes to a full snapshot | emit one local `Synchronizing` event before snapshot bytes; suppress duplicates until the view becomes active again |
 | remote write/control peer stops reading | operation deadline releases the stream epoch and eventually the desired-view demand |
 | continuously ready accept branch with completed handler tasks | reap completed `JoinSet` entries before the next accept; retained task ownership stays bounded |
@@ -390,9 +383,9 @@ outbound-known and inbound-authorization directions explicit.
   occurs after the permit is released.
 - **Good:** retain a correlated peer error's kind/request ID, zeroize its
   message, and re-encode one stable local detail.
-- **Good:** capability-gate semantic viewport per opened epoch, preserve a
-  previously-active controller across only an in-epoch replacement snapshot,
-  and resolve read-only pending controls as Gap before reconnecting.
+- **Good:** preserve a previously-active controller across only an in-epoch
+  replacement snapshot, validate one query-bound semantic history window, and
+  resolve it as a correlated nonzero Gap before reconnecting if the epoch dies.
 - **Bad:** cap the combined route list at four, accept unidirectional QUIC
   streams that no actor consumes, persist a direct address, roll back an
   outcome-unknown authorization, detach a PTY because one device was revoked,
@@ -424,10 +417,10 @@ outbound-known and inbound-authorization directions explicit.
   quiesce-before-Endpoint ordering without creating an Endpoint.
 - `remote_attachment` pure fake-stream tests cover one demand across fresh
   stream/attachment epochs, stable local identity, state ordering, input drop,
-  latest geometry and semantic-scroll coalescing, request-shaped contiguous
-  windows, bit20 -> bit19 -> pager fallback, marker-plus-snapshot preservation,
-  same-epoch visual-sync fences, legacy 0/0 versus window nonzero correlated
-  Gap on epoch loss, bounded stalled writes, pending lease/takeover
+  latest geometry and semantic-history-target coalescing, request-shaped
+  contiguous semantic windows, snapshot preservation, same-epoch visual-sync
+  fences, nonzero correlated Gap on epoch loss, bounded stalled writes,
+  pending lease/takeover
   completion, post-active half-open occupancy retry under paused time,
   first-ever occupancy termination, and other terminal classifications. The
   authenticated `session_wire` PTY regression proves
@@ -505,21 +498,15 @@ for source in [fresh, cache, ticket] {
 Each independently validated source stays bounded, deduplication preserves the
 fallback order, and later sources remain reachable after earlier dial failures.
 
-Viewport negotiation and sync identity follow the same epoch ownership rule:
+History correlation and sync identity follow the same epoch ownership rule:
 
 ```rust
-// Wrong: an old peer receives an unknown kind and a reconnect inherits trust.
-send(TerminalHistoryWindowRequest(query)).await?;
+// Wrong: the query is not retained, and a reconnect inherits prior authority.
+send_kind_317(query).await?;
 next_epoch.controller_was_active = previous_epoch.controller_was_active;
 
-// Correct: capability and prior-active state belong to this opened epoch.
-if epoch.capabilities.contains(Capabilities::TERMINAL_HISTORY_WINDOW) {
-    epoch.save_query_then_send_window(query).await?;
-} else if epoch.capabilities.contains(Capabilities::TERMINAL_VIEWPORT) {
-    epoch.send_viewport(action).await?;
-} else {
-    epoch.request_legacy_history().await?;
-}
+// Correct: save the complete v2 query before the sole canonical request.
+epoch.save_query_then_send_kind_317(query).await?;
 next_epoch.controller_was_active = false;
 ```
 

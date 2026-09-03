@@ -20,7 +20,7 @@ use zterm_daemon::local_ipc::{
 };
 use zterm_daemon::service::DaemonService;
 use zterm_platform::local_unix::{DaemonLock, bind_daemon_socket, remove_own_socket};
-use zterm_proto::{DecodedFrame, FrameDecoder, WireKind, encode_message, v1};
+use zterm_proto::{DecodedFrame, FrameDecoder, WireKind, encode_message, v2};
 
 use state_fixture::TestState;
 
@@ -70,7 +70,7 @@ async fn future_snapshot_ack_recovers_and_wrong_kind_is_stream_local() -> Result
     else {
         return Err("sync requirement was not followed by a replacement snapshot".into());
     };
-    assert_eq!(required.latest_revision, replacement.revision);
+    assert_eq!(required.latest_revision, replacement.revision.get());
     attachment
         .detach()
         .await
@@ -85,9 +85,9 @@ async fn future_snapshot_ack_recovers_and_wrong_kind_is_stream_local() -> Result
         WireKind::TerminalAttachRequest,
         90,
         0,
-        &v1::TerminalAttachRequest {
-            target: Some(v1::TargetSelector {
-                target: Some(v1::target_selector::Target::Local(true)),
+        &v2::TerminalAttachRequest {
+            target: Some(v2::TargetSelector {
+                target: Some(v2::target_selector::Target::Local(true)),
             }),
             session_id: Some(session_id.into()),
             takeover: false,
@@ -105,22 +105,22 @@ async fn future_snapshot_ack_recovers_and_wrong_kind_is_stream_local() -> Result
     let mut decoder = FrameDecoder::new();
     let mut queued = VecDeque::new();
     let initial = read_frame(&mut raw, &mut decoder, &mut queued).await?;
-    let _: v1::TerminalSnapshot = initial
-        .decode_message(WireKind::TerminalSnapshot)
+    let _: v2::TerminalSemanticSnapshot = initial
+        .decode_message(WireKind::TerminalSemanticSnapshot)
         .map_err(session_fixture::display)?;
 
     let wrong_kind = encode_message(
         WireKind::LocalStatusRequest,
         91,
         0,
-        &v1::LocalStatusRequest {},
+        &v2::LocalStatusRequest {},
     )
     .map_err(session_fixture::display)?;
     raw.write_all(&wrong_kind)
         .await
         .map_err(session_fixture::display)?;
     let error_frame = read_frame(&mut raw, &mut decoder, &mut queued).await?;
-    let error: v1::ServiceError = error_frame
+    let error: v2::ServiceError = error_frame
         .decode_message(WireKind::ServiceErrorResponse)
         .map_err(session_fixture::display)?;
     assert_eq!(error.code, "malformed_frame");
@@ -142,8 +142,8 @@ async fn future_snapshot_ack_recovers_and_wrong_kind_is_stream_local() -> Result
         &mut oversized_queued,
     )
     .await?;
-    let _: v1::TerminalSnapshot = initial
-        .decode_message(WireKind::TerminalSnapshot)
+    let _: v2::TerminalSemanticSnapshot = initial
+        .decode_message(WireKind::TerminalSemanticSnapshot)
         .map_err(session_fixture::display)?;
     oversized
         .write_all(&[0x81, 0x80, 0x80, 0x04])
@@ -155,7 +155,7 @@ async fn future_snapshot_ack_recovers_and_wrong_kind_is_stream_local() -> Result
         &mut oversized_queued,
     )
     .await?;
-    let error: v1::ServiceError = error_frame
+    let error: v2::ServiceError = error_frame
         .decode_message(WireKind::ServiceErrorResponse)
         .map_err(session_fixture::display)?;
     assert_eq!(error.code, "frame_too_large");

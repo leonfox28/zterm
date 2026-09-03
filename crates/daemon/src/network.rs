@@ -269,7 +269,7 @@ pub type PairConnectionHandlerFuture =
 /// the one absolute pairing deadline. It never receives the owning Endpoint,
 /// normal peer registry, or infrastructure profile.
 pub trait PairConnectionHandler: Send + Sync + 'static {
-    /// Handles one inbound `zterm-pair/1` connection.
+    /// Handles one inbound `zterm-pair/2` connection.
     fn handle_pair_connection(
         &self,
         connection: PairConnection,
@@ -1563,7 +1563,8 @@ mod tests {
             classify_incoming_alpn(ZTERM_PAIR_ALPN),
             Some(IncomingProtocol::Pairing)
         );
-        assert_eq!(classify_incoming_alpn(b"zterm/1\0"), None);
-        assert_eq!(classify_incoming_alpn(b"zterm-pair/2"), None);
+        assert_eq!(classify_incoming_alpn(b"zterm/2\0"), None);
+        assert_eq!(classify_incoming_alpn(b"zterm/1"), None);
+        assert_eq!(classify_incoming_alpn(b"zterm-pair/1"), None);
     }
 }

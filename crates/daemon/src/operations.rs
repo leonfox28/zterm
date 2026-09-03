@@ -7,14 +7,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use zterm_core::terminal::{
-    ActiveScreen, TerminalHistoryCursor, TerminalHistoryDirection, TerminalHistoryResult,
-    TerminalHistoryWindowQuery, TerminalHistoryWindowResult, TerminalModes, TerminalScrollAction,
-    TerminalScrollMetrics, TerminalSize, TerminalViewportResult,
-};
-#[cfg(unix)]
-use zterm_core::terminal::{
-    TerminalHistoryPage, TerminalHistoryWindowAnchor, TerminalHistoryWindowFrame,
-    TerminalMouseEncoding, TerminalMouseMode, TerminalViewportDisposition, TerminalViewportFrame,
+    TerminalHistoryWindowQuery, TerminalSize, TerminalSurfaceDelta,
+    TerminalSurfaceHistoryWindowResult, TerminalSurfaceSnapshot,
 };
 use zterm_core::{
     AttachmentId, AuthGeneration, AuthorizationStatus, DeviceAlias, DeviceId, DeviceSummary,
@@ -220,147 +214,11 @@ impl SessionClosePreflight {
     }
 }
 
-/// Daemon-authored replacement state consumed by the one CLI renderer.
-#[derive(Clone, Eq, PartialEq)]
-pub struct TerminalViewSnapshot {
-    revision: Revision,
-    size: TerminalSize,
-    active_screen: ActiveScreen,
-    modes: TerminalModes,
-    recent_history_ansi: Vec<u8>,
-    screen_ansi: Vec<u8>,
-    scroll_metrics: Option<TerminalScrollMetrics>,
-}
+/// Replacement state consumed by the one CLI compositor.
+pub type TerminalViewSnapshot = TerminalSurfaceSnapshot;
 
-impl fmt::Debug for TerminalViewSnapshot {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("TerminalViewSnapshot")
-            .field("revision", &self.revision)
-            .field("size", &self.size)
-            .field("active_screen", &self.active_screen)
-            .field("modes", &self.modes)
-            .field("recent_history_ansi_len", &self.recent_history_ansi.len())
-            .field("screen_ansi_len", &self.screen_ansi.len())
-            .field("scroll_metrics", &self.scroll_metrics)
-            .finish()
-    }
-}
-
-impl TerminalViewSnapshot {
-    /// Exact authoritative revision represented by this replacement.
-    #[must_use]
-    pub const fn revision(&self) -> Revision {
-        self.revision
-    }
-
-    /// Host viewport represented by this replacement.
-    #[must_use]
-    pub const fn size(&self) -> TerminalSize {
-        self.size
-    }
-
-    /// Host screen selected after applying this replacement.
-    #[must_use]
-    pub const fn active_screen(&self) -> ActiveScreen {
-        self.active_screen
-    }
-
-    /// Authoritative child input modes represented by this replacement.
-    #[must_use]
-    pub const fn modes(&self) -> TerminalModes {
-        self.modes
-    }
-
-    /// Bounded recent main-screen history, applied before [`Self::screen_ansi`].
-    #[must_use]
-    pub fn recent_history_ansi(&self) -> &[u8] {
-        &self.recent_history_ansi
-    }
-
-    /// Daemon-authored current-screen ANSI.
-    #[must_use]
-    pub fn screen_ansi(&self) -> &[u8] {
-        &self.screen_ansi
-    }
-
-    /// Live main-screen scroll extent, absent for alternate or legacy peers.
-    #[must_use]
-    pub const fn scroll_metrics(&self) -> Option<TerminalScrollMetrics> {
-        self.scroll_metrics
-    }
-}
-
-/// Daemon-authored merged update from one exact acknowledged revision.
-#[derive(Clone, Eq, PartialEq)]
-pub struct TerminalViewDelta {
-    from_revision: Revision,
-    to_revision: Revision,
-    size: TerminalSize,
-    active_screen: ActiveScreen,
-    modes: TerminalModes,
-    ansi: Vec<u8>,
-    scroll_metrics: Option<TerminalScrollMetrics>,
-}
-
-impl fmt::Debug for TerminalViewDelta {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("TerminalViewDelta")
-            .field("from_revision", &self.from_revision)
-            .field("to_revision", &self.to_revision)
-            .field("size", &self.size)
-            .field("active_screen", &self.active_screen)
-            .field("modes", &self.modes)
-            .field("ansi_len", &self.ansi.len())
-            .field("scroll_metrics", &self.scroll_metrics)
-            .finish()
-    }
-}
-
-impl TerminalViewDelta {
-    /// Revision against which this merged update was authored.
-    #[must_use]
-    pub const fn from_revision(&self) -> Revision {
-        self.from_revision
-    }
-
-    /// Revision after this merged update is applied.
-    #[must_use]
-    pub const fn to_revision(&self) -> Revision {
-        self.to_revision
-    }
-
-    /// Host viewport after this merged update.
-    #[must_use]
-    pub const fn size(&self) -> TerminalSize {
-        self.size
-    }
-
-    /// Host screen selected after this merged update.
-    #[must_use]
-    pub const fn active_screen(&self) -> ActiveScreen {
-        self.active_screen
-    }
-
-    /// Authoritative child input modes after this update.
-    #[must_use]
-    pub const fn modes(&self) -> TerminalModes {
-        self.modes
-    }
-
-    /// Daemon-authored ANSI for this contiguous update.
-    #[must_use]
-    pub fn ansi(&self) -> &[u8] {
-        &self.ansi
-    }
-
-    /// Live main-screen scroll extent, absent for alternate or legacy peers.
-    #[must_use]
-    pub const fn scroll_metrics(&self) -> Option<TerminalScrollMetrics> {
-        self.scroll_metrics
-    }
-}
+/// Contiguous semantic update from one exact acknowledged revision.
+pub type TerminalViewDelta = TerminalSurfaceDelta;
 
 /// Monotonic desired-view transport state projected by the local daemon.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -450,6 +308,9 @@ pub struct TerminalViewEnded {
     pub signal: String,
 }
 
+/// Stateless renderer-neutral history-window response.
+pub type TerminalViewHistoryWindow = TerminalSurfaceHistoryWindowResult;
+
 impl fmt::Debug for TerminalViewEnded {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -472,12 +333,8 @@ pub enum TerminalViewEvent {
     Snapshot(TerminalViewSnapshot),
     /// Apply one merged update only when its baseline is contiguous.
     Delta(TerminalViewDelta),
-    /// One correlated bounded page from daemon-authoritative history.
-    History(TerminalHistoryResult),
-    /// One correlated complete attachment-local semantic viewport outcome.
-    Viewport(TerminalViewportResult),
     /// One correlated stateless bounded history-window outcome.
-    HistoryWindow(TerminalHistoryWindowResult),
+    HistoryWindow(TerminalViewHistoryWindow),
     /// The following snapshot replaces the current live rendering baseline.
     SyncRequired {
         /// Latest host revision declared by the synchronization marker.
@@ -505,8 +362,6 @@ impl fmt::Debug for TerminalViewEvent {
                 .finish(),
             Self::Snapshot(snapshot) => formatter.debug_tuple("Snapshot").field(snapshot).finish(),
             Self::Delta(delta) => formatter.debug_tuple("Delta").field(delta).finish(),
-            Self::History(history) => formatter.debug_tuple("History").field(history).finish(),
-            Self::Viewport(viewport) => formatter.debug_tuple("Viewport").field(viewport).finish(),
             Self::HistoryWindow(window) => formatter
                 .debug_tuple("HistoryWindow")
                 .field(window)
@@ -746,45 +601,6 @@ impl TerminalViewCommandWriter {
         }
     }
 
-    /// Requests one bounded main-screen history page. The driver permits only
-    /// one outstanding page request for this view.
-    pub async fn request_history(
-        &self,
-        direction: TerminalHistoryDirection,
-        cursor: Option<TerminalHistoryCursor>,
-        maximum_rows: usize,
-    ) -> Result<(), DaemonError> {
-        #[cfg(unix)]
-        {
-            self.submit(|response| TerminalDriverCommand::RequestHistory {
-                direction,
-                cursor,
-                maximum_rows,
-                response,
-            })
-            .await
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (direction, cursor, maximum_rows);
-            Err(unsupported_command_platform())
-        }
-    }
-
-    /// Requests one attachment-local semantic viewport action.
-    pub async fn request_viewport(&self, action: TerminalScrollAction) -> Result<(), DaemonError> {
-        #[cfg(unix)]
-        {
-            self.submit(|response| TerminalDriverCommand::RequestViewport { action, response })
-                .await
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = action;
-            Err(unsupported_command_platform())
-        }
-    }
-
     /// Requests one stateless bounded history window.
     pub async fn request_history_window(
         &self,
@@ -861,16 +677,6 @@ enum TerminalDriverCommand {
     },
     RequestSync {
         known_revision: Revision,
-        response: tokio::sync::oneshot::Sender<Result<(), DaemonError>>,
-    },
-    RequestHistory {
-        direction: TerminalHistoryDirection,
-        cursor: Option<TerminalHistoryCursor>,
-        maximum_rows: usize,
-        response: tokio::sync::oneshot::Sender<Result<(), DaemonError>>,
-    },
-    RequestViewport {
-        action: TerminalScrollAction,
         response: tokio::sync::oneshot::Sender<Result<(), DaemonError>>,
     },
     RequestHistoryWindow {
@@ -1181,23 +987,6 @@ async fn handle_terminal_driver_command(
             response,
             TerminalDriverCommandResult::Continue,
         ),
-        TerminalDriverCommand::RequestHistory {
-            direction,
-            cursor,
-            maximum_rows,
-            response,
-        } => (
-            client
-                .request_history(direction, cursor, maximum_rows)
-                .await,
-            response,
-            TerminalDriverCommandResult::Continue,
-        ),
-        TerminalDriverCommand::RequestViewport { action, response } => (
-            client.request_viewport(action).await,
-            response,
-            TerminalDriverCommandResult::Continue,
-        ),
         TerminalDriverCommand::RequestHistoryWindow { query, response } => (
             client.request_history_window(query).await,
             response,
@@ -1253,36 +1042,26 @@ fn terminal_event_from_local(
     remote_alias: Option<&str>,
 ) -> Result<Option<TerminalViewEvent>, DaemonError> {
     match event {
-        LocalAttachmentEvent::Snapshot(snapshot) => terminal_snapshot_from_wire(snapshot)
-            .map(TerminalViewEvent::Snapshot)
-            .map(Some),
-        LocalAttachmentEvent::Delta(delta) => terminal_delta_from_wire(delta)
-            .map(TerminalViewEvent::Delta)
-            .map(Some),
-        LocalAttachmentEvent::HistoryPage(page) => terminal_history_from_wire(page)
-            .map(TerminalViewEvent::History)
-            .map(Some),
-        LocalAttachmentEvent::ViewportFrame(frame) => terminal_viewport_from_wire(frame)
-            .map(TerminalViewEvent::Viewport)
-            .map(Some),
-        LocalAttachmentEvent::HistoryWindowFrame(frame) => terminal_history_window_from_wire(frame)
-            .map(TerminalViewEvent::HistoryWindow)
-            .map(Some),
+        LocalAttachmentEvent::Snapshot(snapshot) => Ok(Some(TerminalViewEvent::Snapshot(snapshot))),
+        LocalAttachmentEvent::Delta(delta) => Ok(Some(TerminalViewEvent::Delta(delta))),
+        LocalAttachmentEvent::HistoryWindow(result) => {
+            Ok(Some(TerminalViewEvent::HistoryWindow(result)))
+        }
         LocalAttachmentEvent::ConnectionStatus(status) => {
             let device = remote_alias.ok_or_else(|| {
                 terminal_protocol_error("local terminal received remote connection status")
             })?;
-            let path = match zterm_proto::v1::TerminalConnectionPath::try_from(status.path)
+            let path = match zterm_proto::v2::TerminalConnectionPath::try_from(status.path)
                 .map_err(|_| terminal_protocol_error("unknown terminal connection path"))?
             {
-                zterm_proto::v1::TerminalConnectionPath::Unknown => {
+                zterm_proto::v2::TerminalConnectionPath::Unknown => {
                     TerminalViewConnectionPath::Unknown
                 }
-                zterm_proto::v1::TerminalConnectionPath::Direct => {
+                zterm_proto::v2::TerminalConnectionPath::Direct => {
                     TerminalViewConnectionPath::Direct
                 }
-                zterm_proto::v1::TerminalConnectionPath::Relay => TerminalViewConnectionPath::Relay,
-                zterm_proto::v1::TerminalConnectionPath::Unspecified => {
+                zterm_proto::v2::TerminalConnectionPath::Relay => TerminalViewConnectionPath::Relay,
+                zterm_proto::v2::TerminalConnectionPath::Unspecified => {
                     return Err(terminal_protocol_error(
                         "terminal connection path was unspecified",
                     ));
@@ -1303,22 +1082,22 @@ fn terminal_event_from_local(
             generation: lost.generation,
         })),
         LocalAttachmentEvent::SessionEnded(ended) => {
-            let reason = match zterm_proto::v1::TerminalSessionEndReason::try_from(ended.reason)
+            let reason = match zterm_proto::v2::TerminalSessionEndReason::try_from(ended.reason)
                 .map_err(|_| terminal_protocol_error("unknown terminal session end reason"))?
             {
-                zterm_proto::v1::TerminalSessionEndReason::NaturalExit => {
+                zterm_proto::v2::TerminalSessionEndReason::NaturalExit => {
                     TerminalViewEndReason::NaturalExit
                 }
-                zterm_proto::v1::TerminalSessionEndReason::ExplicitClose => {
+                zterm_proto::v2::TerminalSessionEndReason::ExplicitClose => {
                     TerminalViewEndReason::ExplicitClose
                 }
-                zterm_proto::v1::TerminalSessionEndReason::DaemonStop => {
+                zterm_proto::v2::TerminalSessionEndReason::DaemonStop => {
                     TerminalViewEndReason::DaemonStop
                 }
-                zterm_proto::v1::TerminalSessionEndReason::DriverFailure => {
+                zterm_proto::v2::TerminalSessionEndReason::DriverFailure => {
                     TerminalViewEndReason::DriverFailure
                 }
-                zterm_proto::v1::TerminalSessionEndReason::Unspecified => {
+                zterm_proto::v2::TerminalSessionEndReason::Unspecified => {
                     return Err(terminal_protocol_error(
                         "terminal session end reason was unspecified",
                     ));
@@ -1335,291 +1114,23 @@ fn terminal_event_from_local(
 }
 
 #[cfg(unix)]
-fn terminal_snapshot_from_wire(
-    snapshot: zterm_proto::v1::TerminalSnapshot,
-) -> Result<TerminalViewSnapshot, DaemonError> {
-    Ok(TerminalViewSnapshot {
-        revision: Revision::new(snapshot.revision),
-        size: terminal_size_from_wire(snapshot.rows, snapshot.columns)?,
-        active_screen: terminal_active_screen_from_wire(snapshot.active_screen)?,
-        modes: terminal_modes_from_wire(snapshot.modes)?,
-        recent_history_ansi: snapshot.recent_history_ansi,
-        screen_ansi: snapshot.screen_ansi,
-        scroll_metrics: terminal_scroll_metrics_from_wire(snapshot.scroll_metrics)?,
-    })
-}
-
-#[cfg(unix)]
-fn terminal_delta_from_wire(
-    delta: zterm_proto::v1::TerminalDelta,
-) -> Result<TerminalViewDelta, DaemonError> {
-    Ok(TerminalViewDelta {
-        from_revision: Revision::new(delta.from_revision),
-        to_revision: Revision::new(delta.to_revision),
-        size: terminal_size_from_wire(delta.rows, delta.columns)?,
-        active_screen: terminal_active_screen_from_wire(delta.active_screen)?,
-        modes: terminal_modes_from_wire(delta.modes)?,
-        ansi: delta.ansi,
-        scroll_metrics: terminal_scroll_metrics_from_wire(delta.scroll_metrics)?,
-    })
-}
-
-#[cfg(unix)]
-fn terminal_history_from_wire(
-    page: zterm_proto::v1::TerminalHistoryPage,
-) -> Result<TerminalHistoryResult, DaemonError> {
-    let outcome = zterm_proto::v1::TerminalHistoryOutcome::try_from(page.outcome)
-        .map_err(|_| terminal_protocol_error("unknown terminal history outcome"))?;
-    match outcome {
-        zterm_proto::v1::TerminalHistoryOutcome::Ok => {
-            let cursor = page
-                .cursor
-                .ok_or_else(|| terminal_protocol_error("terminal history page omitted cursor"))?;
-            Ok(TerminalHistoryResult::Page(TerminalHistoryPage {
-                cursor: TerminalHistoryCursor {
-                    epoch: Revision::new(cursor.epoch),
-                    revision: Revision::new(cursor.revision),
-                    start_row: cursor.start_row,
-                    row_count: cursor.row_count,
-                    oldest_row: cursor.oldest_row,
-                    newest_row: cursor.newest_row,
-                },
-                rows: page.rows,
-            }))
-        }
-        zterm_proto::v1::TerminalHistoryOutcome::Changed => {
-            Ok(TerminalHistoryResult::HistoryChanged {
-                epoch: Revision::new(page.current_epoch),
-                revision: Revision::new(page.current_revision),
-            })
-        }
-        zterm_proto::v1::TerminalHistoryOutcome::Gap => Ok(TerminalHistoryResult::HistoryGap {
-            epoch: Revision::new(page.current_epoch),
-            revision: Revision::new(page.current_revision),
-        }),
-        zterm_proto::v1::TerminalHistoryOutcome::Unspecified => Err(terminal_protocol_error(
-            "terminal history outcome was unspecified",
-        )),
-    }
-}
-
-#[cfg(unix)]
-fn terminal_scroll_metrics_from_wire(
-    metrics: Option<zterm_proto::v1::TerminalScrollMetrics>,
-) -> Result<Option<TerminalScrollMetrics>, DaemonError> {
-    metrics
-        .map(|metrics| {
-            let viewport_rows = u16::try_from(metrics.viewport_rows).map_err(|_| {
-                terminal_protocol_error("terminal viewport rows are outside the supported range")
-            })?;
-            let metrics = TerminalScrollMetrics {
-                epoch: Revision::new(metrics.epoch),
-                revision: Revision::new(metrics.revision),
-                offset_from_bottom: metrics.offset_from_bottom,
-                max_offset_from_bottom: metrics.max_offset_from_bottom,
-                viewport_rows,
-            };
-            metrics
-                .is_valid()
-                .then_some(metrics)
-                .ok_or_else(|| terminal_protocol_error("terminal scroll metrics are invalid"))
-        })
-        .transpose()
-}
-
-#[cfg(unix)]
-fn terminal_viewport_from_wire(
-    frame: zterm_proto::v1::TerminalViewportFrame,
-) -> Result<TerminalViewportResult, DaemonError> {
-    let outcome = zterm_proto::v1::TerminalViewportOutcome::try_from(frame.outcome)
-        .map_err(|_| terminal_protocol_error("unknown terminal viewport outcome"))?;
-    match outcome {
-        zterm_proto::v1::TerminalViewportOutcome::Frame => {
-            let metrics = terminal_scroll_metrics_from_wire(frame.metrics)?.ok_or_else(|| {
-                terminal_protocol_error("terminal viewport frame omitted metrics")
-            })?;
-            let disposition =
-                match zterm_proto::v1::TerminalViewportDisposition::try_from(frame.disposition)
-                    .map_err(|_| terminal_protocol_error("unknown terminal viewport disposition"))?
-                {
-                    zterm_proto::v1::TerminalViewportDisposition::Exact => {
-                        TerminalViewportDisposition::Exact
-                    }
-                    zterm_proto::v1::TerminalViewportDisposition::Rebased => {
-                        TerminalViewportDisposition::Rebased
-                    }
-                    zterm_proto::v1::TerminalViewportDisposition::Unspecified => {
-                        return Err(terminal_protocol_error(
-                            "terminal viewport disposition was unspecified",
-                        ));
-                    }
-                };
-            Ok(TerminalViewportResult::Frame(TerminalViewportFrame {
-                disposition,
-                metrics,
-                rows: frame.rows,
-            }))
-        }
-        zterm_proto::v1::TerminalViewportOutcome::Live => {
-            let metrics = terminal_scroll_metrics_from_wire(frame.metrics)?
-                .ok_or_else(|| terminal_protocol_error("terminal live viewport omitted metrics"))?;
-            Ok(TerminalViewportResult::Live(metrics))
-        }
-        zterm_proto::v1::TerminalViewportOutcome::Changed => {
-            Ok(TerminalViewportResult::HistoryChanged {
-                epoch: Revision::new(frame.current_epoch),
-                revision: Revision::new(frame.current_revision),
-            })
-        }
-        zterm_proto::v1::TerminalViewportOutcome::Gap => Ok(TerminalViewportResult::HistoryGap {
-            epoch: Revision::new(frame.current_epoch),
-            revision: Revision::new(frame.current_revision),
-        }),
-        zterm_proto::v1::TerminalViewportOutcome::Unspecified => Err(terminal_protocol_error(
-            "terminal viewport outcome was unspecified",
-        )),
-    }
-}
-
-#[cfg(unix)]
-fn terminal_history_window_from_wire(
-    frame: zterm_proto::v1::TerminalHistoryWindowFrame,
-) -> Result<TerminalHistoryWindowResult, DaemonError> {
-    let outcome = zterm_proto::v1::TerminalHistoryWindowOutcome::try_from(frame.outcome)
-        .map_err(|_| terminal_protocol_error("unknown terminal history window outcome"))?;
-    match outcome {
-        zterm_proto::v1::TerminalHistoryWindowOutcome::Frame => {
-            let anchor = frame.anchor.ok_or_else(|| {
-                terminal_protocol_error("terminal history window frame omitted anchor")
-            })?;
-            let viewport = terminal_size_from_wire(anchor.viewport_rows, anchor.viewport_columns)?;
-            let anchor = TerminalHistoryWindowAnchor {
-                epoch: Revision::new(anchor.epoch),
-                revision: Revision::new(anchor.revision),
-                max_offset_from_bottom: anchor.max_offset_from_bottom,
-                viewport,
-            };
-            let disposition =
-                match zterm_proto::v1::TerminalViewportDisposition::try_from(frame.disposition)
-                    .map_err(|_| {
-                        terminal_protocol_error("unknown terminal history window disposition")
-                    })? {
-                    zterm_proto::v1::TerminalViewportDisposition::Exact => {
-                        TerminalViewportDisposition::Exact
-                    }
-                    zterm_proto::v1::TerminalViewportDisposition::Rebased => {
-                        TerminalViewportDisposition::Rebased
-                    }
-                    zterm_proto::v1::TerminalViewportDisposition::Unspecified => {
-                        return Err(terminal_protocol_error(
-                            "terminal history window disposition was unspecified",
-                        ));
-                    }
-                };
-            Ok(TerminalHistoryWindowResult::Frame(
-                TerminalHistoryWindowFrame {
-                    disposition,
-                    anchor,
-                    target_offset_from_bottom: frame.target_offset_from_bottom,
-                    first_row_from_live_top: frame.first_row_from_live_top,
-                    ansi_rows: frame.ansi_rows,
-                },
-            ))
-        }
-        zterm_proto::v1::TerminalHistoryWindowOutcome::Changed => {
-            Ok(TerminalHistoryWindowResult::HistoryChanged {
-                epoch: Revision::new(frame.current_epoch),
-                revision: Revision::new(frame.current_revision),
-            })
-        }
-        zterm_proto::v1::TerminalHistoryWindowOutcome::Gap => {
-            Ok(TerminalHistoryWindowResult::HistoryGap {
-                epoch: Revision::new(frame.current_epoch),
-                revision: Revision::new(frame.current_revision),
-            })
-        }
-        zterm_proto::v1::TerminalHistoryWindowOutcome::Unspecified => Err(terminal_protocol_error(
-            "terminal history window outcome was unspecified",
-        )),
-    }
-}
-
-#[cfg(unix)]
-fn terminal_size_from_wire(rows: u32, columns: u32) -> Result<TerminalSize, DaemonError> {
-    let rows = u16::try_from(rows)
-        .ok()
-        .filter(|rows| *rows > 0)
-        .ok_or_else(|| terminal_protocol_error("terminal rows are outside the supported range"))?;
-    let columns = u16::try_from(columns)
-        .ok()
-        .filter(|columns| *columns > 0)
-        .ok_or_else(|| {
-            terminal_protocol_error("terminal columns are outside the supported range")
-        })?;
-    Ok(TerminalSize::new(rows, columns))
-}
-
-#[cfg(unix)]
-fn terminal_active_screen_from_wire(value: i32) -> Result<ActiveScreen, DaemonError> {
-    match zterm_proto::v1::TerminalActiveScreen::try_from(value)
-        .map_err(|_| terminal_protocol_error("unknown terminal active screen"))?
-    {
-        zterm_proto::v1::TerminalActiveScreen::Main => Ok(ActiveScreen::Main),
-        zterm_proto::v1::TerminalActiveScreen::Alternate => Ok(ActiveScreen::Alternate),
-        zterm_proto::v1::TerminalActiveScreen::Unspecified => Err(terminal_protocol_error(
-            "terminal active screen was unspecified",
-        )),
-    }
-}
-
-#[cfg(unix)]
-fn terminal_modes_from_wire(
-    modes: Option<zterm_proto::v1::TerminalModes>,
-) -> Result<TerminalModes, DaemonError> {
-    let modes = modes.ok_or_else(|| terminal_protocol_error("terminal update omitted modes"))?;
-    let mouse_mode = match modes.mouse_mode {
-        0 => TerminalMouseMode::None,
-        1 => TerminalMouseMode::Press,
-        2 => TerminalMouseMode::PressRelease,
-        3 => TerminalMouseMode::ButtonMotion,
-        4 => TerminalMouseMode::AnyMotion,
-        _ => return Err(terminal_protocol_error("unknown terminal mouse mode")),
-    };
-    let mouse_encoding = match modes.mouse_encoding {
-        0 => TerminalMouseEncoding::Default,
-        1 => TerminalMouseEncoding::Utf8,
-        2 => TerminalMouseEncoding::Sgr,
-        _ => return Err(terminal_protocol_error("unknown terminal mouse encoding")),
-    };
-    Ok(TerminalModes {
-        application_keypad: modes.application_keypad,
-        application_cursor: modes.application_cursor,
-        bracketed_paste: modes.bracketed_paste,
-        focus_reporting: modes.focus_reporting,
-        alternate_scroll: modes.alternate_scroll,
-        mouse_mode,
-        mouse_encoding,
-    })
-}
-
-#[cfg(unix)]
 fn terminal_transport_state_from_wire(
     value: i32,
 ) -> Result<TerminalViewTransportState, DaemonError> {
-    match zterm_proto::v1::TerminalTransportState::try_from(value)
+    match zterm_proto::v2::TerminalTransportState::try_from(value)
         .map_err(|_| terminal_protocol_error("unknown terminal transport state"))?
     {
-        zterm_proto::v1::TerminalTransportState::Preparing => {
+        zterm_proto::v2::TerminalTransportState::Preparing => {
             Ok(TerminalViewTransportState::Preparing)
         }
-        zterm_proto::v1::TerminalTransportState::Synchronizing => {
+        zterm_proto::v2::TerminalTransportState::Synchronizing => {
             Ok(TerminalViewTransportState::Synchronizing)
         }
-        zterm_proto::v1::TerminalTransportState::Active => Ok(TerminalViewTransportState::Active),
-        zterm_proto::v1::TerminalTransportState::Reconnecting => {
+        zterm_proto::v2::TerminalTransportState::Active => Ok(TerminalViewTransportState::Active),
+        zterm_proto::v2::TerminalTransportState::Reconnecting => {
             Ok(TerminalViewTransportState::Reconnecting)
         }
-        zterm_proto::v1::TerminalTransportState::Unspecified => Err(terminal_protocol_error(
+        zterm_proto::v2::TerminalTransportState::Unspecified => Err(terminal_protocol_error(
             "terminal transport state was unspecified",
         )),
     }
@@ -2381,7 +1892,7 @@ impl LocalRuntime {
                 viewport,
             )
             .await?;
-            let initial_snapshot = terminal_snapshot_from_wire(client.initial_snapshot().clone())?;
+            let initial_snapshot = client.initial_snapshot().clone();
             Ok(PreparedTerminalView {
                 session_id: client.session_id(),
                 attachment_id: client.attachment_id(),
@@ -3087,7 +2598,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use zterm_core::{Capabilities, DeviceId};
     #[cfg(unix)]
-    use zterm_proto::{DecodedFrame, FrameDecoder, WireKind, encode_message, v1};
+    use zterm_proto::{DecodedFrame, FrameDecoder, WireKind, encode_message, v2};
 
     use super::*;
     use crate::network::{
@@ -3174,7 +2685,7 @@ mod tests {
         let attachment_id = AttachmentId::from_array(*ATTACHMENT_SENTINEL);
         let project = |path, rtt_ms| {
             terminal_event_from_local(
-                LocalAttachmentEvent::ConnectionStatus(v1::TerminalConnectionStatusEvent {
+                LocalAttachmentEvent::ConnectionStatus(v2::TerminalConnectionStatusEvent {
                     attachment_id: Some(attachment_id.into()),
                     path,
                     rtt_ms,
@@ -3187,17 +2698,17 @@ mod tests {
 
         for (event, expected_path, expected_rtt) in [
             (
-                project(v1::TerminalConnectionPath::Unknown as i32, None),
+                project(v2::TerminalConnectionPath::Unknown as i32, None),
                 TerminalViewConnectionPath::Unknown,
                 None,
             ),
             (
-                project(v1::TerminalConnectionPath::Direct as i32, Some(7)),
+                project(v2::TerminalConnectionPath::Direct as i32, Some(7)),
                 TerminalViewConnectionPath::Direct,
                 Some(7),
             ),
             (
-                project(v1::TerminalConnectionPath::Relay as i32, Some(19)),
+                project(v2::TerminalConnectionPath::Relay as i32, Some(19)),
                 TerminalViewConnectionPath::Relay,
                 Some(19),
             ),
@@ -3216,9 +2727,9 @@ mod tests {
         }
 
         let error = terminal_event_from_local(
-            LocalAttachmentEvent::ConnectionStatus(v1::TerminalConnectionStatusEvent {
+            LocalAttachmentEvent::ConnectionStatus(v2::TerminalConnectionStatusEvent {
                 attachment_id: Some(attachment_id.into()),
-                path: v1::TerminalConnectionPath::Direct as i32,
+                path: v2::TerminalConnectionPath::Direct as i32,
                 rtt_ms: Some(7),
             }),
             None,
@@ -3249,7 +2760,7 @@ mod tests {
         let device_id = DeviceId::from_array([0x52; 32]);
         let observed = Ok(ObservedState::Running(DaemonStatus {
             protocol: ProtocolStatus {
-                wire_major: 1,
+                wire_major: zterm_core::WIRE_MAJOR,
                 state_schema: 1,
                 capabilities: Capabilities::LOCAL_LIFECYCLE,
             },
@@ -3547,10 +3058,10 @@ mod tests {
                 WireKind::TerminalSessionEnded,
                 0,
                 0,
-                &v1::TerminalSessionEnded {
+                &v2::TerminalSessionEnded {
                     session_id: Some(session_id.into()),
                     attachment_id: Some(attachment_id.into()),
-                    reason: v1::TerminalSessionEndReason::NaturalExit as i32,
+                    reason: v2::TerminalSessionEndReason::NaturalExit as i32,
                     exit_code: 0,
                     signal: String::new(),
                 },
@@ -3635,10 +3146,10 @@ mod tests {
                 WireKind::TerminalSessionEnded,
                 0,
                 0,
-                &v1::TerminalSessionEnded {
+                &v2::TerminalSessionEnded {
                     session_id: Some(session_id.into()),
                     attachment_id: Some(attachment_id.into()),
-                    reason: v1::TerminalSessionEndReason::NaturalExit as i32,
+                    reason: v2::TerminalSessionEndReason::NaturalExit as i32,
                     exit_code: 0,
                     signal: String::new(),
                 },
@@ -3811,10 +3322,10 @@ mod tests {
             attachment_id,
             [closure_schedule_frame(
                 WireKind::TerminalSessionEnded,
-                &v1::TerminalSessionEnded {
+                &v2::TerminalSessionEnded {
                     session_id: Some(session_id.into()),
                     attachment_id: Some(attachment_id.into()),
-                    reason: v1::TerminalSessionEndReason::DaemonStop as i32,
+                    reason: v2::TerminalSessionEndReason::DaemonStop as i32,
                     exit_code: 0,
                     signal: String::new(),
                 },
@@ -3836,7 +3347,7 @@ mod tests {
             attachment_id,
             [closure_schedule_frame(
                 WireKind::TerminalLeaseLost,
-                &v1::TerminalLeaseLost {
+                &v2::TerminalLeaseLost {
                     attachment_id: Some(attachment_id.into()),
                     generation: 23,
                 },
@@ -3856,22 +3367,22 @@ mod tests {
             [
                 closure_schedule_frame(
                     WireKind::TerminalTransportStateEvent,
-                    &v1::TerminalTransportStateEvent {
+                    &v2::TerminalTransportStateEvent {
                         attachment_id: Some(attachment_id.into()),
-                        state: v1::TerminalTransportState::Reconnecting as i32,
+                        state: v2::TerminalTransportState::Reconnecting as i32,
                     },
                 ),
                 closure_schedule_frame(
                     WireKind::TerminalConnectionStatusEvent,
-                    &v1::TerminalConnectionStatusEvent {
+                    &v2::TerminalConnectionStatusEvent {
                         attachment_id: Some(attachment_id.into()),
-                        path: v1::TerminalConnectionPath::Unknown as i32,
+                        path: v2::TerminalConnectionPath::Unknown as i32,
                         rtt_ms: None,
                     },
                 ),
                 closure_schedule_frame(
                     WireKind::TerminalSyncRequired,
-                    &v1::TerminalSyncRequired {
+                    &v2::TerminalSyncRequired {
                         attachment_id: Some(attachment_id.into()),
                         latest_revision: 29,
                     },
@@ -3919,7 +3430,7 @@ mod tests {
             attachment_id,
             [closure_schedule_frame(
                 WireKind::ServiceErrorResponse,
-                &v1::ServiceError {
+                &v2::ServiceError {
                     code: typed_error.kind().code().to_owned(),
                     message: typed_error.detail().to_owned(),
                 },
@@ -3946,7 +3457,7 @@ mod tests {
             let initial_ack =
                 read_terminal_test_frame(&mut daemon, &mut decoder, &mut queued).await;
             assert_eq!(initial_ack.kind, WireKind::TerminalSnapshotApplied);
-            let initial: v1::TerminalSnapshotApplied = initial_ack
+            let initial: v2::TerminalSnapshotApplied = initial_ack
                 .decode_message(WireKind::TerminalSnapshotApplied)
                 .expect("initial snapshot acknowledgement");
             assert_eq!(initial.revision, 1);
@@ -3960,7 +3471,7 @@ mod tests {
                         WireKind::TerminalLeaseLost,
                         0,
                         0,
-                        &v1::TerminalLeaseLost {
+                        &v2::TerminalLeaseLost {
                             attachment_id: Some(attachment_id.into()),
                             generation: 7,
                         },
@@ -4111,7 +3622,7 @@ mod tests {
                         WireKind::ServiceErrorResponse,
                         takeover.request_id,
                         0,
-                        &v1::ServiceError {
+                        &v2::ServiceError {
                             code: DomainErrorKind::OperationOutcomeUnknown.code().to_owned(),
                             message: "takeover outcome is unknown".to_owned(),
                         },
@@ -4163,8 +3674,7 @@ mod tests {
             session_id,
             attachment_id,
         );
-        let initial_snapshot =
-            terminal_snapshot_from_wire(client.initial_snapshot().clone()).expect("test snapshot");
+        let initial_snapshot = client.initial_snapshot().clone();
         (
             PreparedTerminalView {
                 session_id,
@@ -4204,9 +3714,9 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn test_operation_lease() -> v1::SessionOperationLeaseResponse {
-        v1::SessionOperationLeaseResponse {
-            lease: Some(v1::OperationLease {
+    fn test_operation_lease() -> v2::SessionOperationLeaseResponse {
+        v2::SessionOperationLeaseResponse {
+            lease: Some(v2::OperationLease {
                 daemon_incarnation: vec![0xb3; 16],
                 ordinal: 1,
             }),
@@ -4214,15 +3724,15 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn test_takeover_response(session_id: SessionId) -> v1::SessionMutateResponse {
-        v1::SessionMutateResponse {
-            session: Some(v1::SessionSummary {
+    fn test_takeover_response(session_id: SessionId) -> v2::SessionMutateResponse {
+        v2::SessionMutateResponse {
+            session: Some(v2::SessionSummary {
                 session_id: Some(session_id.into()),
                 name: "main".to_owned(),
                 revision: 1,
                 has_controller: true,
                 working_directory: String::new(),
-                viewport: Some(v1::TerminalViewport {
+                viewport: Some(v2::TerminalViewport {
                     rows: 24,
                     columns: 80,
                 }),

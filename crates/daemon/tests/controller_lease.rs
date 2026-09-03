@@ -536,7 +536,7 @@ fn wait_for_safe_marker(
 
 #[cfg(unix)]
 fn safe_snapshot_contains(
-    snapshot: &zterm_core::terminal::TerminalSnapshot,
+    snapshot: &zterm_core::terminal::TerminalSurfaceSnapshot,
     marker: &str,
 ) -> Result<bool, String> {
     support::snapshot_text(snapshot)

@@ -1,8 +1,8 @@
 syntax = "proto3";
 
-package zterm.v1;
+package zterm.v2;
 
-import "zterm/v1/common.proto";
+import "zterm/v2/common.proto";
 
 message TerminalAttachRequest {
   TargetSelector target = 1;
@@ -13,6 +13,7 @@ message TerminalAttachRequest {
   TerminalViewport viewport = 6;
   ResumeViewId resume_view_id = 7;
   optional uint64 known_revision = 8;
+  reserved 9;
 }
 
 enum TerminalActiveScreen {
@@ -29,31 +30,6 @@ message TerminalModes {
   uint32 mouse_mode = 5;
   uint32 mouse_encoding = 6;
   bool alternate_scroll = 7;
-}
-
-message TerminalSnapshot {
-  SessionId session_id = 1;
-  AttachmentId attachment_id = 2;
-  uint64 revision = 3;
-  uint32 rows = 4;
-  uint32 columns = 5;
-  bytes screen_ansi = 6;
-  bytes recent_history_ansi = 7;
-  TerminalActiveScreen active_screen = 8;
-  TerminalModes modes = 9;
-  TerminalScrollMetrics scroll_metrics = 10;
-}
-
-message TerminalDelta {
-  uint64 from_revision = 1;
-  uint64 to_revision = 2;
-  bytes ansi = 3;
-  uint32 rows = 4;
-  uint32 columns = 5;
-  TerminalActiveScreen active_screen = 6;
-  TerminalModes modes = 7;
-  AttachmentId attachment_id = 8;
-  TerminalScrollMetrics scroll_metrics = 9;
 }
 
 message TerminalInput {
@@ -122,45 +98,6 @@ message TerminalTransportStateEvent {
   TerminalTransportState state = 2;
 }
 
-enum TerminalHistoryDirection {
-  TERMINAL_HISTORY_DIRECTION_UNSPECIFIED = 0;
-  TERMINAL_HISTORY_DIRECTION_NEWEST = 1;
-  TERMINAL_HISTORY_DIRECTION_OLDER = 2;
-  TERMINAL_HISTORY_DIRECTION_NEWER = 3;
-}
-
-message TerminalHistoryCursor {
-  uint64 epoch = 1;
-  uint64 revision = 2;
-  uint64 start_row = 3;
-  uint32 row_count = 4;
-  uint64 oldest_row = 5;
-  uint64 newest_row = 6;
-}
-
-message TerminalHistoryRequest {
-  AttachmentId attachment_id = 1;
-  TerminalHistoryDirection direction = 2;
-  TerminalHistoryCursor cursor = 3;
-  uint32 maximum_rows = 4;
-}
-
-enum TerminalHistoryOutcome {
-  TERMINAL_HISTORY_OUTCOME_UNSPECIFIED = 0;
-  TERMINAL_HISTORY_OUTCOME_OK = 1;
-  TERMINAL_HISTORY_OUTCOME_CHANGED = 2;
-  TERMINAL_HISTORY_OUTCOME_GAP = 3;
-}
-
-message TerminalHistoryPage {
-  AttachmentId attachment_id = 1;
-  TerminalHistoryOutcome outcome = 2;
-  TerminalHistoryCursor cursor = 3;
-  repeated bytes rows = 4;
-  uint64 current_epoch = 5;
-  uint64 current_revision = 6;
-}
-
 message TerminalScrollMetrics {
   uint64 epoch = 1;
   uint64 revision = 2;
@@ -169,40 +106,10 @@ message TerminalScrollMetrics {
   uint32 viewport_rows = 5;
 }
 
-message TerminalViewportAction {
-  oneof action {
-    sint32 scroll_by_lines = 1;
-    uint64 scroll_to_offset = 2;
-  }
-}
-
-message TerminalViewportRequest {
-  AttachmentId attachment_id = 1;
-  TerminalViewportAction action = 2;
-}
-
-enum TerminalViewportOutcome {
-  TERMINAL_VIEWPORT_OUTCOME_UNSPECIFIED = 0;
-  TERMINAL_VIEWPORT_OUTCOME_FRAME = 1;
-  TERMINAL_VIEWPORT_OUTCOME_LIVE = 2;
-  TERMINAL_VIEWPORT_OUTCOME_CHANGED = 3;
-  TERMINAL_VIEWPORT_OUTCOME_GAP = 4;
-}
-
 enum TerminalViewportDisposition {
   TERMINAL_VIEWPORT_DISPOSITION_UNSPECIFIED = 0;
   TERMINAL_VIEWPORT_DISPOSITION_EXACT = 1;
   TERMINAL_VIEWPORT_DISPOSITION_REBASED = 2;
-}
-
-message TerminalViewportFrame {
-  AttachmentId attachment_id = 1;
-  TerminalViewportOutcome outcome = 2;
-  TerminalViewportDisposition disposition = 3;
-  TerminalScrollMetrics metrics = 4;
-  repeated bytes rows = 5;
-  uint64 current_epoch = 6;
-  uint64 current_revision = 7;
 }
 
 message TerminalHistoryWindowAnchor {
@@ -228,14 +135,92 @@ enum TerminalHistoryWindowOutcome {
   TERMINAL_HISTORY_WINDOW_OUTCOME_GAP = 3;
 }
 
-message TerminalHistoryWindowFrame {
+message TerminalRgbColor {
+  uint32 red = 1;
+  uint32 green = 2;
+  uint32 blue = 3;
+}
+
+message TerminalColor {
+  oneof value {
+    bool default_color = 1;
+    uint32 indexed = 2;
+    TerminalRgbColor rgb = 3;
+  }
+}
+
+message TerminalStyle {
+  TerminalColor foreground = 1;
+  TerminalColor background = 2;
+  bool bold = 3;
+  bool dim = 4;
+  bool italic = 5;
+  bool underline = 6;
+  bool inverse = 7;
+}
+
+message TerminalCell {
+  string contents = 1;
+  bool wide = 2;
+  bool wide_continuation = 3;
+  TerminalStyle style = 4;
+}
+
+message TerminalSurfaceRow {
+  repeated TerminalCell cells = 1;
+  bool wrapped = 2;
+}
+
+message TerminalCursor {
+  uint32 row = 1;
+  uint32 column = 2;
+  bool visible = 3;
+  TerminalStyle style = 4;
+}
+
+message TerminalSurface {
+  uint32 row_count = 1;
+  uint32 column_count = 2;
+  TerminalActiveScreen active_screen = 3;
+  repeated TerminalSurfaceRow rows = 4;
+  TerminalCursor cursor = 5;
+  TerminalModes modes = 6;
+  TerminalScrollMetrics scroll_metrics = 7;
+}
+
+message TerminalSemanticSnapshot {
+  SessionId session_id = 1;
+  AttachmentId attachment_id = 2;
+  uint64 revision = 3;
+  TerminalSurface surface = 4;
+}
+
+message TerminalSemanticRowPatch {
+  uint32 row = 1;
+  TerminalSurfaceRow replacement = 2;
+}
+
+message TerminalSemanticDelta {
+  AttachmentId attachment_id = 1;
+  uint64 from_revision = 2;
+  uint64 to_revision = 3;
+  uint32 row_count = 4;
+  uint32 column_count = 5;
+  TerminalActiveScreen active_screen = 6;
+  repeated TerminalSemanticRowPatch row_patches = 7;
+  TerminalCursor cursor = 8;
+  TerminalModes modes = 9;
+  TerminalScrollMetrics scroll_metrics = 10;
+}
+
+message TerminalSemanticHistoryWindowFrame {
   AttachmentId attachment_id = 1;
   TerminalHistoryWindowOutcome outcome = 2;
   TerminalViewportDisposition disposition = 3;
   TerminalHistoryWindowAnchor anchor = 4;
   uint64 target_offset_from_bottom = 5;
   sint64 first_row_from_live_top = 6;
-  repeated bytes ansi_rows = 7;
+  repeated TerminalSurfaceRow rows = 7;
   uint64 current_epoch = 8;
   uint64 current_revision = 9;
 }

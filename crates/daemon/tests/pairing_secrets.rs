@@ -194,12 +194,12 @@ fn fallible_adapters_take_zeroizing_ownership_before_validation() {
 
     let proto_source = include_str!("../../proto/src/lib.rs");
     let proof_start = proto_source
-        .find("impl TryFrom<v1::PairProof> for PairProof")
+        .find("impl TryFrom<v2::PairProof> for PairProof")
         .expect("PairProof adapter");
     let proof_adapter = &proto_source[proof_start..proof_start + 450];
     assert!(proof_adapter.contains("Zeroizing::new(value.controller_proof)"));
     let accepted_start = proto_source
-        .find("impl TryFrom<v1::PairAccepted> for PairAccepted")
+        .find("impl TryFrom<v2::PairAccepted> for PairAccepted")
         .expect("PairAccepted adapter");
     let accepted_adapter = &proto_source[accepted_start..accepted_start + 900];
     let proof_owner = accepted_adapter

@@ -27,7 +27,7 @@ use zterm_core::{
     MAX_TICKET_TEXT_BYTES, PAIR_PROTOCOL_VERSION, PairBegin, PairChallenge, PairFingerprint,
     PairNonce, PairProof, PairSecret, PairTicketFields, RelayHint, TransportLimits,
 };
-use zterm_proto::{WireKind, v1};
+use zterm_proto::{WireKind, v2};
 
 use crate::authorization::AuthorizationRegistry;
 use crate::connection_broker::{ConnectionBroker, ConnectionIdentity, PairConnection};
@@ -716,7 +716,7 @@ impl PairingServiceInner {
                 );
             }
         };
-        let mut begin_wire = v1::PairBegin::from(&begin);
+        let mut begin_wire = v2::PairBegin::from(&begin);
         let begin_write = framing
             .write_message(&mut io, WireKind::PairBegin, &begin_wire, deadline)
             .await;
@@ -726,7 +726,7 @@ impl PairingServiceInner {
             return ControllerPairAttempt::failed(error, false);
         }
 
-        let challenge_wire: v1::PairChallenge = match framing
+        let challenge_wire: v2::PairChallenge = match framing
             .read_message(&mut io, WireKind::PairChallenge, deadline)
             .await
         {
@@ -749,7 +749,7 @@ impl PairingServiceInner {
         };
         let offer_key = Zeroizing::new(fields.offer_key(secret));
         let controller_proof = Zeroizing::new(transcript.controller_proof(&offer_key));
-        let mut proof_wire = v1::PairProof {
+        let mut proof_wire = v2::PairProof {
             controller_proof: controller_proof.to_vec(),
         };
         // A cancelled write_all may already have delivered a complete frame;
@@ -762,7 +762,7 @@ impl PairingServiceInner {
             return ControllerPairAttempt::failed(error, true);
         }
 
-        let mut accepted_wire: v1::PairAccepted = match framing
+        let mut accepted_wire: v2::PairAccepted = match framing
             .read_message(&mut io, WireKind::PairAccepted, deadline)
             .await
         {
@@ -811,7 +811,7 @@ impl PairingServiceInner {
             .unwrap_or(deadline)
             .min(deadline);
 
-        let begin_wire: v1::PairBegin = framing
+        let begin_wire: v2::PairBegin = framing
             .read_message(&mut io, WireKind::PairBegin, first_frame_deadline)
             .await?;
         let begin = PairBegin::try_from(begin_wire)
@@ -820,12 +820,12 @@ impl PairingServiceInner {
             .manager
             .prepare_challenge_until(controller_device_id, &begin, deadline)
             .map_err(PairingError::peer_error)?;
-        let challenge_wire = v1::PairChallenge::from(prepared.challenge());
+        let challenge_wire = v2::PairChallenge::from(prepared.challenge());
         framing
             .write_message(&mut io, WireKind::PairChallenge, &challenge_wire, deadline)
             .await?;
 
-        let mut proof_wire: v1::PairProof = framing
+        let mut proof_wire: v2::PairProof = framing
             .read_message(&mut io, WireKind::PairProof, deadline)
             .await?;
         let proof = PairProof::from_slice(&proof_wire.controller_proof)
@@ -926,7 +926,7 @@ impl PairingServiceInner {
         let accepted = committed
             .pair_accepted()
             .map_err(PairingError::peer_error)?;
-        let mut accepted_wire = v1::PairAccepted::from(&accepted);
+        let mut accepted_wire = v2::PairAccepted::from(&accepted);
         let write = framing
             .write_message(&mut *io, WireKind::PairAccepted, &accepted_wire, deadline)
             .await;
@@ -1343,7 +1343,7 @@ fn invalid_pair_ticket(detail: &'static str) -> DaemonError {
     DaemonError::new(DomainErrorKind::PairTicketInvalid, detail)
 }
 
-fn pair_challenge_from_wire(mut wire: v1::PairChallenge) -> Result<PairChallenge, DaemonError> {
+fn pair_challenge_from_wire(mut wire: v2::PairChallenge) -> Result<PairChallenge, DaemonError> {
     let nonce = PairNonce::from_bytes(&wire.host_nonce)
         .map_err(|_| invalid_pair_ticket("pairing challenge nonce is invalid"));
     wire.host_nonce.zeroize();
@@ -1352,7 +1352,7 @@ fn pair_challenge_from_wire(mut wire: v1::PairChallenge) -> Result<PairChallenge
 }
 
 fn validate_pair_accepted(
-    wire: &mut v1::PairAccepted,
+    wire: &mut v2::PairAccepted,
     transcript: &zterm_core::PairTranscript,
     offer_key: &[u8; 32],
 ) -> Result<AuthGeneration, DaemonError> {
@@ -1776,7 +1776,7 @@ mod tests {
         .expect("challenge");
         encoded(
             WireKind::PairChallenge,
-            &v1::PairChallenge::from(&challenge),
+            &v2::PairChallenge::from(&challenge),
         )
     }
 
@@ -1847,11 +1847,11 @@ mod tests {
             Zeroizing::new([0xee; 32])
         };
 
-        let mut begin_wire = v1::PairBegin::from(&begin);
+        let mut begin_wire = v2::PairBegin::from(&begin);
         let mut input = encoded(WireKind::PairBegin, &begin_wire);
         begin_wire.offer_id.zeroize();
         begin_wire.controller_nonce.zeroize();
-        let mut proof_wire = v1::PairProof {
+        let mut proof_wire = v2::PairProof {
             controller_proof: proof.to_vec(),
         };
         let proof_frame = Zeroizing::new(encoded(WireKind::PairProof, &proof_wire));
@@ -1894,7 +1894,7 @@ mod tests {
         let local = device_id(0x11);
         let host = device_id(0x22);
         let ticket = ticket(host);
-        let invalid = v1::PairChallenge {
+        let invalid = v2::PairChallenge {
             host_nonce: vec![0; 31],
             selected_version: PAIR_PROTOCOL_VERSION,
             ticket_expiry_unix: ticket.fields.expires_at_unix(),

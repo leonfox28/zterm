@@ -1,5 +1,9 @@
 # 迁移终端状态引擎至 `alacritty_terminal` 及连续滚动 follow-up
 
+> Sections R1–R20 retain completed migration/scroll history. Where those historical contracts
+> mention ANSI wire, fixed wire major, capabilities, or fallback, the final R21–R27 direct-cutover
+> section is authoritative.
+
 ## Decision State
 
 - 2026-09-02，用户已决定从 `vt100 0.16.2` 直接迁移到 Alacritty 官方维护的
@@ -8,8 +12,9 @@
   Alacritty 官方仓库提交 `94e7c8874e526b1e67b349d9ba30ddf81669119e`。
 - Zterm 自有 Rust crate 继续执行 workspace `unsafe_code = "forbid"`。不引入社区 wrapper、
   Ghostty/Zig/C FFI、bindings、fork 或 in-repo unsafe island。
-- `portable-pty`、一个 Session 对应一个 PTY、现有 child/reader/writer ownership、当前
-  protobuf/wire major、latest-only attachment 和 daemon-lifetime session 均保持不变。
+- `portable-pty`、一个 Session 对应一个 PTY、现有 child/reader/writer ownership、latest-only
+  attachment 和 daemon-lifetime session 均保持不变。最初迁移保持 wire major；最终 semantic
+  direct cutover 按 R22 协调升级 wire major/ALPN。
 - 本任务不运行或新增 throughput、latency、CPU、RSS 或候选对比 benchmark，也不对迁移后
   性能作保证。功能兼容、不可信输入驱动状态的确定性安全上限、安全过滤和跨平台构建仍是
   必须通过的正确性门。
@@ -22,7 +27,8 @@
 ## Goal
 
 用官方 Rust `alacritty_terminal` 替换 daemon 的 VT parser/grid/state 实现，同时保留 Zterm
-自有领域模型、ANSI wire projection、断线恢复、history paging、输入安全边界和PTY生命周期；
+自有领域模型、断线恢复、输入安全边界和PTY生命周期，并最终以 semantic surface/history
+window 取代 ANSI wire projection 与兼容 paging；
 建立一个host-only engine边界，使未来desktop/mobile UI可以继续演进而不
 依赖具体 terminal-core 类型。
 
@@ -32,7 +38,7 @@
   Unicode grid 能力，减少继续扩展小型 `vt100` adapter 的长期成本。
 - 用户从 Ghostty、kitty、Alacritty、tmux 或普通 shell 启动/使用 Zterm 时，外层终端与
   daemon 状态机仍是清晰隔离的两层，不共享 parser、PTY 或内存对象。
-- remote client 继续消费稳定的 Zterm snapshot/delta/history，而不感知 Alacritty 私有类型；
+- remote client 继续消费稳定的 Zterm semantic snapshot/delta/history，而不感知 Alacritty 私有类型；
   后续可在不更换 PTY/session 架构的前提下增加 GUI renderer、选择、搜索或 semantic wire。
 - 保持 Rust 产品代码无 `unsafe`，不承担第三方 Ghostty wrapper/FFI 的 soundness 与构建链。
 
@@ -70,7 +76,7 @@
 ### R2. Host-Only Crate Boundary
 
 - `crates/core/src/terminal.rs` 保留 Zterm-owned DTO：size、screen、cell/style/cursor、modes、
-  side events、update、snapshot/delta/history、screen selector constants 和 frame byte limiter。
+  side events、semantic surface/snapshot/delta/history-window 和 frame byte limiter。
 - 新增 `crates/terminal`，持有 `TerminalModel`、opaque checkpoint、terminal error、
   Alacritty adapter、ingress policy、projector和ANSI encoder。
 - daemon 直接依赖 `zterm-core + zterm-terminal`；proto保持core-only。CLI作为同时承载本地
@@ -86,8 +92,8 @@
 ### R3. Preserve the Zterm Terminal Contract
 
 - 保留 `TerminalModel` 的行为边界：checked construction/size validation、ordered ingest、
-  empty no-op、checked revision、same-size resize revision、snapshot、checkpoint、merged
-  delta-or-resync、semantic state、history page。
+  empty no-op、checked revision、same-size resize revision、semantic snapshot、checkpoint、merged
+  semantic delta-or-resync、semantic state、history window。
 - 非空外部 ingest 无论内部怎样分段，只推进一次 revision；chunk whole/one-byte/fixed/
   deterministic-random 必须得到相同 semantic state、replies 和允许的 side events。
 - 保持 main/alternate screen、cursor、indexed/RGB/default colors、bold/dim/italic/underline/
@@ -124,18 +130,16 @@
 - private `ProjectedScreen` 使用 fixed/inline bounded cell text、row wrap、cursor、modes 和
   active screen；`TerminalCheckpoint` 只保存一个 latest active viewport，不保存 engine type、
   inactive screen 或 history。
-- full snapshot 由 Zterm allowlisted ANSI encoder生成：单一 screen metadata selector、受控
-  clear/home/CUP/EL、当前 SGR subset、printable UTF-8、cursor visibility 和明确 mode transitions。
-  不调用或转发任意 upstream formatter output。
-- delta比较 owned checkpoint与最新 projected rows，重画 changed rows并恢复 cursor/modes。
-  future revision、size mismatch、active-screen mismatch、checkpoint format mismatch 或
-  delta bytes >= full snapshot 一律 `Resync`。
-- snapshot继续先应用 `recent_history_ansi`、再应用 `screen_ansi`。8 MiB limiter只删除最老的
-  complete history lines，不截断 active screen。
-- main history通过 Alacritty grid negative-line range oldest-to-newest读取，不修改
+- full snapshot 直接投影为 exact rectangular semantic surface；desktop ANSI 只在最终 compositor
+  后由唯一 presenter 生成，不调用或转发 upstream formatter output。
+- delta 比较 owned checkpoint 与最新 projected rows，产生 sorted full-row replacements 和完整
+  cursor/modes/metrics；future revision、size/screen/format mismatch 一律 `Resync`。
+- snapshot 不含 `recent_history_ansi`；8 MiB frame cap 在 proto semantic payload 处执行，历史由
+  bounded history-window/cache 独立读取。
+- main history 通过 Alacritty grid negative-line range oldest-to-newest读取，不修改
   `display_offset`、revision、checkpoint或 live viewport。alternate active时仍返回 Changed。
 - append below capacity保留 epoch；resize、clear/shrink、capacity eviction/identity ambiguity
-  推进 epoch并返回 Changed/Gap，不拼接无法证明连续的 page。
+  推进 epoch并返回 Changed/Gap，不拼接无法证明连续的 window。
 
 ### R6. Bounded Untrusted State Without Aggregate Memory Admission
 
@@ -226,8 +230,8 @@ the local macOS arm64 implementation environment.
 - font shaping、glyph atlas、GPU/CPU renderer、Android/iOS UI、selection/search交互；本次 follow-up
   明确批准的 CLI 右侧字符滚动条除外。
 - Kitty graphics/keyboard protocol、OSC 8 hyperlink UI、advanced styles、palette/theme同步。
-- protobuf semantic surface v2或 wire-major变化；本次 follow-up 允许在 v1 中增加有 capability
-  保护的 viewport request/frame 和可选 scroll metrics 字段。
+- persistent-state schema migration 或保留多 wire major 并行服务；R22 的一次性 wire-major/ALPN
+  cutover 明确在 scope 内。
 - Android/iOS local shell、mobile engine runtime/device/App Store/NDK验收。
 - candidate comparison、throughput/latency/CPU/RSS benchmark或性能优化承诺。
 - 对Alacritty内部grid/cache/processor capacity建立per-session或aggregate memory quota。
@@ -241,8 +245,8 @@ the local macOS arm64 implementation environment.
 - 取消aggregate memory admission意味着8个合法Session的实际内存总量不再有128 MiB产品
   保证；Alacritty缓存可能在Session缩小后继续保留，通常到Session关闭才整体释放。若未来
   需要host级保护，应另立基于进程/OS压力的策略，而不是恢复不准确的`size_of<Cell>`估算。
-- 当前 ANSI wire意味着 native mobile UI仍需要自己的安全 terminal widget/parser；未来
-  semantic surface可以复用本次 `ProjectedScreen` seam，但不在本任务实现。
+- semantic wire 让 native mobile UI 后续直接消费 surface/cache；pixel renderer、font/IME/touch
+  仍不在本任务实现。
 - 固定 `TERM=xterm-256color` 需要目标宿主具备对应 terminfo；正式 native runner和 real PTY
   fixture必须验证，缺失时作为 blocker处理，不能回退继承外层 TERM。
 
@@ -607,3 +611,209 @@ the local macOS arm64 implementation environment.
 
 - [x] 最终 planning summary 已提交；用户随后于 2026-09-03 明确回复“批准实施”。本次授权只
   覆盖上述 desktop host-owned viewport cadence，不扩大到全局 PTY scheduler 或 Android。
+
+## Semantic Presentation and Single-Presenter Direct Cutover (Planning Reconverged 2026-09-03)
+
+> Supersession note: R19/R20 and Phase 7 correctly deferred semantic-cell wire for that already
+> completed smooth-viewport release. The user has now explicitly brought that work into this new
+> R21–R27 scope; those historical deferrals must not be read as current exclusions.
+> The later direct-cutover decision also supersedes every mixed-version/fallback requirement in the
+> historical sections above: all nodes will be upgraded together and only the semantic presentation
+> protocol remains in the product.
+
+### Decision state and root-cause classification
+
+- 用户确认直接完成一次完整 semantic-presentation migration，而不是先发布 extent-only 修复、
+  之后再迁移架构。实现可拆为可验证、可回滚的内部阶段和 commits，但只有一个 user-visible
+  completion/release boundary，不发布中间补丁版本。
+- **架构/边界缺陷**：daemon-authored terminal ANSI、attachment-local history/status/gutter、capture
+  mode 与 cursor restoration 没有进入同一个 desired frame，也没有共享一个只在 write + flush
+  后推进的 physical baseline。此前的 gutter、status、return-live 与 nested-TUI right-margin 问题是
+  同一缺失不变量的多个表现。
+- **已删除的局部缺陷路径**：legacy changed-row encoder 的 inclusive `EL0` 是已确认的局部错误，
+  但 direct cutover 后该 encoder 不再有产品消费者，因此删除整条 ANSI presentation path，而不是
+  继续维护一个修正后的 compatibility adapter。
+- Herdr、PiAgent、Ghostty 只是 regression/smoke fixtures。产品逻辑不得识别 application、process、
+  title、theme、glyph 或 terminal brand。
+- 项目级诊断顺序已写入
+  `.trellis/spec/guides/root-cause-and-architecture-thinking-guide.md` 并加入当前任务 implement/check
+  上下文：先分类 local / architecture / undetermined；确属局部违反既有契约时直接局部修复，不为
+  重构而重构。
+- 用户随后明确撤销 mixed-version compatibility 目标，并承诺发布后升级全部节点。本节 PRD、
+  design、implement、research 与 manifests 因此再次收敛；产品代码冻结在当前部分实施状态，等待
+  本次 direct-cutover summary 之后的新的明确批准。
+
+### Goal
+
+把当前“daemon 发送 ANSI、CLI 再追加 chrome”的 split-composition path 迁移为：daemon 发送有界、
+版本化的 Zterm semantic terminal surface；client 保留完整 live/history state，先完成显式 region
+layout 与 composition，再由唯一 desktop presenter 从 last successfully committed frame 原子过渡到
+next frame。该边界必须让未知 nested TUI 自然正确，并让下一阶段 Android 无需解析 desktop ANSI 或
+链接 Alacritty。
+
+### R21. Exact renderer-neutral semantic surface
+
+- `zterm-core` 新增 full-width `TerminalSurfaceRow`、`TerminalSurface`、revision-bound snapshot、
+  full-row delta patch 与 semantic history-window result；复用现有 cell/style/color/cursor/modes/size/
+  screen/anchor/cache domain types，不暴露 Alacritty type。
+- 每个 surface 必须有恰好 `rows` 个 row、每个 row 恰好 `columns` 个 cell，并保留 wrapped、wide
+  head/continuation、bounded cell text、style、cursor、child input modes 与 main scroll metrics。
+- delta 只接受 exact revision + size + active-screen baseline；row index 唯一、递增且有界。size、
+  screen、format 或 baseline 不兼容时返回完整 semantic snapshot，不创造 terminal-command
+  pseudo-protocol。
+- validator 在任何 backend 输出 text 前拒绝 control/ESC、超过现有 22-byte cell cap、orphan/非法
+  wide pair、越界 cursor、错误 row shape、非法 metrics/revision 与超过 8 MiB 的 content frame；
+  Debug 必须 content-redacted。
+- semantic snapshot 不重放 `recent_history_ansi`。现有 bounded client-owned history window/cache
+  是 desktop/mobile 共同的 scroll truth，不依赖 outer terminal physical scrollback。
+
+### R22. Mandatory semantic wire-major cutover
+
+- 将 product wire major 与 normal/pair ALPN 一次性升级到下一 major；旧 binary 必须在 local
+  readiness 或 authenticated handshake 阶段明确失败，不能进入 attachment 后再静默降级。
+- 将 protobuf source/package 与 Rust generated module 从 `proto/zterm/v1` / `zterm.v1` / `v1`
+  直接迁移到 `proto/zterm/v2` / `zterm.v2` / `v2`；删除产品中的 v1 generated module，不并行
+  编译两代 schema。`PairTicketV1`、持久 route cache 等独立数据格式若 wire shape 未变可保留其
+  自身版本名，不能因此保留 wire-v1 transport。
+- terminal attach 不再携带 presentation preference；semantic snapshot/delta/history-window 是唯一
+  表示，因此删除 capability bit 21、encoding enum、epoch family negotiation 与 cross-family state。
+- 在新 wire major 内让 semantic snapshot/delta 使用 terminal content 的主 kind 301/302，semantic
+  history-window response 使用 318；317 request 保持 renderer-neutral。旧 ANSI 301/302/318 payload、
+  312/313 pager、315/316 stateful viewport 与相应 protobuf/domain/validator/allowlist 全部删除，不复用
+  为 fallback。
+- local 与 remote attachment 只接受 semantic kinds；remote bridge 可以结构化解码 terminal cells，
+  用于验证 shape/content bounds、revision、correlation 与 request identity，改写私有 attachment ID
+  后重新编码转发；它不得解释应用内容、转换表示、合成 UI、构造 ANSI 或执行 presentation。
+- trusted-device/store/session 数据不迁移；升级全部 binary 后现有身份与 Session 生命周期继续使用。
+  发布前 rollback 只能回滚整次 wire-major release，不能通过重新开启 legacy adapter 完成。
+
+### R23. One model and semantic attachment boundary
+
+- `ProjectedScreen` 与 checkpoint 继续由 `zterm-terminal` 私有持有；每个 Session 仍只有一个 PTY、
+  一个 root child、一个 Alacritty model。`portable-pty`、ordered no-drop drain、reply ordering、
+  controller/takeover 与 detach/reconnect lifecycle 不变。
+- attachment 在 initial snapshot/resume delta、latest update、final drain、sync-required 与 history
+  response 的完整生命周期中只使用 semantic values，不再存储或分派 presentation encoding。
+- model 必须直接从同一 projection 产出 surface/row patch/history rows；删除 ANSI full/delta/history
+  encoder、ANSI snapshot/delta domain values 与 CLI ANSI/VT compatibility renderer。
+- existing checkpoint 是 semantic baseline，因此 exact revision reconnect 可以直接 resume；不再存在
+  encoding change 或 cross-family replacement 分支。
+
+### R24. Attachment surface, cache, and explicit composition
+
+- CLI semantic path 新增一个 `AttachmentSurface`：只安装完整 snapshot、只应用 contiguous full-row
+  patch；gap 保留 last complete presentation 并请求 full sync，不能先修改 visible/committed state。
+- 使用唯一 `ViewportCache<TerminalSurfaceRow>`。same-epoch anchoring、one-in-flight/latest-wins、16 ms desktop
+  presentation cadence、33 ms drag request pacing 与 one-report/one-line input ownership不变。
+- history pinned 时，后台 live surface 可以继续前进，但 visible source 仍是 complete cached main
+  slice、cursor hidden；return-live 只把最新 complete surface 合成并提交一次。
+- `ChromeLayout` 在 composition 前分配不重叠 regions：Main = child + optional one-column gutter；
+  Alternate = full child width/no gutter；remote status 独占 final physical row。region transfer 不通过
+  repaint ordering、glyph 或 application detection 修复。
+- compositor 以 complete visible terminal/history rows、status、gutter、cursor 与 host-mode policy
+  生成一个 renderer-neutral `ComposedFrame`。使用 bounded sparse absolute rows，避免按任意
+  `u16 physical_rows * physical_columns` 分配；overlap/out-of-bounds 是明确 internal error。
+
+### R25. Sole semantic desktop presenter
+
+- active semantic attachment 期间，只有一个 presenter 可以写 terminal cells、status、gutter、
+  cursor、outer keyboard/paste/focus modes、host mouse capture 与 DEC 2026 transaction。生命周期
+  guard 只负责进入 UI 前的 alternate/raw setup 与退出后的 unconditional restore。
+- incremental presentation 比较 previous committed 与 next composed frame；changed set 必须扩张到
+  old/new wide span，按 absolute `CUP` + style runs 输出，并用 literal default blanks 删除旧 cells。
+  incremental path 禁止 `EL0`/`EL2` row-tail shortcut，rightmost cell 后也不依赖 pending-wrap cursor。
+- child mouse/alternate-scroll modes 只决定 input router；physical host 始终由 Zterm 以 SGR any-motion
+  capture，禁止把 child mouse mode 当作第二套 outer mode owner。其他必要 keyboard/paste/focus policy
+  由 presenter 从 child semantics 统一派生。
+- 每个 transition 完整构造后使用一个 DEC 2026 begin/end、一次 `write_all`、一次 `flush`；只有两者
+  都成功才推进 committed frame。write/flush failure 将 baseline 标为 unknown，best-effort 结束
+  DEC 2026，下一次只允许 full clear + complete repaint。
+- resize、screen/layout change 或 missing baseline 走 full resync。status 与
+  reconnect notice 是 compositor input；不得再用 standalone newline 或独立 chrome repaint 修改屏幕。
+
+### R26. Remove superseded presentation paths
+
+- 删除 core/model/driver/session/proto/local IPC/remote bridge/operations/CLI 中的 legacy ANSI
+  snapshot、delta、recent-history、row encoder、family enum/variants、preference/capability 与 fallback。
+- 删除只为逐代兼容存在的 312/313 history pager、315/316 stateful viewport、legacy window 318 与
+  CLI pager/viewport/cache/render branches；滚轮、PageUp、拖动和 return-live 全部归一到 semantic
+  history-window + one cache reducer。
+- 删除不再可达的测试 helper、wire conversions、error variants、feature probes、legacy fixtures 和
+  corrected-EL0 临时实现，并清理只被这些路径引用的 module、public alias、Cargo dependency/feature
+  和 generated artifact。旧数字在 wire-major-2 registry 中由新的唯一 semantic payload 占用或标为
+  reserved；禁止保留 deprecated shim、dual-schema module 或死分支“以防将来兼容”。
+- 仅保留仍有独立当前用途的通用机制，例如 snapshot acknowledgement、sync request/required、
+  input/resize/detach、controller lifecycle、history coordinate/cache primitives 和 terminal guard。
+
+### R27. Verification and one release boundary
+
+- core/proto/model tests覆盖 exact shape/roundtrip、malformed/untrusted payload、revision/row patch、
+  Unicode/wide/wrapped/style/cursor/modes、maximum dimensions、history coordinates、redaction 与
+  semantic snapshot/patch replay equivalence；必须证明当前 semantic path 未构造 ANSI。
+- session/local/remote tests覆盖 initial full、resume delta、ack、gap/resync、reconnect、takeover、
+  final drain、local/direct/relay 与旧 wire-major 的明确拒绝；不存在 negotiation/fallback matrix。
+- compositor/presenter tests覆盖 Main/Alternate/status/gutter ownership transfer、live/history、resize、
+  rightmost/wide/styled blank、cursor/modes/capture、chrome-only update、一个 transaction/write/flush、
+  partial failure 后 full retry，以及 active semantic mode 没有旁路 writer。
+- normative automated fixture 是无 application identity 的 nested alternate-screen TUI；Herdr 在真实
+  Ghostty/macOS 中验证 entry、first/continuous/reverse wheel、resize、exit/re-entry 和 return-live。
+  Linux 使用通用 right-margin/nested-TUI fixture，并单独记录 local/direct/relay evidence。
+- 完成 focused tests、workspace fmt/check/Clippy/tests/docs、source policy、cargo-deny、`just check`、
+  independent Trellis review 与 owning specs 更新后，才允许合并和发布。没有 interim patch release。
+- 延续用户决定：不运行 throughput/latency/CPU/RSS benchmark，不作性能结论；所有产品 Rust 继续
+  `unsafe_code = "forbid"`。
+
+### Acceptance criteria
+
+- [ ] 最新 client + 最新 local/remote daemon 的 live snapshot、delta 与 history window 全程是 semantic
+  cells；CLI 不解析 daemon ANSI，model/bridge 也不为该 attachment 构造或翻译 ANSI。
+- [ ] 一个 complete attachment surface 与一个 complete composed frame 分别拥有 semantic/physical
+  baseline；所有 active semantic output 只能经过 sole presenter，baseline 只在 write + flush 成功后
+  提交。
+- [ ] generic nested TUI 的 right-edge cell 在 initial/first delta/continuous/reverse wheel、resize、
+  screen switch、exit/re-entry 与 return-live 后保持正确；short rows 与旧 wide cells 被精确 blank，
+  没有 application/terminal-brand 特判。
+- [ ] Main gutter、Alternate child full width、remote status 与 cursor/mode/capture 在所有 ownership
+  transitions 中由 layout/compositor 决定；不存在 post-child cleanup、standalone status/reconnect write
+  或失败后 speculative baseline。
+- [ ] wire major/ALPN cutover 在 local/direct/relay 上通过；旧 binary 在握手阶段明确失败。产品 source
+  中不存在 wire-v1 generated module、presentation preference、bit21、legacy kinds/payload、family
+  switch 或 downgrade。
+- [ ] ANSI snapshot/delta/history encoder 与 CLI compatibility renderer 已删除；rightmost、short/empty、
+  styled blank、wide/combining 的正确性只由 semantic compositor/presenter oracle 覆盖。
+- [ ] macOS 与 Linux 的自动化和真实连接证据均完成，所有质量门通过，specs 与任务证据同步后才
+  merge/release；Android 可以消费 core/proto semantic surface/cache，而无需 Alacritty/ANSI parser。
+
+### Explicitly out of scope
+
+- Android UI、font shaping/glyph atlas、IME、selection/search、pixel/inertial touch/fling、native vsync、
+  device/Play Store release；这些在本 migration 后进入下一任务。
+- 新增 Ratatui/其他 renderer、第二个 terminal parser/model、Alacritty renderer/tty/event loop、
+  pane tree、multiplexer 或改变 one-Session/one-PTY。
+- application/process/title/theme/glyph/`TERM`/terminal-brand detection，forced periodic repaint，
+  debounce-based correctness，或把 child DECAWM/DEC 2026 直接透传给 outer terminal。
+- Kitty graphics/keyboard、OSC 8 UI、advanced styles/palette、performance benchmark 或恢复 aggregate
+  terminal-memory admission。
+
+### Risks and deferred work
+
+- 最大风险是 wire-major coordinated rollout、reconnect/resume 一致性、wide-cell physical invalidation、以及把当前
+  large `terminal_ui.rs` 中所有 active writer 收束到 presenter。每项都有独立红测、internal rollback
+  point 与 final no-bypass audit。
+- Unicode width policy 在 Alacritty 与 outer emulator 间可能有差异。source wide flags 作为 domain
+  truth，presenter 用 absolute positioning 隔离 cursor drift；更完整 grapheme/font parity 属于 native
+  renderer 工作，不扩大本次 terminal semantics。
+- direct cutover 意味着未升级节点不可连接；这是用户明确接受的部署约束。实现必须让这种失败发生
+  在版本/ALPN握手边界并给出稳定诊断，而不是保留运行时 fallback 或在 terminal frame 处偶然报错。
+- 不新建 speculative shared presentation crate。当前可证实的移动复用边界是 core/proto semantic
+  surface、history coordinates 与 cache reducer；desktop cell compositor 留在 CLI，Android 后续按 native
+  layout/rendering policy 消费相同 surface。如果实施证据表明确有跨平台稳定代码边界，必须先重新收敛
+  design，而不是临时搬层。
+
+### Planning gate
+
+- [x] 用户已确认完整 migration、one-release boundary，并明确撤销 mixed-version compatibility。
+- [x] PRD、research、technical design、implementation phases 与 task contexts 已按 direct-cutover scope
+  重写并校验。
+- [x] 已向用户展示本次 reconverged final planning summary；用户随后明确“批准实施”。不得把
+  extent-only patch 发布为过渡版本。

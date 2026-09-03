@@ -3,16 +3,13 @@
 //! This crate is the only zterm-owned dependency boundary around Alacritty's
 //! terminal state engine. PTY ownership remains in `zterm-platform`.
 
-mod ansi;
 mod engine;
 mod ingress;
 mod model;
 mod projection;
 
 pub use model::{TerminalCheckpoint, TerminalError, TerminalModel};
-
-/// Maximum UTF-8 bytes projected from one terminal cell.
-pub const MAX_CELL_TEXT_BYTES: usize = 22;
+pub use zterm_core::terminal::MAX_CELL_TEXT_BYTES;
 
 /// Maximum retained combining-character bytes across both model screens.
 pub const MAX_COMBINING_BYTES_PER_SESSION: usize = 64 * 1024;

@@ -15,7 +15,7 @@ use prost::Message;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use zeroize::Zeroize;
 use zterm_core::{AttachmentId, DeviceId, DomainErrorKind, OperationLease, Revision, SessionName};
-use zterm_proto::{DecodedFrame, FrameDecoder, WireKind, v1};
+use zterm_proto::{DecodedFrame, FrameDecoder, WireKind, v2};
 
 use crate::connection_broker::{ConnectionBroker, ConnectionDemand, StreamPurpose};
 use crate::device_directory::{DeviceDirectory, ResolvedSessionTarget};
@@ -271,7 +271,7 @@ impl RequestContract {
         let frame = decode_exact_frame(request)?;
         let (wire_target, response_kind, retry_class) = match frame.kind {
             WireKind::SessionListRequest => {
-                let message: v1::SessionListRequest = frame
+                let message: v2::SessionListRequest = frame
                     .decode_message(WireKind::SessionListRequest)
                     .map_err(protocol_error)?;
                 (
@@ -281,7 +281,7 @@ impl RequestContract {
                 )
             }
             WireKind::SessionOperationLeaseRequest => {
-                let message: v1::SessionOperationLeaseRequest = frame
+                let message: v2::SessionOperationLeaseRequest = frame
                     .decode_message(WireKind::SessionOperationLeaseRequest)
                     .map_err(protocol_error)?;
                 (
@@ -291,7 +291,7 @@ impl RequestContract {
                 )
             }
             WireKind::SessionCreateRequest => {
-                let message: v1::SessionCreateRequest = frame
+                let message: v2::SessionCreateRequest = frame
                     .decode_message(WireKind::SessionCreateRequest)
                     .map_err(protocol_error)?;
                 (
@@ -301,7 +301,7 @@ impl RequestContract {
                 )
             }
             WireKind::SessionRenameRequest => {
-                let message: v1::SessionRenameRequest = frame
+                let message: v2::SessionRenameRequest = frame
                     .decode_message(WireKind::SessionRenameRequest)
                     .map_err(protocol_error)?;
                 (
@@ -311,7 +311,7 @@ impl RequestContract {
                 )
             }
             WireKind::SessionCloseRequest => {
-                let message: v1::SessionCloseRequest = frame
+                let message: v2::SessionCloseRequest = frame
                     .decode_message(WireKind::SessionCloseRequest)
                     .map_err(protocol_error)?;
                 (
@@ -321,7 +321,7 @@ impl RequestContract {
                 )
             }
             WireKind::SessionTakeoverRequest => {
-                let message: v1::SessionTakeoverRequest = frame
+                let message: v2::SessionTakeoverRequest = frame
                     .decode_message(WireKind::SessionTakeoverRequest)
                     .map_err(protocol_error)?;
                 (
@@ -401,7 +401,7 @@ pub(crate) fn validate_session_unary_response(
 pub(crate) fn decode_session_service_error(
     frame: &DecodedFrame,
 ) -> Result<DaemonError, DaemonError> {
-    let mut response: v1::ServiceError = frame
+    let mut response: v2::ServiceError = frame
         .decode_message(WireKind::ServiceErrorResponse)
         .map_err(protocol_error)?;
     let kind = DomainErrorKind::from_code(&response.code);
@@ -416,7 +416,7 @@ pub(crate) fn decode_session_service_error(
 }
 
 fn content_free_service_error_frame(frame: DecodedFrame, error: &DaemonError) -> DecodedFrame {
-    let response = v1::ServiceError {
+    let response = v2::ServiceError {
         code: error.kind().code().to_owned(),
         message: error.detail().to_owned(),
     };
@@ -434,7 +434,7 @@ fn validate_session_unary_response_payload(
 ) -> Result<(), DaemonError> {
     match expected_kind {
         WireKind::SessionListResponse => {
-            let response: v1::SessionListResponse = frame
+            let response: v2::SessionListResponse = frame
                 .decode_message(expected_kind)
                 .map_err(protocol_error)?;
             for summary in response.sessions {
@@ -443,7 +443,7 @@ fn validate_session_unary_response_payload(
             Ok(())
         }
         WireKind::SessionOperationLeaseResponse => {
-            let response: v1::SessionOperationLeaseResponse = frame
+            let response: v2::SessionOperationLeaseResponse = frame
                 .decode_message(expected_kind)
                 .map_err(protocol_error)?;
             let _: OperationLease = response
@@ -454,7 +454,7 @@ fn validate_session_unary_response_payload(
             Ok(())
         }
         WireKind::SessionMutateResponse => {
-            let response: v1::SessionMutateResponse = frame
+            let response: v2::SessionMutateResponse = frame
                 .decode_message(expected_kind)
                 .map_err(protocol_error)?;
             session_summary_from_wire(
@@ -471,7 +471,7 @@ fn validate_session_unary_response_payload(
 }
 
 pub(crate) fn session_summary_from_wire(
-    summary: v1::SessionSummary,
+    summary: v2::SessionSummary,
 ) -> Result<SessionSummary, DaemonError> {
     let session_id = summary
         .session_id
@@ -630,10 +630,10 @@ fn decode_exact_frame(bytes: &[u8]) -> Result<DecodedFrame, DaemonError> {
 }
 
 fn require_exact_remote_target(
-    target: Option<v1::TargetSelector>,
+    target: Option<v2::TargetSelector>,
     expected: DeviceId,
 ) -> Result<(), DaemonError> {
-    let Some(v1::target_selector::Target::Device(device)) = target.and_then(|target| target.target)
+    let Some(v2::target_selector::Target::Device(device)) = target.and_then(|target| target.target)
     else {
         return Err(DaemonError::new(
             DomainErrorKind::MalformedFrame,
@@ -1083,7 +1083,7 @@ mod tests {
     #[cfg(unix)]
     impl LocalBridgePeer {
         fn pair(session_id: SessionId, attachment_id: AttachmentId) -> (Self, DuplexStream) {
-            let (stream, bridge) = duplex(64 * 1024);
+            let (stream, bridge) = duplex(1024 * 1024);
             (
                 Self {
                     stream,
@@ -1149,7 +1149,7 @@ mod tests {
         async fn detach_before(&mut self, deadline: Instant) {
             self.send_before(
                 WireKind::TerminalDetach,
-                &v1::TerminalDetach {
+                &v2::TerminalDetach {
                     attachment_id: Some(self.attachment_id.into()),
                 },
                 deadline,
@@ -1331,7 +1331,7 @@ mod tests {
         request: &[u8],
         deadline: Instant,
     ) -> Result<(DecodedFrame, Vec<u8>), RemoteAttemptError> {
-        let (mut client_stream, server_stream) = duplex(64 * 1024);
+        let (mut client_stream, server_stream) = duplex(1024 * 1024);
         let server_exchange = server.handle_remote_stream(
             server_stream,
             context.clone(),
@@ -1427,7 +1427,7 @@ mod tests {
             WireKind::SessionListResponse,
             41,
             0,
-            &v1::SessionListResponse { sessions: vec![] },
+            &v2::SessionListResponse { sessions: vec![] },
         )
         .expect("bounded response");
         let (mut reader, mut writer) = duplex(4096);
@@ -1446,14 +1446,14 @@ mod tests {
             WireKind::SessionListResponse,
             42,
             0,
-            &v1::SessionListResponse { sessions: vec![] },
+            &v2::SessionListResponse { sessions: vec![] },
         )
         .expect("first response");
         let second = encode_message(
             WireKind::SessionListResponse,
             42,
             0,
-            &v1::SessionListResponse { sessions: vec![] },
+            &v2::SessionListResponse { sessions: vec![] },
         )
         .expect("second response");
         let (mut reader, mut writer) = duplex(4096);
@@ -1501,7 +1501,7 @@ mod tests {
             WireKind::LocalSessionUnaryRequest,
             131,
             1_000,
-            &v1::LocalSessionUnaryRequest {
+            &v2::LocalSessionUnaryRequest {
                 target_device_id: Some(target.into()),
                 frame: list_request(target, 131),
             },
@@ -1511,7 +1511,7 @@ mod tests {
             WireKind::TerminalInput,
             132,
             1_000,
-            &v1::TerminalInput {
+            &v2::TerminalInput {
                 operation_id: None,
                 attachment_id: None,
                 bytes: Vec::new(),
@@ -1558,7 +1558,7 @@ mod tests {
         let response = decoded_message(
             WireKind::SessionListResponse,
             51,
-            &v1::SessionListResponse { sessions: vec![] },
+            &v2::SessionListResponse { sessions: vec![] },
         );
         let transport = FakeTransport::scripted([
             ScriptedOutcome::PostWrite,
@@ -1589,8 +1589,8 @@ mod tests {
         let unused_second_response = decoded_message(
             WireKind::SessionOperationLeaseResponse,
             161,
-            &v1::SessionOperationLeaseResponse {
-                lease: Some(v1::OperationLease {
+            &v2::SessionOperationLeaseResponse {
+                lease: Some(v2::OperationLease {
                     daemon_incarnation: vec![4; DaemonIncarnation::LENGTH],
                     ordinal: 29,
                 }),
@@ -1625,7 +1625,7 @@ mod tests {
         let response = decoded_message(
             WireKind::SessionMutateResponse,
             61,
-            &v1::SessionMutateResponse {
+            &v2::SessionMutateResponse {
                 session: Some(valid_session_summary(8)),
             },
         );
@@ -1651,7 +1651,7 @@ mod tests {
         assert_eq!(state.requests[0], request);
 
         let frame = decode_exact_frame(&state.requests[1]).expect("recorded request decodes");
-        let message: v1::SessionCreateRequest = frame
+        let message: v2::SessionCreateRequest = frame
             .decode_message(WireKind::SessionCreateRequest)
             .expect("create request");
         let operation: OperationId = message
@@ -1703,7 +1703,7 @@ mod tests {
             .await
             .expect("the host issues one replay lease through the real wire server");
         let lease: OperationLease = lease_response
-            .decode_message::<v1::SessionOperationLeaseResponse>(
+            .decode_message::<v2::SessionOperationLeaseResponse>(
                 WireKind::SessionOperationLeaseResponse,
             )
             .expect("decode daemon-issued lease response")
@@ -1934,7 +1934,7 @@ mod tests {
             WireKind::SessionMutateResponse,
             101,
             0,
-            &v1::SessionMutateResponse {
+            &v2::SessionMutateResponse {
                 session: Some(valid_session_summary(12)),
             },
         )
@@ -1944,7 +1944,7 @@ mod tests {
             WireKind::SessionMutateResponse,
             101,
             0,
-            &v1::SessionMutateResponse { session: None },
+            &v2::SessionMutateResponse { session: None },
         )
         .expect("well-framed but incomplete typed mutation response");
         let transport = FakeTransport::scripted([
@@ -1975,12 +1975,12 @@ mod tests {
         let wrong_kind = decoded_message(
             WireKind::SessionListResponse,
             111,
-            &v1::SessionListResponse { sessions: vec![] },
+            &v2::SessionListResponse { sessions: vec![] },
         );
         let wrong_request_id = decoded_message(
             WireKind::SessionMutateResponse,
             112,
-            &v1::SessionMutateResponse {
+            &v2::SessionMutateResponse {
                 session: Some(valid_session_summary(13)),
             },
         );
@@ -2012,12 +2012,12 @@ mod tests {
         let wrong = decoded_message(
             WireKind::SessionMutateResponse,
             121,
-            &v1::SessionMutateResponse { session: None },
+            &v2::SessionMutateResponse { session: None },
         );
         let correct = decoded_message(
             WireKind::SessionListResponse,
             121,
-            &v1::SessionListResponse { sessions: vec![] },
+            &v2::SessionListResponse { sessions: vec![] },
         );
         let transport = FakeTransport::scripted([
             ScriptedOutcome::Response(wrong),
@@ -2046,7 +2046,7 @@ mod tests {
         let response = decoded_message(
             WireKind::ServiceErrorResponse,
             71,
-            &v1::ServiceError {
+            &v2::ServiceError {
                 code: DomainErrorKind::OperationOutcomeUnknown.code().to_owned(),
                 message: UNTRUSTED_MESSAGE.to_owned(),
             },
@@ -2067,7 +2067,7 @@ mod tests {
             .await
             .expect("complete typed error is returned to the local client");
         assert_eq!(reply.kind, WireKind::ServiceErrorResponse);
-        let projected: v1::ServiceError = reply
+        let projected: v2::ServiceError = reply
             .decode_message(WireKind::ServiceErrorResponse)
             .expect("content-free typed error");
         assert_eq!(
@@ -2086,7 +2086,7 @@ mod tests {
         let response = decoded_message(
             WireKind::SessionMutateResponse,
             151,
-            &v1::SessionMutateResponse {
+            &v2::SessionMutateResponse {
                 session: Some(valid_session_summary(17)),
             },
         );
@@ -2204,7 +2204,7 @@ mod tests {
             inner: blocked_bridge,
             first_pending: Some(first_pending),
         };
-        let (healthy_bridge, healthy_server_stream) = duplex(64 * 1024);
+        let (healthy_bridge, healthy_server_stream) = duplex(1024 * 1024);
         let transport = Arc::new(TaskPrivateSharedTransport::new(
             server.clone(),
             context.clone(),
@@ -2289,7 +2289,7 @@ mod tests {
                 .expect("unary task joins")
                 .expect("unary RPC succeeds through the real Session wire server");
         assert_eq!(unary_response.kind, WireKind::SessionListResponse);
-        let listed: v1::SessionListResponse = unary_response
+        let listed: v2::SessionListResponse = unary_response
             .decode_message(WireKind::SessionListResponse)
             .expect("decode isolated unary response");
         assert_eq!(listed.sessions.len(), 1);
@@ -2380,7 +2380,7 @@ mod tests {
             let frame = client.next_before(deadline).await;
             match frame.kind {
                 WireKind::TerminalTransportStateEvent => {
-                    let state: v1::TerminalTransportStateEvent = frame
+                    let state: v2::TerminalTransportStateEvent = frame
                         .decode_message(WireKind::TerminalTransportStateEvent)
                         .expect("decode local bridge transport state");
                     let attachment_id: AttachmentId = state
@@ -2389,20 +2389,20 @@ mod tests {
                         .try_into()
                         .expect("local bridge transport attachment ID is valid");
                     assert_eq!(attachment_id, client.attachment_id);
-                    let state = v1::TerminalTransportState::try_from(state.state)
+                    let state = v2::TerminalTransportState::try_from(state.state)
                         .expect("known local transport state");
                     match state {
-                        v1::TerminalTransportState::Preparing => saw_preparing = true,
-                        v1::TerminalTransportState::Synchronizing => {
+                        v2::TerminalTransportState::Preparing => saw_preparing = true,
+                        v2::TerminalTransportState::Synchronizing => {
                             assert!(saw_preparing);
                             saw_synchronizing = true;
                         }
                         _ => panic!("initial bridge state advanced out of order"),
                     }
                 }
-                WireKind::TerminalSnapshot => {
-                    let snapshot: v1::TerminalSnapshot = frame
-                        .decode_message(WireKind::TerminalSnapshot)
+                WireKind::TerminalSemanticSnapshot => {
+                    let snapshot: v2::TerminalSemanticSnapshot = frame
+                        .decode_message(WireKind::TerminalSemanticSnapshot)
                         .expect("decode authoritative local bridge snapshot");
                     assert!(saw_preparing && saw_synchronizing);
                     let session_id: SessionId = snapshot
@@ -2422,7 +2422,7 @@ mod tests {
                     client
                         .send_before(
                             WireKind::TerminalSnapshotApplied,
-                            &v1::TerminalSnapshotApplied {
+                            &v2::TerminalSnapshotApplied {
                                 attachment_id: Some(local_attachment_id.into()),
                                 revision: revision.get(),
                             },
@@ -2437,7 +2437,7 @@ mod tests {
 
         let frame = client.next_before(deadline).await;
         assert_eq!(frame.kind, WireKind::TerminalTransportStateEvent);
-        let state: v1::TerminalTransportStateEvent = frame
+        let state: v2::TerminalTransportStateEvent = frame
             .decode_message(WireKind::TerminalTransportStateEvent)
             .expect("decode local bridge activation state");
         let attachment_id: AttachmentId = state
@@ -2447,8 +2447,8 @@ mod tests {
             .expect("local bridge activation attachment ID is valid");
         assert_eq!(attachment_id, client.attachment_id);
         assert_eq!(
-            v1::TerminalTransportState::try_from(state.state),
-            Ok(v1::TerminalTransportState::Active)
+            v2::TerminalTransportState::try_from(state.state),
+            Ok(v2::TerminalTransportState::Active)
         );
         snapshot_revision
     }
@@ -2463,13 +2463,13 @@ mod tests {
             WireKind::TerminalAttachRequest,
             request_id,
             5_000,
-            &v1::TerminalAttachRequest {
+            &v2::TerminalAttachRequest {
                 target: Some(wire_target(target)),
                 session_id: Some(session_id.into()),
                 takeover: false,
                 session_name: String::new(),
                 create_main: false,
-                viewport: Some(v1::TerminalViewport {
+                viewport: Some(v2::TerminalViewport {
                     rows: 24,
                     columns: 80,
                 }),
@@ -2497,9 +2497,9 @@ mod tests {
         DeviceId::from_array([byte; DeviceId::LENGTH])
     }
 
-    fn wire_target(target: DeviceId) -> v1::TargetSelector {
-        v1::TargetSelector {
-            target: Some(v1::target_selector::Target::Device(target.into())),
+    fn wire_target(target: DeviceId) -> v2::TargetSelector {
+        v2::TargetSelector {
+            target: Some(v2::target_selector::Target::Device(target.into())),
         }
     }
 
@@ -2508,7 +2508,7 @@ mod tests {
             WireKind::SessionListRequest,
             request_id,
             1_000,
-            &v1::SessionListRequest {
+            &v2::SessionListRequest {
                 target: Some(wire_target(target)),
             },
         )
@@ -2520,7 +2520,7 @@ mod tests {
             WireKind::SessionOperationLeaseRequest,
             request_id,
             1_000,
-            &v1::SessionOperationLeaseRequest {
+            &v2::SessionOperationLeaseRequest {
                 target: Some(wire_target(target)),
             },
         )
@@ -2532,7 +2532,7 @@ mod tests {
             WireKind::SessionCreateRequest,
             request_id,
             1_000,
-            &v1::SessionCreateRequest {
+            &v2::SessionCreateRequest {
                 operation_id: Some(
                     OperationId {
                         lease: OperationLease {
@@ -2562,7 +2562,7 @@ mod tests {
             WireKind::SessionCreateRequest,
             request_id,
             5_000,
-            &v1::SessionCreateRequest {
+            &v2::SessionCreateRequest {
                 operation_id: Some(operation_id.into()),
                 target: Some(wire_target(target)),
                 name: name.to_owned(),
@@ -2584,7 +2584,7 @@ mod tests {
             WireKind::SessionRenameRequest,
             request_id,
             5_000,
-            &v1::SessionRenameRequest {
+            &v2::SessionRenameRequest {
                 operation_id: Some(operation_id.into()),
                 target: Some(wire_target(target)),
                 session_id: Some(session_id.into()),
@@ -2604,7 +2604,7 @@ mod tests {
             WireKind::SessionCloseRequest,
             request_id,
             5_000,
-            &v1::SessionCloseRequest {
+            &v2::SessionCloseRequest {
                 operation_id: Some(operation_id.into()),
                 target: Some(wire_target(target)),
                 session_id: Some(session_id.into()),
@@ -2614,7 +2614,7 @@ mod tests {
     }
 
     fn mutation_summary(frame: &DecodedFrame) -> SessionSummary {
-        let response: v1::SessionMutateResponse = frame
+        let response: v2::SessionMutateResponse = frame
             .decode_message(WireKind::SessionMutateResponse)
             .expect("decode mutation response");
         session_summary_from_wire(
@@ -2630,19 +2630,19 @@ mod tests {
         let operation_id = match frame.kind {
             WireKind::SessionCreateRequest => {
                 frame
-                    .decode_message::<v1::SessionCreateRequest>(WireKind::SessionCreateRequest)
+                    .decode_message::<v2::SessionCreateRequest>(WireKind::SessionCreateRequest)
                     .expect("decode recorded create")
                     .operation_id
             }
             WireKind::SessionRenameRequest => {
                 frame
-                    .decode_message::<v1::SessionRenameRequest>(WireKind::SessionRenameRequest)
+                    .decode_message::<v2::SessionRenameRequest>(WireKind::SessionRenameRequest)
                     .expect("decode recorded rename")
                     .operation_id
             }
             WireKind::SessionCloseRequest => {
                 frame
-                    .decode_message::<v1::SessionCloseRequest>(WireKind::SessionCloseRequest)
+                    .decode_message::<v2::SessionCloseRequest>(WireKind::SessionCloseRequest)
                     .expect("decode recorded close")
                     .operation_id
             }
@@ -2762,16 +2762,16 @@ mod tests {
         )
     }
 
-    fn valid_session_summary(byte: u8) -> v1::SessionSummary {
-        v1::SessionSummary {
-            session_id: Some(v1::SessionId {
+    fn valid_session_summary(byte: u8) -> v2::SessionSummary {
+        v2::SessionSummary {
+            session_id: Some(v2::SessionId {
                 value: vec![byte; 16],
             }),
             name: "build".to_owned(),
             revision: 4,
             has_controller: false,
             working_directory: "/tmp".to_owned(),
-            viewport: Some(v1::TerminalViewport {
+            viewport: Some(v2::TerminalViewport {
                 rows: 24,
                 columns: 80,
             }),

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use iroh::SecretKey;
 use zterm_core::{DeviceId, DomainErrorKind, TransportLimits};
 use zterm_daemon::connection_broker::StreamPurpose;
-use zterm_proto::{FrameDecoder, WireKind, encode_message, v1};
+use zterm_proto::{FrameDecoder, WireKind, encode_message, v2};
 
 #[path = "support/network_fixture.rs"]
 mod network_fixture;
@@ -54,7 +54,7 @@ async fn concurrent_demands_and_streams_share_one_primary_dial() {
                 WireKind::SessionListRequest,
                 request_id,
                 0,
-                &v1::SessionListRequest { target: None },
+                &v2::SessionListRequest { target: None },
             )
             .map_err(|error| error.to_string())?;
             stream
@@ -73,7 +73,7 @@ async fn concurrent_demands_and_streams_share_one_primary_dial() {
             if frame.kind != WireKind::ServiceErrorResponse || frame.request_id != request_id {
                 return Err("unexpected service response".to_owned());
             }
-            let error: v1::ServiceError = frame
+            let error: v2::ServiceError = frame
                 .decode_message(WireKind::ServiceErrorResponse)
                 .map_err(|error| error.to_string())?;
             if error.code != DomainErrorKind::ServiceNotImplemented.code() {

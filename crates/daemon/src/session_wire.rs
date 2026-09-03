@@ -22,8 +22,8 @@ use tokio::sync::{mpsc, oneshot};
 use zeroize::Zeroizing;
 #[cfg(unix)]
 use zterm_core::terminal::{
-    MAX_HISTORY_PAGE_ROWS, TerminalHistoryCursor, TerminalHistoryDirection,
-    TerminalHistoryWindowAnchor, TerminalHistoryWindowQuery, TerminalScrollAction, TerminalSize,
+    TerminalHistoryWindowAnchor, TerminalHistoryWindowQuery, TerminalSize, TerminalSurfaceDelta,
+    TerminalSurfaceSnapshot,
 };
 #[cfg(unix)]
 use zterm_core::{
@@ -31,7 +31,7 @@ use zterm_core::{
     ResourceLimits, ResumeViewId, Revision, SessionId, SessionName, SessionSelector,
 };
 #[cfg(unix)]
-use zterm_proto::{DecodedFrame, FrameDecoder, WireKind, encode_message, v1};
+use zterm_proto::{DecodedFrame, FrameDecoder, WireKind, encode_message, v2};
 
 #[cfg(unix)]
 use crate::authorization::AuthorizationRegistry;
@@ -207,7 +207,7 @@ impl SessionRequestContext {
         !matches!(self, Self::LocalSameUid { .. })
     }
 
-    fn require_target(&self, target: Option<v1::TargetSelector>) -> Result<(), DaemonError> {
+    fn require_target(&self, target: Option<v2::TargetSelector>) -> Result<(), DaemonError> {
         self.require_target_with_local_detail(
             target,
             "local session request requires target.local=true",
@@ -216,7 +216,7 @@ impl SessionRequestContext {
 
     fn require_terminal_target(
         &self,
-        target: Option<v1::TargetSelector>,
+        target: Option<v2::TargetSelector>,
     ) -> Result<(), DaemonError> {
         self.require_target_with_local_detail(
             target,
@@ -226,15 +226,15 @@ impl SessionRequestContext {
 
     fn require_target_with_local_detail(
         &self,
-        target: Option<v1::TargetSelector>,
+        target: Option<v2::TargetSelector>,
         local_detail: &'static str,
     ) -> Result<(), DaemonError> {
         match (self, target.and_then(|target| target.target)) {
-            (Self::LocalSameUid { .. }, Some(v1::target_selector::Target::Local(true))) => Ok(()),
+            (Self::LocalSameUid { .. }, Some(v2::target_selector::Target::Local(true))) => Ok(()),
             (Self::LocalSameUid { .. }, _) => Err(malformed(local_detail)),
             (
                 Self::RemoteAuthenticated { own_device_id, .. },
-                Some(v1::target_selector::Target::Device(device)),
+                Some(v2::target_selector::Target::Device(device)),
             ) => {
                 let target: DeviceId = device.try_into().map_err(protocol_error)?;
                 if target == *own_device_id {
@@ -630,9 +630,7 @@ impl SessionWireServer {
         };
         let attachment = prepared.attachment;
         let initial = if let Some(delta) = prepared.initial_delta {
-            let message = zterm_proto::terminal_delta_message(attachment.attachment_id(), delta);
-            encode_message(WireKind::TerminalDelta, first.frame.request_id, 0, &message)
-                .map_err(protocol_error)?
+            encode_delta(first.frame.request_id, attachment.attachment_id(), delta)?
         } else {
             encode_snapshot(
                 first.frame.request_id,
@@ -743,7 +741,7 @@ impl SessionWireServer {
         frame: &DecodedFrame,
         deadline: Instant,
     ) -> Result<PreparedAttachment, DaemonError> {
-        let request: v1::TerminalAttachRequest = frame
+        let request: v2::TerminalAttachRequest = frame
             .decode_message(WireKind::TerminalAttachRequest)
             .map_err(protocol_error)?;
         context.require_terminal_target(request.target.clone())?;
@@ -792,7 +790,7 @@ impl SessionWireServer {
         let result: Result<ServiceReply, DaemonError> = async {
             match frame.kind {
                 WireKind::SessionListRequest => {
-                    let request: v1::SessionListRequest = decode_request(frame)?;
+                    let request: v2::SessionListRequest = decode_request(frame)?;
                     context.require_target(request.target)?;
                     let sessions = context
                         .run_effect(&self.sessions, deadline, |sessions, _principal| {
@@ -805,12 +803,12 @@ impl SessionWireServer {
                     ServiceReply::message(
                         WireKind::SessionListResponse,
                         request_id,
-                        &v1::SessionListResponse { sessions },
+                        &v2::SessionListResponse { sessions },
                         false,
                     )
                 }
                 WireKind::SessionOperationLeaseRequest => {
-                    let request: v1::SessionOperationLeaseRequest = decode_request(frame)?;
+                    let request: v2::SessionOperationLeaseRequest = decode_request(frame)?;
                     context.require_target(request.target)?;
                     let lease = context
                         .run_effect(&self.sessions, deadline, |sessions, principal| {
@@ -820,14 +818,14 @@ impl SessionWireServer {
                     ServiceReply::message(
                         WireKind::SessionOperationLeaseResponse,
                         request_id,
-                        &v1::SessionOperationLeaseResponse {
+                        &v2::SessionOperationLeaseResponse {
                             lease: Some(lease.into()),
                         },
                         false,
                     )
                 }
                 WireKind::SessionCreateRequest => {
-                    let request: v1::SessionCreateRequest = decode_request(frame)?;
+                    let request: v2::SessionCreateRequest = decode_request(frame)?;
                     context.require_target(request.target)?;
                     let operation_id = required_operation_id(request.operation_id)?;
                     let name = session_name(&request.name)?;
@@ -853,7 +851,7 @@ impl SessionWireServer {
                     mutate_reply(request_id, summary)
                 }
                 WireKind::SessionRenameRequest => {
-                    let request: v1::SessionRenameRequest = decode_request(frame)?;
+                    let request: v2::SessionRenameRequest = decode_request(frame)?;
                     context.require_target(request.target)?;
                     let operation_id = required_operation_id(request.operation_id)?;
                     let session_id = required_session_id(request.session_id)?;
@@ -872,7 +870,7 @@ impl SessionWireServer {
                     mutate_reply(request_id, summary)
                 }
                 WireKind::SessionCloseRequest => {
-                    let request: v1::SessionCloseRequest = decode_request(frame)?;
+                    let request: v2::SessionCloseRequest = decode_request(frame)?;
                     context.require_target(request.target)?;
                     let operation_id = required_operation_id(request.operation_id)?;
                     let session_id = required_session_id(request.session_id)?;
@@ -884,7 +882,7 @@ impl SessionWireServer {
                     mutate_reply(request_id, summary)
                 }
                 WireKind::SessionTakeoverRequest => {
-                    let request: v1::SessionTakeoverRequest = decode_request(frame)?;
+                    let request: v2::SessionTakeoverRequest = decode_request(frame)?;
                     context.require_target(request.target)?;
                     let attachment_id = request
                         .attachment_id
@@ -1163,7 +1161,7 @@ async fn process_attachment_frame(
     let deadline = Instant::now() + limits.request_deadline(frame.deadline_ms);
     match frame.kind {
         WireKind::TerminalSnapshotApplied => {
-            let request: v1::TerminalSnapshotApplied = frame
+            let request: v2::TerminalSnapshotApplied = frame
                 .decode_message(WireKind::TerminalSnapshotApplied)
                 .map_err(protocol_error)?;
             require_attachment_id(request.attachment_id, attachment)?;
@@ -1180,7 +1178,7 @@ async fn process_attachment_frame(
             Ok(false)
         }
         WireKind::TerminalSyncRequest => {
-            let request: v1::TerminalSyncRequest = frame
+            let request: v2::TerminalSyncRequest = frame
                 .decode_message(WireKind::TerminalSyncRequest)
                 .map_err(protocol_error)?;
             require_attachment_id(request.attachment_id, attachment)?;
@@ -1194,73 +1192,8 @@ async fn process_attachment_frame(
             send_resync(frame.request_id, attachment, snapshot, outbound, deadline).await?;
             Ok(false)
         }
-        WireKind::TerminalHistoryRequest => {
-            let request: v1::TerminalHistoryRequest = frame
-                .decode_message(WireKind::TerminalHistoryRequest)
-                .map_err(protocol_error)?;
-            require_attachment_id(request.attachment_id, attachment)?;
-            let direction = terminal_history_direction(request.direction)?;
-            let cursor = request.cursor.map(terminal_history_cursor);
-            let maximum_rows = usize::try_from(request.maximum_rows)
-                .map_err(|_| malformed("terminal history page bound is not representable"))?;
-            if maximum_rows == 0 || maximum_rows > MAX_HISTORY_PAGE_ROWS {
-                return Err(malformed(
-                    "terminal history page bound is outside the allowed range",
-                ));
-            }
-            let attachment_worker = Arc::clone(attachment);
-            let result = request_context
-                .run_effect(&server.sessions, deadline, move |_sessions, _principal| {
-                    attachment_worker.history_page_until(direction, cursor, maximum_rows, deadline)
-                })
-                .await?;
-            let message =
-                zterm_proto::terminal_history_page_message(attachment.attachment_id(), result);
-            send_attachment_outbound_until(
-                outbound,
-                AttachmentOutbound::queued(
-                    encode_message(WireKind::TerminalHistoryPage, frame.request_id, 0, &message)
-                        .map_err(protocol_error)?,
-                    deadline,
-                ),
-                deadline,
-            )
-            .await?;
-            Ok(false)
-        }
-        WireKind::TerminalViewportRequest => {
-            let request: v1::TerminalViewportRequest = frame
-                .decode_message(WireKind::TerminalViewportRequest)
-                .map_err(protocol_error)?;
-            require_attachment_id(request.attachment_id, attachment)?;
-            let action = terminal_scroll_action(request.action)?;
-            let attachment_worker = Arc::clone(attachment);
-            let result = request_context
-                .run_effect(&server.sessions, deadline, move |_sessions, _principal| {
-                    attachment_worker.scroll_viewport_until(action, deadline)
-                })
-                .await?;
-            let message =
-                zterm_proto::terminal_viewport_frame_message(attachment.attachment_id(), result);
-            send_attachment_outbound_until(
-                outbound,
-                AttachmentOutbound::queued(
-                    encode_message(
-                        WireKind::TerminalViewportFrame,
-                        frame.request_id,
-                        0,
-                        &message,
-                    )
-                    .map_err(protocol_error)?,
-                    deadline,
-                ),
-                deadline,
-            )
-            .await?;
-            Ok(false)
-        }
         WireKind::TerminalHistoryWindowRequest => {
-            let request: v1::TerminalHistoryWindowRequest = frame
+            let request: v2::TerminalHistoryWindowRequest = frame
                 .decode_message(WireKind::TerminalHistoryWindowRequest)
                 .map_err(protocol_error)?;
             let query = terminal_history_window_query(&request)?;
@@ -1271,29 +1204,27 @@ async fn process_attachment_frame(
                     attachment_worker.history_window_until(query, deadline)
                 })
                 .await?;
-            let message = zterm_proto::terminal_history_window_frame_message(
+            let message = zterm_proto::terminal_surface_history_window_frame_message(
                 attachment.attachment_id(),
                 result,
             );
+            let bytes = encode_message(
+                WireKind::TerminalSemanticHistoryWindowFrame,
+                frame.request_id,
+                0,
+                &message,
+            )
+            .map_err(protocol_error)?;
             send_attachment_outbound_until(
                 outbound,
-                AttachmentOutbound::queued(
-                    encode_message(
-                        WireKind::TerminalHistoryWindowFrame,
-                        frame.request_id,
-                        0,
-                        &message,
-                    )
-                    .map_err(protocol_error)?,
-                    deadline,
-                ),
+                AttachmentOutbound::queued(bytes, deadline),
                 deadline,
             )
             .await?;
             Ok(false)
         }
         WireKind::TerminalInput => {
-            let request: v1::TerminalInput = frame
+            let request: v2::TerminalInput = frame
                 .decode_message(WireKind::TerminalInput)
                 .map_err(protocol_error)?;
             require_attachment_id(request.attachment_id, attachment)?;
@@ -1306,11 +1237,11 @@ async fn process_attachment_frame(
             Ok(false)
         }
         WireKind::TerminalResize => {
-            let request: v1::TerminalResize = frame
+            let request: v2::TerminalResize = frame
                 .decode_message(WireKind::TerminalResize)
                 .map_err(protocol_error)?;
             require_attachment_id(request.attachment_id, attachment)?;
-            let size = v1::TerminalViewport {
+            let size = v2::TerminalViewport {
                 rows: request.rows,
                 columns: request.columns,
             }
@@ -1325,7 +1256,7 @@ async fn process_attachment_frame(
             Ok(false)
         }
         WireKind::TerminalDetach => {
-            let request: v1::TerminalDetach = frame
+            let request: v2::TerminalDetach = frame
                 .decode_message(WireKind::TerminalDetach)
                 .map_err(protocol_error)?;
             require_attachment_id(request.attachment_id, attachment)?;
@@ -1339,7 +1270,7 @@ async fn process_attachment_frame(
             Ok(true)
         }
         WireKind::SessionOperationLeaseRequest => {
-            let request: v1::SessionOperationLeaseRequest = frame
+            let request: v2::SessionOperationLeaseRequest = frame
                 .decode_message(WireKind::SessionOperationLeaseRequest)
                 .map_err(protocol_error)?;
             request_context.require_terminal_target(request.target)?;
@@ -1355,7 +1286,7 @@ async fn process_attachment_frame(
                         WireKind::SessionOperationLeaseResponse,
                         frame.request_id,
                         0,
-                        &v1::SessionOperationLeaseResponse {
+                        &v2::SessionOperationLeaseResponse {
                             lease: Some(lease.into()),
                         },
                     )
@@ -1368,7 +1299,7 @@ async fn process_attachment_frame(
             Ok(false)
         }
         WireKind::SessionTakeoverRequest => {
-            let request: v1::SessionTakeoverRequest = frame
+            let request: v2::SessionTakeoverRequest = frame
                 .decode_message(WireKind::SessionTakeoverRequest)
                 .map_err(protocol_error)?;
             request_context.require_terminal_target(request.target.clone())?;
@@ -1393,7 +1324,7 @@ async fn process_attachment_frame(
                     sessions.takeover_until(principal, operation_id, &attachment_worker, deadline)
                 })
                 .await?;
-            let message = v1::SessionMutateResponse {
+            let message = v2::SessionMutateResponse {
                 session: Some(session_summary_proto(summary)),
             };
             send_attachment_outbound_until(
@@ -1542,7 +1473,7 @@ where
             Ok(false)
         }
         AttachmentLifecycle::LeaseLost { generation } => {
-            let message = v1::TerminalLeaseLost {
+            let message = v2::TerminalLeaseLost {
                 attachment_id: Some(attachment.attachment_id().into()),
                 generation,
             };
@@ -1610,13 +1541,11 @@ where
 {
     let (bytes, operation) = match update {
         AttachmentUpdate::Delta(delta) => {
-            let message = zterm_proto::terminal_delta_message(attachment.attachment_id(), delta);
-            let bytes =
-                encode_message(WireKind::TerminalDelta, 0, 0, &message).map_err(protocol_error)?;
+            let bytes = encode_delta(0, attachment.attachment_id(), delta)?;
             (bytes, "write terminal delta")
         }
         AttachmentUpdate::Snapshot(snapshot) => {
-            let required = v1::TerminalSyncRequired {
+            let required = v2::TerminalSyncRequired {
                 attachment_id: Some(attachment.attachment_id().into()),
                 latest_revision: snapshot.revision.get(),
             };
@@ -1646,11 +1575,11 @@ where
 async fn send_resync(
     request_id: u64,
     attachment: &SessionAttachment,
-    snapshot: zterm_core::terminal::TerminalSnapshot,
+    snapshot: TerminalSurfaceSnapshot,
     outbound: &mpsc::Sender<AttachmentOutbound>,
     deadline: Instant,
 ) -> Result<(), DaemonError> {
-    let required = v1::TerminalSyncRequired {
+    let required = v2::TerminalSyncRequired {
         attachment_id: Some(attachment.attachment_id().into()),
         latest_revision: snapshot.revision.get(),
     };
@@ -1675,15 +1604,27 @@ fn encode_snapshot(
     request_id: u64,
     session_id: SessionId,
     attachment_id: AttachmentId,
-    snapshot: zterm_core::terminal::TerminalSnapshot,
+    snapshot: TerminalSurfaceSnapshot,
 ) -> Result<Vec<u8>, DaemonError> {
-    let message = zterm_proto::terminal_snapshot_message(session_id, attachment_id, snapshot);
-    encode_message(WireKind::TerminalSnapshot, request_id, 0, &message).map_err(protocol_error)
+    let message =
+        zterm_proto::terminal_surface_snapshot_message(session_id, attachment_id, snapshot);
+    encode_message(WireKind::TerminalSemanticSnapshot, request_id, 0, &message)
+        .map_err(protocol_error)
+}
+
+#[cfg(unix)]
+fn encode_delta(
+    request_id: u64,
+    attachment_id: AttachmentId,
+    delta: TerminalSurfaceDelta,
+) -> Result<Vec<u8>, DaemonError> {
+    let message = zterm_proto::terminal_surface_delta_message(attachment_id, delta);
+    encode_message(WireKind::TerminalSemanticDelta, request_id, 0, &message).map_err(protocol_error)
 }
 
 #[cfg(unix)]
 fn terminal_selector(
-    request: &v1::TerminalAttachRequest,
+    request: &v2::TerminalAttachRequest,
 ) -> Result<(Option<SessionSelector>, bool), DaemonError> {
     let has_id = request.session_id.is_some();
     let has_name = !request.session_name.is_empty();
@@ -1713,7 +1654,7 @@ fn terminal_selector(
 #[cfg(unix)]
 fn terminal_resume_request(
     context: &SessionRequestContext,
-    request: &v1::TerminalAttachRequest,
+    request: &v2::TerminalAttachRequest,
 ) -> Result<Option<RemoteResumeRequest>, DaemonError> {
     if !context.is_remote() {
         if request.resume_view_id.is_some() || request.known_revision.is_some() {
@@ -1742,7 +1683,7 @@ fn terminal_resume_request(
 
 #[cfg(unix)]
 fn require_attachment_id(
-    attachment_id: Option<v1::AttachmentId>,
+    attachment_id: Option<v2::AttachmentId>,
     attachment: &SessionAttachment,
 ) -> Result<(), DaemonError> {
     let attachment_id: AttachmentId = attachment_id
@@ -1762,28 +1703,28 @@ fn require_attachment_id(
 fn session_ended_message(
     attachment: &SessionAttachment,
     reason: zterm_core::SessionEndReason,
-) -> v1::TerminalSessionEnded {
+) -> v2::TerminalSessionEnded {
     let (reason, exit_code, signal) = match reason {
         zterm_core::SessionEndReason::NaturalExit { exit_code, signal } => (
-            v1::TerminalSessionEndReason::NaturalExit,
+            v2::TerminalSessionEndReason::NaturalExit,
             exit_code,
             signal.unwrap_or_default(),
         ),
         zterm_core::SessionEndReason::ExplicitClose => (
-            v1::TerminalSessionEndReason::ExplicitClose,
+            v2::TerminalSessionEndReason::ExplicitClose,
             0,
             String::new(),
         ),
         zterm_core::SessionEndReason::DaemonStop => {
-            (v1::TerminalSessionEndReason::DaemonStop, 0, String::new())
+            (v2::TerminalSessionEndReason::DaemonStop, 0, String::new())
         }
         zterm_core::SessionEndReason::DriverFailure => (
-            v1::TerminalSessionEndReason::DriverFailure,
+            v2::TerminalSessionEndReason::DriverFailure,
             0,
             String::new(),
         ),
     };
-    v1::TerminalSessionEnded {
+    v2::TerminalSessionEnded {
         session_id: Some(attachment.session_id().into()),
         attachment_id: Some(attachment.attachment_id().into()),
         reason: reason as i32,
@@ -1810,7 +1751,7 @@ fn mutate_reply(request_id: u64, summary: SessionSummary) -> Result<ServiceReply
     ServiceReply::message(
         WireKind::SessionMutateResponse,
         request_id,
-        &v1::SessionMutateResponse {
+        &v2::SessionMutateResponse {
             session: Some(session_summary_proto(summary)),
         },
         false,
@@ -1818,8 +1759,8 @@ fn mutate_reply(request_id: u64, summary: SessionSummary) -> Result<ServiceReply
 }
 
 #[cfg(unix)]
-fn session_summary_proto(summary: SessionSummary) -> v1::SessionSummary {
-    v1::SessionSummary {
+fn session_summary_proto(summary: SessionSummary) -> v2::SessionSummary {
+    v2::SessionSummary {
         session_id: Some(summary.session_id.into()),
         name: summary.name.to_string(),
         revision: summary.revision.get(),
@@ -1831,7 +1772,7 @@ fn session_summary_proto(summary: SessionSummary) -> v1::SessionSummary {
 
 #[cfg(unix)]
 fn required_operation_id(
-    operation_id: Option<v1::OperationId>,
+    operation_id: Option<v2::OperationId>,
 ) -> Result<OperationId, DaemonError> {
     operation_id
         .ok_or_else(|| malformed("session mutation omitted operation_id"))?
@@ -1840,7 +1781,7 @@ fn required_operation_id(
 }
 
 #[cfg(unix)]
-fn required_session_id(session_id: Option<v1::SessionId>) -> Result<SessionId, DaemonError> {
+fn required_session_id(session_id: Option<v2::SessionId>) -> Result<SessionId, DaemonError> {
     session_id
         .ok_or_else(|| malformed("session mutation omitted session_id"))?
         .try_into()
@@ -1861,47 +1802,8 @@ fn local_request_view_id(request_id: u64) -> AttachmentId {
 }
 
 #[cfg(unix)]
-fn terminal_history_direction(value: i32) -> Result<TerminalHistoryDirection, DaemonError> {
-    match v1::TerminalHistoryDirection::try_from(value) {
-        Ok(v1::TerminalHistoryDirection::Newest) => Ok(TerminalHistoryDirection::Newest),
-        Ok(v1::TerminalHistoryDirection::Older) => Ok(TerminalHistoryDirection::Older),
-        Ok(v1::TerminalHistoryDirection::Newer) => Ok(TerminalHistoryDirection::Newer),
-        Ok(v1::TerminalHistoryDirection::Unspecified) | Err(_) => {
-            Err(malformed("terminal history direction is invalid"))
-        }
-    }
-}
-
-#[cfg(unix)]
-fn terminal_history_cursor(value: v1::TerminalHistoryCursor) -> TerminalHistoryCursor {
-    TerminalHistoryCursor {
-        epoch: Revision::new(value.epoch),
-        revision: Revision::new(value.revision),
-        start_row: value.start_row,
-        row_count: value.row_count,
-        oldest_row: value.oldest_row,
-        newest_row: value.newest_row,
-    }
-}
-
-#[cfg(unix)]
-fn terminal_scroll_action(
-    value: Option<v1::TerminalViewportAction>,
-) -> Result<TerminalScrollAction, DaemonError> {
-    match value.and_then(|value| value.action) {
-        Some(v1::terminal_viewport_action::Action::ScrollByLines(lines)) => {
-            Ok(TerminalScrollAction::ScrollByLines(lines))
-        }
-        Some(v1::terminal_viewport_action::Action::ScrollToOffset(offset)) => {
-            Ok(TerminalScrollAction::ScrollToOffset(offset))
-        }
-        None => Err(malformed("terminal viewport action is missing")),
-    }
-}
-
-#[cfg(unix)]
 fn terminal_history_window_query(
-    request: &v1::TerminalHistoryWindowRequest,
+    request: &v2::TerminalHistoryWindowRequest,
 ) -> Result<TerminalHistoryWindowQuery, DaemonError> {
     let anchor = request
         .anchor
@@ -2237,7 +2139,7 @@ mod tests {
             let frame = decoded_message(
                 WireKind::LocalDeviceRevokeRequest,
                 request_id,
-                &v1::LocalDeviceRevokeRequest {
+                &v2::LocalDeviceRevokeRequest {
                     device_id: Some(device_id.into()),
                 },
             );
@@ -2330,9 +2232,9 @@ mod tests {
         }
     }
 
-    fn remote_target(device_id: DeviceId) -> v1::TargetSelector {
-        v1::TargetSelector {
-            target: Some(v1::target_selector::Target::Device(device_id.into())),
+    fn remote_target(device_id: DeviceId) -> v2::TargetSelector {
+        v2::TargetSelector {
+            target: Some(v2::target_selector::Target::Device(device_id.into())),
         }
     }
 
@@ -2356,7 +2258,7 @@ mod tests {
 
     fn service_error_kind(bytes: &[u8]) -> DomainErrorKind {
         let frame = decode_one(bytes);
-        let error: v1::ServiceError = frame
+        let error: v2::ServiceError = frame
             .decode_message(WireKind::ServiceErrorResponse)
             .expect("typed service error");
         DomainErrorKind::from_code(&error.code).expect("stable domain error code")
@@ -2426,12 +2328,12 @@ mod tests {
     async fn start_remote_attachment(
         server: SessionWireServer,
         context: SessionRequestContext,
-        request: v1::TerminalAttachRequest,
+        request: v2::TerminalAttachRequest,
     ) -> (
         TestRemotePeer,
         tokio::task::JoinHandle<Result<(), DaemonError>>,
     ) {
-        let (peer, service_stream) = tokio::io::duplex(64 * 1024);
+        let (peer, service_stream) = tokio::io::duplex(1024 * 1024);
         let task = tokio::spawn(async move {
             server
                 .handle_remote_stream(
@@ -2453,8 +2355,8 @@ mod tests {
         session_id: SessionId,
         view_id: ResumeViewId,
         known_revision: Option<Revision>,
-    ) -> v1::TerminalAttachRequest {
-        v1::TerminalAttachRequest {
+    ) -> v2::TerminalAttachRequest {
+        v2::TerminalAttachRequest {
             target: Some(remote_target(own)),
             session_id: Some(session_id.into()),
             takeover: false,
@@ -2466,60 +2368,140 @@ mod tests {
         }
     }
 
-    async fn acknowledge_and_barrier(
+    async fn acknowledge_and_observe_semantic_state(
         peer: &mut TestRemotePeer,
-        own: DeviceId,
         attachment_id: AttachmentId,
         revision: Revision,
     ) -> Revision {
         peer.send(
             WireKind::TerminalSnapshotApplied,
             2,
-            &v1::TerminalSnapshotApplied {
+            &v2::TerminalSnapshotApplied {
                 attachment_id: Some(attachment_id.into()),
                 revision: revision.get(),
             },
         )
         .await;
+        let mut latest_revision = revision;
+        let mut pending_resync = None;
+        let mut next_request_id = 3;
+        let mut probe_request_id = next_request_id;
+        next_request_id += 1;
+        send_history_probe(peer, attachment_id, probe_request_id, latest_revision).await;
+        loop {
+            let observed = peer.next().await;
+            match observed.kind {
+                WireKind::TerminalSyncRequired => {
+                    let required: v2::TerminalSyncRequired = observed
+                        .decode_message(WireKind::TerminalSyncRequired)
+                        .expect("decode semantic resynchronization marker");
+                    let required_attachment: AttachmentId = required
+                        .attachment_id
+                        .expect("resynchronization marker carries an attachment ID")
+                        .try_into()
+                        .expect("resynchronization attachment ID is valid");
+                    assert_eq!(required_attachment, attachment_id);
+                    assert!(pending_resync.replace(required.latest_revision).is_none());
+                }
+                WireKind::TerminalSemanticSnapshot => {
+                    let snapshot: v2::TerminalSemanticSnapshot = observed
+                        .decode_message(WireKind::TerminalSemanticSnapshot)
+                        .expect("decode semantic resynchronization snapshot");
+                    let (_, snapshot_attachment, snapshot) =
+                        zterm_proto::terminal_surface_snapshot_from_message(snapshot)
+                            .expect("validate semantic resynchronization snapshot");
+                    assert_eq!(snapshot_attachment, attachment_id);
+                    assert_eq!(
+                        pending_resync.take(),
+                        Some(snapshot.revision.get()),
+                        "a semantic replacement snapshot follows its exact marker"
+                    );
+                    latest_revision = snapshot.revision;
+                    let acknowledgement_request_id = next_request_id;
+                    next_request_id += 1;
+                    peer.send(
+                        WireKind::TerminalSnapshotApplied,
+                        acknowledgement_request_id,
+                        &v2::TerminalSnapshotApplied {
+                            attachment_id: Some(attachment_id.into()),
+                            revision: latest_revision.get(),
+                        },
+                    )
+                    .await;
+                    probe_request_id = next_request_id;
+                    next_request_id += 1;
+                    send_history_probe(peer, attachment_id, probe_request_id, latest_revision)
+                        .await;
+                }
+                WireKind::TerminalSemanticDelta => {
+                    assert_eq!(observed.request_id, 0);
+                    let delta: v2::TerminalSemanticDelta = observed
+                        .decode_message(WireKind::TerminalSemanticDelta)
+                        .expect("decode live delta preceding the activation barrier");
+                    let delta_attachment: AttachmentId = delta
+                        .attachment_id
+                        .expect("live activation delta carries an attachment ID")
+                        .try_into()
+                        .expect("live activation delta attachment ID is valid");
+                    assert_eq!(delta_attachment, attachment_id);
+                    assert_eq!(delta.from_revision, latest_revision.get());
+                    assert!(delta.to_revision > delta.from_revision);
+                    latest_revision = Revision::new(delta.to_revision);
+                }
+                WireKind::TerminalSemanticHistoryWindowFrame => {
+                    if observed.request_id == probe_request_id {
+                        let frame: v2::TerminalSemanticHistoryWindowFrame = observed
+                            .decode_message(WireKind::TerminalSemanticHistoryWindowFrame)
+                            .expect("decode semantic active-state observation");
+                        let frame_attachment: AttachmentId = frame
+                            .attachment_id
+                            .expect("semantic observation carries an attachment ID")
+                            .try_into()
+                            .expect("semantic observation attachment ID is valid");
+                        assert_eq!(frame_attachment, attachment_id);
+                        assert!(pending_resync.is_none());
+                        return latest_revision;
+                    }
+                }
+                WireKind::ServiceErrorResponse => {
+                    let request_id = observed.request_id;
+                    let error: v2::ServiceError = observed
+                        .decode_message(WireKind::ServiceErrorResponse)
+                        .expect("decode semantic observation error");
+                    let kind = DomainErrorKind::from_code(&error.code)
+                        .expect("stable semantic observation error");
+                    assert_eq!(kind, DomainErrorKind::NotSynchronized);
+                    assert!(request_id <= probe_request_id);
+                }
+                kind => panic!("unexpected semantic activation frame: {kind:?}"),
+            }
+        }
+    }
+
+    async fn send_history_probe(
+        peer: &mut TestRemotePeer,
+        attachment_id: AttachmentId,
+        request_id: u64,
+        revision: Revision,
+    ) {
         peer.send(
-            WireKind::SessionOperationLeaseRequest,
-            3,
-            &v1::SessionOperationLeaseRequest {
-                target: Some(remote_target(own)),
+            WireKind::TerminalHistoryWindowRequest,
+            request_id,
+            &v2::TerminalHistoryWindowRequest {
+                attachment_id: Some(attachment_id.into()),
+                anchor: Some(v2::TerminalHistoryWindowAnchor {
+                    epoch: 0,
+                    revision: revision.get(),
+                    max_offset_from_bottom: 0,
+                    viewport_rows: 24,
+                    viewport_columns: 80,
+                }),
+                target_offset_from_bottom: 0,
+                older_margin_rows: 0,
+                newer_margin_rows: 0,
             },
         )
         .await;
-        let mut latest_revision = revision;
-        loop {
-            let barrier = peer.next().await;
-            if barrier.kind == WireKind::TerminalDelta {
-                assert_eq!(barrier.request_id, 0);
-                let delta: v1::TerminalDelta = barrier
-                    .decode_message(WireKind::TerminalDelta)
-                    .expect("decode live delta preceding the activation barrier");
-                let delta_attachment: AttachmentId = delta
-                    .attachment_id
-                    .expect("live activation delta carries an attachment ID")
-                    .try_into()
-                    .expect("live activation delta attachment ID is valid");
-                assert_eq!(delta_attachment, attachment_id);
-                assert_eq!(delta.from_revision, latest_revision.get());
-                assert!(delta.to_revision >= delta.from_revision);
-                latest_revision = Revision::new(delta.to_revision);
-                continue;
-            }
-            assert_eq!(barrier.kind, WireKind::SessionOperationLeaseResponse);
-            assert_eq!(barrier.request_id, 3);
-            let barrier: v1::SessionOperationLeaseResponse = barrier
-                .decode_message(WireKind::SessionOperationLeaseResponse)
-                .expect("decode remote activation barrier");
-            let _: OperationLease = barrier
-                .lease
-                .expect("activation barrier returns a daemon-issued lease")
-                .try_into()
-                .expect("valid activation-barrier lease");
-            return latest_revision;
-        }
     }
 
     fn unix_wire_service(own: DeviceId, working_directory: PathBuf) -> SessionService {
@@ -2542,21 +2524,29 @@ mod tests {
         })
     }
 
-    fn unix_script_wire_service(
+    fn unix_delayed_output_wire_service(
         own: DeviceId,
         working_directory: PathBuf,
-        script: &'static str,
+        output_marker: PathBuf,
     ) -> SessionService {
-        let shell = [Path::new("/bin/sh"), Path::new("/usr/bin/sh")]
+        let shell = Path::new("/bin/sh").to_path_buf();
+        let cat = [Path::new("/bin/cat"), Path::new("/usr/bin/cat")]
             .into_iter()
             .find(|path| path.is_file())
-            .expect("POSIX shell fixture")
+            .expect("POSIX cat fixture")
             .to_path_buf();
         SessionService::with_spawner(own, ResourceLimits::default(), move |size, requested| {
             let cwd = requested.unwrap_or(&working_directory).to_path_buf();
             let session = PtyHost::new()
                 .spawn(
-                    ExplicitPtyCommand::new(&shell, &cwd).arg("-c").arg(script),
+                    ExplicitPtyCommand::new(&shell, &cwd)
+                        .arg("-c")
+                        .arg(
+                            "while [ ! -f \"$1\" ]; do sleep 0.01; done; printf 'resume-delta\\r\\n'; exec \"$2\"",
+                        )
+                        .arg("zterm-checkpoint-fixture")
+                        .arg(&output_marker)
+                        .arg(&cat),
                     PtySize::new(size.rows, size.columns),
                 )
                 .map_err(|error| {
@@ -2575,48 +2565,6 @@ mod tests {
             replacement.is_none(),
             "exact matrix snapshot acknowledgement cannot require replacement",
         );
-    }
-
-    async fn wait_for_attachment_text(prepared: &PreparedAttachment, expected: &[u8]) {
-        let contains = |snapshot: &zterm_core::terminal::TerminalSnapshot| {
-            snapshot
-                .recent_history_ansi
-                .windows(expected.len())
-                .chain(snapshot.screen_ansi.windows(expected.len()))
-                .any(|bytes| bytes == expected)
-        };
-        if contains(&prepared.snapshot) {
-            return;
-        }
-
-        let mut revisions = prepared
-            .attachment
-            .revision_watch()
-            .expect("history fixture revision watermark");
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                revisions
-                    .changed()
-                    .await
-                    .expect("history fixture driver remains live");
-                let snapshot = prepared
-                    .attachment
-                    .sync_latest(prepared.snapshot.revision)
-                    .expect("history fixture latest snapshot");
-                if contains(&snapshot) {
-                    assert!(
-                        prepared
-                            .attachment
-                            .snapshot_applied(snapshot.revision)
-                            .expect("acknowledge history fixture snapshot")
-                            .is_none()
-                    );
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("history fixture output deadline");
     }
 
     fn session_summary(sessions: &SessionService, session_id: SessionId) -> SessionSummary {
@@ -2638,7 +2586,7 @@ mod tests {
             WireKind::SessionOperationLeaseRequest,
             request_id,
             0,
-            &v1::SessionOperationLeaseRequest {
+            &v2::SessionOperationLeaseRequest {
                 target: Some(remote_target(own)),
             },
         )
@@ -2648,7 +2596,7 @@ mod tests {
         let frame = decode_one(&response);
         assert_eq!(frame.request_id, request_id);
         assert_eq!(frame.kind, WireKind::SessionOperationLeaseResponse);
-        let response: v1::SessionOperationLeaseResponse = frame
+        let response: v2::SessionOperationLeaseResponse = frame
             .decode_message(WireKind::SessionOperationLeaseResponse)
             .expect("decode matrix operation lease");
         response
@@ -2663,7 +2611,7 @@ mod tests {
         context: SessionRequestContext,
         request: Vec<u8>,
     ) -> (Result<(), DaemonError>, Vec<u8>) {
-        let (mut client, service_stream) = tokio::io::duplex(64 * 1024);
+        let (mut client, service_stream) = tokio::io::duplex(1024 * 1024);
         let deadline = Instant::now() + Duration::from_secs(1);
         let task = tokio::spawn(async move {
             server
@@ -2698,14 +2646,14 @@ mod tests {
             WireKind::SessionListRequest,
             41,
             0,
-            &v1::SessionListRequest { target: None },
+            &v2::SessionListRequest { target: None },
         )
         .expect("encode first frame");
         let trailing = encode_message(
             WireKind::SessionListRequest,
             42,
             0,
-            &v1::SessionListRequest { target: None },
+            &v2::SessionListRequest { target: None },
         )
         .expect("encode trailing frame");
         let (mut client, mut server) = tokio::io::duplex(4 * 1024);
@@ -2834,7 +2782,7 @@ mod tests {
         assert!(!error.detail().to_ascii_lowercase().contains("local"));
 
         let frame = decode_one(&response);
-        let response: v1::ServiceError = frame
+        let response: v2::ServiceError = frame
             .decode_message(WireKind::ServiceErrorResponse)
             .expect("typed service error");
         assert!(!response.message.to_ascii_lowercase().contains("local"));
@@ -2852,7 +2800,7 @@ mod tests {
             WireKind::SessionListRequest,
             71,
             0,
-            &v1::SessionListRequest {
+            &v2::SessionListRequest {
                 target: Some(remote_target(own)),
             },
         )
@@ -2866,7 +2814,7 @@ mod tests {
         result.expect("current generation list succeeds");
         let frame = decode_one(&response);
         assert_eq!(frame.kind, WireKind::SessionListResponse);
-        let response: v1::SessionListResponse = frame
+        let response: v2::SessionListResponse = frame
             .decode_message(WireKind::SessionListResponse)
             .expect("decode list response");
         assert!(response.sessions.is_empty());
@@ -2875,7 +2823,7 @@ mod tests {
             WireKind::SessionListRequest,
             72,
             0,
-            &v1::SessionListRequest {
+            &v2::SessionListRequest {
                 target: Some(remote_target(device(0x33))),
             },
         )
@@ -2893,9 +2841,9 @@ mod tests {
             WireKind::SessionListRequest,
             73,
             0,
-            &v1::SessionListRequest {
-                target: Some(v1::TargetSelector {
-                    target: Some(v1::target_selector::Target::Local(true)),
+            &v2::SessionListRequest {
+                target: Some(v2::TargetSelector {
+                    target: Some(v2::target_selector::Target::Local(true)),
                 }),
             },
         )
@@ -2908,146 +2856,6 @@ mod tests {
         .await;
         result.expect("typed local-target rejection is a complete unary response");
         assert_eq!(service_error_kind(&response), DomainErrorKind::Unauthorized);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn same_uid_history_and_authenticated_remote_viewport_route_to_one_session_owner() {
-        let temporary = tempfile::tempdir().expect("temporary history routing fixture");
-        let own = device(0x19);
-        let remote = device(0x1a);
-        let accepted = generation(4);
-        let sessions = unix_script_wire_service(
-            own,
-            temporary.path().to_path_buf(),
-            "i=0; while [ \"$i\" -lt 12 ]; do printf 'history-%02d\\r\\n' \"$i\"; i=$((i + 1)); done; printf 'history-ready'; exec /bin/cat",
-        );
-        let local = sessions.local_principal(AttachmentId::from_array([0x1b; 16]));
-        let lease = sessions
-            .issue_operation_lease(local)
-            .expect("history fixture create lease");
-        let summary = sessions
-            .create(
-                local,
-                OperationId { lease, sequence: 1 },
-                SessionName::new("history-routing").expect("history fixture Session name"),
-                None,
-                Some(TerminalSize::new(3, 24)),
-            )
-            .expect("history fixture Session creates");
-        let local_attachment = sessions
-            .prepare_attach(
-                local,
-                Some(SessionSelector::Id(summary.session_id)),
-                false,
-                false,
-                None,
-            )
-            .expect("same-UID attachment prepares");
-        activate_attachment(&local_attachment);
-        wait_for_attachment_text(&local_attachment, b"history-ready").await;
-        let local_page = local_attachment
-            .attachment
-            .history_page_until(
-                TerminalHistoryDirection::Newest,
-                None,
-                8,
-                Instant::now() + Duration::from_secs(2),
-            )
-            .expect("same-UID history request reaches the Session owner");
-        let zterm_core::terminal::TerminalHistoryResult::Page(local_page) = local_page else {
-            panic!("stable same-UID history returns a page");
-        };
-        assert!(!local_page.rows.is_empty());
-        drop(local_attachment);
-
-        let authorization = authorized_registry(remote, accepted);
-        let (mut peer, task) = start_remote_attachment(
-            SessionWireServer::new(sessions),
-            remote_context(own, remote, accepted, authorization),
-            remote_attach_request(
-                own,
-                summary.session_id,
-                ResumeViewId::from_array([0x1c; 16]),
-                None,
-            ),
-        )
-        .await;
-        let snapshot = peer.next().await;
-        assert_eq!(snapshot.kind, WireKind::TerminalSnapshot);
-        let snapshot: v1::TerminalSnapshot = snapshot
-            .decode_message(WireKind::TerminalSnapshot)
-            .expect("authenticated remote history snapshot");
-        let attachment_id: AttachmentId = snapshot
-            .attachment_id
-            .expect("authenticated remote attachment ID")
-            .try_into()
-            .expect("fixed-width authenticated remote attachment ID");
-        acknowledge_and_barrier(
-            &mut peer,
-            own,
-            attachment_id,
-            Revision::new(snapshot.revision),
-        )
-        .await;
-
-        peer.send(
-            WireKind::TerminalViewportRequest,
-            6,
-            &v1::TerminalViewportRequest {
-                attachment_id: Some(attachment_id.into()),
-                action: Some(v1::TerminalViewportAction {
-                    action: Some(v1::terminal_viewport_action::Action::ScrollByLines(3)),
-                }),
-            },
-        )
-        .await;
-        let viewport = peer.next().await;
-        assert_eq!(viewport.kind, WireKind::TerminalViewportFrame);
-        assert_eq!(viewport.request_id, 6);
-        let viewport: v1::TerminalViewportFrame = viewport
-            .decode_message(WireKind::TerminalViewportFrame)
-            .expect("authenticated remote viewport frame");
-        assert_eq!(
-            v1::TerminalViewportOutcome::try_from(viewport.outcome)
-                .expect("known viewport outcome"),
-            v1::TerminalViewportOutcome::Frame
-        );
-        let metrics = viewport.metrics.expect("viewport metrics");
-        assert_eq!(metrics.offset_from_bottom, 3);
-        assert_eq!(viewport.rows.len(), 3);
-
-        peer.send(
-            WireKind::TerminalHistoryRequest,
-            7,
-            &v1::TerminalHistoryRequest {
-                attachment_id: Some(attachment_id.into()),
-                direction: v1::TerminalHistoryDirection::Newest as i32,
-                cursor: None,
-                maximum_rows: 8,
-            },
-        )
-        .await;
-        let page = peer.next().await;
-        assert_eq!(page.kind, WireKind::TerminalHistoryPage);
-        assert_eq!(page.request_id, 7);
-        let page: v1::TerminalHistoryPage = page
-            .decode_message(WireKind::TerminalHistoryPage)
-            .expect("authenticated remote history page");
-        assert_eq!(
-            v1::TerminalHistoryOutcome::try_from(page.outcome).expect("known history outcome"),
-            v1::TerminalHistoryOutcome::Ok
-        );
-        assert_eq!(page.rows, local_page.rows);
-
-        peer.stream
-            .shutdown()
-            .await
-            .expect("finish authenticated remote history fixture");
-        tokio::time::timeout(Duration::from_secs(2), task)
-            .await
-            .expect("authenticated remote history server task deadline")
-            .expect("authenticated remote history server task")
-            .expect("authenticated remote history transport EOF is normal");
     }
 
     #[tokio::test]
@@ -3068,7 +2876,7 @@ mod tests {
                     WireKind::SessionListRequest,
                     81,
                     0,
-                    &v1::SessionListRequest {
+                    &v2::SessionListRequest {
                         target: Some(remote_target(own)),
                     },
                 )
@@ -3080,7 +2888,7 @@ mod tests {
                     WireKind::SessionOperationLeaseRequest,
                     82,
                     0,
-                    &v1::SessionOperationLeaseRequest {
+                    &v2::SessionOperationLeaseRequest {
                         target: Some(remote_target(own)),
                     },
                 )
@@ -3101,7 +2909,7 @@ mod tests {
             WireKind::TerminalAttachRequest,
             83,
             0,
-            &v1::TerminalAttachRequest {
+            &v2::TerminalAttachRequest {
                 target: Some(remote_target(own)),
                 session_id: None,
                 takeover: false,
@@ -3136,7 +2944,7 @@ mod tests {
                 WireKind::SessionOperationLeaseRequest,
                 91,
                 0,
-                &v1::SessionOperationLeaseRequest {
+                &v2::SessionOperationLeaseRequest {
                     target: Some(remote_target(own)),
                 },
             )
@@ -3150,7 +2958,7 @@ mod tests {
         )
         .await;
         let frame = decode_one(&response);
-        let lease: v1::SessionOperationLeaseResponse = frame
+        let lease: v2::SessionOperationLeaseResponse = frame
             .decode_message(WireKind::SessionOperationLeaseResponse)
             .expect("decode operation lease");
         assert!(lease.lease.is_some());
@@ -3349,7 +3157,7 @@ mod tests {
                     &decoded_message(
                         WireKind::SessionListRequest,
                         405,
-                        &v1::SessionListRequest {
+                        &v2::SessionListRequest {
                             target: Some(remote_target(own)),
                         },
                     ),
@@ -3398,7 +3206,7 @@ mod tests {
                 decoded_message(
                     WireKind::TerminalInput,
                     407,
-                    &v1::TerminalInput {
+                    &v2::TerminalInput {
                         operation_id: Some(
                             OperationId {
                                 lease: remote_lease,
@@ -3431,7 +3239,7 @@ mod tests {
                 decoded_message(
                     WireKind::TerminalResize,
                     408,
-                    &v1::TerminalResize {
+                    &v2::TerminalResize {
                         operation_id: Some(
                             OperationId {
                                 lease: remote_lease,
@@ -3465,7 +3273,7 @@ mod tests {
                 decoded_message(
                     WireKind::SessionTakeoverRequest,
                     409,
-                    &v1::SessionTakeoverRequest {
+                    &v2::SessionTakeoverRequest {
                         operation_id: Some(
                             OperationId {
                                 lease: remote_lease,
@@ -3569,7 +3377,7 @@ mod tests {
             .expect("matrix revoke completes after close releases")
             .expect("matrix revoke task does not panic");
         assert_eq!(revoke_frame.kind, WireKind::LocalDeviceRevokeResponse);
-        let revoke_response: v1::LocalDeviceRevokeResponse = revoke_frame
+        let revoke_response: v2::LocalDeviceRevokeResponse = revoke_frame
             .decode_message(WireKind::LocalDeviceRevokeResponse)
             .expect("decode matrix revoke response");
         let revoked_device: DeviceSummary = revoke_response
@@ -3708,7 +3516,12 @@ mod tests {
         let remote = device(0x44);
         let accepted = generation(5);
         let authorization = authorized_registry(remote, accepted);
-        let sessions = unix_wire_service(own, temporary.path().to_path_buf());
+        let output_marker = temporary.path().join("emit-resume-delta");
+        let sessions = unix_delayed_output_wire_service(
+            own,
+            temporary.path().to_path_buf(),
+            output_marker.clone(),
+        );
         let local = sessions.local_principal(AttachmentId::from_array([0x45; 16]));
         let lease = sessions
             .issue_operation_lease(local)
@@ -3733,9 +3546,9 @@ mod tests {
         )
         .await;
         let first_snapshot = first.next().await;
-        assert_eq!(first_snapshot.kind, WireKind::TerminalSnapshot);
-        let first_snapshot: v1::TerminalSnapshot = first_snapshot
-            .decode_message(WireKind::TerminalSnapshot)
+        assert_eq!(first_snapshot.kind, WireKind::TerminalSemanticSnapshot);
+        let first_snapshot: v2::TerminalSemanticSnapshot = first_snapshot
+            .decode_message(WireKind::TerminalSemanticSnapshot)
             .expect("initial remote snapshot");
         let first_attachment: AttachmentId = first_snapshot
             .attachment_id
@@ -3743,9 +3556,8 @@ mod tests {
             .expect("initial attachment ID")
             .try_into()
             .expect("fixed-width initial attachment ID");
-        let baseline = acknowledge_and_barrier(
+        let baseline = acknowledge_and_observe_semantic_state(
             &mut first,
-            own,
             first_attachment,
             Revision::new(first_snapshot.revision),
         )
@@ -3760,6 +3572,23 @@ mod tests {
             .expect("transport EOF server task completes")
             .expect("transport EOF server task")
             .expect("transport EOF is a normal attachment end");
+        std::fs::write(&output_marker, b"emit").expect("release delayed PTY output");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let advanced = sessions
+                    .list()
+                    .expect("observe delayed PTY revision")
+                    .into_iter()
+                    .find(|candidate| candidate.session_id == summary.session_id)
+                    .is_some_and(|candidate| candidate.revision > baseline);
+                if advanced {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("delayed PTY output advances the saved checkpoint");
 
         let (mut resumed, resumed_task) = start_remote_attachment(
             server.clone(),
@@ -3770,11 +3599,11 @@ mod tests {
         let resumed_delta = resumed.next().await;
         assert_eq!(
             resumed_delta.kind,
-            WireKind::TerminalDelta,
+            WireKind::TerminalSemanticDelta,
             "authenticated transport EOF moves the one exact checkpoint"
         );
-        let resumed_delta: v1::TerminalDelta = resumed_delta
-            .decode_message(WireKind::TerminalDelta)
+        let resumed_delta: v2::TerminalSemanticDelta = resumed_delta
+            .decode_message(WireKind::TerminalSemanticDelta)
             .expect("exact resumed delta");
         let resumed_attachment: AttachmentId = resumed_delta
             .attachment_id
@@ -3784,9 +3613,8 @@ mod tests {
             .expect("fixed-width resumed attachment ID");
         assert_ne!(resumed_attachment, first_attachment);
         assert_eq!(resumed_delta.from_revision, baseline.get());
-        let resumed_revision = acknowledge_and_barrier(
+        let resumed_revision = acknowledge_and_observe_semantic_state(
             &mut resumed,
-            own,
             resumed_attachment,
             Revision::new(resumed_delta.to_revision),
         )
@@ -3795,7 +3623,7 @@ mod tests {
             .send(
                 WireKind::TerminalInput,
                 4,
-                &v1::TerminalInput {
+                &v2::TerminalInput {
                     operation_id: None,
                     attachment_id: Some(AttachmentId::from_array([0xff; 16]).into()),
                     bytes: b"must-not-reach-pty".to_vec(),
@@ -3805,7 +3633,7 @@ mod tests {
         let protocol_error = resumed.next().await;
         assert_eq!(protocol_error.kind, WireKind::ServiceErrorResponse);
         assert_eq!(protocol_error.request_id, 4);
-        let protocol_error: v1::ServiceError = protocol_error
+        let protocol_error: v2::ServiceError = protocol_error
             .decode_message(WireKind::ServiceErrorResponse)
             .expect("typed protocol failure");
         assert_eq!(
@@ -3828,11 +3656,11 @@ mod tests {
         let after_protocol_snapshot = after_protocol.next().await;
         assert_eq!(
             after_protocol_snapshot.kind,
-            WireKind::TerminalSnapshot,
+            WireKind::TerminalSemanticSnapshot,
             "protocol failure discards rather than saves the live checkpoint"
         );
-        let after_protocol_snapshot: v1::TerminalSnapshot = after_protocol_snapshot
-            .decode_message(WireKind::TerminalSnapshot)
+        let after_protocol_snapshot: v2::TerminalSemanticSnapshot = after_protocol_snapshot
+            .decode_message(WireKind::TerminalSemanticSnapshot)
             .expect("authoritative snapshot after protocol failure");
         let after_protocol_attachment: AttachmentId = after_protocol_snapshot
             .attachment_id
@@ -3840,9 +3668,8 @@ mod tests {
             .expect("post-protocol attachment ID")
             .try_into()
             .expect("fixed-width post-protocol attachment ID");
-        let after_protocol_revision = acknowledge_and_barrier(
+        let after_protocol_revision = acknowledge_and_observe_semantic_state(
             &mut after_protocol,
-            own,
             after_protocol_attachment,
             Revision::new(after_protocol_snapshot.revision),
         )
@@ -3851,7 +3678,7 @@ mod tests {
             .send(
                 WireKind::TerminalDetach,
                 4,
-                &v1::TerminalDetach {
+                &v2::TerminalDetach {
                     attachment_id: Some(after_protocol_attachment.into()),
                 },
             )
@@ -3876,11 +3703,11 @@ mod tests {
         let after_explicit_snapshot = after_explicit.next().await;
         assert_eq!(
             after_explicit_snapshot.kind,
-            WireKind::TerminalSnapshot,
+            WireKind::TerminalSemanticSnapshot,
             "explicit detach never creates a resume cell"
         );
-        let after_explicit_snapshot: v1::TerminalSnapshot = after_explicit_snapshot
-            .decode_message(WireKind::TerminalSnapshot)
+        let after_explicit_snapshot: v2::TerminalSemanticSnapshot = after_explicit_snapshot
+            .decode_message(WireKind::TerminalSemanticSnapshot)
             .expect("authoritative snapshot after explicit detach");
         after_explicit_snapshot
             .attachment_id
@@ -3903,9 +3730,9 @@ mod tests {
 
     #[test]
     fn history_window_query_enforces_product_viewport_limits_at_dispatch() {
-        let mut request = v1::TerminalHistoryWindowRequest {
+        let mut request = v2::TerminalHistoryWindowRequest {
             attachment_id: None,
-            anchor: Some(v1::TerminalHistoryWindowAnchor {
+            anchor: Some(v2::TerminalHistoryWindowAnchor {
                 epoch: 1,
                 revision: 1,
                 max_offset_from_bottom: 10,
@@ -3937,7 +3764,7 @@ mod tests {
             WireKind::SessionListRequest,
             101,
             0,
-            &v1::SessionListRequest {
+            &v2::SessionListRequest {
                 target: Some(remote_target(own)),
             },
         )

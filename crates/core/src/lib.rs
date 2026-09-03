@@ -44,7 +44,7 @@ pub const PHASE_NAME: &str = "phase-one-core-local-daemon";
 pub const STATE_SCHEMA_VERSION: u32 = 1;
 
 /// Product wire major shared by local IPC and authenticated network streams.
-pub const WIRE_MAJOR: u32 = 1;
+pub const WIRE_MAJOR: u32 = 2;
 
 /// Immutable identity exposed by build and status projections.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
