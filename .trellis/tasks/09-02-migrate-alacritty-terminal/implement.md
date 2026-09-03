@@ -677,3 +677,57 @@ Hosted PR follow-up evidence (2026-09-03):
 
 - [x] 用户已批准 desktop/mobile 共用 client-owned viewport cache，并明确要求按该方案实施
   （2026-09-03）。
+
+## Post-release follow-up: live-bottom gutter flicker (2026-09-03)
+
+### 1. Root Cause Category
+
+- **Category**: D — Test Coverage Gap, with B — Cross-Layer Contract.
+- **Specific cause**: returning from history enters `ResumePending`. The old
+  implementation returned no scroll metrics in that state, so the
+  `SyncRequired` chrome transaction and replacement snapshot each cleared the
+  gutter before `Active` redrew the live thumb. Legacy viewport coalescing also
+  stored an intermediate response that was never painted, conflating received
+  state with presentation authority.
+
+### 2. Why the first anti-flicker fix was incomplete
+
+1. It correctly kept history content unchanged while a replacement was pending,
+   but tested `write_history` rather than every chrome frame in the event loop.
+2. DEC 2026 made each individual write atomic, but could not make three separate
+   transactions atomic as a group; the blank gutter transaction remained real.
+3. The state model distinguished desired and cached offsets, but the legacy
+   fallback still treated the latest received frame as if it had been rendered.
+
+### 3. Prevention Mechanisms
+
+| Priority | Mechanism | Specific action | Status |
+| --- | --- | --- | --- |
+| P0 | Architecture | Preserve validated last-painted metrics in `ResumePending`; switch to replacement live metrics only after snapshot observation | DONE |
+| P0 | Architecture | Do not replace legacy presentation state with a coalesced intermediate frame that immediately schedules another request | DONE |
+| P0 | Tests | Assert every frame in `History -> ResumePending -> SyncRequired -> Snapshot -> Active`, including nonblank old and offset-zero final chrome | DONE |
+| P1 | Invalidation | Clear mismatched metrics on resize and clear both live/presented identity on true reconnect | DONE |
+| P1 | Knowledge | Record received/desired/presented separation in local IPC spec and cross-layer checklist | DONE |
+
+### 4. Systematic Expansion
+
+- **Similar issues**: Android must not promote a fetched window to visible
+  scroll state until the UI frame containing it commits; latest-wins transport
+  state and presentation state remain distinct.
+- **Design improvement**: model last-painted chrome explicitly at transition
+  boundaries instead of deriving it from the newest response object.
+- **Process improvement**: rendering regressions must enumerate intermediate
+  output transactions, not merely compare the initial and final reducers.
+
+### 5. Verification
+
+- `cargo +1.98.0 test -p zterm-cli --all-features`: 56 passed, 3 ignored.
+- `cargo +1.98.0 clippy -p zterm-cli --all-targets --all-features -- -D warnings`: passed.
+- `cargo +1.98.0 fmt --all -- --check`, `sh tests/source-policy.sh`, and
+  `git diff --check`: passed.
+- Independent `trellis-check` found and fixed reconnect identity and unpainted
+  legacy-coalescing gaps, then passed the complete CLI suite, format, Clippy,
+  type-check, and source policy.
+- Real Ghostty observation remains the user-owned acceptance step; no claim is
+  made from byte-level tests that every outer-terminal implementation paints
+  synchronized updates identically.

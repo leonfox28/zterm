@@ -2293,6 +2293,7 @@ mod unix {
         ResumePending {
             retained_input: Vec<u8>,
             snapshot_applied: bool,
+            presented_scroll_metrics: Option<TerminalScrollMetrics>,
         },
     }
 
@@ -2380,6 +2381,16 @@ mod unix {
                 );
             }
             if changed {
+                if let ViewportState::ResumePending {
+                    presented_scroll_metrics,
+                    ..
+                } = &mut self.state
+                {
+                    // The old thumb geometry belongs to the previous viewport.
+                    // Wait for the replacement snapshot instead of projecting it
+                    // onto a size it never described.
+                    *presented_scroll_metrics = None;
+                }
                 self.observe_window_anchor(self.live_metrics);
             }
         }
@@ -2809,18 +2820,27 @@ mod unix {
             history.viewport_pending = false;
             match result {
                 TerminalViewportResult::Frame(frame) => {
+                    if let Some(action) = history.queued_scroll.take() {
+                        // The server has advanced the attachment baseline, but
+                        // this coalesced intermediate frame was never painted.
+                        // Keep `history.frame` aligned with the last complete
+                        // host presentation while requesting the final target.
+                        history.viewport_pending = true;
+                        return Ok(ViewportEffect::RequestViewport(action));
+                    }
                     history.notice = (frame.disposition
                         == zterm_core::terminal::TerminalViewportDisposition::Rebased)
                         .then_some("[zterm: retained history changed; showing closest view]");
                     history.frame = Some(frame);
+                    Ok(ViewportEffect::Render)
                 }
                 TerminalViewportResult::Live(metrics) => {
                     self.live_metrics = Some(metrics);
-                    return Ok(self.start_resume(Vec::new()));
+                    Ok(self.start_resume(Vec::new()))
                 }
                 TerminalViewportResult::HistoryChanged { .. } => {
                     history.queued_scroll = None;
-                    return Ok(ViewportEffect::None);
+                    Ok(ViewportEffect::None)
                 }
                 TerminalViewportResult::HistoryGap { epoch, revision }
                     if epoch.get() == 0 && revision.get() == 0 =>
@@ -2833,21 +2853,15 @@ mod unix {
                     history.viewport_pending = false;
                     history.queued_scroll = None;
                     history.notice = Some(HISTORY_LOADING_NOTICE);
-                    return Ok(ViewportEffect::Request(HistoryRequest {
+                    Ok(ViewportEffect::Request(HistoryRequest {
                         direction: TerminalHistoryDirection::Newest,
                         cursor: None,
-                    }));
+                    }))
                 }
                 TerminalViewportResult::HistoryGap { .. } => {
                     history.queued_scroll = None;
-                    return Ok(ViewportEffect::None);
+                    Ok(ViewportEffect::None)
                 }
-            }
-            if let Some(action) = history.queued_scroll.take() {
-                history.viewport_pending = true;
-                Ok(ViewportEffect::RequestViewport(action))
-            } else {
-                Ok(ViewportEffect::Render)
             }
         }
 
@@ -3026,8 +3040,20 @@ mod unix {
                         })
                 }
                 ViewportState::History(_) => None,
-                ViewportState::ResumePending { .. } => None,
+                ViewportState::ResumePending {
+                    snapshot_applied,
+                    presented_scroll_metrics,
+                    ..
+                } => {
+                    if *snapshot_applied {
+                        self.live_metrics
+                            .filter(|metrics| metrics.viewport_rows == self.content_size.rows)
+                    } else {
+                        *presented_scroll_metrics
+                    }
+                }
             }
+            .filter(|metrics| metrics.is_valid())
         }
 
         fn observe_live_metrics(&mut self, metrics: Option<TerminalScrollMetrics>) {
@@ -3064,6 +3090,7 @@ mod unix {
         }
 
         fn start_resume(&mut self, retained_input: Vec<u8>) -> ViewportEffect {
+            let presented_scroll_metrics = self.scroll_metrics();
             self.discard_viewport_response |= matches!(
                 &self.state,
                 ViewportState::History(history)
@@ -3077,6 +3104,7 @@ mod unix {
             self.state = ViewportState::ResumePending {
                 retained_input,
                 snapshot_applied: false,
+                presented_scroll_metrics,
             };
             ViewportEffect::Resume
         }
@@ -3114,6 +3142,21 @@ mod unix {
             } else {
                 self.discard_window_response |= self.window_cache.request_pending();
                 self.window_cache.invalidate();
+            }
+            // A replacement attachment epoch cannot authenticate even the
+            // previously live extent. Keep the old pixels in place, but do
+            // not project their metrics into reconnecting chrome.
+            self.live_metrics = None;
+            if let ViewportState::ResumePending {
+                snapshot_applied,
+                presented_scroll_metrics,
+                ..
+            } = &mut self.state
+            {
+                // A transport reconnect has no validated relationship to the
+                // pixels from the previous attachment epoch.
+                *snapshot_applied = false;
+                *presented_scroll_metrics = None;
             }
         }
 
@@ -4162,6 +4205,7 @@ mod unix {
                     state: ViewportState::ResumePending {
                         retained_input: retained.clone(),
                         snapshot_applied: true,
+                        presented_scroll_metrics: None,
                     },
                     content_size: TerminalSize::new(2, 20),
                     live_metrics: None,
@@ -4555,6 +4599,11 @@ mod unix {
                     .expect("normal input begins bounded resume"),
                 ViewportEffect::Resume
             ));
+            assert_eq!(
+                viewport.scroll_metrics(),
+                None,
+                "the pager protocol must not invent scrollbar metrics while resuming"
+            );
             viewport
                 .retain_resume_input(b"-paste")
                 .expect("paste bytes stay bounded while the snapshot is pending");
@@ -4563,6 +4612,95 @@ mod unix {
             assert_eq!(viewport.finish_resume(), Some(b"key-paste".to_vec()));
             assert_eq!(viewport.finish_resume(), None);
             assert!(viewport.is_live());
+        }
+
+        #[test]
+        fn ordinary_input_resume_preserves_legacy_metrics_until_snapshot_or_resize() {
+            let layout = ChromeLayout::new(TerminalSize::new(3, 10), false, ActiveScreen::Main);
+            let live = TerminalScrollMetrics {
+                epoch: Revision::new(2),
+                revision: Revision::new(7),
+                offset_from_bottom: 0,
+                max_offset_from_bottom: 10,
+                viewport_rows: 3,
+            };
+            let history = TerminalScrollMetrics {
+                offset_from_bottom: 4,
+                ..live
+            };
+            let mut viewport = ViewportController::with_layout(layout, Some(live));
+            viewport.window_supported = false;
+            assert!(matches!(
+                viewport.navigate(true, 4),
+                ViewportEffect::RequestViewport(_)
+            ));
+            assert!(matches!(
+                viewport
+                    .apply_viewport(TerminalViewportResult::Frame(TerminalViewportFrame {
+                        disposition: TerminalViewportDisposition::Exact,
+                        metrics: history,
+                        rows: vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()],
+                    }))
+                    .expect("complete legacy viewport frame"),
+                ViewportEffect::Render
+            ));
+            assert!(matches!(
+                viewport.navigate(true, 1),
+                ViewportEffect::RequestViewport(TerminalScrollAction::ScrollByLines(1))
+            ));
+            assert!(matches!(viewport.navigate(true, 1), ViewportEffect::None));
+            assert!(matches!(
+                viewport
+                    .apply_viewport(TerminalViewportResult::Frame(TerminalViewportFrame {
+                        disposition: TerminalViewportDisposition::Exact,
+                        metrics: TerminalScrollMetrics {
+                            offset_from_bottom: 5,
+                            ..history
+                        },
+                        rows: vec![b"older".to_vec(), b"middle".to_vec(), b"newer".to_vec()],
+                    }))
+                    .expect("coalesced intermediate semantic frame"),
+                ViewportEffect::RequestViewport(TerminalScrollAction::ScrollByLines(1))
+            ));
+            assert_eq!(
+                viewport.scroll_metrics(),
+                Some(history),
+                "an unpainted coalesced frame must not replace presented geometry"
+            );
+
+            assert!(matches!(
+                viewport
+                    .retain_or_resume(b"input".to_vec())
+                    .expect("ordinary input starts one authoritative resume"),
+                ViewportEffect::Resume
+            ));
+            assert_eq!(viewport.scroll_metrics(), Some(history));
+
+            viewport.resize(TerminalSize::new(4, 9));
+            assert_eq!(
+                viewport.scroll_metrics(),
+                None,
+                "old metrics cannot be projected onto resized chrome"
+            );
+            viewport.observe_snapshot(Some(TerminalScrollMetrics {
+                epoch: Revision::new(9),
+                revision: Revision::new(8),
+                viewport_rows: 4,
+                ..live
+            }));
+            assert_eq!(
+                viewport.scroll_metrics(),
+                None,
+                "structurally invalid replacement metrics never reach chrome"
+            );
+            let resized_live = TerminalScrollMetrics {
+                revision: Revision::new(8),
+                viewport_rows: 4,
+                ..live
+            };
+            viewport.observe_snapshot(Some(resized_live));
+            assert_eq!(viewport.scroll_metrics(), Some(resized_live));
+            assert_eq!(viewport.finish_resume(), Some(b"input".to_vec()));
         }
 
         #[test]
@@ -4717,6 +4855,130 @@ mod unix {
                 viewport.visible_history_rows().map(|visible| visible.0),
                 Some(&[b"-4".to_vec(), b"-3".to_vec(), b"-2".to_vec()][..])
             );
+        }
+
+        #[test]
+        fn history_window_resume_never_presents_a_blank_gutter_before_live_snapshot() {
+            let physical = TerminalSize::new(4, 10);
+            let layout = ChromeLayout::new(physical, false, ActiveScreen::Main);
+            let live = TerminalScrollMetrics {
+                epoch: Revision::new(2),
+                revision: Revision::new(7),
+                offset_from_bottom: 0,
+                max_offset_from_bottom: 12,
+                viewport_rows: layout.child.rows,
+            };
+            let mut viewport = ViewportController::with_layout(layout, Some(live));
+            let ViewportEffect::RequestHistoryWindow(query) = viewport.navigate(true, 4) else {
+                panic!("the uncached history target must request one window");
+            };
+            let shape = query
+                .response_shape(query.anchor)
+                .expect("controller query has one valid response shape");
+            assert!(matches!(
+                viewport
+                    .apply_history_window(TerminalHistoryWindowResult::Frame(
+                        zterm_core::terminal::TerminalHistoryWindowFrame {
+                            disposition: shape.disposition,
+                            anchor: query.anchor,
+                            target_offset_from_bottom: shape.target_offset_from_bottom,
+                            first_row_from_live_top: shape.first_row_from_live_top,
+                            ansi_rows: vec![b"row".to_vec(); shape.row_count],
+                        },
+                    ))
+                    .expect("complete cached history window"),
+                ViewportEffect::Render
+            ));
+            let history_metrics = TerminalScrollMetrics {
+                offset_from_bottom: 4,
+                ..live
+            };
+            assert_eq!(viewport.scroll_metrics(), Some(history_metrics));
+
+            let mut status = StatusRenderer::new(None, physical);
+            let mut history_output = Vec::new();
+            render_history_with_chrome(
+                &mut history_output,
+                &viewport,
+                &mut status,
+                TerminalViewTransportState::Active,
+            )
+            .expect("present the complete cached history frame");
+            assert!(contains_bytes(&history_output, b"row"));
+
+            assert!(matches!(
+                viewport.navigate(false, 4),
+                ViewportEffect::Resume
+            ));
+            assert_eq!(
+                viewport.scroll_metrics(),
+                Some(history_metrics),
+                "ResumePending retains the scrollbar which is still on screen"
+            );
+            viewport.observe_sync_required();
+            let mut sync_frame = Vec::new();
+            render_history_with_chrome(
+                &mut sync_frame,
+                &viewport,
+                &mut status,
+                TerminalViewTransportState::Synchronizing,
+            )
+            .expect("repair chrome while the replacement snapshot is in flight");
+            assert!(contains_bytes(&sync_frame, "▐".as_bytes()));
+            assert!(contains_bytes(&sync_frame, "▕".as_bytes()));
+
+            let replacement_live = TerminalScrollMetrics {
+                revision: Revision::new(8),
+                ..live
+            };
+            viewport.observe_snapshot(Some(replacement_live));
+            assert_eq!(viewport.scroll_metrics(), Some(replacement_live));
+            let mut snapshot_output = Vec::new();
+            let mut renderer = TerminalRenderer::new();
+            renderer
+                .apply_snapshot_with_chrome(
+                    &mut snapshot_output,
+                    RenderSnapshot {
+                        revision: replacement_live.revision,
+                        active_screen: ActiveScreen::Main,
+                        modes: TerminalModes::default(),
+                        recent_history_ansi: b"",
+                        screen_ansi: b"\x1b[?1049llive",
+                    },
+                    |writer| {
+                        write_chrome(
+                            writer,
+                            &viewport,
+                            &mut status,
+                            TerminalViewTransportState::Synchronizing,
+                        )
+                    },
+                )
+                .expect("atomically present the replacement snapshot and live chrome");
+
+            let mut expected = HOST_SYNC_BEGIN.to_vec();
+            expected.extend_from_slice(b"live");
+            let expected_viewport = ViewportController::with_layout(layout, Some(replacement_live));
+            let mut expected_status = StatusRenderer::new(None, physical);
+            write_chrome(
+                &mut expected,
+                &expected_viewport,
+                &mut expected_status,
+                TerminalViewTransportState::Synchronizing,
+            )
+            .expect("build exact live-bottom chrome");
+            expected.extend_from_slice(HOST_INPUT_CAPTURE);
+            expected.extend_from_slice(HOST_SYNC_END);
+            assert_eq!(snapshot_output, expected);
+
+            assert_eq!(viewport.finish_resume(), Some(Vec::new()));
+            assert!(viewport.is_live());
+            assert_eq!(viewport.scroll_metrics(), Some(replacement_live));
+            let mut active_frame = Vec::new();
+            render_scrollbar(&mut active_frame, &viewport)
+                .expect("the Active transition retains live-bottom chrome");
+            assert!(contains_bytes(&active_frame, "▐".as_bytes()));
+            assert!(contains_bytes(&active_frame, "▕".as_bytes()));
         }
 
         #[test]
@@ -5414,6 +5676,11 @@ mod unix {
             assert_eq!(
                 viewport.drag_grab_row, None,
                 "transport capture loss also clears a live drag"
+            );
+            assert_eq!(
+                viewport.scroll_metrics(),
+                None,
+                "a new attachment epoch must not reuse live scrollbar identity"
             );
         }
 

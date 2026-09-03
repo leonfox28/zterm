@@ -352,6 +352,13 @@ attachment-local presentation, and transport/controller synchronization.
       display offset for one client.
 - [ ] Distinguish an in-epoch replacement snapshot from a true reconnect. State
       which presentation values survive each transition and which are reset.
+- [ ] Distinguish received, desired, and actually presented state. A coalesced
+      response that immediately schedules a newer target is not allowed to
+      replace presentation metrics until its complete frame is painted.
+- [ ] Trace transition bugs through every externally emitted frame, not only
+      endpoint state. For terminal return-to-live, cover `History ->
+      ResumePending -> SyncRequired -> Snapshot -> Active` and assert that
+      chrome never passes through an empty or stale intermediate.
 - [ ] For full-duplex races, record both current synchronization state and
       whether this exact controller was previously Active. Never carry that
       fact into a new stream epoch or takeover.

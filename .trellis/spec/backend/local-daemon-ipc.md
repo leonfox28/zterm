@@ -60,6 +60,12 @@ ChromeLayout::new(physical: TerminalSize, remote: bool, screen: ActiveScreen)
 ScrollbarGeometry::new(track_rows: u16, metrics: TerminalScrollMetrics)
     -> Option<ScrollbarGeometry>
 
+ViewportState::ResumePending {
+    retained_input: Vec<u8>,
+    snapshot_applied: bool,
+    presented_scroll_metrics: Option<TerminalScrollMetrics>,
+}
+
 const HOST_INPUT_CAPTURE: &[u8] = b"\x1b[?1003h\x1b[?1006h";
 
 spawn_inside_runtime<T>(runtime: &tokio::runtime::Runtime, spawn: impl FnOnce() -> T)
@@ -299,6 +305,17 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   and content-free Changed/Gap never paint an intermediate blank or partial
   history frame. The last complete presentation stays visible until one full
   replacement is locally available.
+- Received viewport state and presented viewport state are separate authorities.
+  A coalesced legacy viewport frame that immediately triggers the next request
+  has not been painted and must not replace the retained frame or scrollbar
+  metrics. When a painted history view enters `ResumePending`, it snapshots the
+  last valid presented metrics. A `SyncRequired` chrome repair continues to use
+  those metrics; after the authoritative replacement snapshot is observed, that
+  same atomic snapshot transaction uses the new valid live metrics at offset
+  zero. It must never render an empty gutter between those two complete states.
+  A resize clears retained metrics whose `viewport_rows` no longer match, and a
+  true reconnect clears both live and retained metrics because the new stream
+  epoch cannot authenticate their identity.
 - A window response is installable only when it is the exact shape of the
   saved query and contains the latest desired full-height slice. Same-epoch
   append translates a pinned offset by history growth. Epoch/size change,
@@ -434,6 +451,10 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
 | child declares mouse reporting / alternate+alternate-scroll | forward exactly one mouse report / one cursor-key sequence; do not move Zterm history |
 | composed render path omits DEC 2026 closure/host capture or flushes before chrome/capture | renderer contract failure; snapshot/delta/history/chrome tests must compare exact byte order, one write, and one flush |
 | cache miss/loading/resume/resize/content-free outcome has no complete new frame | issue/retain only the bounded request and keep the prior complete presentation; never blank or partially repaint content |
+| `ResumePending` receives `SyncRequired` before its replacement snapshot | keep the last painted, valid scrollbar geometry; do not turn missing replacement metrics into a blank gutter frame |
+| replacement snapshot is observed while resuming | use its validated live metrics in the same snapshot/chrome transaction; do not wait for a later `Active` repaint to restore the thumb |
+| a coalesced legacy viewport response immediately schedules a newer target | advance the request baseline but retain the last painted frame/metrics; an unpainted response is not presentation authority |
+| resume geometry changes or the attachment truly reconnects | clear mismatched retained metrics / clear both live and retained metrics; never project stale thumb geometry onto a new size or stream epoch |
 | command write closure races a buffered typed lifecycle event | publish the typed event; suppress raw `Broken pipe`/OS text and do not retry the command |
 | terminal driver command sender/response owner closes after its final typed event/error entered the event queue | suppress the command-channel fallback and let the queued event win; if no event is confirmed within the same bounded window, return normalized `daemon_stopped` |
 | `create_main` request was written but no complete correlated initial result is validated | `operation_outcome_unknown`; do not claim the default Session was absent or retry under a new identity |
@@ -474,6 +495,12 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
 - **Good:** satisfy wheel/drag from a complete local cached slice, prefetch only
   at a bounded low-water edge, and atomically replace the prior frame when a
   validated request-shaped window becomes ready.
+- **Good:** preserve the painted history thumb through `ResumePending` and
+  `SyncRequired`, then replace it directly with the validated live-bottom thumb
+  inside the authoritative snapshot transaction.
+- **Bad:** derive chrome from the most recently received coalesced frame, clear
+  the gutter while a replacement snapshot is pending, or retain metrics across
+  a resize/reconnect merely because the old terminal pixels are still visible.
 - **Bad:** trust socket permissions without peer credentials, decode before the
   UID gate, let clap accept a ticket/path/socket override, block the
   current-thread runtime on PTY work, or remove a socket by pathname without
@@ -559,7 +586,14 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   reverse-video Unicode-safe status output, mode-derived one-report wheel/Page
   routing, cached hit/no-request, edge prefetch, 33 ms drag/release-final,
   resize refill, request/Changed/Gap frame retention, and exact-once input
-  across Live/History/ResumePending/background sync. Operations
+  across Live/History/ResumePending/background sync. They must trace the full
+  `History -> ResumePending -> SyncRequired -> Snapshot -> Active` sequence and
+  assert every emitted chrome frame: the pre-snapshot frame retains the last
+  painted thumb, the snapshot frame contains validated offset-zero chrome in
+  the same DEC-2026 transaction, and the Active frame does not repair a blank
+  intermediate. Coalesced-but-unpainted legacy frames, pager/no-metrics,
+  invalid replacement metrics, resize, and true reconnect are separate
+  regressions. Operations
   tests prove both local-stream closure and top-level command send/response-owner
   closure defer to an already queued typed terminal outcome, while closure with
   no event is normalized without raw OS text. The top-level schedule uses one
@@ -614,6 +648,26 @@ if update.render_local {
 if let Some(query) = update.request {
     save_complete_query_then_send(query).await?;
 }
+```
+
+```rust
+// Wrong: the latest response was coalesced and never painted, while resume
+// temporarily converts "no replacement metrics yet" into a blank gutter.
+history.frame = Some(intermediate_frame);
+state = ResumePending { snapshot_applied: false };
+render_scrollbar(None);
+
+// Correct: presentation authority changes only when a complete frame is
+// committed. Preserve it until the replacement snapshot supplies valid live
+// metrics, then compose those metrics into that same atomic snapshot frame.
+if queued_target.is_some() {
+    request_latest_without_replacing_presented_frame();
+}
+state = ResumePending {
+    snapshot_applied: false,
+    presented_scroll_metrics: last_painted_metrics,
+    ..
+};
 ```
 
 ```rust
