@@ -345,6 +345,12 @@ attachment-local presentation, and transport/controller synchronization.
 
 - [ ] Map one repaint as bytes -> Zterm chrome -> host capture -> one flush;
       never assume child mode output preserves the physical capture state.
+- [ ] For every screen/layout transition, assign ownership of status rows,
+      gutters, overlays, and reclaimed cells before ordering writers. Stale
+      cleanup is valid only while the current layout still assigns that region
+      to Zterm; after ownership transfers to the child, child output must be the
+      final writer. Test growth, shrink/clamp, removal, and multiple desired
+      layouts against the last successfully presented layout.
 - [ ] Route each wheel report from authoritative screen/modes and hit geometry,
       not process names or screen contents; assert exactly one owner.
 - [ ] Store scroll position at the attachment boundary and pass it as a typed
@@ -362,6 +368,9 @@ attachment-local presentation, and transport/controller synchronization.
       requests immediately, but advance the presented baseline only after the
       outer write succeeds. One dirty bit/deadline should reference current
       state rather than retain intermediate frame payloads.
+- [ ] Treat chrome geometry as presented state too. Frame construction and
+      failed write/flush attempts must not advance its baseline; retries must
+      still perform the repair required from the last committed frame.
 - [ ] Test cadence cancellation at every authority change. Resume, cache miss,
       snapshot/resync, resize, reconnect, detach, and cleanup must not let a
       stale timer promote an unseen desired offset into painted chrome.

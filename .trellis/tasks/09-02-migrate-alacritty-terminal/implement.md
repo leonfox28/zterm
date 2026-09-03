@@ -902,3 +902,88 @@ Hosted PR follow-up evidence (2026-09-03):
 - Real Ghostty perceived-cadence smoke remains the user-owned acceptance step. A burst that crosses
   a 16 ms boundary may intentionally produce two normally spaced frames; final offset must remain
   exact and no back-to-back per-report flush may return.
+
+## Post-smoke follow-up: nested Herdr scrollbar erased (2026-09-03)
+
+### 1. Root Cause Category
+
+- **Category**: B — Cross-Layer Contract, with D — Test Coverage Gap and E —
+  Implicit Assumption.
+- **Specific cause**: a Main-to-Alternate transition transferred Zterm's final
+  gutter column back to the child, but `write_scrollbar` still appended spaces
+  for the former gutter after the authoritative child snapshot. Herdr rendered
+  its own pane scrollbar in that rightmost column, so the later Zterm chrome
+  bytes erased it inside the same otherwise-atomic DEC-2026 transaction.
+- **Discriminating evidence**: the initial hypotheses were 55% stale host
+  chrome, 25% terminal-model/rightmost-cell projection, and 20% Herdr mode or
+  configuration. Herdr's pinned source confirmed it owns the outer alternate
+  screen and draws pane chrome in the pane's final column. An exact-byte red
+  regression then showed child `▐` followed by Zterm CUP-plus-space writes to
+  the same column, raising stale chrome above 95%. Projection tests confirmed
+  that the model and ANSI encoder preserve the rightmost child cell.
+
+### 2. Why Earlier Scrollbar Tests Missed It
+
+1. Layout tests proved that Alternate had no Zterm gutter and received the full
+   width, but did not assert the final writer of the reclaimed physical column.
+2. Clearing an old gutter is correct for Main-to-Main relocation, so that rule
+   was incorrectly generalized to a transition where the region changed owner.
+3. DEC 2026 prevents partial visual presentation of one transaction; it cannot
+   repair a transaction whose final byte order itself overwrites child content.
+4. The original stale state followed the most recently requested layout rather
+   than the last successfully painted layout, leaving consecutive resize and
+   failed-write cases underspecified.
+
+### 3. Prevention Mechanisms
+
+| Priority | Mechanism | Specific action | Status |
+| --- | --- | --- | --- |
+| P0 | Ownership | When Main transfers the gutter to Alternate or width `<=4`, never clear that reclaimed child column after child output | DONE |
+| P0 | Presentation | Track the last successfully presented gutter independently from desired layout and commit it only after write plus flush succeed | DONE |
+| P0 | Ordering | For Main-to-Main relocation, clear the committed old column first and draw the final desired gutter last to repair right-margin clamp | DONE |
+| P0 | Tests | Assert exact bytes/write/flush for child-column preservation, grow/shrink, multiple layouts, removal, and write/flush failure retry | DONE |
+| P1 | Knowledge | Record region ownership transfer and last-writer rules in design, local IPC spec, and cross-layer checklist | DONE |
+
+### 4. Systematic Expansion
+
+- **Similar issues**: tmux, PiAgent, editors, and any future nested TUI may draw
+  a border or scrollbar in the final alternate-screen column. Process-name
+  handling would hide this bug for only known applications, so routing remains
+  mode/layout based.
+- **Design improvement**: every status row, gutter, selection, title, overlay,
+  and future Android chrome region needs an explicit owner per state plus an
+  explicit final writer during ownership transfer.
+- **Process improvement**: transition regressions must start from a committed
+  prior frame and compare the full composed byte transaction, including output
+  failures and retries, rather than infer presentation from desired layout.
+
+### 5. Knowledge Capture
+
+- [x] Update `.trellis/spec/backend/local-daemon-ipc.md` with gutter ownership,
+  presentation authority, validation matrix, tests, and wrong/correct examples.
+- [x] Update the cross-layer checklist with region ownership, final-writer, and
+  failed-transaction rules.
+- [x] Correct this task's design wording: the child snapshot or physical resize
+  replaces/clips a reclaimed gutter; Zterm does not clear it afterward.
+- [x] Verify that this product repository has no
+  `src/templates/markdown/spec/` mirror to synchronize.
+- [ ] Confirm the reviewed debug binary in real Ghostty with a Herdr pane that
+  has enough retained output for its own scrollbar to be visible.
+
+### 6. Verification
+
+- The regression first failed with an exact transaction containing Herdr's
+  rightmost `▐` followed by Zterm spaces at that same column. The corrected
+  Alternate transaction contains child content, host capture, and DEC-2026 end
+  with no reclaimed-column cleanup.
+- Independent review found and fixed consecutive-layout and failed-transaction
+  authority gaps. `zterm-cli` passed 69 library tests with 3 intentional
+  isolated-process helpers ignored; CLI main/integration tests, check, Clippy
+  with `-D warnings`, format, source policy, and `git diff --check` passed.
+- The repository-level `just check` passed, including all workspace tests and
+  docs, policy/secret checks, cargo-deny, and Relay verification.
+- The pinned Herdr 0.8.2 terminal-model black box passed alternate-screen,
+  resize, detached progress, resync, bounded pending work, and cleanup. It does
+  not replace the remaining real Ghostty compositor smoke.
+- The reviewed all-features debug binary was rebuilt at `target/debug/zterm`
+  after the final repository gate.

@@ -292,6 +292,18 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   not resized or overwritten until return-to-live. Main/alternate transitions
   submit at most one geometry change, and `ResizeCoalescer::last_submitted`
   suppresses the resize-produced same-screen replacement.
+- Gutter ownership follows the effective layout, not the prior desired layout.
+  `ViewportController` retains the last successfully presented gutter column
+  and advances it only after the complete outer transaction succeeds. While
+  both the presented and current layouts own different gutters, chrome clears
+  the old column before drawing the current gutter last; this ordering repairs
+  any right-margin clamp after a width shrink. When Alternate or a width of at
+  most four removes the gutter, the reclaimed column is child-owned: the
+  authoritative child snapshot or physical resize replaces/clips the old
+  pixels, and chrome must not clear that column after child bytes. Multiple
+  unpresented layout changes always compare the final desired gutter with the
+  last committed gutter. Alternate-to-Main may draw the newly reserved gutter
+  after child content because ownership has transferred back to Zterm.
 - A main gutter with no valid history metrics is cleared and blank. With
   history it renders `▕` track and a proportional, minimum-one-row `▐` thumb;
   live maps to bottom and oldest maps to top using overflow-safe arithmetic.
@@ -496,6 +508,9 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
 | live wheel occurs during fresh synchronization | swallow Zterm gutter/history navigation and do not forward it to the child; an already-pinned view may continue only across background replacement sync |
 | child declares mouse reporting / alternate+alternate-scroll | forward exactly one mouse report / one cursor-key sequence; do not move Zterm history |
 | composed render path omits DEC 2026 closure/host capture or flushes before chrome/capture | renderer contract failure; snapshot/delta/history/chrome tests must compare exact byte order, one write, and one flush |
+| Main transfers its gutter to Alternate, or a resize reduces usable width to at most four | let the authoritative child snapshot repaint, or the physical resize clip, the former gutter; emit no post-child clear into the reclaimed column |
+| Main retains a gutter but its column changes, including multiple layouts before one presentation | compare with the last successfully presented column, clear that old column first, and draw the final current gutter last in the same transaction |
+| a transaction that would change gutter presentation fails during write or flush | retain the previous presented-gutter baseline so a retry performs the same required ownership-safe repair |
 | cache miss/loading/resume/resize/content-free outcome has no complete new frame | issue/retain only the bounded request and keep the prior complete presentation; never blank or partially repaint content |
 | one stdin delivery contains multiple host-owned wheel reports | apply every one-line report to the desired offset, then emit at most one latest complete history/chrome transaction for that delivery; never flush once per report |
 | repeated host-owned updates arrive before the 16 ms deadline | keep one dirty bit and the original deadline, send request/prefetch effects immediately, and present only the latest complete target when due; do not slide the deadline or build a frame queue |
@@ -546,6 +561,12 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
 - **Good:** let terminal modes select wheel ownership, retain one attachment's
   semantic viewport across a background replacement snapshot, and compose
   child bytes, chrome, host capture, and one flush as a single repaint.
+- **Good:** when Main transfers the rightmost column to an Alternate child,
+  leave the child's authoritative snapshot as the final writer of that column;
+  advance the presented-gutter baseline only after the transaction succeeds.
+- **Base:** when one Main layout replaces another, clear the last committed
+  gutter before drawing the new gutter last, even if the old coordinate clamps
+  at a narrower right margin.
 - **Good:** satisfy wheel/drag from a complete local cached slice, prefetch only
   at a bounded low-water edge, and atomically replace the prior frame when a
   validated request-shaped window becomes ready.
@@ -567,6 +588,9 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
 - **Bad:** derive chrome from the most recently received coalesced frame, clear
   the gutter while a replacement snapshot is pending, or retain metrics across
   a resize/reconnect merely because the old terminal pixels are still visible.
+- **Bad:** append stale-gutter spaces after an Alternate child's full-width
+  snapshot, infer the old gutter from an unpresented intermediate layout, or
+  commit gutter presentation state while merely building a frame.
 - **Bad:** equate every non-`Active` state with a lost connection observation,
   or emit separate Synchronizing, Snapshot, and unchanged Active transactions;
   DEC 2026 cannot make multiple transactions visually atomic as a group.
@@ -672,7 +696,13 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   reconnect regression resets that observation and proves it cannot reappear
   during replacement-stream synchronization. Coalesced-but-unpainted legacy
   frames, pager/no-metrics, invalid replacement metrics, resize, and true
-  reconnect are separate regressions. Operations
+  reconnect are separate regressions. Gutter-ownership regressions first
+  present a real Main gutter, then compare exact transactions for
+  Main-to-Alternate child rightmost-column preservation, Main grow/shrink,
+  multiple unpresented layouts, width-at-most-four removal, and failed
+  write/flush retries. They require the final owner to be the last writer and
+  forbid advancing the presented-gutter baseline on a failed transaction.
+  Operations
   tests prove both local-stream closure and top-level command send/response-owner
   closure defer to an already queued typed terminal outcome, while closure with
   no event is normalized without raw OS text. The top-level schedule uses one
@@ -766,6 +796,21 @@ viewport.observe_presentation();
 ```
 
 ```rust
+// Wrong: the child has reclaimed the rightmost column, but stale Zterm chrome
+// is composed afterward and erases a nested TUI's scrollbar.
+write_child_alternate_snapshot()?;
+clear_previous_gutter_column()?;
+
+// Correct: only clear a stale column while both layouts assign it to Zterm.
+// The child snapshot is authoritative when ownership transfers away, and the
+// presented baseline advances only after the outer write and flush succeed.
+write_child_alternate_snapshot()?;
+write_current_owned_chrome_without_reclaimed_column_cleanup()?;
+present_atomic_frame()?;
+viewport.observe_presentation();
+```
+
+```rust
 // Wrong: synchronization is treated as disconnection and every state change
 // leaks another complete frame to the user's terminal.
 if transport_state != TerminalViewTransportState::Active {
@@ -840,6 +885,9 @@ assert_eq!(error.kind(), DomainErrorKind::DeadlineExceeded);
 - Flushing child ANSI before status/gutter/capture composition, or permitting a
   child mode transition to leave outer `1003/1006` capture disabled; omitting
   the outer DEC 2026 end from normal or cleanup paths.
+- Clearing a former gutter after a full-width child snapshot has reclaimed the
+  column, deriving stale cleanup from an unpresented layout, or advancing the
+  presented-gutter baseline before the atomic write and flush succeed.
 - Flushing one outer history frame per decoded wheel report, using an
   always-running/global PTY render ticker, sliding a pending cadence deadline on
   every input, or treating a locally presentable cache target as actually

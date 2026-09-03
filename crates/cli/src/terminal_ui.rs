@@ -24,7 +24,6 @@ pub async fn run_terminal(
 
 #[cfg(unix)]
 mod unix {
-    use std::cell::Cell;
     #[cfg(test)]
     use std::collections::VecDeque;
     use std::fmt;
@@ -2473,7 +2472,9 @@ mod unix {
         // presentable target, it subsequently advances only after a complete
         // outer-terminal transaction succeeds.
         last_presented_scroll_metrics: Option<TerminalScrollMetrics>,
-        stale_gutter_column: Cell<Option<u16>>,
+        // This is the physical column committed by the same successful outer
+        // transaction, not merely the most recently requested layout.
+        presented_gutter_column: Option<u16>,
         discard_viewport_response: bool,
         discard_window_response: bool,
         window_supported: bool,
@@ -2494,7 +2495,7 @@ mod unix {
                 drag_last_request: None,
                 drag_deferred_target: None,
                 last_presented_scroll_metrics: None,
-                stale_gutter_column: Cell::new(None),
+                presented_gutter_column: None,
                 discard_viewport_response: false,
                 discard_window_response: false,
                 window_supported: true,
@@ -2512,7 +2513,7 @@ mod unix {
                 drag_last_request: None,
                 drag_deferred_target: None,
                 last_presented_scroll_metrics: live_metrics,
-                stale_gutter_column: Cell::new(None),
+                presented_gutter_column: None,
                 discard_viewport_response: false,
                 discard_window_response: false,
                 window_supported: true,
@@ -2574,9 +2575,6 @@ mod unix {
         }
 
         fn set_layout(&mut self, layout: ChromeLayout) {
-            if self.gutter_column != layout.gutter_column {
-                self.stale_gutter_column.set(self.gutter_column);
-            }
             self.resize(layout.child);
             self.gutter_column = layout.gutter_column;
             if self.gutter_column.is_none() {
@@ -3234,6 +3232,7 @@ mod unix {
 
         fn observe_presentation(&mut self) {
             self.last_presented_scroll_metrics = self.scroll_metrics();
+            self.presented_gutter_column = self.gutter_column;
         }
 
         fn observe_live_metrics(&mut self, metrics: Option<TerminalScrollMetrics>) {
@@ -4033,8 +4032,10 @@ mod unix {
     }
 
     fn write_scrollbar(writer: &mut impl Write, viewport: &ViewportController) -> io::Result<()> {
-        let stale_column = viewport.stale_gutter_column.replace(None);
-        if let Some(column) = stale_column {
+        let presented_column = viewport.presented_gutter_column;
+        if let (Some(column), Some(current_column)) = (presented_column, viewport.gutter_column)
+            && column != current_column
+        {
             writer.write_all(b"\x1b7\x1b[0m")?;
             for row in 0..viewport.content_size.rows {
                 write!(writer, "\x1b[{};{}H ", row + 1, column)?;
@@ -4042,6 +4043,10 @@ mod unix {
             writer.write_all(b"\x1b[0m\x1b8")?;
         }
         let Some(column) = viewport.gutter_column else {
+            // Alternate screen snapshots repaint the reclaimed column before
+            // chrome is composed, while a <=4-column physical resize clips the
+            // old gutter. Clearing either afterward could overwrite child
+            // content through a right-margin clamp.
             return Ok(());
         };
         let geometry = viewport
@@ -4062,7 +4067,8 @@ mod unix {
             };
             writer.write_all(glyph.as_bytes())?;
         }
-        writer.write_all(b"\x1b[0m\x1b8")
+        writer.write_all(b"\x1b[0m\x1b8")?;
+        Ok(())
     }
 
     fn write_chrome(
@@ -4078,11 +4084,13 @@ mod unix {
     #[cfg(test)]
     fn render_scrollbar(
         writer: &mut impl Write,
-        viewport: &ViewportController,
+        viewport: &mut ViewportController,
     ) -> Result<(), CliError> {
         present_atomic(writer, "render terminal scrollbar", |frame| {
             write_scrollbar(frame, viewport)
-        })
+        })?;
+        viewport.observe_presentation();
+        Ok(())
     }
 
     fn render_history_with_chrome(
@@ -4418,6 +4426,14 @@ mod unix {
                     .expect("install fixture history window"),
                 ViewportEffect::Render
             ));
+            let mut status = StatusRenderer::new(None, physical);
+            render_history_with_chrome(
+                &mut Vec::new(),
+                &viewport,
+                &mut status,
+                TerminalViewTransportState::Active,
+            )
+            .expect("present fixture history window");
             viewport.observe_presentation();
             (viewport, physical)
         }
@@ -4610,7 +4626,7 @@ mod unix {
                     drag_last_request: None,
                     drag_deferred_target: None,
                     last_presented_scroll_metrics: None,
-                    stale_gutter_column: Cell::new(None),
+                    presented_gutter_column: None,
                     discard_viewport_response: false,
                     discard_window_response: false,
                     window_supported: true,
@@ -4914,6 +4930,7 @@ mod unix {
                 TerminalViewTransportState::Active,
             )
             .expect("present the old active path");
+            viewport.observe_presentation();
             status.reset_for_reconnect();
             viewport.reset_presentation_for_reconnect();
             assert!(
@@ -4926,6 +4943,7 @@ mod unix {
                 )
                 .expect("present the true reconnect state")
             );
+            viewport.observe_presentation();
             let mut renderer = TerminalRenderer::new();
             renderer
                 .apply_snapshot_with_chrome(
@@ -4947,6 +4965,7 @@ mod unix {
                     },
                 )
                 .expect("present the replacement-stream snapshot");
+            viewport.observe_presentation();
 
             assert_eq!(output.frames.len(), 3);
             assert!(contains_bytes(&output.frames[0], b"remote | direct | 8 ms"));
@@ -5528,6 +5547,14 @@ mod unix {
                     .expect("complete legacy viewport frame"),
                 ViewportEffect::Render
             ));
+            let mut status = StatusRenderer::new(None, TerminalSize::new(3, 10));
+            render_history_with_chrome(
+                &mut Vec::new(),
+                &viewport,
+                &mut status,
+                TerminalViewTransportState::Active,
+            )
+            .expect("present the initial legacy viewport frame");
             viewport.observe_presentation();
             assert!(matches!(
                 viewport.navigate(true, 1),
@@ -5810,6 +5837,7 @@ mod unix {
                 TerminalViewTransportState::Synchronizing,
             )
             .expect("repair chrome while the replacement snapshot is in flight");
+            viewport.observe_presentation();
             assert!(contains_bytes(&sync_frame, "▐".as_bytes()));
             assert!(contains_bytes(&sync_frame, "▕".as_bytes()));
 
@@ -5841,6 +5869,7 @@ mod unix {
                     },
                 )
                 .expect("atomically present the replacement snapshot and live chrome");
+            viewport.observe_presentation();
 
             let mut expected = HOST_SYNC_BEGIN.to_vec();
             expected.extend_from_slice(b"live");
@@ -5861,7 +5890,7 @@ mod unix {
             assert!(viewport.is_live());
             assert_eq!(viewport.scroll_metrics(), Some(replacement_live));
             let mut active_frame = Vec::new();
-            render_scrollbar(&mut active_frame, &viewport)
+            render_scrollbar(&mut active_frame, &mut viewport)
                 .expect("the Active transition retains live-bottom chrome");
             assert!(contains_bytes(&active_frame, "▐".as_bytes()));
             assert!(contains_bytes(&active_frame, "▕".as_bytes()));
@@ -5965,6 +5994,7 @@ mod unix {
                     },
                 )
                 .expect("present one authoritative live replacement");
+            viewport.observe_presentation();
 
             assert_eq!(viewport.finish_resume(), Some(Vec::new()));
             assert!(
@@ -6484,6 +6514,267 @@ mod unix {
         }
 
         #[test]
+        fn alternate_snapshot_leaves_reclaimed_rightmost_column_owned_by_child() {
+            let physical = TerminalSize::new(3, 8);
+            let main_layout = ChromeLayout::new(physical, false, ActiveScreen::Main);
+            let mut viewport = ViewportController::with_layout(main_layout, None);
+            let mut renderer = TerminalRenderer::new();
+            let mut status = StatusRenderer::new(None, physical);
+            renderer
+                .apply_snapshot_with_chrome(
+                    &mut Vec::new(),
+                    RenderSnapshot {
+                        revision: Revision::new(1),
+                        active_screen: ActiveScreen::Main,
+                        modes: TerminalModes::default(),
+                        recent_history_ansi: b"",
+                        screen_ansi: b"\x1b[?1049l\x1b[0m\x1b[2J\x1b[Hmain",
+                    },
+                    |writer| {
+                        write_chrome(
+                            writer,
+                            &viewport,
+                            &mut status,
+                            TerminalViewTransportState::Active,
+                        )
+                    },
+                )
+                .expect("initial main snapshot");
+            viewport.observe_presentation();
+            assert_eq!(viewport.presented_gutter_column, Some(8));
+
+            viewport.set_layout(ChromeLayout::new(physical, false, ActiveScreen::Alternate));
+            let mut output = ViewportFrameWriter::default();
+            let child_frame = "\x1b[0m\x1b[2J\x1b[H\x1b[1;8H▐";
+            let mut screen_ansi = b"\x1b[?1049l\x1b[?1049h".to_vec();
+            screen_ansi.extend_from_slice(child_frame.as_bytes());
+            renderer
+                .apply_snapshot_with_chrome(
+                    &mut output,
+                    RenderSnapshot {
+                        revision: Revision::new(2),
+                        active_screen: ActiveScreen::Alternate,
+                        modes: TerminalModes::default(),
+                        recent_history_ansi: b"",
+                        screen_ansi: &screen_ansi,
+                    },
+                    |writer| {
+                        write_chrome(
+                            writer,
+                            &viewport,
+                            &mut status,
+                            TerminalViewTransportState::Active,
+                        )
+                    },
+                )
+                .expect("alternate snapshot transaction");
+            viewport.observe_presentation();
+
+            assert_eq!(
+                output.bytes,
+                [
+                    HOST_SYNC_BEGIN,
+                    child_frame.as_bytes(),
+                    HOST_INPUT_CAPTURE,
+                    HOST_SYNC_END,
+                ]
+                .concat(),
+                "Zterm must not clear the reclaimed column after child content"
+            );
+            assert_eq!(output.frames.len(), 1);
+            assert_eq!(output.writes, 1);
+            assert_eq!(output.flushes, 1);
+            assert_eq!(viewport.presented_gutter_column, None);
+        }
+
+        #[test]
+        fn main_gutter_relocation_tracks_the_last_presented_column() {
+            let initial_layout =
+                ChromeLayout::new(TerminalSize::new(3, 8), false, ActiveScreen::Main);
+            let live = TerminalScrollMetrics {
+                epoch: Revision::new(1),
+                revision: Revision::new(2),
+                offset_from_bottom: 0,
+                max_offset_from_bottom: 6,
+                viewport_rows: initial_layout.child.rows,
+            };
+            let mut viewport = ViewportController::with_layout(initial_layout, Some(live));
+            render_scrollbar(&mut Vec::new(), &mut viewport).expect("initial gutter presentation");
+            viewport.set_layout(ChromeLayout::new(
+                TerminalSize::new(3, 10),
+                false,
+                ActiveScreen::Main,
+            ));
+            viewport.set_layout(ChromeLayout::new(
+                TerminalSize::new(3, 12),
+                false,
+                ActiveScreen::Main,
+            ));
+
+            let mut output = ViewportFrameWriter::default();
+            render_scrollbar(&mut output, &mut viewport).expect("relocated gutter transaction");
+            assert_eq!(
+                output.bytes,
+                [
+                    HOST_SYNC_BEGIN,
+                    b"\x1b7\x1b[0m\x1b[1;8H \x1b[2;8H \x1b[3;8H \x1b[0m\x1b8".as_slice(),
+                    "\x1b7\x1b[0m\x1b[1;12H▕\x1b[2;12H▕\x1b[3;12H▐\x1b[0m\x1b8".as_bytes(),
+                    HOST_INPUT_CAPTURE,
+                    HOST_SYNC_END,
+                ]
+                .concat()
+            );
+            assert_eq!(output.frames.len(), 1);
+            assert_eq!(output.writes, 1);
+            assert_eq!(output.flushes, 1);
+        }
+
+        #[test]
+        fn gutter_shrink_repaints_after_any_right_margin_clamp() {
+            let initial_layout =
+                ChromeLayout::new(TerminalSize::new(3, 10), false, ActiveScreen::Main);
+            let live = TerminalScrollMetrics {
+                epoch: Revision::new(1),
+                revision: Revision::new(2),
+                offset_from_bottom: 0,
+                max_offset_from_bottom: 6,
+                viewport_rows: initial_layout.child.rows,
+            };
+            let mut viewport = ViewportController::with_layout(initial_layout, Some(live));
+            render_scrollbar(&mut Vec::new(), &mut viewport).expect("initial gutter presentation");
+            viewport.set_layout(ChromeLayout::new(
+                TerminalSize::new(3, 8),
+                false,
+                ActiveScreen::Main,
+            ));
+
+            let mut output = ViewportFrameWriter::default();
+            render_scrollbar(&mut output, &mut viewport).expect("narrower gutter transaction");
+            assert_eq!(
+                output.bytes,
+                [
+                    HOST_SYNC_BEGIN,
+                    b"\x1b7\x1b[0m\x1b[1;10H \x1b[2;10H \x1b[3;10H \x1b[0m\x1b8".as_slice(),
+                    "\x1b7\x1b[0m\x1b[1;8H▕\x1b[2;8H▕\x1b[3;8H▐\x1b[0m\x1b8".as_bytes(),
+                    HOST_INPUT_CAPTURE,
+                    HOST_SYNC_END,
+                ]
+                .concat(),
+                "the new gutter must be written after clearing the out-of-range old column"
+            );
+            assert_eq!(output.frames.len(), 1);
+            assert_eq!(output.writes, 1);
+            assert_eq!(output.flushes, 1);
+        }
+
+        #[test]
+        fn narrow_layout_removes_gutter_without_clamped_cleanup() {
+            let initial_layout =
+                ChromeLayout::new(TerminalSize::new(3, 5), false, ActiveScreen::Main);
+            let mut viewport = ViewportController::with_layout(initial_layout, None);
+            render_scrollbar(&mut Vec::new(), &mut viewport).expect("initial gutter presentation");
+            viewport.set_layout(ChromeLayout::new(
+                TerminalSize::new(3, 4),
+                false,
+                ActiveScreen::Main,
+            ));
+
+            let mut output = ViewportFrameWriter::default();
+            render_scrollbar(&mut output, &mut viewport).expect("gutter removal transaction");
+            assert_eq!(
+                output.bytes,
+                [HOST_SYNC_BEGIN, HOST_INPUT_CAPTURE, HOST_SYNC_END].concat(),
+                "the clipped gutter column must not be cleared through a clamped coordinate"
+            );
+            assert_eq!(output.frames.len(), 1);
+            assert_eq!(output.writes, 1);
+            assert_eq!(output.flushes, 1);
+        }
+
+        #[test]
+        fn failed_gutter_transaction_does_not_advance_presented_authority() {
+            #[derive(Clone, Copy)]
+            enum Failure {
+                Write,
+                Flush,
+            }
+
+            struct FailOnceWriter {
+                failure: Option<Failure>,
+                bytes: Vec<u8>,
+            }
+
+            impl Write for FailOnceWriter {
+                fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                    if matches!(self.failure, Some(Failure::Write)) {
+                        self.failure = None;
+                        return Err(io::Error::other("injected gutter write failure"));
+                    }
+                    self.bytes.extend_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+
+                fn flush(&mut self) -> io::Result<()> {
+                    if matches!(self.failure, Some(Failure::Flush)) {
+                        self.failure = None;
+                        return Err(io::Error::other("injected gutter flush failure"));
+                    }
+                    Ok(())
+                }
+            }
+
+            for failure in [Failure::Write, Failure::Flush] {
+                let initial_layout =
+                    ChromeLayout::new(TerminalSize::new(3, 8), false, ActiveScreen::Main);
+                let live = TerminalScrollMetrics {
+                    epoch: Revision::new(1),
+                    revision: Revision::new(2),
+                    offset_from_bottom: 0,
+                    max_offset_from_bottom: 6,
+                    viewport_rows: initial_layout.child.rows,
+                };
+                let mut viewport = ViewportController::with_layout(initial_layout, Some(live));
+                render_scrollbar(&mut Vec::new(), &mut viewport)
+                    .expect("initial gutter presentation");
+                assert_eq!(viewport.presented_gutter_column, Some(8));
+                viewport.set_layout(ChromeLayout::new(
+                    TerminalSize::new(3, 12),
+                    false,
+                    ActiveScreen::Main,
+                ));
+
+                let mut failed = FailOnceWriter {
+                    failure: Some(failure),
+                    bytes: Vec::new(),
+                };
+                render_scrollbar(&mut failed, &mut viewport)
+                    .expect_err("the injected outer transaction failure must propagate");
+                assert_eq!(
+                    viewport.presented_gutter_column,
+                    Some(8),
+                    "building or partially delivering a frame is not presentation authority"
+                );
+
+                let mut retry = ViewportFrameWriter::default();
+                render_scrollbar(&mut retry, &mut viewport)
+                    .expect("retry the complete gutter transaction");
+                assert_eq!(
+                    retry.bytes,
+                    [
+                        HOST_SYNC_BEGIN,
+                        b"\x1b7\x1b[0m\x1b[1;8H \x1b[2;8H \x1b[3;8H \x1b[0m\x1b8".as_slice(),
+                        "\x1b7\x1b[0m\x1b[1;12H▕\x1b[2;12H▕\x1b[3;12H▐\x1b[0m\x1b8".as_bytes(),
+                        HOST_INPUT_CAPTURE,
+                        HOST_SYNC_END,
+                    ]
+                    .concat()
+                );
+                assert_eq!((retry.frames.len(), retry.writes, retry.flushes), (1, 1, 1));
+                assert_eq!(viewport.presented_gutter_column, Some(12));
+            }
+        }
+
+        #[test]
         fn gutter_owns_pointer_before_child_and_renders_redacted_track_transaction() {
             let layout = ChromeLayout::new(TerminalSize::new(4, 8), false, ActiveScreen::Main);
             let metrics = TerminalScrollMetrics {
@@ -6495,7 +6786,7 @@ mod unix {
             };
             let mut viewport = ViewportController::with_layout(layout, Some(metrics));
             let mut output = Vec::new();
-            render_scrollbar(&mut output, &viewport).expect("render scrollbar transaction");
+            render_scrollbar(&mut output, &mut viewport).expect("render scrollbar transaction");
             assert!(contains_bytes(&output, "▕".as_bytes()));
             assert!(contains_bytes(&output, "▐".as_bytes()));
             assert!(output.ends_with(&[HOST_INPUT_CAPTURE, HOST_SYNC_END].concat()));
@@ -6929,6 +7220,7 @@ mod unix {
                     },
                 )
                 .expect("fully flushed snapshot");
+            viewport.observe_presentation();
             let mut expected = HOST_SYNC_BEGIN.to_vec();
             expected.extend_from_slice(b"historyscreen");
             write_chrome(
@@ -6965,6 +7257,7 @@ mod unix {
                     },
                 )
                 .expect("fully flushed delta");
+            viewport.observe_presentation();
             expected.extend_from_slice(HOST_SYNC_BEGIN);
             expected.extend_from_slice(b"delta");
             write_chrome(
@@ -7002,6 +7295,7 @@ mod unix {
                 TerminalViewTransportState::Active,
             )
             .expect("fully flushed history and chrome");
+            viewport.observe_presentation();
             expected.extend_from_slice(HOST_SYNC_BEGIN);
             write_history(&mut expected, &viewport).expect("expected history rows");
             write_chrome(

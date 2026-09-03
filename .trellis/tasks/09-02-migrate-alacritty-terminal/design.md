@@ -733,8 +733,16 @@ absolute target on motion, and ends on release/capture loss.
 
 In live main, the gutter stays reserved even if a child has mouse reporting. Deliberate input in the
 visible gutter is host chrome; input in the `N-1` child columns follows child modes. In alternate,
-the gutter is cleared before the full `N` columns are handed to the child and no scrollbar hit target
-exists.
+the full `N` columns are handed to the child and no scrollbar hit target exists. The authoritative
+alternate snapshot, composed before Zterm chrome, owns and repaints the reclaimed column; Zterm must
+not append a stale-gutter clear afterward. A physical shrink to four columns or fewer similarly clips
+the former gutter instead of clearing through a coordinate that could clamp onto child content.
+
+The CLI records the last successfully presented gutter separately from current desired layout. If
+Main retains ownership while the gutter moves, it clears the committed old column before drawing the
+final desired gutter last in the same transaction. Multiple layout changes before presentation still
+compare against that committed baseline, and failed writes/flushes do not advance it. Alternate-to-
+Main draws the newly Zterm-owned gutter after child content.
 
 The effective presentation screen remains Main while a Zterm history frame is pinned, even if a
 background child delta declares Alternate. This prevents a hidden child state transition from
