@@ -756,19 +756,12 @@ mod unix {
                             viewport.observe_sync_required();
                             if transport_state != TerminalViewTransportState::Synchronizing {
                                 transport_state = TerminalViewTransportState::Synchronizing;
-                                if let Err(error) = render_view_stdout(
-                                    &viewport,
-                                    &mut status_renderer,
-                                    transport_state,
-                                ) {
-                                    break 'terminal Err(error);
-                                }
-                                viewport.observe_presentation();
-                                viewport_pacer.mark_presented(Instant::now());
                             }
                             // The marker and its authoritative replacement snapshot are emitted
-                            // together. Treat that replacement as already in flight instead of
-                            // clearing attachment scroll state with a redundant sync request.
+                            // together. Keep the last complete host presentation untouched while
+                            // that replacement is in flight instead of repainting an identical
+                            // history frame or clearing attachment scroll state with a redundant
+                            // sync request.
                             sync_requested = true;
                         }
                         TerminalViewEvent::LeaseLost { .. } => {
@@ -1230,6 +1223,7 @@ mod unix {
         let (next, pending_resize) = resize_coalescer.enter_transport_state(next);
         if next == TerminalViewTransportState::Reconnecting {
             viewport.reset_presentation_for_reconnect();
+            status_renderer.reset_for_reconnect();
         }
         let resume_input = transition_transport_input_state(
             stdin,
@@ -1244,9 +1238,15 @@ mod unix {
         if next != previous && !status_renderer.enabled() {
             render_transport_state_stdout(next)?;
         }
-        render_view_stdout(viewport, status_renderer, next)?;
-        viewport.observe_presentation();
-        viewport_pacer.mark_presented(Instant::now());
+        if render_transport_transition_view_stdout(
+            viewport,
+            status_renderer,
+            next,
+            resume_input.is_some(),
+        )? {
+            viewport.observe_presentation();
+            viewport_pacer.mark_presented(Instant::now());
+        }
         if let Some(size) = pending_resize {
             writer.resize(size).await?;
         }
@@ -2291,6 +2291,13 @@ mod unix {
             Ok(())
         }
 
+        fn reset_for_reconnect(&mut self) {
+            // A replacement stream has a new path-observation epoch. Do not
+            // let an old direct/relay sample reappear while it synchronizes.
+            self.path = TerminalViewConnectionPath::Unknown;
+            self.rtt_ms = None;
+        }
+
         #[cfg(test)]
         fn render(
             &mut self,
@@ -2318,7 +2325,11 @@ mod unix {
                 bytes.extend_from_slice(b";1H\x1b[0m\x1b[K\x1b8");
             }
             if let (Some(row), Some(device)) = (current_row, self.device.as_deref()) {
-                let (path, latency) = if transport_state == TerminalViewTransportState::Active {
+                // Synchronizing is also used for an in-epoch visual snapshot
+                // replacement. Only a genuine reconnect invalidates the
+                // selected-path observation.
+                let (path, latency) = if transport_state != TerminalViewTransportState::Reconnecting
+                {
                     match self.path {
                         TerminalViewConnectionPath::Direct => {
                             ("direct", self.rtt_ms.map(|rtt| format!("{rtt} ms")))
@@ -3935,14 +3946,13 @@ mod unix {
         render_transport_state(&mut output, state)
     }
 
-    fn render_chrome_stdout(
+    fn render_chrome_with_writer(
+        writer: &mut impl Write,
         viewport: &ViewportController,
         renderer: &mut StatusRenderer,
         state: TerminalViewTransportState,
     ) -> Result<(), CliError> {
-        let stdout = io::stdout();
-        let mut output = stdout.lock();
-        present_atomic(&mut output, "render terminal chrome", |frame| {
+        present_atomic(writer, "render terminal chrome", |frame| {
             write_chrome(frame, viewport, renderer, state)
         })
     }
@@ -4118,11 +4128,58 @@ mod unix {
         status: &mut StatusRenderer,
         transport_state: TerminalViewTransportState,
     ) -> Result<(), CliError> {
+        let stdout = io::stdout();
+        let mut output = stdout.lock();
+        render_view_with_writer(&mut output, viewport, status, transport_state)
+    }
+
+    fn render_view_with_writer(
+        writer: &mut impl Write,
+        viewport: &ViewportController,
+        status: &mut StatusRenderer,
+        transport_state: TerminalViewTransportState,
+    ) -> Result<(), CliError> {
         if viewport.is_history() || viewport.is_resume_pending() {
-            render_history_stdout(viewport, status, transport_state)
+            render_history_with_chrome(writer, viewport, status, transport_state)
         } else {
-            render_chrome_stdout(viewport, status, transport_state)
+            render_chrome_with_writer(writer, viewport, status, transport_state)
         }
+    }
+
+    fn render_transport_transition_view_with_writer(
+        writer: &mut impl Write,
+        viewport: &ViewportController,
+        status: &mut StatusRenderer,
+        transport_state: TerminalViewTransportState,
+        resumed_from_snapshot: bool,
+    ) -> Result<bool, CliError> {
+        let resume_sync_is_visually_unchanged = viewport.is_resume_pending()
+            && transport_state == TerminalViewTransportState::Synchronizing;
+        // The old complete history frame remains authoritative until the
+        // snapshot replaces it. Once that snapshot has been painted, changing
+        // ResumePending to Live changes no pixels either.
+        if resumed_from_snapshot || resume_sync_is_visually_unchanged {
+            return Ok(false);
+        }
+        render_view_with_writer(writer, viewport, status, transport_state)?;
+        Ok(true)
+    }
+
+    fn render_transport_transition_view_stdout(
+        viewport: &ViewportController,
+        status: &mut StatusRenderer,
+        transport_state: TerminalViewTransportState,
+        resumed_from_snapshot: bool,
+    ) -> Result<bool, CliError> {
+        let stdout = io::stdout();
+        let mut output = stdout.lock();
+        render_transport_transition_view_with_writer(
+            &mut output,
+            viewport,
+            status,
+            transport_state,
+            resumed_from_snapshot,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4302,6 +4359,7 @@ mod unix {
         #[derive(Default)]
         struct ViewportFrameWriter {
             bytes: Vec<u8>,
+            frames: Vec<Vec<u8>>,
             writes: usize,
             flushes: usize,
         }
@@ -4310,6 +4368,7 @@ mod unix {
             fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
                 self.writes += 1;
                 self.bytes.extend_from_slice(bytes);
+                self.frames.push(bytes.to_vec());
                 Ok(bytes.len())
             }
 
@@ -4797,6 +4856,26 @@ mod unix {
             assert!(!contains_bytes(&inactive_output, b"relay"));
             assert!(!contains_bytes(&inactive_output, b"7 ms"));
 
+            let mut same_epoch =
+                StatusRenderer::new(Some("开发机".to_owned()), TerminalSize::new(3, 26));
+            same_epoch.path = TerminalViewConnectionPath::Relay;
+            same_epoch.rtt_ms = Some(7);
+            let mut same_epoch_output = Vec::new();
+            same_epoch
+                .render(
+                    &mut same_epoch_output,
+                    TerminalViewTransportState::Synchronizing,
+                )
+                .expect("render same-epoch synchronizing status");
+            assert!(contains_bytes(
+                &same_epoch_output,
+                "开发机 | relay | 7 ms".as_bytes()
+            ));
+            assert!(!contains_bytes(
+                &same_epoch_output,
+                "开发机 | -- | --".as_bytes()
+            ));
+
             let mut narrow =
                 StatusRenderer::new(Some("开发机".to_owned()), TerminalSize::new(2, 5));
             narrow.path = TerminalViewConnectionPath::Direct;
@@ -4816,6 +4895,74 @@ mod unix {
                 ]
                 .concat()
             );
+        }
+
+        #[test]
+        fn true_reconnect_clears_the_old_path_through_replacement_snapshot() {
+            let physical = TerminalSize::new(4, 30);
+            let layout = ChromeLayout::new(physical, true, ActiveScreen::Main);
+            let mut viewport = ViewportController::with_layout(layout, None);
+            let mut status = StatusRenderer::new(Some("remote".to_owned()), physical);
+            status.path = TerminalViewConnectionPath::Direct;
+            status.rtt_ms = Some(8);
+            let mut output = ViewportFrameWriter::default();
+
+            render_chrome_with_writer(
+                &mut output,
+                &viewport,
+                &mut status,
+                TerminalViewTransportState::Active,
+            )
+            .expect("present the old active path");
+            status.reset_for_reconnect();
+            viewport.reset_presentation_for_reconnect();
+            assert!(
+                render_transport_transition_view_with_writer(
+                    &mut output,
+                    &viewport,
+                    &mut status,
+                    TerminalViewTransportState::Reconnecting,
+                    false,
+                )
+                .expect("present the true reconnect state")
+            );
+            let mut renderer = TerminalRenderer::new();
+            renderer
+                .apply_snapshot_with_chrome(
+                    &mut output,
+                    RenderSnapshot {
+                        revision: Revision::new(3),
+                        active_screen: ActiveScreen::Main,
+                        modes: TerminalModes::default(),
+                        recent_history_ansi: b"",
+                        screen_ansi: b"\x1b[?1049lreplacement-live",
+                    },
+                    |writer| {
+                        write_chrome(
+                            writer,
+                            &viewport,
+                            &mut status,
+                            TerminalViewTransportState::Synchronizing,
+                        )
+                    },
+                )
+                .expect("present the replacement-stream snapshot");
+
+            assert_eq!(output.frames.len(), 3);
+            assert!(contains_bytes(&output.frames[0], b"remote | direct | 8 ms"));
+            for frame in &output.frames[1..] {
+                assert!(contains_bytes(frame, b"remote | -- | --"));
+                assert!(!contains_bytes(frame, b"direct"));
+                assert!(!contains_bytes(frame, b"8 ms"));
+            }
+            assert!(contains_bytes(&output.frames[2], b"replacement-live"));
+            for frame in &output.frames {
+                assert!(frame.starts_with(HOST_SYNC_BEGIN));
+                assert!(contains_bytes(frame, HOST_INPUT_CAPTURE));
+                assert!(frame.ends_with(HOST_SYNC_END));
+            }
+            assert_eq!(output.writes, 3);
+            assert_eq!(output.flushes, 3);
         }
 
         #[test]
@@ -5718,6 +5865,144 @@ mod unix {
                 .expect("the Active transition retains live-bottom chrome");
             assert!(contains_bytes(&active_frame, "▐".as_bytes()));
             assert!(contains_bytes(&active_frame, "▕".as_bytes()));
+        }
+
+        #[test]
+        fn remote_history_resume_keeps_connection_status_stable_across_every_frame() {
+            let physical = TerminalSize::new(10, 30);
+            let layout = ChromeLayout::new(physical, true, ActiveScreen::Main);
+            let live = TerminalScrollMetrics {
+                epoch: Revision::new(2),
+                revision: Revision::new(7),
+                offset_from_bottom: 0,
+                max_offset_from_bottom: 18,
+                viewport_rows: layout.child.rows,
+            };
+            let mut viewport = ViewportController::with_layout(layout, Some(live));
+            let ViewportEffect::RequestHistoryWindow(query) = viewport.navigate(true, 6) else {
+                panic!("the uncached history target must request one window");
+            };
+            let shape = query
+                .response_shape(query.anchor)
+                .expect("controller query has one valid response shape");
+            assert!(matches!(
+                viewport
+                    .apply_history_window(TerminalHistoryWindowResult::Frame(
+                        zterm_core::terminal::TerminalHistoryWindowFrame {
+                            disposition: shape.disposition,
+                            anchor: query.anchor,
+                            target_offset_from_bottom: shape.target_offset_from_bottom,
+                            first_row_from_live_top: shape.first_row_from_live_top,
+                            ansi_rows: vec![b"history-row".to_vec(); shape.row_count],
+                        },
+                    ))
+                    .expect("complete cached history window"),
+                ViewportEffect::Render
+            ));
+
+            let mut status = StatusRenderer::new(Some("remote".to_owned()), physical);
+            status.path = TerminalViewConnectionPath::Direct;
+            status.rtt_ms = Some(11);
+            let active_status = b"remote | direct | 11 ms";
+            let inactive_status = b"remote | -- | --";
+            let mut output = ViewportFrameWriter::default();
+
+            render_history_with_chrome(
+                &mut output,
+                &viewport,
+                &mut status,
+                TerminalViewTransportState::Active,
+            )
+            .expect("present history with the known connection status");
+            viewport.observe_presentation();
+            assert_eq!(output.frames.len(), 1);
+            assert!(contains_bytes(&output.frames[0], "\x1b[5;30H▐".as_bytes()));
+
+            assert!(matches!(
+                viewport.navigate(false, 6),
+                ViewportEffect::Resume
+            ));
+            assert!(
+                !render_transport_transition_view_with_writer(
+                    &mut output,
+                    &viewport,
+                    &mut status,
+                    TerminalViewTransportState::Synchronizing,
+                    false,
+                )
+                .expect("the in-epoch synchronizing transition is visually silent")
+            );
+            viewport.observe_sync_required();
+            assert_eq!(
+                output.frames.len(),
+                1,
+                "Synchronizing and SyncRequired retain the last complete frame"
+            );
+
+            let replacement_live = TerminalScrollMetrics {
+                revision: Revision::new(8),
+                ..live
+            };
+            viewport.observe_snapshot(Some(replacement_live));
+            let mut renderer = TerminalRenderer::new();
+            renderer
+                .apply_snapshot_with_chrome(
+                    &mut output,
+                    RenderSnapshot {
+                        revision: replacement_live.revision,
+                        active_screen: ActiveScreen::Main,
+                        modes: TerminalModes::default(),
+                        recent_history_ansi: b"",
+                        screen_ansi: b"\x1b[?1049llive-row",
+                    },
+                    |writer| {
+                        write_chrome(
+                            writer,
+                            &viewport,
+                            &mut status,
+                            TerminalViewTransportState::Synchronizing,
+                        )
+                    },
+                )
+                .expect("present one authoritative live replacement");
+
+            assert_eq!(viewport.finish_resume(), Some(Vec::new()));
+            assert!(
+                !render_transport_transition_view_with_writer(
+                    &mut output,
+                    &viewport,
+                    &mut status,
+                    TerminalViewTransportState::Active,
+                    true,
+                )
+                .expect("the post-snapshot Active transition is visually silent")
+            );
+
+            assert_eq!(output.frames.len(), 2);
+            for frame in &output.frames {
+                assert!(
+                    contains_bytes(frame, active_status),
+                    "every in-epoch frame must retain the known connection status"
+                );
+                assert!(
+                    !contains_bytes(frame, inactive_status),
+                    "an in-epoch visual sync must not project a false disconnect"
+                );
+            }
+            assert!(contains_bytes(&output.frames[0], b"history-row"));
+            assert!(!contains_bytes(&output.frames[0], b"live-row"));
+            assert!(contains_bytes(&output.frames[1], b"live-row"));
+            assert!(
+                contains_bytes(&output.frames[1], "\x1b[7;30H▐".as_bytes()),
+                "the replacement snapshot paints the offset-zero thumb in its own transaction"
+            );
+            for frame in &output.frames {
+                assert!(frame.starts_with(HOST_SYNC_BEGIN));
+                assert!(contains_bytes(frame, HOST_INPUT_CAPTURE));
+                assert!(frame.ends_with(HOST_SYNC_END));
+            }
+            assert_eq!(output.writes, 2);
+            assert_eq!(output.flushes, 2);
         }
 
         #[test]

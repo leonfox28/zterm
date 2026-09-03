@@ -732,6 +732,91 @@ Hosted PR follow-up evidence (2026-09-03):
   made from byte-level tests that every outer-terminal implementation paints
   synchronized updates identically.
 
+## Post-smoke follow-up: remote status-row flash and return-live pause (2026-09-03)
+
+### 1. Root Cause Category
+
+- **Category**: D — Test Coverage Gap, with B — Cross-Layer Contract and E —
+  Implicit Assumption.
+- **Specific cause**: the CLI treated every non-`Active` transport state as if
+  the last observed connection path/RTT were invalid. Return-to-live is an
+  in-epoch visual synchronization, however, so its
+  `Synchronizing -> Snapshot -> Active` sequence painted `-- | --`, restored
+  direct/relay + RTT, and then issued an unchanged Active repaint. That leaked
+  internal coordination into the status row and added avoidable writes/flushes.
+- **Discriminating evidence**: the prior probabilities were 55% intermediate
+  transition frames, 25% a stale 16 ms cadence deadline, and 20% host-terminal
+  composition. A deterministic writer trace reproduced the path as
+  `direct -> -- -> direct` with extra transactions while showing the cadence
+  timer was cancelled. This raises the intermediate-frame cause above 95%; a
+  real Ghostty smoke remains necessary only for host-compositor confirmation.
+
+### 2. Why the prior fixes were incomplete
+
+1. The first return-live regression asserted content and scrollbar geometry,
+   but did not assert the remote status row in every stdout transaction.
+2. DEC 2026 makes one transaction atomic; it cannot hide a false status frame
+   or an unchanged Active repaint emitted as separate transactions.
+3. Transport synchronization and connection-observation validity were modeled
+   implicitly through one `Active` comparison, so an in-epoch snapshot repair
+   looked indistinguishable from a true reconnect to the status renderer.
+
+### 3. Prevention Mechanisms
+
+| Priority | Mechanism | Specific action | Status |
+| --- | --- | --- | --- |
+| P0 | Architecture | Preserve validated path/RTT through same-epoch synchronization; clear it only at a true reconnect epoch boundary | DONE |
+| P0 | Presentation | Retain the complete history frame until one replacement Snapshot atomically paints live content, bottom thumb, and status | DONE |
+| P0 | State transition | Let post-Snapshot Active complete input/resize state without repainting an unchanged visual result | DONE |
+| P0 | Tests | Enumerate actual DEC-2026 transactions and assert content, gutter, status, writes, and flushes across the full resume sequence | DONE |
+| P1 | Knowledge | Record the separate transport, connection-observation, and presentation authorities in code-spec and review checklist | DONE |
+
+### 4. Systematic Expansion
+
+- **Similar issues**: any future title/tab/badge, Android connection indicator,
+  cursor overlay, or selection chrome can flicker if derived directly from a
+  transient synchronization state instead of its own validity epoch.
+- **Design improvement**: transition handlers decide separately whether state
+  work, observation invalidation, and visual presentation are required. A
+  visually complete replacement Snapshot is presentation authority even though
+  the later Active event still owns input fencing and resize completion.
+- **Process improvement**: transition tests must inspect the sequence and count
+  of externally written frames, including every Zterm-owned chrome region,
+  rather than checking only reducer endpoints or one component.
+
+### 5. Knowledge Capture
+
+- [x] Update `.trellis/spec/backend/local-daemon-ipc.md` with executable
+  preservation/reset rules, matrix cases, tests, and wrong/correct examples.
+- [x] Update the cross-layer terminal-presentation checklist to include
+  connection-observation authority, the status row, and transaction count.
+- [x] Add same-epoch direct/relay preservation and true-reconnect isolation
+  regressions at the real composed-frame writer boundary.
+- [x] Verify this product repository has no `src/templates/markdown/spec/`
+  mirror, so there is no generated spec counterpart to synchronize.
+- [ ] Confirm the reviewed debug binary in real Ghostty by returning to live
+  repeatedly with wheel and scrollbar drag; this is user-owned acceptance.
+
+### 6. Verification
+
+- The regression first failed on the old `remote | -- | --` Synchronizing
+  frame. The fixed sequence contains exactly the retained history transaction
+  and one authoritative live Snapshot transaction; both retain direct/relay +
+  RTT, DEC 2026 boundaries, host capture, one write, and one flush.
+- Independent `trellis-check` found no production-code defect. It expanded the
+  tests to Relay + RTT and to a true reconnect's full replacement Snapshot, so
+  stale Direct/RTT cannot hide behind a chrome-only test.
+- Focused tests and the complete `zterm-cli` suite passed with 64 library tests
+  and 3 intentional isolated-process helpers ignored; main/integration tests,
+  workspace all-target/all-feature check and Clippy with `-D warnings`, format,
+  source policy, and `git diff --check` passed.
+- The repository-level `just check` passed after the production, regression,
+  task, and spec changes, including all workspace tests/docs, policy and secret
+  checks, cargo-deny, and Relay static/upstream verification. The reviewed
+  `target/debug/zterm` was then rebuilt with all CLI features.
+- Real Ghostty/macOS/Linux composition remains the explicit smoke boundary;
+  byte-level tests prove what Zterm emits, not when each host compositor paints.
+
 ## Phase 8 — Herdr-style Host Viewport Presentation Cadence (Planning)
 
 ### 1. Isolate timing state

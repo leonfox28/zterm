@@ -6,6 +6,9 @@ Apply this contract to the per-user daemon, Unix socket service, peer
 credentials, detached launch, setup/status/doctor/log commands, and lifecycle
 locks. It also covers the Unix raw-terminal UI, its host mouse capture,
 attachment-local history viewport, and Zterm-owned status/scrollbar chrome.
+Apply the presentation rules whenever a transport transition decides whether
+the last observed connection path/RTT is still valid and whether stdout should
+receive another complete frame.
 
 ## 2. Signatures
 
@@ -69,6 +72,15 @@ ViewportPresentationPacer::mark_presented(&mut self, now: Instant)
 ViewportPresentationPacer::cancel(&mut self)
 
 ViewportController::observe_presentation(&mut self)
+
+StatusRenderer::reset_for_reconnect(&mut self)
+render_transport_transition_view_with_writer(
+    writer: &mut impl Write,
+    viewport: &ViewportController,
+    status: &mut StatusRenderer,
+    transport_state: TerminalViewTransportState,
+    resumed_from_snapshot: bool,
+) -> Result<bool, CliError>
 
 ViewportState::ResumePending {
     retained_input: Vec<u8>,
@@ -306,6 +318,17 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   before returning the original error. Raw-mode cleanup begins by ending DEC
   2026, then disables capture/restores the user's terminal on normal exit,
   signal, error, and panic.
+- Transport synchronization and connection-path validity are independent.
+  Same-stream `SyncRequired`/`Synchronizing` during return-to-live preserves the
+  last observed direct/relay path and RTT. It emits no standalone transition
+  frame while a valid complete history presentation is retained. The
+  authoritative replacement snapshot atomically paints live content,
+  offset-zero scrollbar, status row, capture, and cursor state; the following
+  `Active` event still completes the input fence, buffered-input forwarding,
+  and pending-resize state, but does not repaint an already-complete visual
+  result. A true `Reconnecting` transition is the connection-observation epoch
+  boundary: clear path/RTT before any replacement-stream synchronization and
+  show unknown until a new validated status observation arrives.
 - The primary history path is a client-owned `ViewportCache<Vec<u8>>` fed by
   bounded 317/318 windows. A full cached slice applies wheel/Page/drag to the
   desired offset locally without a request. All host events decoded from one
@@ -481,6 +504,9 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
 | compatible same-epoch live history grows while a complete pinned frame is pending | translate the cached target and keep the valid pending presentation; do not discard it merely because the background revision advanced |
 | `ResumePending` receives `SyncRequired` before its replacement snapshot | keep the last painted, valid scrollbar geometry; do not turn missing replacement metrics into a blank gutter frame |
 | replacement snapshot is observed while resuming | use its validated live metrics in the same snapshot/chrome transaction; do not wait for a later `Active` repaint to restore the thumb |
+| same-epoch return-to-live enters `SyncRequired`/`Synchronizing` with a known path/RTT | emit no intermediate presentation and retain the last complete status row until the replacement snapshot atomically paints the same observation |
+| `Active` follows the authoritative resume snapshot with no newer visual state | complete the input fence, buffered-input forwarding, and pending-resize transition without a redundant stdout transaction |
+| transport enters true `Reconnecting` | clear the prior path/RTT observation before rendering or synchronizing the replacement stream; show unknown until that stream supplies a validated status |
 | a coalesced legacy viewport response immediately schedules a newer target | advance the request baseline but retain the last painted frame/metrics; an unpainted response is not presentation authority |
 | resume geometry changes or the attachment truly reconnects | clear mismatched retained metrics / clear both live and retained metrics; never project stale thumb geometry onto a new size or stream epoch |
 | command write closure races a buffered typed lifecycle event | publish the typed event; suppress raw `Broken pipe`/OS text and do not retry the command |
@@ -533,9 +559,17 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
 - **Good:** preserve the painted history thumb through `ResumePending` and
   `SyncRequired`, then replace it directly with the validated live-bottom thumb
   inside the authoritative snapshot transaction.
+- **Good:** preserve a validated direct/relay + RTT observation through an
+  in-epoch visual sync, paint it with the replacement snapshot, and let the
+  following `Active` event perform state/input work without an unchanged frame.
+- **Base:** a fresh attachment or true reconnect shows unknown connection
+  details until that connection epoch reports a validated path and RTT.
 - **Bad:** derive chrome from the most recently received coalesced frame, clear
   the gutter while a replacement snapshot is pending, or retain metrics across
   a resize/reconnect merely because the old terminal pixels are still visible.
+- **Bad:** equate every non-`Active` state with a lost connection observation,
+  or emit separate Synchronizing, Snapshot, and unchanged Active transactions;
+  DEC 2026 cannot make multiple transactions visually atomic as a group.
 - **Bad:** trust socket permissions without peer credentials, decode before the
   UID gate, let clap accept a ticket/path/socket override, block the
   current-thread runtime on PTY work, or remove a socket by pathname without
@@ -631,10 +665,14 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   `History -> ResumePending -> SyncRequired -> Snapshot -> Active` sequence and
   assert every emitted chrome frame: the pre-snapshot frame retains the last
   painted thumb, the snapshot frame contains validated offset-zero chrome in
-  the same DEC-2026 transaction, and the Active frame does not repair a blank
-  intermediate. Coalesced-but-unpainted legacy frames, pager/no-metrics,
-  invalid replacement metrics, resize, and true reconnect are separate
-  regressions. Operations
+  the same DEC-2026 transaction, and the Active transition does not repair a
+  blank intermediate or emit an unchanged repaint. For remote views, the same
+  regression asserts the exact transaction count and requires every emitted
+  in-epoch frame to contain the stable path/RTT status row. A separate true-
+  reconnect regression resets that observation and proves it cannot reappear
+  during replacement-stream synchronization. Coalesced-but-unpainted legacy
+  frames, pager/no-metrics, invalid replacement metrics, resize, and true
+  reconnect are separate regressions. Operations
   tests prove both local-stream closure and top-level command send/response-owner
   closure defer to an already queued typed terminal outcome, while closure with
   no event is normalized without raw OS text. The top-level schedule uses one
@@ -725,6 +763,25 @@ last_presented_metrics = viewport_cache.desired_metrics();
 // Correct: keep desired and actually presented state independent.
 present_latest_complete_cached_frame_atomically()?;
 viewport.observe_presentation();
+```
+
+```rust
+// Wrong: synchronization is treated as disconnection and every state change
+// leaks another complete frame to the user's terminal.
+if transport_state != TerminalViewTransportState::Active {
+    status.show_unknown();
+}
+render_view_for_sync()?;
+render_replacement_snapshot()?;
+render_unchanged_active_view()?;
+
+// Correct: only a real connection-epoch boundary invalidates path/RTT.
+if transport_state == TerminalViewTransportState::Reconnecting {
+    status.reset_for_reconnect();
+}
+retain_complete_frame_during_same_epoch_sync();
+render_replacement_snapshot_with_content_and_all_chrome_atomically()?;
+complete_active_input_and_resize_state_without_unchanged_repaint()?;
 ```
 
 ```rust
