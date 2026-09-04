@@ -19,10 +19,9 @@ use tokio::sync::watch;
 #[cfg(all(unix, test))]
 use zterm_core::terminal::TerminalHistoryWindowAnchor;
 #[cfg(unix)]
-use zterm_core::terminal::TerminalHistoryWindowQuery;
+use zterm_core::terminal::{TerminalHistoryWindowQuery, TerminalSurfaceHistoryWindowResult};
 use zterm_core::terminal::{
-    TerminalSize, TerminalSurfaceDelta, TerminalSurfaceDeltaResult,
-    TerminalSurfaceHistoryWindowResult, TerminalSurfaceSnapshot,
+    TerminalSize, TerminalSurfaceDelta, TerminalSurfaceDeltaResult, TerminalSurfaceSnapshot,
 };
 use zterm_core::{
     AttachmentId, AttachmentPrincipal, ControllerLease, DaemonIncarnation, DeviceId,
