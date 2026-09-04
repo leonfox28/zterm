@@ -12,7 +12,7 @@
   "assignee": "leon",
   "createdAt": "2026-09-01",
   "completedAt": null,
-  "branch": "main",
+  "branch": "fix/release-prepare-reliability",
   "base_branch": "main",
   "worktree_path": null,
   "commit": null,

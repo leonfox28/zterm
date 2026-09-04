@@ -152,7 +152,7 @@ keeps all existing Unix runtime and Windows shared-boundary tests.
 
 ## Branch and pull-request flow
 
-Normal substantive work and release preparation use a branch and pull request:
+Normal substantive work uses a branch and pull request:
 
 ```bash
 git switch -c <topic>
@@ -165,6 +165,11 @@ CI runs for the pull request, not a duplicate branch-push workflow. Updating
 the branch cancels the older PR-head run. Merge only after the stable `CI gate`
 is green; the resulting `main` push runs the full integration graph plus all
 four exact-SHA release-readiness builds.
+
+The deterministic two-file release-version commit is the narrow exception to
+the local `just check` step: `just release-prepare VERSION` runs focused
+version/lock validation, then its required PR CI owns the complete gate. See
+[Release operations](releasing.md) for that path.
 
 After this workflow change is merged, a repository administrator must apply
 the following one-time `main` protection checklist. The repository code does

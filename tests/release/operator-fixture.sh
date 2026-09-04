@@ -13,6 +13,10 @@ fail() {
     exit 1
 }
 
+real_cargo=$(command -v cargo) || fail "cargo is required"
+"$real_cargo" +1.98.0 --version >/dev/null 2>&1 \
+    || fail "the pinned Cargo 1.98.0 toolchain is required"
+
 cat >"$fake_bin/cargo" <<'FAKE_CARGO'
 #!/bin/sh
 set -eu
@@ -24,20 +28,7 @@ case " $* " in
         [ "$candidate" = 0.1.10 ] || exit 1
         printf '%s\n' "next release version $candidate is valid"
         ;;
-    *' pkgid '*)
-        version=$(sed -n '/^\[workspace.package\]$/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)
-        printf 'path+file:///fixture#zterm-cli@%s\n' "$version"
-        ;;
-    *' metadata '*)
-        version=$(sed -n '/^\[workspace.package\]$/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)
-        awk -v version="$version" '
-            /^version = "[^"]+"$/ { print "version = \"" version "\""; next }
-            { print }
-        ' Cargo.lock >Cargo.lock.fixture
-        mv Cargo.lock.fixture Cargo.lock
-        printf '%s\n' '{}'
-        ;;
-    *) exit 1 ;;
+    *) exec "$REAL_CARGO" "$@" ;;
 esac
 FAKE_CARGO
 
@@ -45,10 +36,7 @@ cat >"$fake_bin/just" <<'FAKE_JUST'
 #!/bin/sh
 set -eu
 printf 'just %s\n' "$*" >>"$FAKE_TRACE"
-[ "${FAKE_JUST_FAIL:-0}" != 1 ]
-if [ "${FAKE_JUST_DIRTY:-0}" = 1 ]; then
-    printf '%s\n' 'unexpected check output' >unexpected-check-output
-fi
+exit 97
 FAKE_JUST
 
 cat >"$fake_bin/gh" <<'FAKE_GH'
@@ -64,9 +52,27 @@ case "$command_name" in
         ;;
     release) exit 1 ;;
     pr)
-        [ "${1:-}" = create ] || exit 1
-        [ "${FAKE_PR_FAIL:-0}" != 1 ] || exit 1
-        printf '%s\n' 'https://example.invalid/pull/1'
+        pr_command=${1:-}
+        case "$pr_command" in
+            list)
+                if [ -f "$FAKE_STATE_DIR/pr-record" ]; then
+                    cat "$FAKE_STATE_DIR/pr-record"
+                fi
+                ;;
+            create)
+                [ "${FAKE_PR_FAIL:-0}" != 1 ] || exit 1
+                pr_sha=$(git rev-parse HEAD)
+                if [ -n "${FAKE_PR_SHA:-}" ]; then
+                    pr_sha=$FAKE_PR_SHA
+                fi
+                pr_branch=$(git branch --show-current)
+                printf 'https://example.invalid/pull/1\tOPEN\t%s\tmain\t%s\tfalse\n' \
+                    "$pr_branch" "$pr_sha" >"$FAKE_STATE_DIR/pr-record"
+                [ "${FAKE_PR_AMBIGUOUS:-0}" != 1 ] || exit 1
+                printf '%s\n' 'https://example.invalid/pull/1'
+                ;;
+            *) exit 1 ;;
+        esac
         ;;
     api)
         case " $* " in
@@ -110,28 +116,34 @@ git -C "$seed" config user.name 'Operator Fixture'
 git -C "$seed" config user.email fixture@example.invalid
 cat >"$seed/Cargo.toml" <<'MANIFEST'
 [workspace]
-members = []
+members = ["crates/cli"]
+resolver = "2"
 
 [workspace.package]
 version = "0.1.9"
+edition = "2021"
 MANIFEST
-cat >"$seed/Cargo.lock" <<'LOCKFILE'
-version = 4
-
-[[package]]
+mkdir -p "$seed/crates/cli/src" "$seed/tests"
+cat >"$seed/crates/cli/Cargo.toml" <<'MEMBER_MANIFEST'
+[package]
 name = "zterm-cli"
-version = "0.1.9"
-LOCKFILE
-mkdir -p "$seed/tests"
+version.workspace = true
+edition.workspace = true
+MEMBER_MANIFEST
+: >"$seed/crates/cli/src/lib.rs"
+"$real_cargo" +1.98.0 generate-lockfile --manifest-path "$seed/Cargo.toml"
 cat >"$seed/tests/workspace-version.sh" <<'VERSION_TEST'
 #!/bin/sh
 set -eu
 manifest_version=$(sed -n '/^\[workspace.package\]$/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)
 lock_version=$(sed -n '/^name = "zterm-cli"$/{n;s/^version = "\([^"]*\)"/\1/p;}' Cargo.lock)
 [ "$manifest_version" = "$lock_version" ]
+if [ "${FIXTURE_VERSION_EXTRA:-0}" = 1 ]; then
+    printf '%s\n' 'unexpected validator output' >unexpected-version-output
+fi
 VERSION_TEST
 chmod 700 "$seed/tests/workspace-version.sh"
-git -C "$seed" add Cargo.toml Cargo.lock tests/workspace-version.sh
+git -C "$seed" add Cargo.toml Cargo.lock crates tests/workspace-version.sh
 git -C "$seed" commit --quiet -m baseline
 
 new_case() {
@@ -140,7 +152,8 @@ new_case() {
     case_remote="$case_root/remote.git"
     case_worktree="$case_root/worktree"
     case_trace="$case_root/trace.log"
-    mkdir -p "$case_root"
+    case_state="$case_root/gh-state"
+    mkdir -p "$case_root" "$case_state"
     git init --quiet --bare "$case_remote"
     git -C "$seed" push --quiet "$case_remote" main
     git --git-dir="$case_remote" symbolic-ref HEAD refs/heads/main
@@ -152,7 +165,9 @@ new_case() {
 
 run_operator() {
     env PATH="$fake_bin:$PATH" \
+        REAL_CARGO="$real_cargo" \
         FAKE_TRACE="$case_trace" \
+        FAKE_STATE_DIR="$case_state" \
         FAKE_REPOSITORY=fixture/zterm \
         ZTERM_RELEASE_TEST_MODE=1 \
         ZTERM_RELEASE_REPOSITORY=fixture/zterm \
@@ -258,33 +273,37 @@ fi
 [ "$(git --git-dir="$case_remote" cat-file -t refs/tags/v0.1.10)" = tag ] \
     || fail "existing annotated tag fixture was not preserved"
 
-new_case failed-check
+new_case partial-inventory
 operator_command=prepare
 operator_version=0.1.10
-if run_operator FAKE_JUST_FAIL=1 >"$case_root/stdout" 2>"$case_root/stderr"; then
-    fail "failed pre-push gate was accepted"
+if run_operator FIXTURE_VERSION_EXTRA=1 >"$case_root/stdout" 2>"$case_root/stderr"; then
+    fail "unexpected release inventory was accepted"
 fi
 [ "$(git -C "$case_worktree" branch --show-current)" = release/v0.1.10 ] \
-    || fail "failed check did not retain the local release branch"
+    || fail "inventory failure did not retain the local release branch"
 [ -n "$(git -C "$case_worktree" status --porcelain)" ] \
-    || fail "failed check did not retain the version diff"
+    || fail "inventory failure did not retain the partial version diff"
+inventory_diagnostic='release operator failed: release preparation inventory mismatch
+expected:
+Cargo.lock
+Cargo.toml
+actual:
+Cargo.lock
+Cargo.toml
+unexpected-version-output'
+grep -Fq "$inventory_diagnostic" "$case_root/stderr" \
+    || fail "inventory failure did not print stable expected and actual sets"
 if git --git-dir="$case_remote" show-ref --verify --quiet refs/heads/release/v0.1.10; then
-    fail "failed check pushed the release branch"
+    fail "inventory failure pushed the release branch"
 fi
-assert_no_remote_tag failed-check
-
-new_case dirty-after-check
-operator_command=prepare
-operator_version=0.1.10
-if run_operator FAKE_JUST_DIRTY=1 >"$case_root/stdout" 2>"$case_root/stderr"; then
-    fail "unexpected check output was accepted"
+updates_before_resume=$(grep -Fc 'cargo +1.98.0 update --workspace' "$case_trace" || true)
+if run_operator >"$case_root/resume-stdout" 2>"$case_root/resume-stderr"; then
+    fail "dirty partial release branch was auto-resumed"
 fi
-grep -Fq 'release preparation changed files outside Cargo.toml and Cargo.lock' \
-    "$case_root/stderr" || fail "post-check inventory failed for the wrong reason"
-if git --git-dir="$case_remote" show-ref --verify --quiet refs/heads/release/v0.1.10; then
-    fail "unexpected check output pushed the release branch"
-fi
-assert_no_remote_tag dirty-after-check
+[ "$(grep -Fc 'cargo +1.98.0 update --workspace' "$case_trace" || true)" \
+    -eq "$updates_before_resume" ] \
+    || fail "dirty partial resume reran Cargo generation"
+assert_no_remote_tag partial-inventory
 
 new_case prepare-success
 operator_command=prepare
@@ -299,8 +318,128 @@ changed_files=$(git --git-dir="$case_remote" diff-tree --no-commit-id --name-onl
     refs/heads/release/v0.1.10 | LC_ALL=C sort)
 [ "$changed_files" = "Cargo.lock
 Cargo.toml" ] || fail "release commit changed files outside Cargo.toml and Cargo.lock"
+lock_contents=$(git --git-dir="$case_remote" \
+    show refs/heads/release/v0.1.10:Cargo.lock)
+lock_version=$(printf '%s\n' "$lock_contents" \
+    | sed -n '/^name = "zterm-cli"$/{n;s/^version = "\([^"]*\)"/\1/p;}')
+[ "$lock_version" = 0.1.10 ] \
+    || fail "real Cargo did not refresh the inherited workspace package version"
+grep -Fxq 'cargo +1.98.0 update --workspace' "$case_trace" \
+    || fail "prepare bypassed real Cargo workspace lock generation"
+grep -Fxq 'cargo +1.98.0 metadata --locked --format-version 1 --no-deps' \
+    "$case_trace" || fail "prepare did not perform locked metadata validation"
+if grep -Fq 'just check' "$case_trace"; then
+    fail "prepare duplicated the release PR full quality gate"
+fi
 grep -Fq 'gh pr create ' "$case_trace" || fail "prepare did not open a PR"
 assert_no_remote_tag prepare-success
+
+new_case created-pr-sha-mismatch
+operator_command=prepare
+operator_version=0.1.10
+mismatched_pr_sha=0000000000000000000000000000000000000000
+if run_operator FAKE_PR_SHA="$mismatched_pr_sha" \
+    >"$case_root/stdout" 2>"$case_root/stderr"; then
+    fail "newly created PR with a mismatched head SHA was accepted"
+fi
+grep -Fq "existing PR head is $mismatched_pr_sha" "$case_root/stderr" \
+    || fail "newly created PR identity was not read back and checked"
+[ "$(grep -Fc 'gh pr list ' "$case_trace")" -eq 2 ] \
+    || fail "newly created PR was not queried after creation"
+[ "$(grep -Fc 'gh pr create ' "$case_trace")" -eq 1 ] \
+    || fail "mismatched newly created PR was duplicated"
+assert_no_remote_tag created-pr-sha-mismatch
+
+new_case resume-existing-pr
+operator_command=prepare
+operator_version=0.1.10
+if run_operator FAKE_PR_AMBIGUOUS=1 \
+    >"$case_root/first-stdout" 2>"$case_root/first-stderr"; then
+    fail "ambiguous PR creation unexpectedly succeeded"
+fi
+[ -z "$(git -C "$case_worktree" status --porcelain --untracked-files=all)" ] \
+    || fail "ambiguous PR result did not retain a clean release commit"
+local_release_sha=$(git -C "$case_worktree" rev-parse HEAD)
+remote_release_sha=$(git --git-dir="$case_remote" \
+    rev-parse refs/heads/release/v0.1.10)
+[ "$local_release_sha" = "$remote_release_sha" ] \
+    || fail "ambiguous PR result did not retain the exact remote branch"
+grep -Fq 'rerun: just release-prepare 0.1.10' "$case_root/first-stderr" \
+    || fail "ambiguous PR result did not print the bounded resume command"
+if ! run_operator >"$case_root/resume-stdout" 2>"$case_root/resume-stderr"; then
+    cat "$case_root/resume-stderr" >&2
+    fail "exact release commit did not resume"
+fi
+[ "$(grep -Fc 'cargo +1.98.0 update --workspace' "$case_trace")" -eq 1 ] \
+    || fail "resume regenerated the release lockfile"
+[ "$(grep -Fc 'gh pr create ' "$case_trace")" -eq 1 ] \
+    || fail "resume created a duplicate PR"
+[ "$(grep -Fc 'gh pr list ' "$case_trace")" -eq 2 ] \
+    || fail "prepare did not reconcile PR state on both attempts"
+grep -Fq 'Release PR: https://example.invalid/pull/1' "$case_root/resume-stdout" \
+    || fail "resume did not return the existing PR URL"
+assert_no_remote_tag resume-existing-pr
+
+new_case divergent-remote
+operator_command=prepare
+operator_version=0.1.10
+if run_operator FAKE_PR_FAIL=1 >"$case_root/first-stdout" 2>"$case_root/first-stderr"; then
+    fail "fixture PR failure unexpectedly succeeded"
+fi
+diverter="$case_root/diverter"
+git clone --quiet "$case_remote" "$diverter"
+git -C "$diverter" config user.name 'Operator Fixture'
+git -C "$diverter" config user.email fixture@example.invalid
+git -C "$diverter" switch --quiet release/v0.1.10
+printf '%s\n' divergent >"$diverter/divergent-change"
+git -C "$diverter" add divergent-change
+git -C "$diverter" commit --quiet -m 'diverge release branch'
+git -C "$diverter" push --quiet origin release/v0.1.10
+divergent_sha=$(git -C "$diverter" rev-parse HEAD)
+if run_operator >"$case_root/resume-stdout" 2>"$case_root/resume-stderr"; then
+    fail "divergent remote release branch was accepted"
+fi
+grep -Fq "remote branch release/v0.1.10 points to $divergent_sha" \
+    "$case_root/resume-stderr" \
+    || fail "remote divergence did not report the conflicting SHA"
+[ "$(git --git-dir="$case_remote" rev-parse refs/heads/release/v0.1.10)" \
+    = "$divergent_sha" ] || fail "operator overwrote the divergent remote branch"
+assert_no_remote_tag divergent-remote
+
+new_case wrong-release-subject
+operator_command=prepare
+operator_version=0.1.10
+if run_operator FAKE_PR_FAIL=1 >"$case_root/first-stdout" 2>"$case_root/first-stderr"; then
+    fail "fixture PR failure unexpectedly succeeded"
+fi
+git -C "$case_worktree" commit --quiet --amend -m 'wrong release subject'
+if run_operator >"$case_root/resume-stdout" 2>"$case_root/resume-stderr"; then
+    fail "release commit with the wrong subject was accepted"
+fi
+grep -Fq "release commit subject is 'wrong release subject'" \
+    "$case_root/resume-stderr" \
+    || fail "wrong release subject failed for an unexpected reason"
+assert_no_remote_tag wrong-release-subject
+
+new_case closed-release-pr
+operator_command=prepare
+operator_version=0.1.10
+if run_operator FAKE_PR_AMBIGUOUS=1 \
+    >"$case_root/first-stdout" 2>"$case_root/first-stderr"; then
+    fail "ambiguous PR creation unexpectedly succeeded"
+fi
+awk 'BEGIN { FS = OFS = "\t" } { $2 = "CLOSED"; print }' \
+    "$case_state/pr-record" >"$case_state/pr-record.closed"
+mv "$case_state/pr-record.closed" "$case_state/pr-record"
+if run_operator >"$case_root/resume-stdout" 2>"$case_root/resume-stderr"; then
+    fail "closed release PR was reused"
+fi
+grep -Fq 'existing PR for release/v0.1.10 is not open' \
+    "$case_root/resume-stderr" \
+    || fail "closed release PR failed for an unexpected reason"
+[ "$(grep -Fc 'gh pr create ' "$case_trace")" -eq 1 ] \
+    || fail "closed PR state created a competing PR"
+assert_no_remote_tag closed-release-pr
 
 new_case missing-green-ci
 operator_command=publish

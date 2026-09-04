@@ -47,7 +47,7 @@ Local checks prevent portable mistakes, PR CI prevents a red integration branch,
 | --- | --- |
 | `just doctor` | Read-only prerequisite report for exact Rust, just, ShellCheck, actionlint, cargo-deny, gh, jq and Docker-related optional evidence. It prints exact install guidance and never installs global tools. |
 | `just check-fast` | Source/version/release policy, secret scan, format and native Clippy owners for the edit loop. |
-| `just check` | Required pre-push local gate: fast checks, native workspace tests/docs, dependency policy and locally reproducible relay contracts. It reports the remaining hosted OS/architecture and Docker/QEMU evidence. |
+| `just check` | Required pre-push local gate for ordinary substantive changes: fast checks, native workspace tests/docs, dependency policy and locally reproducible relay contracts. The deterministic two-file release commit instead uses focused version/lock validation followed by required PR CI. It reports the remaining hosted OS/architecture and Docker/QEMU evidence. |
 | `just ci-policy` | Canonical version, format, workflow/static release policy, maintained ShellCheck, Python fixture source and actionlint. |
 | `just ci-unix` | Full Unix Clippy and workspace tests; matrix inputs decide the two OS-family CLI smoke owners and the one docs owner. |
 | `just ci-windows` | Hosted Windows shared/unsupported-boundary Clippy and shared-contract tests. |
@@ -145,14 +145,16 @@ The command performs all read-only checks before creating a branch:
 1. verify canonical repository/maintainer gh context, clean worktree, current `main`, fetched tags and exact equality with `origin/main`;
 2. reject an existing release branch, local/remote tag or GitHub Release;
 3. use the Rust `semver` owner in `zterm-release-tool validate-next-version` to require canonical strictly newer input;
-4. create `release/vVERSION`, update only `[workspace.package].version`, refresh path-package versions in `Cargo.lock` through Cargo, and verify the exact changed-file inventory;
-5. run `just check` plus release-specific prepare preflight;
+4. create `release/vVERSION`, update only `[workspace.package].version`, run `cargo +1.98.0 update --workspace`, then validate with `cargo +1.98.0 metadata --locked --format-version 1 --no-deps`, `tests/workspace-version.sh`, and the exact changed-file inventory;
+5. do not repeat `just check`: the release PR's required CI is the complete format/Clippy/test/docs/dependency owner, while prepare owns only deterministic version/lock generation and focused validation;
 6. commit `chore: prepare vVERSION release`, push only the release branch and open a PR targeting `main`;
 7. print the PR URL and state that publication is blocked until human merge and exact main CI success.
 
 README/development prose stops embedding a mutable current version. Relay publication tests derive the workspace version and construct their matching/mismatching tags dynamically. That makes Cargo.toml/Cargo.lock the normal release-PR diff rather than a recurring list of manual text replacements.
 
-If a check fails after the local branch is created, the command leaves the branch and diff for inspection and prints recovery steps. It never automatically deletes user work or pushes a tag.
+If generation or focused validation fails after the local branch is created, the command leaves the dirty branch and diff for inspection and prints recovery steps. It never automatically repairs/deletes partial work or pushes a tag.
+
+If the exact release commit was created but branch push or PR creation returned an ambiguous network failure, rerunning the same command from that clean `release/vVERSION` branch enters a bounded resume path. The operator requires one exact commit directly on current `origin/main`, the expected subject, requested workspace version, locked Cargo validity, and an exact `Cargo.toml`/`Cargo.lock` diff. It may then reuse only a remote branch at the same SHA and one open PR for that same head/base, or create the missing remote branch/PR. A divergent remote, closed/merged/ambiguous PR, extra commit/file, dirty tree, or changed main fails closed. This is not a generic release state machine.
 
 ### `release-publish`
 
@@ -270,3 +272,17 @@ One implementation worker owns the coherent workflow/script slice, followed by o
 ## 14. Deferred decisions
 
 After 20–30 real PR/main runs, compare critical path, execution time, cache hit rate, flaky failures and unique platform catches. Only then consider nextest, path classification, or changing Linux ARM/macOS Intel from full tests to compile-only. Preview channels, docs snapshot automation, issue closing and stronger OCI immutability remain separate product/operations decisions.
+
+## 15. 2026-09-04 prepare reliability correction
+
+The repeated first-attempt failures in v0.1.10–v0.1.14 came from a local implementation/test mismatch: production invoked `cargo metadata --no-deps` as though it generated lockfile changes, while the fixture silently rewrote `Cargo.lock` on that command. Real Cargo does not provide that side effect.
+
+The correction keeps the existing two-phase architecture and narrows each owner:
+
+- Cargo explicitly generates the lock change with `update --workspace`.
+- Locked metadata, workspace-version policy, and exact inventory validate the generated state.
+- The private fixture delegates those commands to the pinned real Cargo; it only substitutes the repository-specific SemVer tool and GitHub API.
+- Release PR CI is the sole full quality gate for the generated commit; local prepare does not duplicate it immediately before push.
+- A small resume transition exists only after the exact clean commit boundary. Partial generation remains deliberately manual, and `release-publish` is unchanged.
+
+This avoids a custom lockfile parser, a persistent operator-state schema, a temporary production worktree, or broad reconciliation rules that would add more failure states than the observed problem warrants.

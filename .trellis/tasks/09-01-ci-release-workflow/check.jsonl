@@ -8,3 +8,4 @@
 {"file":".trellis/tasks/09-01-ci-release-workflow/research/current-state.md","reason":"Compare target job ownership, failure diagnostics and timings against the recorded baseline rather than generic assumptions."}
 {"file":".trellis/tasks/09-01-ci-release-workflow/research/redundancy-analysis.md","reason":"Ensure only pure duplication was removed and all distinct trust/platform evidence retains an owner."}
 {"file":".trellis/tasks/09-01-ci-release-workflow/research/open-source-comparison.md","reason":"Reject accidental copying of Herdr's direct-main or weaker release publication boundaries while preserving its command/cache benefits."}
+{"file":".trellis/tasks/09-01-ci-release-workflow/research/release-prepare-lock-refresh.md","reason":"Verify the implementation fixes the observed Cargo/test mismatch, does not grow into a generic state machine, and covers exact clean-commit resume plus divergence rejection."}
