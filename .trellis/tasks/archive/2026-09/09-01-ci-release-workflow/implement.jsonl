@@ -9,3 +9,4 @@
 {"file":".trellis/tasks/09-01-ci-release-workflow/research/redundancy-analysis.md","reason":"Per-check repetition, unique platform evidence and safe first-pass removal analysis."}
 {"file":".trellis/tasks/09-01-ci-release-workflow/research/open-source-comparison.md","reason":"Pinned Herdr comparison and approved synthesis of borrowed versus intentionally stronger zterm behavior."}
 {"file":".trellis/tasks/08-24-distribution-release/research/release-workflow-comparison.md","reason":"Parent research for ripgrep, uv, just and release security/atomicity patterns that constrain this child task."}
+{"file":".trellis/tasks/09-01-ci-release-workflow/research/release-prepare-lock-refresh.md","reason":"Production evidence, root-cause classification, truthful Cargo test boundary, and deliberately bounded prepare-resume contract for the follow-up."}

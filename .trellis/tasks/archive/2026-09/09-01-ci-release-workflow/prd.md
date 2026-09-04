@@ -33,7 +33,7 @@
 ### R2 — One local command owner
 
 - 新增仓库级 `justfile`，至少提供 `doctor`、`check-fast`、`check`、CI profile recipes、`release-prepare <version>` 和 `release-publish <version>`。
-- `just check` 是 push 前权威入口；CI 调用相同 recipes/underlying scripts，不在 YAML 复制一套容易漂移的命令。
+- `just check` 是普通实质性改动的 push 前权威入口；由 operator 确定性生成的两文件 release commit 只跑 focused version/lock validation，完整 gate 由其必经 PR CI 拥有。CI 调用相同 recipes/underlying scripts，不在 YAML 复制一套容易漂移的命令。
 - `doctor` 对 Rust、just、ShellCheck、actionlint、cargo-deny、gh/jq 和需要 Docker 的 hosted-only 能力给出明确结果与安装/复现提示；不得静默跳过一个 required owner。
 - 本地单平台检查明确列出 hosted-only evidence，不能冒充 macOS/Linux/Windows 或另一架构的运行结果。
 
@@ -54,7 +54,7 @@
 
 ### R5 — Two-phase release operator
 
-- `just release-prepare <version>` 从干净且同步的 `main` 创建本地 release branch，验证 canonical newer SemVer，更新唯一 workspace version 与 `Cargo.lock`，运行 preflight/check，创建 commit，push branch 并打开 release PR；任何检查失败都不得 push tag 或公开 release。
+- `just release-prepare <version>` 从干净且同步的 `main` 创建本地 release branch，验证 canonical newer SemVer，显式运行 Cargo 的 workspace lockfile 更新，再以 locked metadata、workspace-version 和 exact changed-file inventory 做 focused validation，创建 commit，push branch 并打开 release PR；完整 format/Clippy/test/docs/dependency gate 由随后必经的 release PR CI 拥有，任何检查失败都不得 push tag 或公开 release。
 - release-time 当前版本文本从 README/docs/test fixture 中移除或动态派生，使正常版本升级只需修改 Cargo version/lock，而非手工搜索多处数字。
 - `just release-publish <version>` 只能从干净、与 `origin/main` 相同的 `main` 执行；它重新检查版本、tag/release vacancy、exact-SHA successful main CI 和 branch protection precondition，随后创建 annotated tag、push，并显示/跟踪 release run。
 - 两个命令都 fail closed，不 force push、不覆盖 branch/tag/release，不自动删除失败现场，并输出明确恢复动作。
@@ -79,6 +79,14 @@
 - README 只链接权威说明并保留简短命令，不复制易漂移的完整流水线。
 - workflow 的策略逻辑尽量由可 ShellCheck/测试的仓库脚本拥有；相关 Trellis distribution/relay/cross-platform spec 与新 owner 同步。
 
+### R9 — Post-release prepare reliability
+
+- 2026-09-04 对 v0.1.10–v0.1.14 的实际发布复盘确认：`cargo metadata --no-deps` 不会刷新 workspace package 在 `Cargo.lock` 中的版本；operator 把它当生成动作，而 fixture 又伪造了该副作用，造成每次 prepare 首次失败。这是实现与测试证据不匹配，不是发布状态机缺失。
+- lockfile 生成动作必须是显式 `cargo +1.98.0 update --workspace`；随后 `cargo +1.98.0 metadata --locked --format-version 1 --no-deps` 只能验证，不得被测试替身赋予真实 Cargo 不具备的写入行为。
+- changed-file inventory 失败必须同时打印 expected 与 actual；prepare 不再在已受 release PR CI 保护的路径上重复运行本地 `just check`。
+- 只允许从当前 `release/vVERSION` 上的 clean、单一、exact release commit 续跑不确定的 branch push/PR create：commit parent 必须是当前 `origin/main`，版本、message 和两文件 diff 必须匹配；同 SHA 的 remote branch/PR 可复用，任何 divergence 都 fail closed。dirty/partial branch 仍保留给人工诊断，不自动修复。
+- 不引入通用状态文件、Cargo.lock 自定义 parser、生产临时 worktree 或 publish 状态机重写；现有 tag/Release vacancy、exact-green main、签名与 immutable publication 契约保持不变。
+
 ## Acceptance Criteria
 
 - [ ] AC1：维护者只需记忆 `just check`、`just release-prepare VERSION`、`just release-publish VERSION` 三个主入口，`just --list` 和文档能解释其边界。
@@ -96,6 +104,10 @@
 - [ ] AC13：任一 release verification 失败都不会替换既有 tag/Release；relay retry 的非原子边界和恢复命令被文档明确说明。
 - [ ] AC14：actionlint、ShellCheck、focused lifecycle/release/relay tests、workspace tests/docs/dependency checks和一次非破坏性 operator fixture均通过。
 - [ ] AC15：branch-protection checklist 指定稳定 `CI gate`、禁止 direct/force push，并说明 workflow 合入后由管理员启用；不假装代码能自动修改 repository settings。
+- [ ] AC16：真实 Cargo 1.98 fixture 证明 `cargo update --workspace` 更新 lockfile，随后 locked metadata/workspace-version/exact inventory 通过；fixture 不再伪造 metadata 写锁文件。
+- [ ] AC17：prepare 成功路径不调用 `just check`，只提交 `Cargo.toml` 与 `Cargo.lock`；完整 gate 仍由 release PR CI 和合并后的 main CI 拥有。
+- [ ] AC18：clean exact release commit 在 push/PR 响应不确定后可安全重跑；同 SHA remote branch/开放 PR 被复用，remote/commit/message/version/inventory 任一不一致均拒绝。
+- [ ] AC19：inventory 错误展示稳定的 expected/actual 文件集合，partial dirty branch 不被自动提交、清理、push 或转成 tag。
 
 ## Key Decisions
 
@@ -104,6 +116,7 @@
 - 2026-09-01：release commit 同样通过 PR；发布入口明确拆成 `release-prepare` 与 `release-publish`，不为一条同步命令 bypass protected main。
 - 2026-09-01：tag 后允许 release-specific final-artifact verification，但不重复普通 CI suite。
 - 2026-09-01：保留 zterm 强于 Herdr 的 exact-green、签名、protected approval、installer、draft round-trip、immutable 和 relay contracts。
+- 2026-09-04：把 release-prepare 收敛为“确定性两文件生成 + focused validation + PR CI”，并只为 exact clean commit 增加有限续跑；拒绝用通用状态机掩盖局部 Cargo 命令与测试替身错误。
 
 ## Out of Scope
 

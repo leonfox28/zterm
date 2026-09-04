@@ -29,13 +29,23 @@ just release-prepare 0.2.0
 Before creating a branch, the command verifies GitHub authentication and the
 canonical repository, branch/tag/Release vacancy, and a strictly newer version
 through the Rust `semver` owner. It then creates `release/v0.2.0`, changes only
-the workspace version in `Cargo.toml` plus Cargo-generated `Cargo.lock`, runs
-`just check`, commits, pushes only the release branch, and opens a PR.
+the workspace version in `Cargo.toml`, runs `cargo +1.98.0 update --workspace`
+to refresh Cargo-generated `Cargo.lock`, and validates the result with locked
+metadata, the workspace-version check, and an exact two-file inventory. It then
+commits, pushes only the release branch, and opens a PR. The command does not
+repeat `just check`; the required release PR `CI gate` owns the complete format,
+Clippy, test, docs, dependency, and portable-policy suite.
 
-If a check fails, no tag or public release state exists. The local release
-branch and diff are intentionally retained for diagnosis. Fix the branch, run
-`just check`, and push/open the PR manually; the operator never force-pushes or
-deletes the failure evidence.
+If generation or focused validation fails, no tag or public release state
+exists. The dirty local release branch and diff are intentionally retained for
+diagnosis and are not auto-resumed; inspect and finish that partial branch
+manually. If branch push or PR creation returns an ambiguous network error
+after the exact clean release commit exists, restore connectivity and rerun the
+same `just release-prepare 0.2.0` command. Resume succeeds only when the commit
+is directly based on current `origin/main`, has the exact message, version, and
+two-file inventory, and any remote branch/open PR names that same SHA. A moved
+main, divergent branch, closed/mismatched PR, extra commit, or dirty tree is
+rejected rather than repaired or overwritten.
 
 Merge the PR only after `CI gate` is green. Then wait for the new `main` push
 run to succeed. That exact run, including all four native readiness builds, is
@@ -91,6 +101,10 @@ never promoted from ordinary CI artifacts.
 
 ## Failure and recovery boundaries
 
+- During release preparation, a dirty partial branch is retained only for
+  manual diagnosis. An exact clean release commit may be resumed with the same
+  `release-prepare` command after an ambiguous push/PR response; the operator
+  reuses only the same-SHA remote branch and matching open PR.
 - Before the tag push, fix the precondition and rerun. If annotated tag
   creation succeeded locally but its push failed, first prove the remote tag is
   absent, inspect the retained tag, and push that exact tag manually.

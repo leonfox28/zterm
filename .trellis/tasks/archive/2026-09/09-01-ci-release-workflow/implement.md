@@ -1,9 +1,8 @@
 # CI and release workflow implementation plan
 
-> Implementation status (2026-09-01): Steps 0–9 have been implemented and the
-> full local gates passed. This is the retained execution plan, not a list of
-> work to repeat. Real PR/`main` timing and the first formal publication remain
-> post-merge operational evidence; the current runbooks are
+> Implementation status (2026-09-04): Steps 0–9 were implemented on
+> 2026-09-01. Step 10 is the focused reliability follow-up based on real
+> v0.1.10–v0.1.14 operator evidence; the current runbooks are
 > `docs/development.md` and `docs/releasing.md`.
 
 ## Execution model
@@ -66,7 +65,7 @@
 
 - [ ] Add `tools/release/find-green-main-ci.sh COMMIT` as the exact successful completed `ci.yml` main-push query; return a single run ID/URL or fail without side effects.
 - [ ] Add `tools/release/operator.sh prepare VERSION` with all read-only preflight before branch creation: clean/synced main, canonical repo/auth, vacancy and canonical newer version.
-- [ ] Prepare only `Cargo.toml` and Cargo-generated `Cargo.lock`, validate the changed-file allowlist, run `just check`, then commit/push `release/vVERSION` and open a PR. Never push main/tag from prepare.
+- [ ] Prepare only `Cargo.toml` and Cargo-generated `Cargo.lock`, validate the changed-file allowlist, run the focused version/lock validators, then commit/push `release/vVERSION` and open a PR. The release PR owns the full `just check`-equivalent CI gate; never push main/tag from prepare.
 - [ ] Add `publish VERSION` with clean exact origin/main, branch-protection visibility, version/vacancy/exact-green checks before annotated tag creation and push.
 - [ ] Discover and watch the exact resulting release run with a bounded poll; make an Environment approval wait explicit and print a resume command if the local watcher exits.
 - [ ] Make every failure preserve its branch/diff/remote state and print targeted recovery. Forbid force push, release/tag deletion and asset replacement tokens in static policy.
@@ -122,6 +121,24 @@
 - [ ] Dispatch one independent Trellis checker with `check.jsonl`, PRD/design and the diff. Fix concrete findings, rerun affected gates, then one final broad gate.
 - [ ] Produce a before/after job/check ownership table and note that real PR/main timing and formal relay publication remain post-merge operational evidence.
 
+## Step 10 — Correct and simplify release preparation after production evidence
+
+- [x] Replace the incorrect metadata-as-generator call with `cargo +1.98.0 update --workspace`; run locked no-deps metadata only after generation as a validator.
+- [x] Keep workspace-version and exact two-file inventory validation; make inventory failures print unambiguous expected and actual sets.
+- [x] Remove `just check` from `release-prepare`; assert in the fixture that prepare does not call it, while leaving PR/main CI recipes unchanged as the full gate.
+- [x] Add bounded resume only when invoked from a clean expected release branch whose single commit is directly based on current `origin/main` and exactly matches message, requested version, locked Cargo state, and `Cargo.toml`/`Cargo.lock` inventory.
+- [x] Reuse only a same-SHA remote branch and same-head/base open PR; create a missing branch/PR, and reject divergence, ambiguous/closed PR state, dirty partial branches, or moved `origin/main`.
+- [x] Make the fixture use pinned real Cargo for pkgid/update/metadata and cover real lock refresh, no-`just check`, exact resume, and divergent/partial rejection without external GitHub state.
+- [x] Update `docs/releasing.md` and the distribution lifecycle code-spec. Do not change CI topology, tag/signing/release/relay workflows, product Rust code, or `release-publish`.
+- [x] Run shell syntax, ShellCheck, workspace/release static policy, operator fixture, task context validation, `git diff --check`, then the repository's broad gate once before independent Trellis review.
+
+Step 10 verification (2026-09-04): sh/dash syntax, ShellCheck, real-Cargo
+operator fixture, workspace-version, release static policy, `just ci-policy`,
+task context validation, `git diff --check`, and full `just check` all passed.
+An independent Trellis checker reported no findings. Production GitHub PR API
+behavior and hosted OS/release execution remain the intentional PR/main/next-
+release evidence boundary.
+
 ## Acceptance mapping
 
 | Steps | Acceptance criteria |
@@ -133,7 +150,8 @@
 | 6 | AC10, AC11, AC13 |
 | 7 | AC12, AC13 |
 | 8 | AC1, AC15 |
-| 9 | AC14 and final verification of all criteria |
+| 9 | AC14 and final verification of AC1–AC15 |
+| 10 | AC16–AC19 and regression verification of AC8–AC9 |
 
 ## Rollback points and stop conditions
 

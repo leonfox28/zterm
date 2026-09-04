@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 9
-- **Last Active**: 2026-09-01
+- **Total Sessions**: 10
+- **Last Active**: 2026-09-04
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~236 | Active |
+| `journal-1.md` | ~258 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 10 | 2026-09-04 | Harden release preparation | `367a7f9` | `fix/release-prepare-reliability` |
 | 9 | 2026-09-01 | Update Trellis to 0.6.16 | `b91b942` | `main` |
 | 8 | 2026-09-01 | Remote terminal UX v0.1.9 | `fff36b9`, `3080d1f`, `f2b9b11`, `8976c31`, `a104a1c`, `158364e`, `fceb075` | `main` |
 | 7 | 2026-08-24 | Close remote CLI and plan Phase 1 release acceptance | `3ae4c3a` | `main` |

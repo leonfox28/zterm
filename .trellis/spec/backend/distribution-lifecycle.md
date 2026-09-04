@@ -343,3 +343,149 @@ class FixtureHTTPServer(http.server.ThreadingHTTPServer):
 
 The ordering is the safety property: authentication precedes impact, explicit
 impact approval precedes stop, and retained-binary activation precedes commit.
+
+## Scenario: deterministic release preparation and bounded resume
+
+### 1. Scope / Trigger
+
+- Trigger this scenario when changing `just release-prepare`, its Cargo/Git/GitHub
+  operations, recovery behavior, fixture, or operator runbook.
+- Release preparation is a reversible PR-producing phase. It may update version
+  metadata and publish a review branch/PR, but it must never create a tag,
+  Release, signature, asset, or relay image.
+- A dirty partially prepared branch is diagnostic evidence, not resumable
+  operator state. Automated resume begins only after an exact clean release
+  commit exists.
+
+### 2. Signatures
+
+The public command and direct repository owner are:
+
+```text
+just release-prepare <VERSION>
+sh tools/release/operator.sh prepare <VERSION>
+```
+
+`VERSION` is canonical SemVer without a leading `v` or build metadata, and must
+be strictly newer on a fresh preparation. The deterministic Cargo sequence is:
+
+```text
+cargo +1.98.0 update --workspace
+cargo +1.98.0 metadata --locked --format-version 1 --no-deps
+sh tests/workspace-version.sh
+```
+
+### 3. Contracts
+
+- Fresh prepare starts on a clean `main` exactly equal to fetched
+  `origin/main`, proves branch/tag/Release vacancy, and validates the next
+  version before creating `release/vVERSION`.
+- After editing exactly one `[workspace.package].version`, `cargo update
+  --workspace` is the only lockfile-generation owner. Locked metadata and the
+  workspace-version script validate the result; they are not generation APIs.
+- Before commit and push, the complete changed/staged/untracked inventory is
+  exactly `Cargo.lock` plus `Cargo.toml`. An inventory failure prints both the
+  expected and actual sorted sets.
+- Prepare does not run `just check`. The required release PR `CI gate` owns the
+  complete format, Clippy, test, docs, dependency, and portable policy evidence;
+  merged `main` CI owns exact-SHA release readiness.
+- Resume is accepted only while already on the clean expected release branch.
+  Its HEAD is one commit directly above current fetched `origin/main`, has the
+  exact subject `chore: prepare vVERSION release`, contains only the two version
+  files, resolves the requested workspace version, and passes locked metadata
+  plus workspace-version validation.
+- A missing remote release branch may be pushed. An existing remote branch may
+  be reused only when its SHA exactly equals local HEAD; divergence is never
+  overwritten. One open PR may be reused only when its head SHA, head branch,
+  and base `main` match. Missing PR state may be created; closed, merged,
+  multiple, malformed, or unavailable PR state fails closed.
+- Push/PR network ambiguity is recovered by rerunning the same command after
+  connectivity returns. The operator does not persist a parallel state file,
+  infer success from an error, force-push, delete evidence, or repair dirty
+  branches.
+- `release-publish`, exact-green main, annotated tags, protected signing,
+  immutable native Release, and relay publication retain their existing
+  contracts.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Real Cargo cannot update the workspace lock | Stop on the local release branch; no branch push, PR, or tag |
+| Locked metadata or workspace-version validation fails | Stop with the generated diff retained; no branch push, PR, or tag |
+| Inventory is missing `Cargo.lock` or contains an extra path | Print expected and actual sorted inventories; do not commit/push |
+| Fresh invocation sees an existing local/remote release branch | Reject; only an invocation already on an exact clean release commit can enter resume |
+| Resume branch is dirty, has an extra commit/file, wrong subject/version, or parent differs from current `origin/main` | Reject without modifying local or remote state |
+| Remote release branch is absent | Push the exact local release commit once, then reconcile PR state |
+| Remote release branch SHA equals local HEAD | Reuse it; do not force-push or create a second branch |
+| Remote release branch SHA differs | Reject and report both sides; never overwrite it |
+| One open PR matches exact head SHA/branch and base `main` | Reuse its URL and complete prepare |
+| No PR matches after the exact remote branch is proven | Create one PR |
+| PR query is unavailable, ambiguous, closed, merged, or mismatched | Reject; do not guess or create competing review state |
+
+### 5. Good/Base/Bad Cases
+
+- Good: a fresh prepare changes the manifest, real Cargo refreshes all workspace
+  package lock entries, focused validators pass, the exact commit is pushed,
+  and one release PR is returned without running the local full suite.
+- Good: PR creation times out after GitHub accepted it; the next invocation from
+  the unchanged clean release branch proves local, remote, and open-PR identity
+  and returns the existing PR.
+- Base: generation fails and leaves a dirty local release branch. The operator
+  reports it for inspection; the maintainer may fix it manually, but rerunning
+  does not reinterpret it as a safe checkpoint.
+- Bad: mocking `cargo metadata` to rewrite `Cargo.lock`, because production
+  Cargo does not provide that effect and the fixture would hide the failure.
+- Bad: adding a generic state machine that accepts arbitrary existing branches,
+  commits, or PRs, or rerunning the full local gate already required by PR CI.
+
+### 6. Tests Required
+
+- `sh tests/release/operator-fixture.sh` uses a task-private Git remote and fake
+  GitHub boundary but pinned real Cargo 1.98 for `pkgid`, `update`, and
+  `metadata`.
+- The fixture asserts a real inherited workspace version moves from the
+  baseline to the requested version in both `Cargo.toml` and `Cargo.lock`, the
+  committed inventory is exactly two files, metadata is invoked with `--locked`,
+  and no `just check` command runs.
+- The fixture covers dirty/partial generation rejection, expected/actual
+  inventory diagnostics, exact clean-commit resume with same remote SHA/open PR,
+  missing remote/PR continuation where applicable, and remote/commit/PR
+  divergence rejection. It asserts no tag in every prepare path.
+- `sh tests/release/static.sh`, ShellCheck, shell syntax, task context validation,
+  `git diff --check`, and the repository broad gate remain required before
+  merge. No fixture contacts the production GitHub repository.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```sh
+# metadata --no-deps is not a lockfile update command.
+sed -i.bak 's/^version = .*/version = "NEXT"/' Cargo.toml
+cargo +1.98.0 metadata --format-version 1 --no-deps >/dev/null
+just check
+```
+
+```sh
+# A fake side effect makes the test pass while production fails.
+case "$*" in
+  *metadata*) rewrite_every_lock_version ;;
+esac
+```
+
+#### Correct
+
+```sh
+update_the_single_workspace_version
+cargo +1.98.0 update --workspace
+cargo +1.98.0 metadata --locked --format-version 1 --no-deps >/dev/null
+sh tests/workspace-version.sh
+require_exact_release_change_inventory
+# The pushed PR's required CI gate owns the full suite.
+```
+
+The architectural boundary is the exact clean release commit: before it,
+failures retain local evidence for manual diagnosis; after it, identity can be
+proven across local Git, the remote branch, and the open PR without inventing
+another durable state model.
