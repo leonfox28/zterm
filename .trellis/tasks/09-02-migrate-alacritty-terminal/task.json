@@ -18,7 +18,9 @@
   "commit": null,
   "pr_url": null,
   "subtasks": [],
-  "children": [],
+  "children": [
+    "09-04-terminal-selection-copy"
+  ],
   "parent": "08-20-cross-platform-relay-terminal-mvp",
   "relatedFiles": [
     "Cargo.toml",
