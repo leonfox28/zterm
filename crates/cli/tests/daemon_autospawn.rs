@@ -42,11 +42,25 @@ use state_fixture::TestState;
 #[cfg(unix)]
 const TERMINAL_CHILD_PREFIX: &str = "--zterm-test-terminal=";
 #[cfg(unix)]
-const TERMINAL_RESTORE_BYTES: &[u8] = b"\x1b[?2026l\x1b[?9l\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1007l\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[?1l\x1b>\x1b[0m\x1b[?25h\x1b[?1049l";
+const TERMINAL_RESTORE_BYTES: &[u8] = b"\x1b[?2026l\x1b[?9l\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1007l\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[?1l\x1b>\x1b[<u\x1b[0m\x1b[?25h\x1b[?1049l";
 #[cfg(unix)]
 const TERMINAL_CONNECT_MARKER: &[u8] = b"\xe7\x95\x8c";
 #[cfg(unix)]
 const TERMINAL_BARE_MARKER: &[u8] = b"\xe9\x9b\xaa";
+#[cfg(unix)]
+const TERMINAL_COPY_SCREEN: &[u8] = b"\x1b[2J\x1b[HXY";
+#[cfg(unix)]
+const TERMINAL_COPY_GESTURE: &[u8] = b"\x1b[<0;1;1M\x1b[<32;2;1M\x1b[<0;2;1m";
+#[cfg(unix)]
+const TERMINAL_COPY_KEYS: &[u8] = b"\x1b[99:67;6:1u\x1b[99:67;6:2u\x1b[99:67;6:3u";
+#[cfg(unix)]
+const TERMINAL_COPY_OSC52: &[u8] = b"\x1b]52;c;WFk=\x07";
+#[cfg(unix)]
+const TERMINAL_KEYBOARD_PUSH_DISABLED: &[u8] = b"\x1b[>0u";
+#[cfg(unix)]
+const TERMINAL_KEYBOARD_SELECTION_FLAGS: &[u8] = b"\x1b[=7u";
+#[cfg(unix)]
+const TERMINAL_KEYBOARD_POP: &[u8] = b"\x1b[<u";
 #[cfg(unix)]
 const TERMINAL_SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
 #[cfg(unix)]
@@ -104,7 +118,7 @@ fn run_terminal_child_if_requested() -> bool {
         DaemonLauncher::for_test("/does/not/exist".into(), "--must-not-run".to_owned()),
     );
     let arguments = match mode {
-        "connect" | "scroll" => vec!["zterm", "connect", "local"],
+        "connect" | "scroll" | "copy" => vec!["zterm", "connect", "local"],
         "bare-signal" => vec!["zterm"],
         "non-tty-connect" => vec!["zterm", "connect", "local"],
         _ => panic!("unknown terminal child mode"),
@@ -360,6 +374,10 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
 
     let scroll_output = run_local_terminal_child(&runtime, &state.paths, "scroll").await;
     assert!(contains_bytes(&scroll_output, TERMINAL_RESTORE_BYTES));
+    wait_for_detach(&runtime, "local", &ui_main_id.to_string()).await;
+
+    let copy_output = run_local_terminal_child(&runtime, &state.paths, "copy").await;
+    assert_local_selection_copy(&copy_output);
     wait_for_detach(&runtime, "local", &ui_main_id.to_string()).await;
 
     let bare_output = run_local_terminal_child(&runtime, &state.paths, "bare-signal").await;
@@ -657,12 +675,15 @@ async fn run_local_terminal_child(
     let input_probe = match mode {
         "connect" => TERMINAL_CONNECT_MARKER,
         "scroll" => b"ZTERM_SCROLL_PROBE".as_slice(),
+        "copy" => TERMINAL_COPY_SCREEN,
         "bare-signal" => TERMINAL_BARE_MARKER,
         _ => panic!("unsupported terminal PTY fixture mode"),
     };
 
     let presentation_count = Arc::new(AtomicUsize::new(0));
     let reader_presentation_count = Arc::clone(&presentation_count);
+    let clipboard_count = Arc::new(AtomicUsize::new(0));
+    let reader_clipboard_count = Arc::clone(&clipboard_count);
     let reader = std::thread::spawn(move || {
         let mut master = master;
         let mut bytes = Vec::new();
@@ -681,6 +702,8 @@ async fn run_local_terminal_child(
                         .filter(|window| *window == TERMINAL_SYNC_END)
                         .count();
                     reader_presentation_count.store(begin_count.min(end_count), Ordering::Release);
+                    reader_clipboard_count
+                        .store(count_bytes(&bytes, TERMINAL_COPY_OSC52), Ordering::Release);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(error) if error.raw_os_error() == Some(nix::errno::Errno::EIO as i32) => break,
@@ -763,6 +786,46 @@ async fn run_local_terminal_child(
             current_controller_revision(runtime).await,
             history_revision,
             "host-owned history scrolling must not forward the wheel to or mutate the child PTY"
+        );
+    } else if mode == "copy" {
+        let selection_revision = quiescent_revision;
+        let selection_presentation = presentation_count.load(Ordering::Acquire);
+        master_writer
+            .write_all(TERMINAL_COPY_GESTURE)
+            .expect("write deterministic local selection gesture");
+        wait_for_presentation_after(
+            &presentation_count,
+            selection_presentation,
+            "local selection did not commit its finalized highlight",
+        );
+        let finalized_revision =
+            wait_for_terminal_quiescence(runtime, &presentation_count, mode).await;
+        assert_eq!(
+            finalized_revision, selection_revision,
+            "attachment-local selection must not mutate the authoritative terminal model"
+        );
+
+        let copy_revision = finalized_revision;
+        let copy_presentation = presentation_count.load(Ordering::Acquire);
+        master_writer
+            .write_all(TERMINAL_COPY_KEYS)
+            .expect("write enhanced copy press, repeat, and release");
+        wait_for_clipboard_after(&clipboard_count, 0);
+        let settled_copy_revision =
+            wait_for_terminal_quiescence(runtime, &presentation_count, mode).await;
+        assert_eq!(
+            clipboard_count.load(Ordering::Acquire),
+            1,
+            "one enhanced physical key actuation must emit one clipboard write"
+        );
+        assert_eq!(
+            presentation_count.load(Ordering::Acquire),
+            copy_presentation,
+            "clipboard output must not commit or advance a presenter frame"
+        );
+        assert_eq!(
+            settled_copy_revision, copy_revision,
+            "local copy must not reach or mutate the child PTY"
         );
     }
     if mode == "bare-signal" {
@@ -1001,6 +1064,72 @@ fn wait_for_terminal_raw_mode(probe: &File, child: &mut std::process::Child, mod
 #[cfg(unix)]
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     find_bytes(haystack, needle).is_some()
+}
+
+#[cfg(unix)]
+fn count_bytes(haystack: &[u8], needle: &[u8]) -> usize {
+    haystack
+        .windows(needle.len())
+        .filter(|window| *window == needle)
+        .count()
+}
+
+#[cfg(unix)]
+fn wait_for_presentation_after(presentation_count: &AtomicUsize, baseline: usize, failure: &str) {
+    let deadline = std::time::Instant::now() + TERMINAL_TEST_TIMEOUT;
+    while presentation_count.load(Ordering::Acquire) <= baseline
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(
+        presentation_count.load(Ordering::Acquire) > baseline,
+        "{failure}"
+    );
+}
+
+#[cfg(unix)]
+fn wait_for_clipboard_after(clipboard_count: &AtomicUsize, baseline: usize) {
+    let deadline = std::time::Instant::now() + TERMINAL_TEST_TIMEOUT;
+    while clipboard_count.load(Ordering::Acquire) <= baseline
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(
+        clipboard_count.load(Ordering::Acquire) > baseline,
+        "enhanced copy did not emit its canonical clipboard sequence"
+    );
+}
+
+#[cfg(unix)]
+fn assert_local_selection_copy(bytes: &[u8]) {
+    assert_eq!(
+        count_bytes(bytes, TERMINAL_COPY_OSC52),
+        1,
+        "copy press/repeat/release must emit one exact canonical OSC 52 write"
+    );
+    assert_eq!(
+        count_bytes(bytes, TERMINAL_KEYBOARD_PUSH_DISABLED),
+        1,
+        "terminal guard must push exactly one keyboard stack entry"
+    );
+    assert_eq!(
+        count_bytes(bytes, TERMINAL_KEYBOARD_POP),
+        1,
+        "terminal guard must pop exactly one keyboard stack entry"
+    );
+
+    let push = find_bytes(bytes, TERMINAL_KEYBOARD_PUSH_DISABLED).expect("keyboard stack push");
+    let selection = find_bytes(bytes, TERMINAL_KEYBOARD_SELECTION_FLAGS)
+        .expect("finalized selection keyboard flags");
+    let clipboard = find_bytes(bytes, TERMINAL_COPY_OSC52).expect("canonical clipboard output");
+    let cleanup = find_bytes(bytes, TERMINAL_RESTORE_BYTES).expect("terminal cleanup bytes");
+    let pop = find_bytes(bytes, TERMINAL_KEYBOARD_POP).expect("keyboard stack pop");
+    assert!(
+        push < selection && selection < clipboard && clipboard < pop && pop >= cleanup,
+        "keyboard stack, selection elevation, clipboard write, and restoration must stay ordered"
+    );
 }
 
 #[cfg(unix)]

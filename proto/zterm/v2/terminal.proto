@@ -30,6 +30,14 @@ message TerminalModes {
   uint32 mouse_mode = 5;
   uint32 mouse_encoding = 6;
   bool alternate_scroll = 7;
+  uint32 keyboard_flags = 8;
+}
+
+// Decoded child-to-controller clipboard write. Raw OSC never crosses a zterm
+// protocol boundary.
+message TerminalClipboardWrite {
+  AttachmentId attachment_id = 1;
+  string text = 2;
 }
 
 message TerminalInput {

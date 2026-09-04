@@ -1,0 +1,16 @@
+{"file": ".trellis/spec/backend/terminal-model.md", "reason": "Verify strict OSC 52 containment, Kitty state/projection, parser uniqueness, bounds, redaction, and the unsafe-free Alacritty boundary."}
+{"file": ".trellis/spec/backend/terminal-driver.md", "reason": "Verify host effects remain latest-only, transient, controller-targeted, nonblocking, and absent from revisions/checkpoints/final replay."}
+{"file": ".trellis/spec/backend/session-service.md", "reason": "Audit controller linearization through initial sync, resync, takeover, detach, remote resume, and Session end."}
+{"file": ".trellis/spec/backend/local-daemon-ipc.md", "reason": "Audit remote/local effect phase and ID validation, latest-only operations delivery, terminal restoration, and typed error behavior."}
+{"file": ".trellis/spec/backend/core-wire-domain.md", "reason": "Verify unique kind 322, retired-kind absence, direct-cutover semantics, keyboard flag validation, and all wire/frame limits."}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "Search every Debug/log/error/metric path for decoded or encoded clipboard content leakage."}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Run focused and workspace gates and check test ownership, lint, documentation, and cross-platform behavior."}
+{"file": ".trellis/spec/guides/root-cause-and-architecture-thinking-guide.md", "reason": "Reject Herdr-, process-, terminal-brand-, or individual-bug patches that bypass the approved generic boundaries."}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Trace mouse/key ownership, semantic selection source, and clipboard effect across all layers and failure paths."}
+{"file": ".trellis/spec/guides/evidence-driven-simplicity.md", "reason": "Check that no unused policy switch, prompt, timer, native fallback, compatibility path, or redundant queue was added."}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "Check reuse of existing cache, modes, presenter, input codec, and latest-only primitives without speculative abstractions."}
+{"file": ".trellis/tasks/09-04-terminal-selection-copy/research/osc52-policy.md", "reason": "Compare the implementation and adversarial tests against the exact strict OSC 52 and 512 KiB policy evidence."}
+{"file": ".trellis/tasks/09-04-terminal-selection-copy/research/keyboard-copy.md", "reason": "Verify actual Ghostty Cmd+C delivery and nested child keyboard semantics match the researched protocol boundary."}
+{"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/local-viewport-cache.md", "reason": "Verify selection identity and invalidation do not regress cached scrolling, pacing, or network request behavior."}
+{"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/semantic-presentation-direct-cutover.md", "reason": "Verify highlight stays in one semantic composition transaction and OSC output stays with the sole presenter."}
+{"file": ".trellis/tasks/09-02-migrate-alacritty-terminal/research/nested-tui-scroll-routing.md", "reason": "Verify the full generic mouse-owner matrix and nested TUI scrollbar/wheel behavior remain intact."}

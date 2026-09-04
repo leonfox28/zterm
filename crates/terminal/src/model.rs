@@ -149,6 +149,7 @@ impl TerminalModel {
                 revision: self.revision,
                 replies: Vec::new(),
                 events: Vec::new(),
+                host_effect: None,
             });
         }
 
@@ -157,11 +158,12 @@ impl TerminalModel {
         self.ingress.process(bytes, &mut self.engine, &mut output)?;
         self.revision = next_revision;
         self.refresh_history_epoch_after_ingest();
-        let (replies, events) = output.finish();
+        let (replies, events, host_effect) = output.finish();
         Ok(TerminalUpdate {
             revision: self.revision,
             replies,
             events,
+            host_effect,
         })
     }
 
@@ -178,6 +180,7 @@ impl TerminalModel {
             revision: self.revision,
             replies: Vec::new(),
             events: Vec::new(),
+            host_effect: None,
         })
     }
 
@@ -471,6 +474,19 @@ mod tests {
             current.delta_or_resync(&future),
             TerminalSurfaceDeltaResult::Resync(_)
         ));
+    }
+
+    #[test]
+    fn an_older_checkpoint_format_forces_a_complete_resync() {
+        let mut model = TerminalModel::new(TerminalSize::new(2, 8), 0).expect("current model");
+        let mut stale = model.checkpoint();
+        stale.projection.version = CHECKPOINT_FORMAT_VERSION.saturating_sub(1);
+        model.ingest(b"new state").expect("advance current model");
+
+        let TerminalSurfaceDeltaResult::Resync(snapshot) = model.delta_or_resync(&stale) else {
+            panic!("an incompatible checkpoint format must not produce a delta");
+        };
+        assert_eq!(snapshot, model.snapshot());
     }
 
     #[test]

@@ -25,6 +25,7 @@ TerminalDriver::try_wait(&self) -> Result<PtyChildState, TerminalDriverError>
 TerminalDriver::wait(&self) -> Result<PtyExitStatus, TerminalDriverError>
 TerminalDriver::close_explicitly(&self) -> Result<PtyExitStatus, TerminalDriverError>
 TerminalDriver::revision_watch(&self) -> watch::Receiver<Revision>
+TerminalDriver::set_effect_target(&self, Option<AttachmentId>) -> Result<(), TerminalDriverError>
 TerminalDriver::check_health(&self) -> Result<(), TerminalDriverError>
 TerminalDriver::finalize_natural(self) -> Result<PtyExitStatus, TerminalDriverError>
 TerminalDriver::finalize_explicit(self) -> Result<PtyExitStatus, TerminalDriverError>
@@ -39,6 +40,7 @@ TerminalAttachment::latest_snapshot(&self)
     -> Result<TerminalSurfaceSnapshot, TerminalDriverError>
 TerminalAttachment::history_window(query: TerminalHistoryWindowQuery)
     -> Result<TerminalSurfaceHistoryWindowResult, TerminalDriverError>
+TerminalAttachment::effect_broker(&self) -> TerminalEffectBroker
 ```
 
 ### 3. Contracts
@@ -50,6 +52,7 @@ blocking PtyReader
   -> fixed-capacity, no-drop byte queue
   -> one ordered TerminalModel mutation point
   -> controlled query replies to the same PtySession
+  -> validated transient host effect to one controller-targeted latest slot
   -> one latest revision condition
 ```
 
@@ -80,6 +83,14 @@ blocking PtyReader
 - Revision notification is latest-only. No list or channel grows once per
   revision. The Tokio watch sender overwrites one watermark; a slow attachment
   may discard its checkpoint and fetch one full latest snapshot.
+- Transient host effects do not enter revision state or the PTY byte queue.
+  After terminal ingest releases the model mutex, one broker mutex snapshots
+  the Session-installed controller target and replaces a single pending value;
+  no target means drop. A payload-free `watch<()>` only wakes attachment
+  writers. `take_for(id)` removes the value only for its event-time target, and
+  every target change clears stale pending content. Thus a slow or disconnected
+  controller cannot backpressure PTY drain, create an effect queue, broadcast
+  to observers, or replay content to a later controller.
 - Zero attachments do not stop the reader, model owner, or root child.
 - Dropping an attachment or transport guard changes only subscription count.
 - `wait()` polls root-child state while releasing the child mutex between
@@ -134,6 +145,9 @@ No environment variable or network object participates in this data path.
 | history-window query is invalid/future, rebased, or alternate-screen | return the model-authored Gap/Rebased/Changed result; never retain a query or synthesize/merge rows in the driver |
 | `sync_changed` sees checkpoint revision equal to the model | `Ok(None)`; do not replace the checkpoint or publish a frame |
 | `sync_changed` sees a behind/incompatible checkpoint | one semantic Delta/Resync and replace the checkpoint at that exact latest state |
+| host effect is produced with no eligible target | drop it without waking a writer or failing PTY drain |
+| multiple effects precede one take | retain only the latest value for the event-time target |
+| controller target changes | atomically clear the old pending value before a new target can take |
 
 ### 5. Good / Base / Bad Cases
 
@@ -182,6 +196,11 @@ No environment variable or network object participates in this data path.
   PTY read, proves Drop returns through a bounded observer, then proves the
   HUP-resistant child and both threads are eventually released. A queue race
   proves finished/aborted queues reject and wake a late producer.
+- Broker tests linearize publish against no-controller, same-controller,
+  takeover, disconnect, and reconnect target changes; prove observer
+  exclusion, latest-wins, and no replay. A same-UID real-PTY fixture emits OSC
+  52 through the actual model/Session/wire path and observes only the validated
+  typed clipboard event.
 - All waits have deadlines and fixtures remove only their own marker/process.
 
 ### 7. Wrong vs Correct

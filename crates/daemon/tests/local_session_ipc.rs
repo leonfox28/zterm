@@ -93,6 +93,13 @@ async fn unary_mutations_and_duplex_reconnect_share_one_live_registry() -> Resul
         .await
         .map_err(|error| format!("initial attachment synchronization failed: {error}"))?;
     attached
+        .write_input(b"printf '\\033]52;c;aGVsbG8=\\a'\n".to_vec())
+        .await
+        .map_err(session_fixture::display)?;
+    wait_for_clipboard(&mut attached, "hello")
+        .await
+        .map_err(|error| format!("PTY clipboard effect failed: {error}"))?;
+    attached
         .write_input(b"printf 'SOCKET-RECONNECT-MARKER\\n'\n".to_vec())
         .await
         .map_err(session_fixture::display)?;
@@ -148,6 +155,7 @@ async fn unary_mutations_and_duplex_reconnect_share_one_live_registry() -> Resul
             }
             LocalAttachmentEvent::SyncRequired(_) => {}
             LocalAttachmentEvent::TransportState(_) => {}
+            LocalAttachmentEvent::ClipboardWrite(_) => {}
             LocalAttachmentEvent::SessionEnded(ended) => {
                 assert_eq!(
                     ended.reason,
@@ -192,7 +200,8 @@ async fn unary_mutations_and_duplex_reconnect_share_one_live_registry() -> Resul
             LocalAttachmentEvent::Snapshot(_)
             | LocalAttachmentEvent::Delta(_)
             | LocalAttachmentEvent::SyncRequired(_)
-            | LocalAttachmentEvent::TransportState(_) => {}
+            | LocalAttachmentEvent::TransportState(_)
+            | LocalAttachmentEvent::ClipboardWrite(_) => {}
             LocalAttachmentEvent::SessionEnded(ended) => break ended,
             LocalAttachmentEvent::LeaseLost(_) => {
                 return Err("controller lease was lost during daemon stop".into());
@@ -951,6 +960,37 @@ async fn wait_for_wire_text(
     Err("terminal stream did not contain reconnect marker".into())
 }
 
+async fn wait_for_clipboard(
+    client: &mut LocalAttachmentClient,
+    expected: &str,
+) -> Result<(), String> {
+    let deadline = Instant::now() + EVENT_DEADLINE;
+    while Instant::now() < deadline {
+        let event = client
+            .read_event(deadline.saturating_duration_since(Instant::now()))
+            .await
+            .map_err(session_fixture::display)?;
+        match event {
+            LocalAttachmentEvent::ClipboardWrite(write) => {
+                return (write.as_str() == expected)
+                    .then_some(())
+                    .ok_or_else(|| "clipboard effect contained unexpected text".to_owned());
+            }
+            LocalAttachmentEvent::LeaseLost(_) | LocalAttachmentEvent::SessionEnded(_) => {
+                return Err(format!("terminal ended before clipboard effect: {event:?}"));
+            }
+            LocalAttachmentEvent::Snapshot(_)
+            | LocalAttachmentEvent::Delta(_)
+            | LocalAttachmentEvent::HistoryWindow(_)
+            | LocalAttachmentEvent::SyncRequired(_)
+            | LocalAttachmentEvent::Takeover(_)
+            | LocalAttachmentEvent::TransportState(_)
+            | LocalAttachmentEvent::ConnectionStatus(_) => {}
+        }
+    }
+    Err("terminal stream did not produce a clipboard effect".into())
+}
+
 async fn wait_for_lease_lost(client: &mut LocalAttachmentClient) -> Result<(), String> {
     loop {
         match client
@@ -965,7 +1005,8 @@ async fn wait_for_lease_lost(client: &mut LocalAttachmentClient) -> Result<(), S
             | LocalAttachmentEvent::TransportState(_)
             | LocalAttachmentEvent::Takeover(_)
             | LocalAttachmentEvent::ConnectionStatus(_)
-            | LocalAttachmentEvent::HistoryWindow(_) => {}
+            | LocalAttachmentEvent::HistoryWindow(_)
+            | LocalAttachmentEvent::ClipboardWrite(_) => {}
             LocalAttachmentEvent::SessionEnded(_) => {
                 return Err("session ended while waiting for controller lease loss".into());
             }

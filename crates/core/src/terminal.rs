@@ -20,6 +20,92 @@ pub const MAX_HISTORY_WINDOW_ROWS: usize = 240;
 /// Maximum UTF-8 bytes carried by one semantic terminal cell.
 pub const MAX_CELL_TEXT_BYTES: usize = 22;
 
+/// Maximum UTF-8 bytes carried by one terminal clipboard write.
+pub const MAX_TERMINAL_CLIPBOARD_BYTES: usize = 512 * 1024;
+
+/// Failure to construct a bounded terminal clipboard write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalClipboardError {
+    /// Clipboard text must contain at least one byte.
+    Empty,
+    /// Clipboard text exceeds [`MAX_TERMINAL_CLIPBOARD_BYTES`].
+    TooLarge,
+    /// Clipboard text contains a NUL scalar.
+    ContainsNul,
+}
+
+impl fmt::Display for TerminalClipboardError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Empty => "terminal clipboard text is empty",
+            Self::TooLarge => "terminal clipboard text exceeds its byte limit",
+            Self::ContainsNul => "terminal clipboard text contains NUL",
+        })
+    }
+}
+
+impl std::error::Error for TerminalClipboardError {}
+
+/// Validated plain UTF-8 text for one transient terminal clipboard write.
+#[derive(Clone, Eq, PartialEq)]
+pub struct TerminalClipboardWrite(String);
+
+impl TerminalClipboardWrite {
+    /// Validates and owns one clipboard write.
+    pub fn new(text: String) -> Result<Self, TerminalClipboardError> {
+        if text.is_empty() {
+            return Err(TerminalClipboardError::Empty);
+        }
+        if text.len() > MAX_TERMINAL_CLIPBOARD_BYTES {
+            return Err(TerminalClipboardError::TooLarge);
+        }
+        if text.contains('\0') {
+            return Err(TerminalClipboardError::ContainsNul);
+        }
+        Ok(Self(text))
+    }
+
+    /// Borrows the validated clipboard text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Moves the validated clipboard text out of this value.
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl fmt::Debug for TerminalClipboardWrite {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalClipboardWrite")
+            .field("text", &"[REDACTED]")
+            .field("text_len", &self.0.len())
+            .finish()
+    }
+}
+
+/// Transient host effect produced by terminal output.
+#[derive(Clone, Eq, PartialEq)]
+pub enum TerminalHostEffect {
+    /// Replace the controlling attachment's system clipboard.
+    ClipboardWrite(TerminalClipboardWrite),
+}
+
+impl fmt::Debug for TerminalHostEffect {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ClipboardWrite(value) => formatter
+                .debug_tuple("ClipboardWrite")
+                .field(value)
+                .finish(),
+        }
+    }
+}
+
 /// Terminal viewport size in character cells.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TerminalSize {
@@ -144,6 +230,68 @@ pub enum TerminalMouseEncoding {
     Sgr,
 }
 
+/// Validated Kitty keyboard protocol flags requested by the hosted application.
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+pub struct TerminalKeyboardFlags(u8);
+
+impl TerminalKeyboardFlags {
+    /// Report ambiguous modified keys with CSI-u sequences.
+    pub const DISAMBIGUATE_ESCAPE_CODES: Self = Self(1 << 0);
+    /// Include press, repeat, and release event kinds.
+    pub const REPORT_EVENT_TYPES: Self = Self(1 << 1);
+    /// Include shifted and base-layout alternate key values.
+    pub const REPORT_ALTERNATE_KEYS: Self = Self(1 << 2);
+    /// Report every key as an escape sequence.
+    pub const REPORT_ALL_KEYS_AS_ESCAPE_CODES: Self = Self(1 << 3);
+    /// Include the text associated with a key event.
+    pub const REPORT_ASSOCIATED_TEXT: Self = Self(1 << 4);
+    /// All flags supported by the terminal domain.
+    pub const ALL: Self = Self((1 << 5) - 1);
+
+    /// Constructs a flag set, rejecting unknown bits.
+    #[must_use]
+    pub const fn from_bits(bits: u8) -> Option<Self> {
+        if bits & !Self::ALL.0 == 0 {
+            Some(Self(bits))
+        } else {
+            None
+        }
+    }
+
+    /// Returns the wire-compatible flag bits.
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Returns whether no keyboard enhancement is requested.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Returns whether every bit in `other` is enabled.
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// Returns the union of two validated flag sets.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+impl fmt::Debug for TerminalKeyboardFlags {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("TerminalKeyboardFlags")
+            .field(&self.0)
+            .finish()
+    }
+}
+
 /// Input and presentation modes needed when attaching a controller.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TerminalModes {
@@ -161,6 +309,8 @@ pub struct TerminalModes {
     pub mouse_mode: TerminalMouseMode,
     /// Mouse event encoding.
     pub mouse_encoding: TerminalMouseEncoding,
+    /// Kitty keyboard protocol flags requested by the hosted application.
+    pub keyboard_flags: TerminalKeyboardFlags,
 }
 
 /// One exact row in a semantic terminal surface.
@@ -840,6 +990,8 @@ pub struct TerminalUpdate {
     pub replies: Vec<u8>,
     /// Bounded non-rendering side events.
     pub events: Vec<TerminalSideEvent>,
+    /// Latest transient host effect produced by this operation.
+    pub host_effect: Option<TerminalHostEffect>,
 }
 
 impl fmt::Debug for TerminalUpdate {
@@ -850,6 +1002,7 @@ impl fmt::Debug for TerminalUpdate {
             .field("replies", &"[REDACTED]")
             .field("reply_len", &self.replies.len())
             .field("events", &self.events)
+            .field("host_effect", &self.host_effect)
             .finish()
     }
 }
@@ -1063,6 +1216,10 @@ mod tests {
                     truncated: true,
                 },
             ],
+            host_effect: Some(TerminalHostEffect::ClipboardWrite(
+                TerminalClipboardWrite::new("TERM_CLIPBOARD_SENTINEL_98da".to_owned())
+                    .expect("valid clipboard value"),
+            )),
         };
         let mut surface = semantic_surface(Revision::new(47));
         surface.rows[1].cells[0].contents = SURFACE_SENTINEL.to_owned();
@@ -1113,6 +1270,7 @@ mod tests {
         }
         assert!(!rendered.contains(std::str::from_utf8(REPLY_SENTINEL).expect("ASCII sentinel")));
         assert!(!rendered.contains(&format!("{REPLY_SENTINEL:?}")));
+        assert!(!rendered.contains("TERM_CLIPBOARD_SENTINEL_98da"));
         assert!(rendered.contains("[REDACTED]"));
         assert!(rendered.contains(&format!("reply_len: {}", REPLY_SENTINEL.len())));
         assert!(rendered.contains("row_patch_count: 1"));
@@ -1121,5 +1279,32 @@ mod tests {
         assert_eq!(update, update.clone());
         assert_eq!(snapshot, snapshot.clone());
         assert_eq!(delta, delta.clone());
+    }
+
+    #[test]
+    fn clipboard_and_keyboard_domain_values_enforce_exact_bounds() {
+        assert_eq!(
+            TerminalClipboardWrite::new(String::new()),
+            Err(TerminalClipboardError::Empty)
+        );
+        assert_eq!(
+            TerminalClipboardWrite::new("a\0b".to_owned()),
+            Err(TerminalClipboardError::ContainsNul)
+        );
+        let exact = TerminalClipboardWrite::new("界".repeat(MAX_TERMINAL_CLIPBOARD_BYTES / 3))
+            .expect("largest complete UTF-8 value below the byte cap");
+        assert!(exact.as_str().len() <= MAX_TERMINAL_CLIPBOARD_BYTES);
+        assert_eq!(
+            TerminalClipboardWrite::new("x".repeat(MAX_TERMINAL_CLIPBOARD_BYTES + 1)),
+            Err(TerminalClipboardError::TooLarge)
+        );
+        assert!(!format!("{exact:?}").contains('界'));
+
+        assert_eq!(
+            TerminalKeyboardFlags::from_bits(0x1f),
+            Some(TerminalKeyboardFlags::ALL)
+        );
+        assert_eq!(TerminalKeyboardFlags::from_bits(0x20), None);
+        assert!(TerminalKeyboardFlags::ALL.contains(TerminalKeyboardFlags::REPORT_ASSOCIATED_TEXT));
     }
 }

@@ -2,8 +2,8 @@
 
 use zterm_core::terminal::{
     ActiveScreen, MAX_SIDE_EVENTS_PER_UPDATE, MAX_TITLE_BYTES, RejectedEffect, TerminalColor,
-    TerminalMouseEncoding, TerminalMouseMode, TerminalSideEvent, TerminalSize, TerminalSurface,
-    UnsupportedSequenceKind,
+    TerminalHostEffect, TerminalMouseEncoding, TerminalMouseMode, TerminalSideEvent, TerminalSize,
+    TerminalSurface, UnsupportedSequenceKind,
 };
 use zterm_terminal::TerminalModel;
 
@@ -22,6 +22,7 @@ struct Run {
     state: TerminalSurface,
     replies: Vec<u8>,
     events: Vec<TerminalSideEvent>,
+    host_effect: Option<TerminalHostEffect>,
 }
 
 fn chunks(bytes: &[u8], chunking: Chunking) -> Vec<&[u8]> {
@@ -53,15 +54,20 @@ fn run(bytes: &[u8], chunking: Chunking) -> Run {
     let mut model = TerminalModel::new(SIZE, 32).expect("corpus size is valid");
     let mut replies = Vec::new();
     let mut events = Vec::new();
+    let mut host_effect = None;
     for chunk in chunks(bytes, chunking) {
         let update = model.ingest(chunk).expect("corpus ingest succeeds");
         replies.extend(update.replies);
         events.extend(update.events);
+        if update.host_effect.is_some() {
+            host_effect = update.host_effect;
+        }
     }
     Run {
         state: model.snapshot().surface,
         replies,
         events,
+        host_effect,
     }
 }
 
@@ -103,6 +109,10 @@ fn assert_run_equivalent(actual: &Run, expected: &Run, chunking: Chunking) {
     );
     assert_eq!(actual.replies, expected.replies, "chunking {chunking:?}");
     assert_eq!(actual.events, expected.events, "chunking {chunking:?}");
+    assert_eq!(
+        actual.host_effect, expected.host_effect,
+        "chunking {chunking:?}"
+    );
 }
 
 fn assert_chunk_invariant(bytes: &[u8]) -> Run {
@@ -248,9 +258,9 @@ fn allowed_side_events_are_bounded_and_unsafe_effects_are_contained() {
         icon_name: "bounded icon".to_owned(),
         truncated: false,
     }));
-    assert!(run.events.contains(&TerminalSideEvent::EffectRejected(
-        RejectedEffect::ClipboardWrite,
-    )));
+    let TerminalHostEffect::ClipboardWrite(clipboard) =
+        run.host_effect.expect("valid clipboard write");
+    assert_eq!(clipboard.as_str(), "secret-bytes");
     assert!(run.events.contains(&TerminalSideEvent::EffectRejected(
         RejectedEffect::ClipboardRead,
     )));
@@ -269,7 +279,10 @@ fn allowed_side_events_are_bounded_and_unsafe_effects_are_contained() {
         .flat_map(|row| &row.cells)
         .map(|cell| cell.contents.as_str())
         .collect::<String>();
-    let serialized = format!("{snapshot:?}{:?}{:?}", update.events, update.replies);
+    let serialized = format!(
+        "{snapshot:?}{:?}{:?}{:?}",
+        update.events, update.replies, update.host_effect
+    );
     for secret in [
         "secret-bytes",
         "c2VjcmV0LWJ5dGVz",
@@ -338,6 +351,7 @@ fn repeated_resize_preserves_chunk_independent_state() {
             state: model.snapshot().surface,
             replies,
             events,
+            host_effect: None,
         }
     }
 

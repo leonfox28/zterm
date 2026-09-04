@@ -24,7 +24,6 @@ pub async fn run_terminal(
 
 #[cfg(unix)]
 mod unix {
-    #[cfg(test)]
     use std::collections::VecDeque;
     use std::fmt;
     use std::future::Future;
@@ -58,7 +57,10 @@ mod unix {
         TerminalCell, TerminalColor, TerminalCursor, TerminalStyle, TerminalSurface,
         TerminalSurfaceHistoryWindowFrame, TerminalSurfaceRowPatch,
     };
-    use zterm_core::viewport_cache::{CachedViewportWindow, ViewportCache, ViewportCacheUpdate};
+    use zterm_core::terminal_selection::{TerminalTextPoint, TerminalTextSelectionError};
+    use zterm_core::viewport_cache::{
+        CachedViewportWindow, ViewportAnchorObservation, ViewportCache, ViewportCacheUpdate,
+    };
     use zterm_core::{DomainErrorKind, RESERVED_DEVICE_ALIAS, SessionId};
     use zterm_daemon::error::DaemonError;
     use zterm_daemon::operations::{
@@ -78,12 +80,23 @@ mod unix {
     mod composition {
         include!("terminal_ui/composition.rs");
     }
+    mod keyboard {
+        include!("terminal_ui/keyboard.rs");
+    }
+    mod selection {
+        include!("terminal_ui/selection.rs");
+    }
 
     use ansi_presenter::DesktopPresenter;
     #[cfg(test)]
     use ansi_presenter::semantic_dirty_runs;
     use attachment_surface::AttachmentSurface;
-    use composition::{ChromeLayout, ComposedFrame, ScrollbarGeometry, normalize_composed_row};
+    use composition::{
+        ChromeLayout, ComposedFrame, LiveViewportProjection, ScrollbarGeometry,
+        normalize_composed_row,
+    };
+    use keyboard::{CopyKeyLease, EnhancedKey, KeyEventKind};
+    use selection::{SelectionController, SelectionSourceIdentity};
 
     const STDIN_CHANNEL_CAPACITY: usize = 8;
     const STDIN_CHUNK_BYTES: usize = 4 * 1024;
@@ -94,7 +107,7 @@ mod unix {
     const HOST_SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
     const HOST_SYNC_END: &[u8] = b"\x1b[?2026l";
     const HOST_INPUT_CAPTURE: &[u8] = b"\x1b[?1003h\x1b[?1006h";
-    const ENTER_TERMINAL_UI: &[u8] = b"\x1b[?1049h\x1b[?25l\x1b[?1003h\x1b[?1006h";
+    const ENTER_TERMINAL_UI: &[u8] = b"\x1b[?1049h\x1b[?25l\x1b[>0u\x1b[?1003h\x1b[?1006h";
     const HOST_SEQUENCE_BOUND: usize = 64;
     const RESUME_INPUT_BOUND: usize = 1024 * 1024 - 1024;
     const PAGE_UP: &[u8] = b"\x1b[5~";
@@ -117,6 +130,7 @@ mod unix {
         "\x1b[?2004l",
         "\x1b[?1l",
         "\x1b>",
+        "\x1b[<u",
         "\x1b[0m",
         "\x1b[?25h",
         "\x1b[?1049l"
@@ -297,9 +311,11 @@ mod unix {
 
         let mut surface = AttachmentSurface::from_snapshot(prepared.initial_snapshot())?;
         let mut presenter = DesktopPresenter::default();
+        let mut selection = SelectionController::default();
         let initial_scroll_metrics = prepared.initial_snapshot().surface.scroll_metrics;
         let mut viewport = ViewportController::with_layout(latest_layout, initial_scroll_metrics);
         let mut status_renderer = StatusRenderer::new(remote_alias, physical_size);
+        reconcile_presenter_selection(&mut selection, &viewport, &surface, &mut presenter);
         present_surface_stdout(
             &surface,
             &mut presenter,
@@ -358,6 +374,7 @@ mod unix {
         }
         let mut sync_requested = false;
         let mut input_codec = HostInputCodec::new();
+        let mut copy_key_lease = CopyKeyLease::default();
         let mut deferred_active = false;
 
         let loop_result = 'terminal: loop {
@@ -434,6 +451,13 @@ mod unix {
                     viewport_pacer.cancel();
                     viewport.set_layout(layout);
                     status_renderer.resize(latest_physical);
+                    selection.cancel();
+                    reconcile_presenter_selection(
+                        &mut selection,
+                        &viewport,
+                        &surface,
+                        &mut presenter,
+                    );
                     if let Err(error) = present_surface_stdout(
                         &surface,
                         &mut presenter,
@@ -460,6 +484,7 @@ mod unix {
                             &mut viewport,
                             &surface,
                             &mut presenter,
+                            &mut selection,
                             &mut status_renderer,
                             &mut resize_coalescer,
                             &writer,
@@ -541,6 +566,7 @@ mod unix {
                                 &mut viewport,
                                 &surface,
                                 &mut presenter,
+                                &mut selection,
                                 &mut status_renderer,
                                 &mut resize_coalescer,
                                 &writer,
@@ -566,6 +592,13 @@ mod unix {
                         }
                         TerminalViewEvent::Snapshot(snapshot) => {
                             viewport_pacer.cancel();
+                            selection.cancel();
+                            reconcile_presenter_selection(
+                                &mut selection,
+                                &viewport,
+                                &surface,
+                                &mut presenter,
+                            );
                             let preserving_resume_input = viewport.is_resume_pending();
                             if transport_state != TerminalViewTransportState::Synchronizing
                                 && !preserving_resume_input
@@ -620,41 +653,17 @@ mod unix {
                             if rendered_live {
                                 viewport_pacer.cancel();
                             }
-                            let delta_result = if rendered_live {
-                                if surface.revision() != delta.from_revision {
-                                    Ok(DeltaRender::Gap)
-                                } else {
-                                    viewport.observe_live_metrics(delta.scroll_metrics);
-                                    let layout = ChromeLayout::new(
-                                        physical_size,
-                                        remote_request,
-                                        delta.active_screen,
-                                    );
-                                    viewport.set_layout(layout);
-                                    apply_delta_stdout(
-                                        &mut surface,
-                                        &mut presenter,
-                                        &delta,
-                                        &viewport,
-                                        &status_renderer,
-                                        transport_state,
-                                        true,
-                                    )
-                                }
-                            } else {
-                                apply_delta_stdout(
-                                    &mut surface,
-                                    &mut presenter,
-                                    &delta,
-                                    &viewport,
-                                    &status_renderer,
-                                    transport_state,
-                                    false,
-                                )
-                            };
+                            let delta_result = apply_delta_stdout(
+                                &mut surface,
+                                &mut presenter,
+                                &delta,
+                                &mut viewport,
+                                &mut selection,
+                                &status_renderer,
+                                transport_state,
+                            );
                             match delta_result {
                                 Ok(DeltaRender::Applied) => {
-                                    viewport.observe_live_metrics(delta.scroll_metrics);
                                     sync_requested = false;
                                     if rendered_live {
                                         viewport.observe_presentation();
@@ -676,6 +685,7 @@ mod unix {
                                                 &mut viewport,
                                                 &surface,
                                                 &mut presenter,
+                                                &mut selection,
                                                 &mut status_renderer,
                                                 &mut resize_coalescer,
                                                 &writer,
@@ -701,6 +711,13 @@ mod unix {
                                 }
                                 Ok(DeltaRender::Gap) => {
                                     viewport_pacer.cancel();
+                                    selection.cancel();
+                                    reconcile_presenter_selection(
+                                        &mut selection,
+                                        &viewport,
+                                        &surface,
+                                        &mut presenter,
+                                    );
                                     if rendered_live {
                                         viewport.begin_resume(Vec::new())?;
                                     }
@@ -736,6 +753,12 @@ mod unix {
                         }
                         TerminalViewEvent::HistoryWindow(result) => {
                             let effect = viewport.apply_view_history_window(result)?;
+                            reconcile_presenter_selection_for_next_frame(
+                                &mut selection,
+                                &viewport,
+                                &surface,
+                                &mut presenter,
+                            );
                             if apply_viewport_effect(
                                 effect,
                                 &mut viewport,
@@ -751,9 +774,29 @@ mod unix {
                             {
                                 sync_requested = true;
                             }
+                            reconcile_presenter_selection(
+                                &mut selection,
+                                &viewport,
+                                &surface,
+                                &mut presenter,
+                            );
+                        }
+                        TerminalViewEvent::ClipboardWrite(write) => {
+                            let stdout = io::stdout();
+                            let mut output = stdout.lock();
+                            if let Err(error) = presenter.write_clipboard(&mut output, &write) {
+                                break Err(error);
+                            }
                         }
                         TerminalViewEvent::SyncRequired { .. } => {
                             viewport_pacer.cancel();
+                            selection.cancel();
+                            reconcile_presenter_selection(
+                                &mut selection,
+                                &viewport,
+                                &surface,
+                                &mut presenter,
+                            );
                             viewport.observe_sync_required();
                             if transport_state != TerminalViewTransportState::Synchronizing {
                                 transport_state = TerminalViewTransportState::Synchronizing;
@@ -783,14 +826,35 @@ mod unix {
                         Some(StdinEvent::Bytes { epoch, bytes })
                             if input_epoch_is_current(epoch, current_input_epoch) =>
                         {
-                            let host_events = match input_codec.feed(&bytes) {
-                                Ok(events) => events,
+                            // A paced history frame may have committed a new
+                            // source since the preceding pointer event. Retire
+                            // any old coordinates before interpreting a copy
+                            // key against the physical keyboard mode.
+                            reconcile_presenter_selection(
+                                &mut selection,
+                                &viewport,
+                                &surface,
+                                &mut presenter,
+                            );
+                            let mut host_events = match input_codec.feed(&bytes) {
+                                Ok(events) => VecDeque::from(events),
                                 Err(error) => break 'terminal Err(error),
                             };
                             let mut force_viewport_presentation = false;
-                            for host_event in host_events {
+                            while let Some(host_event) = host_events.pop_front() {
                                 match host_event {
                                     HostInputEvent::Bytes(bytes) => {
+                                        if let Err(error) = invalidate_selection_stdout(
+                                            &mut selection,
+                                            &mut viewport,
+                                            &surface,
+                                            &mut presenter,
+                                            &status_renderer,
+                                            transport_state,
+                                            &mut viewport_pacer,
+                                        ) {
+                                            break 'terminal Err(error);
+                                        }
                                         for action in prefix.feed(&bytes, Instant::now()) {
                                             match action {
                                                 PrefixAction::Input(bytes) if viewport.is_live()
@@ -822,7 +886,87 @@ mod unix {
                                             }
                                         }
                                     }
+                                    HostInputEvent::LegacyCtrlC => {
+                                        if selection.is_finalized() {
+                                            if let Err(error) = write_selection_clipboard_stdout(
+                                                &selection,
+                                                &viewport,
+                                                &surface,
+                                                &mut presenter,
+                                            ) {
+                                                break 'terminal Err(error);
+                                            }
+                                        } else {
+                                            host_events
+                                                .push_front(HostInputEvent::Bytes(vec![0x03]));
+                                        }
+                                    }
+                                    HostInputEvent::EnhancedKey(key) => {
+                                        let outer_flags = presenter.presented_keyboard_flags();
+                                        match route_enhanced_input(
+                                            &key,
+                                            surface.modes(),
+                                            outer_flags,
+                                            selection.is_finalized(),
+                                            &mut copy_key_lease,
+                                        ) {
+                                            KeyboardRoute::Copy => {
+                                                if let Err(error) =
+                                                    write_selection_clipboard_stdout(
+                                                        &selection,
+                                                        &viewport,
+                                                        &surface,
+                                                        &mut presenter,
+                                                    )
+                                                {
+                                                    break 'terminal Err(error);
+                                                }
+                                            }
+                                            KeyboardRoute::Consume => {}
+                                            KeyboardRoute::Forward {
+                                                bytes,
+                                                clear_selection,
+                                                reinterpret_legacy,
+                                            } => {
+                                                if clear_selection
+                                                    && let Err(error) =
+                                                        invalidate_selection_stdout(
+                                                            &mut selection,
+                                                            &mut viewport,
+                                                            &surface,
+                                                            &mut presenter,
+                                                            &status_renderer,
+                                                            transport_state,
+                                                            &mut viewport_pacer,
+                                                        )
+                                                {
+                                                    break 'terminal Err(error);
+                                                }
+                                                let forwarded = if reinterpret_legacy {
+                                                    host_events_from_legacy_bytes(bytes)
+                                                } else if bytes.is_empty() {
+                                                    Vec::new()
+                                                } else {
+                                                    vec![HostInputEvent::Bytes(bytes)]
+                                                };
+                                                for event in forwarded.into_iter().rev() {
+                                                    host_events.push_front(event);
+                                                }
+                                            }
+                                        }
+                                    }
                                     HostInputEvent::Paste(bytes) => {
+                                        if let Err(error) = invalidate_selection_stdout(
+                                            &mut selection,
+                                            &mut viewport,
+                                            &surface,
+                                            &mut presenter,
+                                            &status_renderer,
+                                            transport_state,
+                                            &mut viewport_pacer,
+                                        ) {
+                                            break 'terminal Err(error);
+                                        }
                                         if viewport.is_live()
                                             && transport_state
                                                 == TerminalViewTransportState::Active
@@ -848,6 +992,17 @@ mod unix {
                                         }
                                     }
                                     HostInputEvent::PageUp | HostInputEvent::PageDown => {
+                                        if let Err(error) = invalidate_selection_stdout(
+                                            &mut selection,
+                                            &mut viewport,
+                                            &surface,
+                                            &mut presenter,
+                                            &status_renderer,
+                                            transport_state,
+                                            &mut viewport_pacer,
+                                        ) {
+                                            break 'terminal Err(error);
+                                        }
                                         let older = matches!(host_event, HostInputEvent::PageUp);
                                         let raw = if older { PAGE_UP } else { PAGE_DOWN };
                                         if viewport.is_resume_pending() {
@@ -886,73 +1041,25 @@ mod unix {
                                         }
                                     }
                                     HostInputEvent::Mouse(mouse) => {
-                                        if let Some(effect) = viewport.handle_gutter_mouse(
+                                        let routed = match route_pointer(
                                             &mouse,
+                                            &mut viewport,
+                                            &surface,
+                                            &mut selection,
                                             live_history_navigation_allowed(transport_state),
                                         ) {
-                                            force_viewport_presentation |= mouse.release;
-                                            if apply_viewport_effect(
-                                                effect,
-                                                &mut viewport,
-                                                &surface,
-                                                &mut presenter,
-                                                &writer,
-                                                &status_renderer,
-                                                transport_state,
-                                                &mut viewport_pacer,
-                                                true,
-                                            ).await? {
-                                                sync_requested = true;
-                                            }
-                                            continue;
-                                        }
-                                        if viewport.outside_layout(&mouse) {
-                                            continue;
-                                        }
-                                        if viewport.is_history() && mouse.is_wheel() {
-                                            let effect = viewport.navigate(mouse.wheel_is_up(), 1);
-                                            if apply_viewport_effect(
-                                                effect,
-                                                &mut viewport,
-                                                &surface,
-                                                &mut presenter,
-                                                &writer,
-                                                &status_renderer,
-                                                transport_state,
-                                                &mut viewport_pacer,
-                                                true,
-                                            ).await? {
-                                                sync_requested = true;
-                                            }
-                                            continue;
-                                        }
-                                        let routed = route_mouse_to_child(
-                                            &mouse,
-                                            surface.active_screen(),
-                                            surface.modes(),
+                                            Ok(routed) => routed,
+                                            Err(error) => break 'terminal Err(error),
+                                        };
+                                        reconcile_presenter_selection(
+                                            &mut selection,
+                                            &viewport,
+                                            &surface,
+                                            &mut presenter,
                                         );
                                         match routed {
-                                            Some(bytes) if viewport.is_resume_pending() => {
-                                                viewport.retain_resume_input(&bytes)?;
-                                            }
-                                            Some(bytes) if viewport.is_live()
-                                                && transport_state
-                                                    == TerminalViewTransportState::Active =>
-                                            {
-                                                if let Err(error) = writer.write_input(bytes).await {
-                                                    break 'terminal Err(error.into());
-                                                }
-                                            }
-                                            Some(_) => {}
-                                            None if viewport.is_live()
-                                                && mouse.is_wheel()
-                                                && live_history_navigation_allowed(transport_state)
-                                                && history_owns_gestures(
-                                                    surface.active_screen(),
-                                                    surface.modes(),
-                                                ) =>
-                                            {
-                                                let effect = viewport.navigate(mouse.wheel_is_up(), 1);
+                                            PointerRoute::Viewport(effect) => {
+                                                force_viewport_presentation |= mouse.release;
                                                 if apply_viewport_effect(
                                                     effect,
                                                     &mut viewport,
@@ -967,7 +1074,31 @@ mod unix {
                                                     sync_requested = true;
                                                 }
                                             }
-                                            None => {}
+                                            PointerRoute::Child(bytes)
+                                                if viewport.is_resume_pending() =>
+                                            {
+                                                viewport.retain_resume_input(&bytes)?;
+                                            }
+                                            PointerRoute::Child(bytes)
+                                                if viewport.is_live()
+                                                    && transport_state
+                                                        == TerminalViewTransportState::Active =>
+                                            {
+                                                if let Err(error) = writer.write_input(bytes).await {
+                                                    break 'terminal Err(error.into());
+                                                }
+                                            }
+                                            PointerRoute::Child(_) | PointerRoute::Ignore => {}
+                                            PointerRoute::SelectionChanged => {
+                                                let now = Instant::now();
+                                                if mark_cached_viewport_dirty(
+                                                    &viewport,
+                                                    &mut viewport_pacer,
+                                                    now,
+                                                ) {
+                                                    force_viewport_presentation |= mouse.release;
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -991,6 +1122,7 @@ mod unix {
                                     &mut viewport,
                                     &surface,
                                     &mut presenter,
+                                    &mut selection,
                                     &mut status_renderer,
                                     &mut resize_coalescer,
                                     &writer,
@@ -1229,6 +1361,7 @@ mod unix {
         viewport: &mut ViewportController,
         surface: &AttachmentSurface,
         presenter: &mut DesktopPresenter,
+        selection: &mut SelectionController,
         status_renderer: &mut StatusRenderer,
         resize_coalescer: &mut ResizeCoalescer,
         writer: &zterm_daemon::operations::TerminalViewCommandWriter,
@@ -1240,6 +1373,9 @@ mod unix {
             viewport.reset_presentation_for_reconnect();
             status_renderer.reset_for_reconnect();
         }
+        if next != previous && next != TerminalViewTransportState::Active {
+            selection.cancel();
+        }
         let resume_input = transition_transport_input_state(
             stdin,
             input_epoch,
@@ -1250,6 +1386,7 @@ mod unix {
             next,
             viewport,
         )?;
+        reconcile_presenter_selection(selection, viewport, surface, presenter);
         if present_transport_transition_stdout(
             surface,
             presenter,
@@ -2190,6 +2327,10 @@ mod unix {
             self.device.is_some() && self.physical_size.rows > 1
         }
 
+        fn is_remote(&self) -> bool {
+            self.device.is_some()
+        }
+
         fn resize(&mut self, physical_size: TerminalSize) {
             self.physical_size = physical_size;
         }
@@ -2319,6 +2460,17 @@ mod unix {
         window_cache: ViewportCache<TerminalSurfaceRow>,
     }
 
+    #[derive(Clone, Copy)]
+    struct ViewportDeltaPlan {
+        content_size: TerminalSize,
+        gutter_column: Option<u16>,
+        live_metrics: Option<TerminalScrollMetrics>,
+        update_live_metrics: bool,
+        content_size_changed: bool,
+        anchor_observation: Option<ViewportAnchorObservation>,
+        selection_source: Option<SelectionSourceIdentity>,
+    }
+
     impl ViewportController {
         fn with_layout(layout: ChromeLayout, live_metrics: Option<TerminalScrollMetrics>) -> Self {
             let mut controller = Self {
@@ -2352,6 +2504,10 @@ mod unix {
 
         fn has_complete_cached_viewport(&self) -> bool {
             self.is_history() && self.window_cache.visible_rows().is_some()
+        }
+
+        fn has_complete_presentable_view(&self) -> bool {
+            self.is_live() || self.has_complete_cached_viewport()
         }
 
         const fn is_resume_pending(&self) -> bool {
@@ -2432,6 +2588,14 @@ mod unix {
         fn outside_layout(&self, mouse: &SgrMouse) -> bool {
             mouse.row > self.content_size.rows
                 || mouse.column > self.gutter_column.unwrap_or(self.content_size.columns)
+        }
+
+        const fn gutter_drag_active(&self) -> bool {
+            self.drag_grab_row.is_some()
+        }
+
+        fn gutter_hit(&self, mouse: &SgrMouse) -> bool {
+            Some(mouse.column) == self.gutter_column && mouse.row <= self.content_size.rows
         }
 
         fn handle_gutter_mouse(
@@ -2729,15 +2893,138 @@ mod unix {
         }
 
         fn observe_presentation(&mut self) {
+            if self.is_history() {
+                let _ = self.window_cache.commit_visible_presentation();
+            }
             self.last_presented_scroll_metrics = self.scroll_metrics();
             self.presented_gutter_column = self.gutter_column;
         }
 
-        fn observe_live_metrics(&mut self, metrics: Option<TerminalScrollMetrics>) {
-            if metrics.is_some() || self.is_live() || self.is_resume_pending() {
-                self.live_metrics = metrics;
+        fn selection_source_identity(
+            &self,
+            surface: &AttachmentSurface,
+        ) -> Option<SelectionSourceIdentity> {
+            match &self.state {
+                ViewportState::Live => Some(SelectionSourceIdentity::Live {
+                    revision: surface.revision(),
+                    screen: surface.active_screen(),
+                    viewport: self.content_size,
+                }),
+                ViewportState::History(history) if history.notice.is_none() => self
+                    .window_cache
+                    .presented_slice_identity()
+                    .map(SelectionSourceIdentity::History),
+                ViewportState::History(_) | ViewportState::ResumePending { .. } => None,
             }
-            self.observe_window_anchor(metrics);
+        }
+
+        fn next_frame_selection_source_identity(
+            &self,
+            surface: &AttachmentSurface,
+        ) -> Option<SelectionSourceIdentity> {
+            match &self.state {
+                ViewportState::Live => Some(SelectionSourceIdentity::Live {
+                    revision: surface.revision(),
+                    screen: surface.active_screen(),
+                    viewport: self.content_size,
+                }),
+                ViewportState::History(history) if history.notice.is_none() => self
+                    .window_cache
+                    .visible_slice_identity()
+                    .map(SelectionSourceIdentity::History),
+                ViewportState::History(_) | ViewportState::ResumePending { .. } => None,
+            }
+        }
+
+        fn selection_rows<'a>(
+            &'a self,
+            surface: &'a AttachmentSurface,
+        ) -> Option<&'a [TerminalSurfaceRow]> {
+            match &self.state {
+                ViewportState::Live => Some(&surface.surface.rows),
+                ViewportState::History(history) if history.notice.is_none() => {
+                    self.window_cache.presented_rows()
+                }
+                ViewportState::History(_) | ViewportState::ResumePending { .. } => None,
+            }
+        }
+
+        fn preview_delta(
+            &self,
+            candidate: &AttachmentSurface,
+            metrics: Option<TerminalScrollMetrics>,
+            live_layout: Option<ChromeLayout>,
+        ) -> ViewportDeltaPlan {
+            debug_assert_eq!(self.is_live(), live_layout.is_some());
+            let content_size = live_layout.map_or(self.content_size, |layout| layout.child);
+            let gutter_column =
+                live_layout.map_or(self.gutter_column, |layout| layout.gutter_column);
+            let update_live_metrics =
+                metrics.is_some() || self.is_live() || self.is_resume_pending();
+            let live_metrics = if update_live_metrics {
+                metrics
+            } else {
+                self.live_metrics
+            };
+            let anchor_observation = metrics.filter(|metrics| metrics.is_valid()).map(|metrics| {
+                self.window_cache
+                    .preview_anchor_observation(TerminalHistoryWindowAnchor {
+                        epoch: metrics.epoch,
+                        revision: metrics.revision,
+                        max_offset_from_bottom: metrics.max_offset_from_bottom,
+                        viewport: content_size,
+                    })
+            });
+            let history_identity = match anchor_observation {
+                Some(observation) => observation.presented_slice_identity(),
+                None => self.window_cache.presented_slice_identity(),
+            };
+            let selection_source = match &self.state {
+                ViewportState::Live => Some(SelectionSourceIdentity::Live {
+                    revision: candidate.revision(),
+                    screen: candidate.active_screen(),
+                    viewport: content_size,
+                }),
+                ViewportState::History(history) if history.notice.is_none() => {
+                    history_identity.map(SelectionSourceIdentity::History)
+                }
+                ViewportState::History(_) | ViewportState::ResumePending { .. } => None,
+            };
+            ViewportDeltaPlan {
+                content_size,
+                gutter_column,
+                live_metrics,
+                update_live_metrics,
+                content_size_changed: self.content_size != content_size,
+                anchor_observation,
+                selection_source,
+            }
+        }
+
+        fn commit_delta(&mut self, plan: ViewportDeltaPlan) {
+            if plan.update_live_metrics {
+                self.live_metrics = plan.live_metrics;
+            }
+            if plan.content_size_changed {
+                self.last_presented_scroll_metrics = None;
+                if let ViewportState::ResumePending {
+                    presented_scroll_metrics,
+                    ..
+                } = &mut self.state
+                {
+                    *presented_scroll_metrics = None;
+                }
+            }
+            self.content_size = plan.content_size;
+            self.gutter_column = plan.gutter_column;
+            if self.gutter_column.is_none() {
+                self.drag_grab_row = None;
+                self.drag_last_request = None;
+                self.drag_deferred_target = None;
+            }
+            if let Some(observation) = plan.anchor_observation {
+                let _ = self.window_cache.commit_anchor_observation(observation);
+            }
         }
 
         fn retain_or_resume(&mut self, bytes: Vec<u8>) -> Result<ViewportEffect, CliError> {
@@ -2889,9 +3176,11 @@ mod unix {
         )
     }
 
-    #[derive(Clone, Eq, PartialEq)]
+    #[derive(Clone, Debug, Eq, PartialEq)]
     enum HostInputEvent {
         Bytes(Vec<u8>),
+        LegacyCtrlC,
+        EnhancedKey(EnhancedKey),
         Paste(Vec<u8>),
         PageUp,
         PageDown,
@@ -2958,7 +3247,27 @@ mod unix {
                         if let Some(mouse) = SgrMouse::parse(raw.clone()) {
                             events.push(HostInputEvent::Mouse(mouse));
                         } else {
-                            push_host_bytes(&mut events, raw);
+                            push_raw_host_bytes(&mut events, raw);
+                        }
+                        continue;
+                    }
+                    if self.pending.len() < HOST_SEQUENCE_BOUND {
+                        break;
+                    }
+                }
+                if self.pending.starts_with(b"\x1b[") {
+                    if let Some(end) = self
+                        .pending
+                        .iter()
+                        .enumerate()
+                        .skip(2)
+                        .find_map(|(index, byte)| (0x40..=0x7e).contains(byte).then_some(index))
+                    {
+                        let raw: Vec<u8> = self.pending.drain(..=end).collect();
+                        if let Some(key) = EnhancedKey::parse(raw.clone()) {
+                            events.push(HostInputEvent::EnhancedKey(key));
+                        } else {
+                            push_raw_host_bytes(&mut events, raw);
                         }
                         continue;
                     }
@@ -2979,7 +3288,7 @@ mod unix {
         }
     }
 
-    #[derive(Clone, Eq, PartialEq)]
+    #[derive(Clone, Debug, Eq, PartialEq)]
     struct SgrMouse {
         code: u16,
         column: u16,
@@ -3025,6 +3334,21 @@ mod unix {
         const fn is_left_press(&self) -> bool {
             !self.release && !self.is_motion() && self.code & 3 == 0
         }
+
+        const fn is_unmodified(&self) -> bool {
+            self.code & (4 | 8 | 16) == 0
+        }
+
+        fn content_point(&self, viewport: TerminalSize) -> Option<TerminalTextPoint> {
+            if self.row == 0
+                || self.column == 0
+                || self.row > viewport.rows
+                || self.column > viewport.columns
+            {
+                return None;
+            }
+            Some(TerminalTextPoint::new(self.row - 1, self.column - 1))
+        }
     }
 
     fn parse_decimal(bytes: &[u8]) -> Option<u16> {
@@ -3054,6 +3378,18 @@ mod unix {
     }
 
     fn push_host_bytes(events: &mut Vec<HostInputEvent>, bytes: Vec<u8>) {
+        for (index, span) in bytes.split(|byte| *byte == 0x03).enumerate() {
+            if index > 0 {
+                events.push(HostInputEvent::LegacyCtrlC);
+            }
+            if span.is_empty() {
+                continue;
+            }
+            push_raw_host_bytes(events, span.to_vec());
+        }
+    }
+
+    fn push_raw_host_bytes(events: &mut Vec<HostInputEvent>, bytes: Vec<u8>) {
         if bytes.is_empty() {
             return;
         }
@@ -3073,6 +3409,137 @@ mod unix {
 
     fn history_owns_gestures(active_screen: ActiveScreen, modes: TerminalModes) -> bool {
         active_screen == ActiveScreen::Main && modes.mouse_mode == TerminalMouseMode::None
+    }
+
+    enum PointerRoute {
+        Viewport(ViewportEffect),
+        Child(Vec<u8>),
+        SelectionChanged,
+        Ignore,
+    }
+
+    fn route_pointer(
+        mouse: &SgrMouse,
+        viewport: &mut ViewportController,
+        surface: &AttachmentSurface,
+        selection: &mut SelectionController,
+        allow_live_navigation: bool,
+    ) -> Result<PointerRoute, CliError> {
+        if viewport.gutter_drag_active() {
+            selection.clear();
+            return Ok(PointerRoute::Viewport(
+                viewport
+                    .handle_gutter_mouse(mouse, allow_live_navigation)
+                    .unwrap_or(ViewportEffect::None),
+            ));
+        }
+
+        if selection.owns_pointer_sequence() {
+            if mouse.release {
+                selection.finish();
+                return Ok(PointerRoute::SelectionChanged);
+            }
+            if mouse.is_motion() {
+                let source = viewport.selection_source_identity(surface);
+                let point = mouse.content_point(viewport.content_size());
+                let rows = viewport.selection_rows(surface);
+                match (source, point, rows) {
+                    (Some(source), Some(point), Some(rows)) => selection
+                        .update(source, point, rows)
+                        .map_err(selection_error)?,
+                    _ => selection.cancel(),
+                }
+                return Ok(PointerRoute::SelectionChanged);
+            }
+            return Ok(PointerRoute::Ignore);
+        }
+
+        if viewport.gutter_hit(mouse) {
+            selection.clear();
+            return Ok(PointerRoute::Viewport(
+                viewport
+                    .handle_gutter_mouse(mouse, allow_live_navigation)
+                    .unwrap_or(ViewportEffect::None),
+            ));
+        }
+        if viewport.outside_layout(mouse) {
+            return Ok(PointerRoute::Ignore);
+        }
+
+        if viewport.is_history() {
+            if mouse.is_wheel() {
+                selection.clear();
+                return Ok(PointerRoute::Viewport(
+                    viewport.navigate(mouse.wheel_is_up(), 1),
+                ));
+            }
+            if mouse.is_left_press() && mouse.is_unmodified() {
+                return begin_pointer_selection(mouse, viewport, surface, selection);
+            }
+            return Ok(PointerRoute::Ignore);
+        }
+
+        let modes = surface.modes();
+        if modes.mouse_mode != TerminalMouseMode::None {
+            selection.clear();
+            return Ok(route_mouse_to_child(mouse, surface.active_screen(), modes)
+                .map(PointerRoute::Child)
+                .unwrap_or(PointerRoute::Ignore));
+        }
+        if mouse.is_wheel()
+            && surface.active_screen() == ActiveScreen::Alternate
+            && modes.alternate_scroll
+        {
+            return Ok(PointerRoute::Child(emulated_wheel_cursor_keys(
+                mouse.wheel_is_up(),
+                modes.application_cursor,
+            )));
+        }
+        if mouse.is_wheel()
+            && allow_live_navigation
+            && history_owns_gestures(surface.active_screen(), modes)
+        {
+            selection.clear();
+            return Ok(PointerRoute::Viewport(
+                viewport.navigate(mouse.wheel_is_up(), 1),
+            ));
+        }
+        if mouse.is_left_press() && mouse.is_unmodified() {
+            return begin_pointer_selection(mouse, viewport, surface, selection);
+        }
+        Ok(PointerRoute::Ignore)
+    }
+
+    fn begin_pointer_selection(
+        mouse: &SgrMouse,
+        viewport: &ViewportController,
+        surface: &AttachmentSurface,
+        selection: &mut SelectionController,
+    ) -> Result<PointerRoute, CliError> {
+        let Some(source) = viewport.selection_source_identity(surface) else {
+            selection.clear();
+            return Ok(PointerRoute::Ignore);
+        };
+        let Some(rows) = viewport.selection_rows(surface) else {
+            selection.clear();
+            return Ok(PointerRoute::Ignore);
+        };
+        let Some(point) = mouse.content_point(viewport.content_size()) else {
+            return Ok(PointerRoute::Ignore);
+        };
+        selection
+            .begin(source, point, rows)
+            .map_err(selection_error)?;
+        Ok(PointerRoute::SelectionChanged)
+    }
+
+    fn selection_error(error: TerminalTextSelectionError) -> CliError {
+        let kind = match error {
+            TerminalTextSelectionError::Clipboard(_) => DomainErrorKind::ResourceExhausted,
+            TerminalTextSelectionError::InvalidRange
+            | TerminalTextSelectionError::InvalidSurface => DomainErrorKind::MalformedFrame,
+        };
+        terminal_daemon_error(kind, "terminal selection could not be projected")
     }
 
     const fn live_history_navigation_allowed(state: TerminalViewTransportState) -> bool {
@@ -3172,6 +3639,148 @@ mod unix {
         Gap,
     }
 
+    enum KeyboardRoute {
+        Copy,
+        Consume,
+        Forward {
+            bytes: Vec<u8>,
+            clear_selection: bool,
+            reinterpret_legacy: bool,
+        },
+    }
+
+    fn route_enhanced_input(
+        key: &EnhancedKey,
+        child_modes: TerminalModes,
+        outer_flags: zterm_core::terminal::TerminalKeyboardFlags,
+        selection_finalized: bool,
+        lease: &mut CopyKeyLease,
+    ) -> KeyboardRoute {
+        if lease.consume(key) {
+            return KeyboardRoute::Consume;
+        }
+        if selection_finalized && key.kind == KeyEventKind::Press && key.is_copy_shortcut() {
+            lease.begin(key);
+            return KeyboardRoute::Copy;
+        }
+        if outer_flags == child_modes.keyboard_flags {
+            KeyboardRoute::Forward {
+                bytes: key.raw.clone(),
+                clear_selection: selection_finalized && key.kind != KeyEventKind::Release,
+                reinterpret_legacy: false,
+            }
+        } else if selection_finalized
+            && child_modes.keyboard_flags.is_empty()
+            && outer_flags
+                == keyboard::desired_outer_keyboard_flags(child_modes.keyboard_flags, true)
+        {
+            KeyboardRoute::Forward {
+                bytes: key.legacy_bytes(child_modes),
+                clear_selection: key.kind != KeyEventKind::Release,
+                reinterpret_legacy: true,
+            }
+        } else {
+            // Only the deliberate local-selection 0 -> flags-7 elevation has
+            // enough information for a lossless legacy downgrade. Preserve
+            // the original event for any other mismatch instead of inventing
+            // child input semantics.
+            KeyboardRoute::Forward {
+                bytes: key.raw.clone(),
+                clear_selection: selection_finalized && key.kind != KeyEventKind::Release,
+                reinterpret_legacy: false,
+            }
+        }
+    }
+
+    fn host_events_from_legacy_bytes(bytes: Vec<u8>) -> Vec<HostInputEvent> {
+        if bytes == PAGE_UP {
+            return vec![HostInputEvent::PageUp];
+        }
+        if bytes == PAGE_DOWN {
+            return vec![HostInputEvent::PageDown];
+        }
+        let mut events = Vec::new();
+        push_host_bytes(&mut events, bytes);
+        events
+    }
+
+    fn reconcile_presenter_selection(
+        selection: &mut SelectionController,
+        viewport: &ViewportController,
+        surface: &AttachmentSurface,
+        presenter: &mut DesktopPresenter,
+    ) {
+        let source = viewport.selection_source_identity(surface);
+        selection.reconcile(source);
+        presenter.set_selection(
+            source,
+            selection.range_for(source),
+            selection.is_finalized(),
+        );
+    }
+
+    fn reconcile_presenter_selection_for_next_frame(
+        selection: &mut SelectionController,
+        viewport: &ViewportController,
+        surface: &AttachmentSurface,
+        presenter: &mut DesktopPresenter,
+    ) {
+        let source = viewport.next_frame_selection_source_identity(surface);
+        selection.reconcile(source);
+        presenter.set_selection(
+            source,
+            selection.range_for(source),
+            selection.is_finalized(),
+        );
+    }
+
+    fn write_selection_clipboard_stdout(
+        selection: &SelectionController,
+        viewport: &ViewportController,
+        surface: &AttachmentSurface,
+        presenter: &mut DesktopPresenter,
+    ) -> Result<bool, CliError> {
+        let Some(source) = viewport.selection_source_identity(surface) else {
+            return Ok(false);
+        };
+        let Some(rows) = viewport.selection_rows(surface) else {
+            return Ok(false);
+        };
+        let Some(write) = selection.extract(source, rows).map_err(selection_error)? else {
+            return Ok(false);
+        };
+        let stdout = io::stdout();
+        let mut output = stdout.lock();
+        presenter.write_clipboard(&mut output, &write)?;
+        Ok(true)
+    }
+
+    fn invalidate_selection_stdout(
+        selection: &mut SelectionController,
+        viewport: &mut ViewportController,
+        surface: &AttachmentSurface,
+        presenter: &mut DesktopPresenter,
+        status: &StatusRenderer,
+        transport_state: TerminalViewTransportState,
+        pacer: &mut ViewportPresentationPacer,
+    ) -> Result<bool, CliError> {
+        let source = viewport.selection_source_identity(surface);
+        let had_overlay = selection.range_for(source).is_some();
+        let previous_flags = presenter.presented_keyboard_flags();
+        selection.cancel();
+        reconcile_presenter_selection(selection, viewport, surface, presenter);
+        let flags_changed =
+            previous_flags != presenter.outer_keyboard_flags(surface.modes().keyboard_flags);
+        if !had_overlay && !flags_changed {
+            return Ok(false);
+        }
+        pacer.cancel();
+        present_surface_stdout(surface, presenter, viewport, status, transport_state)?;
+        viewport.observe_presentation();
+        pacer.mark_presented(Instant::now());
+        Ok(true)
+    }
+
     fn present_surface_with_writer(
         writer: &mut impl Write,
         surface: &AttachmentSurface,
@@ -3187,7 +3796,11 @@ mod unix {
             status,
             transport_state,
         )?;
-        presenter.present(writer, desired)
+        presenter.present(
+            writer,
+            desired,
+            viewport.next_frame_selection_source_identity(surface),
+        )
     }
 
     fn present_surface_stdout(
@@ -3236,26 +3849,83 @@ mod unix {
         surface: &mut AttachmentSurface,
         presenter: &mut DesktopPresenter,
         delta: &TerminalSurfaceDelta,
-        viewport: &ViewportController,
+        viewport: &mut ViewportController,
+        selection: &mut SelectionController,
         status: &StatusRenderer,
         transport_state: TerminalViewTransportState,
-        present: bool,
+    ) -> Result<DeltaRender, CliError> {
+        let stdout = io::stdout();
+        let mut output = stdout.lock();
+        apply_delta_with_writer(
+            &mut output,
+            surface,
+            presenter,
+            delta,
+            viewport,
+            selection,
+            status,
+            transport_state,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_delta_with_writer(
+        writer: &mut impl Write,
+        surface: &mut AttachmentSurface,
+        presenter: &mut DesktopPresenter,
+        delta: &TerminalSurfaceDelta,
+        viewport: &mut ViewportController,
+        selection: &mut SelectionController,
+        status: &StatusRenderer,
+        transport_state: TerminalViewTransportState,
     ) -> Result<DeltaRender, CliError> {
         let Some(candidate) = surface.candidate_after_delta(delta)? else {
             return Ok(DeltaRender::Gap);
         };
-        if present {
-            let stdout = io::stdout();
-            let mut output = stdout.lock();
-            present_surface_with_writer(
-                &mut output,
-                &candidate,
-                presenter,
+        let render_live = viewport.is_live();
+        let live_layout = render_live.then(|| {
+            ChromeLayout::new(
+                status.physical_size,
+                status.is_remote(),
+                candidate.active_screen(),
+            )
+        });
+        let viewport_plan = viewport.preview_delta(&candidate, delta.scroll_metrics, live_layout);
+        let mut candidate_selection = *selection;
+        if render_live {
+            candidate_selection.cancel();
+        }
+        candidate_selection.reconcile(viewport_plan.selection_source);
+        let selection_presentation =
+            candidate_selection.presentation(viewport_plan.selection_source);
+
+        if render_live {
+            let desired = ComposedFrame::compose_live_candidate(
+                &candidate.surface,
+                presenter.baseline.as_ref(),
                 viewport,
+                LiveViewportProjection::new(
+                    viewport_plan.content_size,
+                    viewport_plan.gutter_column,
+                    viewport_plan
+                        .live_metrics
+                        .filter(|metrics| metrics.is_valid()),
+                ),
                 status,
                 transport_state,
             )?;
+            presenter.present_candidate(
+                writer,
+                desired,
+                viewport_plan.selection_source,
+                selection_presentation,
+            )?;
+        } else {
+            presenter.sync_input_modes(writer, candidate.modes(), selection_presentation)?;
         }
+
+        viewport.commit_delta(viewport_plan);
+        *selection = candidate_selection;
         *surface = candidate;
         Ok(DeltaRender::Applied)
     }
@@ -3271,7 +3941,7 @@ mod unix {
         pacer: &mut ViewportPresentationPacer,
         now: Instant,
     ) -> bool {
-        if !viewport.has_complete_cached_viewport() {
+        if !viewport.has_complete_presentable_view() {
             pacer.cancel();
             return false;
         }
@@ -3283,7 +3953,7 @@ mod unix {
         viewport: &ViewportController,
         pacer: &mut ViewportPresentationPacer,
     ) {
-        if !viewport.has_complete_cached_viewport() {
+        if !viewport.has_complete_presentable_view() {
             pacer.cancel();
         }
     }
@@ -3300,7 +3970,7 @@ mod unix {
         if !request.force && !pacer.due(request.now) {
             return Ok(false);
         }
-        if !viewport.has_complete_cached_viewport() {
+        if !viewport.has_complete_presentable_view() {
             pacer.cancel();
             return Ok(false);
         }
@@ -3843,6 +4513,76 @@ mod unix {
             }
         }
 
+        fn install_test_history_window(viewport: &mut ViewportController) {
+            let ViewportEffect::RequestHistoryWindow(query) = viewport.navigate(true, 1) else {
+                panic!("test history navigation must request a complete window");
+            };
+            let shape = query
+                .response_shape(query.anchor)
+                .expect("valid test query");
+            let rows = (0..shape.row_count)
+                .map(|index| {
+                    test_row(
+                        query.anchor.viewport.columns,
+                        &format!("history-{index}"),
+                        TerminalStyle::default(),
+                    )
+                })
+                .collect();
+            let effect = viewport
+                .apply_view_history_window(TerminalSurfaceHistoryWindowResult::Frame(
+                    TerminalSurfaceHistoryWindowFrame {
+                        disposition: shape.disposition,
+                        anchor: query.anchor,
+                        target_offset_from_bottom: shape.target_offset_from_bottom,
+                        first_row_from_live_top: shape.first_row_from_live_top,
+                        rows,
+                    },
+                ))
+                .expect("install complete test history window");
+            assert!(matches!(
+                effect,
+                ViewportEffect::Render | ViewportEffect::RenderAndRequestHistoryWindow(_)
+            ));
+        }
+
+        fn finalize_test_selection(
+            surface: &AttachmentSurface,
+            viewport: &mut ViewportController,
+            presenter: &mut DesktopPresenter,
+            status: &StatusRenderer,
+            output: &mut impl Write,
+        ) -> SelectionController {
+            let source = viewport
+                .selection_source_identity(surface)
+                .expect("test viewport has a presented selection source");
+            let rows = viewport
+                .selection_rows(surface)
+                .expect("test viewport has presented semantic rows");
+            let mut selection = SelectionController::default();
+            selection
+                .begin(source, TerminalTextPoint::new(0, 0), rows)
+                .expect("begin test selection");
+            selection
+                .update(source, TerminalTextPoint::new(0, 1), rows)
+                .expect("extend test selection");
+            selection.finish();
+            reconcile_presenter_selection(&mut selection, viewport, surface, presenter);
+            present_surface_with_writer(
+                output,
+                surface,
+                presenter,
+                viewport,
+                status,
+                TerminalViewTransportState::Active,
+            )
+            .expect("present test selection");
+            viewport.observe_presentation();
+            assert!(selection.is_finalized());
+            assert_eq!(presenter.presented_keyboard_flags().bits(), 7);
+            selection
+        }
+
         #[test]
         fn resize_coalescer_retains_only_the_latest_non_active_viewport() {
             let initial = TerminalSize::new(24, 80);
@@ -4182,7 +4922,7 @@ mod unix {
             let mut output = ViewportFrameWriter::default();
             assert!(
                 presenter
-                    .present(&mut output, desired.clone())
+                    .present(&mut output, desired.clone(), None)
                     .expect("initial frame presents")
             );
             assert_eq!((output.writes, output.flushes), (1, 1));
@@ -4191,10 +4931,820 @@ mod unix {
             assert!(find_bytes(&output.bytes, HOST_INPUT_CAPTURE).is_some());
             assert!(
                 !presenter
-                    .present(&mut output, desired)
+                    .present(&mut output, desired, None)
                     .expect("identical frame is a no-op")
             );
             assert_eq!((output.writes, output.flushes), (1, 1));
+        }
+
+        #[test]
+        fn presenter_clipboard_write_is_canonical_and_does_not_advance_the_frame() {
+            let mut presenter = DesktopPresenter::default();
+            let size = TerminalSize::new(1, 2);
+            let snapshot = test_snapshot(size, ActiveScreen::Alternate, Revision::new(2));
+            let viewport = ViewportController::with_layout(
+                ChromeLayout::new(size, false, ActiveScreen::Alternate),
+                None,
+            );
+            let status = StatusRenderer::new(None, size);
+            let frame = ComposedFrame::compose(
+                &snapshot.surface,
+                None,
+                &viewport,
+                &status,
+                TerminalViewTransportState::Active,
+            )
+            .expect("compose clipboard baseline frame");
+            let mut visual = ViewportFrameWriter::default();
+            presenter
+                .present(&mut visual, frame, None)
+                .expect("present clipboard baseline frame");
+            let baseline = presenter.baseline.clone();
+
+            let write = zterm_core::terminal::TerminalClipboardWrite::new("hello".to_owned())
+                .expect("clipboard value");
+            let mut clipboard = ViewportFrameWriter::default();
+            presenter
+                .write_clipboard(&mut clipboard, &write)
+                .expect("write clipboard escape");
+            assert_eq!(clipboard.bytes, b"\x1b]52;c;aGVsbG8=\x07");
+            assert_eq!((clipboard.writes, clipboard.flushes), (1, 1));
+            assert_eq!(presenter.baseline, baseline);
+        }
+
+        #[test]
+        fn presenter_clipboard_failure_preserves_the_visual_baseline() {
+            struct ClipboardWriteFailure;
+
+            impl Write for ClipboardWriteFailure {
+                fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+                    Err(io::Error::other("injected clipboard failure"))
+                }
+
+                fn flush(&mut self) -> io::Result<()> {
+                    Ok(())
+                }
+            }
+
+            let size = TerminalSize::new(1, 2);
+            let snapshot = test_snapshot(size, ActiveScreen::Alternate, Revision::new(2));
+            let viewport = ViewportController::with_layout(
+                ChromeLayout::new(size, false, ActiveScreen::Alternate),
+                None,
+            );
+            let status = StatusRenderer::new(None, size);
+            let frame = ComposedFrame::compose(
+                &snapshot.surface,
+                None,
+                &viewport,
+                &status,
+                TerminalViewTransportState::Active,
+            )
+            .expect("compose clipboard failure baseline frame");
+            let mut presenter = DesktopPresenter::default();
+            let mut output = ViewportFrameWriter::default();
+            presenter
+                .present(&mut output, frame, None)
+                .expect("present clipboard failure baseline frame");
+            let baseline = presenter.baseline.clone();
+            let write = zterm_core::terminal::TerminalClipboardWrite::new("secret".to_owned())
+                .expect("clipboard value");
+
+            let error = presenter
+                .write_clipboard(&mut ClipboardWriteFailure, &write)
+                .expect_err("injected clipboard write fails");
+            assert!(error.to_string().contains("injected clipboard failure"));
+            assert_eq!(presenter.baseline, baseline);
+            assert!(!error.to_string().contains(write.as_str()));
+        }
+
+        #[test]
+        fn presenter_selection_overlay_and_keyboard_mode_share_one_frame_commit() {
+            let size = TerminalSize::new(1, 4);
+            let snapshot = test_snapshot(size, ActiveScreen::Alternate, Revision::new(2));
+            let viewport = ViewportController::with_layout(
+                ChromeLayout::new(size, false, ActiveScreen::Alternate),
+                None,
+            );
+            let status = StatusRenderer::new(None, size);
+            let frame = ComposedFrame::compose(
+                &snapshot.surface,
+                None,
+                &viewport,
+                &status,
+                TerminalViewTransportState::Active,
+            )
+            .expect("compose selection overlay frame");
+            let mut presenter = DesktopPresenter::default();
+            let source = SelectionSourceIdentity::Live {
+                revision: snapshot.revision,
+                screen: ActiveScreen::Alternate,
+                viewport: size,
+            };
+            presenter.set_selection(
+                Some(source),
+                Some(zterm_core::terminal_selection::TerminalTextRange::new(
+                    TerminalTextPoint::new(0, 0),
+                    TerminalTextPoint::new(0, 1),
+                )),
+                true,
+            );
+            let mut output = ViewportFrameWriter::default();
+            presenter
+                .present(&mut output, frame, Some(source))
+                .expect("present selection overlay frame");
+
+            let committed = presenter.baseline.as_ref().expect("committed frame");
+            assert!(committed.rows[&0][0].style.inverse);
+            assert!(committed.rows[&0][1].style.inverse);
+            assert!(!committed.rows[&0][2].style.inverse);
+            assert_eq!(committed.modes.keyboard_flags.bits(), 7);
+            assert!(find_bytes(&output.bytes, b"\x1b[=7u").is_some());
+
+            presenter.set_selection(None, None, false);
+            assert_eq!(
+                presenter
+                    .outer_keyboard_flags(zterm_core::terminal::TerminalKeyboardFlags::default())
+                    .bits(),
+                0
+            );
+            assert_eq!(presenter.presented_keyboard_flags().bits(), 7);
+            let frame = ComposedFrame::compose(
+                &snapshot.surface,
+                presenter.baseline.as_ref(),
+                &viewport,
+                &status,
+                TerminalViewTransportState::Active,
+            )
+            .expect("compose selection removal frame");
+            presenter
+                .present(&mut output, frame, Some(source))
+                .expect("present selection removal frame");
+            assert_eq!(presenter.presented_keyboard_flags().bits(), 0);
+        }
+
+        #[test]
+        fn hidden_history_delta_synchronizes_only_host_input_modes_and_preserves_selection_elevation()
+         {
+            let physical = TerminalSize::new(3, 8);
+            let layout = ChromeLayout::new(physical, false, ActiveScreen::Main);
+            let snapshot = test_snapshot(layout.child, ActiveScreen::Main, Revision::new(2));
+            let mut surface =
+                AttachmentSurface::from_snapshot(&snapshot).expect("valid history surface");
+            let mut viewport =
+                ViewportController::with_layout(layout, snapshot.surface.scroll_metrics);
+            let status = StatusRenderer::new(None, physical);
+            let mut presenter = DesktopPresenter::default();
+            let mut selection = SelectionController::default();
+            let mut output = ViewportFrameWriter::default();
+
+            present_surface_with_writer(
+                &mut output,
+                &surface,
+                &mut presenter,
+                &viewport,
+                &status,
+                TerminalViewTransportState::Active,
+            )
+            .expect("present initial live frame");
+            viewport.observe_presentation();
+            install_test_history_window(&mut viewport);
+            present_surface_with_writer(
+                &mut output,
+                &surface,
+                &mut presenter,
+                &viewport,
+                &status,
+                TerminalViewTransportState::Active,
+            )
+            .expect("present pinned history frame");
+            viewport.observe_presentation();
+
+            let source = viewport
+                .selection_source_identity(&surface)
+                .expect("presented history has a stable source");
+            let rows = viewport
+                .selection_rows(&surface)
+                .expect("presented history has semantic rows");
+            selection
+                .begin(source, TerminalTextPoint::new(0, 0), rows)
+                .expect("begin history selection");
+            selection
+                .update(source, TerminalTextPoint::new(0, 1), rows)
+                .expect("extend history selection");
+            selection.finish();
+            reconcile_presenter_selection(&mut selection, &viewport, &surface, &mut presenter);
+            present_surface_with_writer(
+                &mut output,
+                &surface,
+                &mut presenter,
+                &viewport,
+                &status,
+                TerminalViewTransportState::Active,
+            )
+            .expect("commit selection overlay and local keyboard elevation");
+            viewport.observe_presentation();
+            assert_eq!(presenter.presented_keyboard_flags().bits(), 7);
+            let selected_rows = presenter
+                .baseline
+                .as_ref()
+                .expect("selection frame is committed")
+                .rows
+                .clone();
+
+            output = ViewportFrameWriter::default();
+            let child_flags = zterm_core::terminal::TerminalKeyboardFlags::from_bits(9)
+                .expect("valid child keyboard flags");
+            let delta = TerminalSurfaceDelta {
+                from_revision: Revision::new(2),
+                to_revision: Revision::new(3),
+                size: layout.child,
+                active_screen: ActiveScreen::Main,
+                row_patches: vec![TerminalSurfaceRowPatch {
+                    row: 0,
+                    replacement: test_row(
+                        layout.child.columns,
+                        "hidden-live-change",
+                        TerminalStyle::default(),
+                    ),
+                }],
+                cursor: snapshot.surface.cursor,
+                modes: TerminalModes {
+                    application_cursor: true,
+                    application_keypad: true,
+                    bracketed_paste: true,
+                    focus_reporting: true,
+                    keyboard_flags: child_flags,
+                    ..TerminalModes::default()
+                },
+                scroll_metrics: Some(TerminalScrollMetrics {
+                    epoch: Revision::new(1),
+                    revision: Revision::new(3),
+                    offset_from_bottom: 0,
+                    max_offset_from_bottom: 10,
+                    viewport_rows: layout.child.rows,
+                }),
+            };
+            assert_eq!(
+                apply_delta_with_writer(
+                    &mut output,
+                    &mut surface,
+                    &mut presenter,
+                    &delta,
+                    &mut viewport,
+                    &mut selection,
+                    &status,
+                    TerminalViewTransportState::Active,
+                )
+                .expect("apply hidden history delta"),
+                DeltaRender::Applied
+            );
+            assert_eq!(output.bytes, b"\x1b[?1h\x1b=\x1b[?2004h\x1b[?1004h\x1b[=9u");
+            assert_eq!((output.writes, output.flushes), (1, 1));
+            assert_eq!(surface.revision(), Revision::new(3));
+            assert!(surface.modes().application_cursor);
+            assert!(surface.modes().application_keypad);
+            assert!(surface.modes().bracketed_paste);
+            assert!(surface.modes().focus_reporting);
+            assert_eq!(surface.modes().keyboard_flags, child_flags);
+            assert_eq!(presenter.presented_keyboard_flags(), child_flags);
+            let committed = presenter
+                .baseline
+                .as_ref()
+                .expect("mode commit retains frame");
+            assert_eq!(committed.rows, selected_rows);
+            assert!(committed.modes.application_cursor);
+            assert!(committed.modes.application_keypad);
+            assert!(committed.modes.bracketed_paste);
+            assert!(committed.modes.focus_reporting);
+            assert_eq!(committed.modes.keyboard_flags, child_flags);
+            assert!(find_bytes(&output.bytes, HOST_SYNC_BEGIN).is_none());
+            assert!(
+                !present_surface_with_writer(
+                    &mut output,
+                    &surface,
+                    &mut presenter,
+                    &viewport,
+                    &status,
+                    TerminalViewTransportState::Active,
+                )
+                .expect("accurate mode baseline makes the next full presentation a no-op")
+            );
+            assert_eq!((output.writes, output.flushes), (1, 1));
+
+            output = ViewportFrameWriter::default();
+            let delta = TerminalSurfaceDelta {
+                from_revision: Revision::new(3),
+                to_revision: Revision::new(4),
+                size: layout.child,
+                active_screen: ActiveScreen::Main,
+                row_patches: Vec::new(),
+                cursor: snapshot.surface.cursor,
+                modes: TerminalModes::default(),
+                scroll_metrics: Some(TerminalScrollMetrics {
+                    epoch: Revision::new(1),
+                    revision: Revision::new(4),
+                    offset_from_bottom: 0,
+                    max_offset_from_bottom: 10,
+                    viewport_rows: layout.child.rows,
+                }),
+            };
+            assert_eq!(
+                apply_delta_with_writer(
+                    &mut output,
+                    &mut surface,
+                    &mut presenter,
+                    &delta,
+                    &mut viewport,
+                    &mut selection,
+                    &status,
+                    TerminalViewTransportState::Active,
+                )
+                .expect("restore child legacy mode behind history"),
+                DeltaRender::Applied
+            );
+            assert_eq!(output.bytes, b"\x1b[?1l\x1b>\x1b[?2004l\x1b[?1004l\x1b[=7u");
+            assert_eq!((output.writes, output.flushes), (1, 1));
+            assert_eq!(surface.modes().keyboard_flags.bits(), 0);
+            assert_eq!(presenter.presented_keyboard_flags().bits(), 7);
+            assert_eq!(
+                presenter
+                    .baseline
+                    .as_ref()
+                    .expect("selection frame remains committed")
+                    .rows,
+                selected_rows
+            );
+
+            output = ViewportFrameWriter::default();
+            let routed_only = TerminalModes {
+                alternate_scroll: true,
+                mouse_mode: TerminalMouseMode::PressRelease,
+                mouse_encoding: TerminalMouseEncoding::Sgr,
+                ..TerminalModes::default()
+            };
+            let delta = TerminalSurfaceDelta {
+                from_revision: Revision::new(4),
+                to_revision: Revision::new(5),
+                size: layout.child,
+                active_screen: ActiveScreen::Main,
+                row_patches: vec![TerminalSurfaceRowPatch {
+                    row: 0,
+                    replacement: test_row(
+                        layout.child.columns,
+                        "routed-live",
+                        TerminalStyle::default(),
+                    ),
+                }],
+                cursor: snapshot.surface.cursor,
+                modes: routed_only,
+                scroll_metrics: Some(TerminalScrollMetrics {
+                    epoch: Revision::new(1),
+                    revision: Revision::new(5),
+                    offset_from_bottom: 0,
+                    max_offset_from_bottom: 10,
+                    viewport_rows: layout.child.rows,
+                }),
+            };
+            assert_eq!(
+                apply_delta_with_writer(
+                    &mut output,
+                    &mut surface,
+                    &mut presenter,
+                    &delta,
+                    &mut viewport,
+                    &mut selection,
+                    &status,
+                    TerminalViewTransportState::Active,
+                )
+                .expect("install routed-only child modes behind history"),
+                DeltaRender::Applied
+            );
+            assert_eq!((output.writes, output.flushes), (0, 0));
+            assert!(output.bytes.is_empty());
+            assert_eq!(surface.modes(), routed_only);
+            let committed = presenter
+                .baseline
+                .as_ref()
+                .expect("routed modes do not alter physical baseline");
+            assert_eq!(committed.rows, selected_rows);
+            assert!(!committed.modes.alternate_scroll);
+            assert_eq!(committed.modes.mouse_mode, TerminalMouseMode::None);
+            assert_eq!(
+                committed.modes.mouse_encoding,
+                TerminalMouseEncoding::default()
+            );
+            assert!(
+                !present_surface_with_writer(
+                    &mut output,
+                    &surface,
+                    &mut presenter,
+                    &viewport,
+                    &status,
+                    TerminalViewTransportState::Active,
+                )
+                .expect("routed-only semantic modes never trigger a physical repaint")
+            );
+            assert_eq!((output.writes, output.flushes), (0, 0));
+        }
+
+        #[test]
+        fn hidden_incompatible_anchor_retires_selection_in_the_sole_mode_transaction() {
+            for (case, epoch, maximum) in [
+                ("epoch change", Revision::new(2), 10),
+                ("history shrink", Revision::new(1), 0),
+            ] {
+                let physical = TerminalSize::new(3, 8);
+                let layout = ChromeLayout::new(physical, false, ActiveScreen::Main);
+                let snapshot = test_snapshot(layout.child, ActiveScreen::Main, Revision::new(2));
+                let mut surface =
+                    AttachmentSurface::from_snapshot(&snapshot).expect("valid history surface");
+                let mut viewport =
+                    ViewportController::with_layout(layout, snapshot.surface.scroll_metrics);
+                let status = StatusRenderer::new(None, physical);
+                let mut presenter = DesktopPresenter::default();
+                let mut setup_output = ViewportFrameWriter::default();
+                present_surface_with_writer(
+                    &mut setup_output,
+                    &surface,
+                    &mut presenter,
+                    &viewport,
+                    &status,
+                    TerminalViewTransportState::Active,
+                )
+                .expect("present initial live frame");
+                viewport.observe_presentation();
+                install_test_history_window(&mut viewport);
+                present_surface_with_writer(
+                    &mut setup_output,
+                    &surface,
+                    &mut presenter,
+                    &viewport,
+                    &status,
+                    TerminalViewTransportState::Active,
+                )
+                .expect("present pinned history frame");
+                viewport.observe_presentation();
+                let mut selection = finalize_test_selection(
+                    &surface,
+                    &mut viewport,
+                    &mut presenter,
+                    &status,
+                    &mut setup_output,
+                );
+                let selected_rows = presenter
+                    .baseline
+                    .as_ref()
+                    .expect("selected history frame is committed")
+                    .rows
+                    .clone();
+
+                let delta = TerminalSurfaceDelta {
+                    from_revision: Revision::new(2),
+                    to_revision: Revision::new(3),
+                    size: layout.child,
+                    active_screen: ActiveScreen::Main,
+                    row_patches: vec![TerminalSurfaceRowPatch {
+                        row: 0,
+                        replacement: test_row(
+                            layout.child.columns,
+                            "hidden-new",
+                            TerminalStyle::default(),
+                        ),
+                    }],
+                    cursor: snapshot.surface.cursor,
+                    modes: TerminalModes::default(),
+                    scroll_metrics: Some(TerminalScrollMetrics {
+                        epoch,
+                        revision: Revision::new(3),
+                        offset_from_bottom: 0,
+                        max_offset_from_bottom: maximum,
+                        viewport_rows: layout.child.rows,
+                    }),
+                };
+                let mut output = ViewportFrameWriter::default();
+                assert_eq!(
+                    apply_delta_with_writer(
+                        &mut output,
+                        &mut surface,
+                        &mut presenter,
+                        &delta,
+                        &mut viewport,
+                        &mut selection,
+                        &status,
+                        TerminalViewTransportState::Active,
+                    )
+                    .unwrap_or_else(|error| panic!("{case} delta failed: {error}")),
+                    DeltaRender::Applied
+                );
+
+                assert_eq!(output.bytes, b"\x1b[=0u", "{case}");
+                assert_eq!((output.writes, output.flushes), (1, 1), "{case}");
+                assert!(
+                    find_bytes(&output.bytes, HOST_SYNC_BEGIN).is_none(),
+                    "{case}"
+                );
+                assert_eq!(surface.revision(), Revision::new(3), "{case}");
+                assert!(!selection.is_finalized(), "{case}");
+                assert_eq!(viewport.selection_source_identity(&surface), None, "{case}");
+                assert!(viewport.window_cache.presented_rows().is_none(), "{case}");
+                assert_eq!(presenter.presented_keyboard_flags().bits(), 0, "{case}");
+                let committed = presenter
+                    .baseline
+                    .as_ref()
+                    .expect("mode-only transaction retains the visual baseline");
+                assert_eq!(committed.rows, selected_rows, "{case}");
+                assert_eq!(committed.modes.keyboard_flags.bits(), 0, "{case}");
+
+                let mut no_io = ViewportFrameWriter::default();
+                assert!(
+                    !presenter
+                        .sync_input_modes(
+                            &mut no_io,
+                            surface.modes(),
+                            selection.presentation(viewport.selection_source_identity(&surface)),
+                        )
+                        .expect("committed candidate needs no second mode sync"),
+                    "{case}"
+                );
+                assert_eq!((no_io.writes, no_io.flushes), (0, 0), "{case}");
+            }
+        }
+
+        #[test]
+        fn hidden_delta_io_failure_keeps_every_semantic_candidate_uncommitted() {
+            #[derive(Clone, Copy, Eq, PartialEq)]
+            enum FailurePoint {
+                Write,
+                Flush,
+            }
+
+            struct TransactionFailure {
+                point: FailurePoint,
+                failed: bool,
+                bytes: Vec<u8>,
+                writes: usize,
+                flushes: usize,
+            }
+
+            impl Write for TransactionFailure {
+                fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                    self.writes += 1;
+                    if self.point == FailurePoint::Write && !self.failed {
+                        self.failed = true;
+                        return Err(io::Error::other("injected input mode write failure"));
+                    }
+                    self.bytes.extend_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+
+                fn flush(&mut self) -> io::Result<()> {
+                    self.flushes += 1;
+                    if self.point == FailurePoint::Flush && !self.failed {
+                        self.failed = true;
+                        return Err(io::Error::other("injected input mode flush failure"));
+                    }
+                    Ok(())
+                }
+            }
+
+            for point in [FailurePoint::Write, FailurePoint::Flush] {
+                let physical = TerminalSize::new(3, 8);
+                let layout = ChromeLayout::new(physical, false, ActiveScreen::Main);
+                let snapshot = test_snapshot(layout.child, ActiveScreen::Main, Revision::new(2));
+                let mut surface =
+                    AttachmentSurface::from_snapshot(&snapshot).expect("valid history surface");
+                let mut viewport =
+                    ViewportController::with_layout(layout, snapshot.surface.scroll_metrics);
+                let status = StatusRenderer::new(None, physical);
+                let mut presenter = DesktopPresenter::default();
+                let mut setup_output = ViewportFrameWriter::default();
+                present_surface_with_writer(
+                    &mut setup_output,
+                    &surface,
+                    &mut presenter,
+                    &viewport,
+                    &status,
+                    TerminalViewTransportState::Active,
+                )
+                .expect("present initial frame");
+                viewport.observe_presentation();
+                install_test_history_window(&mut viewport);
+                present_surface_with_writer(
+                    &mut setup_output,
+                    &surface,
+                    &mut presenter,
+                    &viewport,
+                    &status,
+                    TerminalViewTransportState::Active,
+                )
+                .expect("present history frame");
+                viewport.observe_presentation();
+                let mut selection = finalize_test_selection(
+                    &surface,
+                    &mut viewport,
+                    &mut presenter,
+                    &status,
+                    &mut setup_output,
+                );
+                let selection_before = selection;
+                let anchor_before = viewport.window_cache.anchor();
+                let desired_before = viewport.window_cache.desired_offset_from_bottom();
+                let source_before = viewport.selection_source_identity(&surface);
+                let metrics_before = viewport.live_metrics;
+
+                let delta = TerminalSurfaceDelta {
+                    from_revision: Revision::new(2),
+                    to_revision: Revision::new(3),
+                    size: layout.child,
+                    active_screen: ActiveScreen::Main,
+                    row_patches: Vec::new(),
+                    cursor: snapshot.surface.cursor,
+                    modes: TerminalModes::default(),
+                    scroll_metrics: Some(TerminalScrollMetrics {
+                        epoch: Revision::new(2),
+                        revision: Revision::new(3),
+                        offset_from_bottom: 0,
+                        max_offset_from_bottom: 4,
+                        viewport_rows: layout.child.rows,
+                    }),
+                };
+                let mut failure = TransactionFailure {
+                    point,
+                    failed: false,
+                    bytes: Vec::new(),
+                    writes: 0,
+                    flushes: 0,
+                };
+                let error = apply_delta_with_writer(
+                    &mut failure,
+                    &mut surface,
+                    &mut presenter,
+                    &delta,
+                    &mut viewport,
+                    &mut selection,
+                    &status,
+                    TerminalViewTransportState::Active,
+                )
+                .expect_err("failed physical mode commit rejects every candidate state");
+                assert!(error.to_string().contains(match point {
+                    FailurePoint::Write => "input mode write failure",
+                    FailurePoint::Flush => "input mode flush failure",
+                }));
+                assert_eq!(failure.writes, 1);
+                match point {
+                    FailurePoint::Write => {
+                        assert!(failure.bytes.is_empty());
+                        assert_eq!(failure.flushes, 0);
+                    }
+                    FailurePoint::Flush => {
+                        assert_eq!(failure.bytes, b"\x1b[=0u");
+                        assert_eq!(failure.flushes, 1);
+                    }
+                }
+                assert_eq!(surface.revision(), Revision::new(2));
+                assert_eq!(viewport.window_cache.anchor(), anchor_before);
+                assert_eq!(
+                    viewport.window_cache.desired_offset_from_bottom(),
+                    desired_before
+                );
+                assert_eq!(viewport.selection_source_identity(&surface), source_before);
+                assert_eq!(viewport.live_metrics, metrics_before);
+                assert_eq!(selection, selection_before);
+                assert!(selection.is_finalized());
+                assert_eq!(presenter.presented_keyboard_flags().bits(), 7);
+                assert!(presenter.baseline.is_none());
+
+                let mut recovery = ViewportFrameWriter::default();
+                assert!(
+                    present_surface_with_writer(
+                        &mut recovery,
+                        &surface,
+                        &mut presenter,
+                        &viewport,
+                        &status,
+                        TerminalViewTransportState::Active,
+                    )
+                    .expect("unknown baseline forces a complete pre-delta recovery frame")
+                );
+                assert!(find_bytes(&recovery.bytes, b"\x1b[2J").is_some());
+                assert!(find_bytes(&recovery.bytes, HOST_INPUT_CAPTURE).is_some());
+                assert!(find_bytes(&recovery.bytes, b"\x1b[=7u").is_some());
+                assert_eq!(presenter.presented_keyboard_flags().bits(), 7);
+            }
+        }
+
+        #[test]
+        fn live_delta_presentation_failure_keeps_surface_viewport_and_selection_uncommitted() {
+            struct FlushFailure {
+                bytes: Vec<u8>,
+            }
+
+            impl Write for FlushFailure {
+                fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                    self.bytes.extend_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+
+                fn flush(&mut self) -> io::Result<()> {
+                    Err(io::Error::other("injected live delta flush failure"))
+                }
+            }
+
+            let physical = TerminalSize::new(3, 8);
+            let layout = ChromeLayout::new(physical, false, ActiveScreen::Main);
+            let snapshot = test_snapshot(layout.child, ActiveScreen::Main, Revision::new(2));
+            let mut surface =
+                AttachmentSurface::from_snapshot(&snapshot).expect("valid live surface");
+            let mut viewport =
+                ViewportController::with_layout(layout, snapshot.surface.scroll_metrics);
+            let status = StatusRenderer::new(None, physical);
+            let mut presenter = DesktopPresenter::default();
+            let mut setup_output = ViewportFrameWriter::default();
+            present_surface_with_writer(
+                &mut setup_output,
+                &surface,
+                &mut presenter,
+                &viewport,
+                &status,
+                TerminalViewTransportState::Active,
+            )
+            .expect("present initial live frame");
+            viewport.observe_presentation();
+            let mut selection = finalize_test_selection(
+                &surface,
+                &mut viewport,
+                &mut presenter,
+                &status,
+                &mut setup_output,
+            );
+            let selection_before = selection;
+            let metrics_before = viewport.live_metrics;
+            let anchor_before = viewport.window_cache.anchor();
+            let source_before = viewport.selection_source_identity(&surface);
+
+            let delta = TerminalSurfaceDelta {
+                from_revision: Revision::new(2),
+                to_revision: Revision::new(3),
+                size: layout.child,
+                active_screen: ActiveScreen::Main,
+                row_patches: Vec::new(),
+                cursor: snapshot.surface.cursor,
+                modes: TerminalModes {
+                    application_cursor: true,
+                    ..TerminalModes::default()
+                },
+                scroll_metrics: Some(TerminalScrollMetrics {
+                    epoch: Revision::new(1),
+                    revision: Revision::new(3),
+                    offset_from_bottom: 0,
+                    max_offset_from_bottom: 11,
+                    viewport_rows: layout.child.rows,
+                }),
+            };
+            let mut failure = FlushFailure { bytes: Vec::new() };
+            let error = apply_delta_with_writer(
+                &mut failure,
+                &mut surface,
+                &mut presenter,
+                &delta,
+                &mut viewport,
+                &mut selection,
+                &status,
+                TerminalViewTransportState::Active,
+            )
+            .expect_err("failed live frame rejects every candidate state");
+            assert!(
+                error.to_string().contains("live delta flush failure"),
+                "unexpected live delta failure: {error}"
+            );
+            assert_eq!(surface.revision(), Revision::new(2));
+            assert_eq!(surface.active_screen(), ActiveScreen::Main);
+            assert_eq!(viewport.content_size, layout.child);
+            assert_eq!(viewport.gutter_column, layout.gutter_column);
+            assert_eq!(viewport.live_metrics, metrics_before);
+            assert_eq!(viewport.window_cache.anchor(), anchor_before);
+            assert_eq!(viewport.selection_source_identity(&surface), source_before);
+            assert_eq!(selection, selection_before);
+            assert!(selection.is_finalized());
+            assert_eq!(presenter.presented_keyboard_flags().bits(), 7);
+            assert!(presenter.baseline.is_none());
+
+            let mut recovery = ViewportFrameWriter::default();
+            assert!(
+                present_surface_with_writer(
+                    &mut recovery,
+                    &surface,
+                    &mut presenter,
+                    &viewport,
+                    &status,
+                    TerminalViewTransportState::Active,
+                )
+                .expect("full recovery presents the complete pre-delta state")
+            );
+            assert!(find_bytes(&recovery.bytes, b"\x1b[2J").is_some());
+            assert!(find_bytes(&recovery.bytes, b"\x1b[=7u").is_some());
+            assert_eq!(presenter.presented_keyboard_flags().bits(), 7);
         }
 
         #[test]
@@ -4246,13 +5796,17 @@ mod unix {
                 flushes: 0,
                 fail_next_flush: true,
             };
-            assert!(presenter.present(&mut writer, desired.clone()).is_err());
+            assert!(
+                presenter
+                    .present(&mut writer, desired.clone(), None)
+                    .is_err()
+            );
             assert!(presenter.baseline.is_none());
 
             writer.bytes.clear();
             assert!(
                 presenter
-                    .present(&mut writer, desired)
+                    .present(&mut writer, desired, None)
                     .expect("retry frame presents")
             );
             assert!(
@@ -4315,7 +5869,7 @@ mod unix {
                 flushes: 0,
             };
             let error = presenter
-                .present(&mut writer, desired.clone())
+                .present(&mut writer, desired.clone(), None)
                 .expect_err("the injected partial write fails");
             assert!(error.to_string().contains("injected partial write failure"));
             assert!(presenter.baseline.is_none());
@@ -4324,7 +5878,7 @@ mod unix {
             writer.bytes.clear();
             assert!(
                 presenter
-                    .present(&mut writer, desired)
+                    .present(&mut writer, desired, None)
                     .expect("retry frame presents")
             );
             assert!(
@@ -4372,6 +5926,421 @@ mod unix {
         }
 
         #[test]
+        fn host_codec_bounds_and_preserves_fragmented_csi_u_and_malformed_csi() {
+            let mut codec = HostInputCodec::new();
+            assert!(
+                codec
+                    .feed(b"\x1b[99:67;")
+                    .expect("bounded CSI-u prefix")
+                    .is_empty()
+            );
+            let events = codec.feed(b"6:2u").expect("complete CSI-u event");
+            let [HostInputEvent::EnhancedKey(key)] = events.as_slice() else {
+                panic!("fragmented enhanced key must decode once");
+            };
+            assert_eq!(key.raw, b"\x1b[99:67;6:2u");
+            assert_eq!(key.kind, KeyEventKind::Repeat);
+
+            let malformed = codec
+                .feed(b"\x1b[99;0u")
+                .expect("malformed CSI-u input is preserved");
+            assert_eq!(
+                malformed,
+                vec![HostInputEvent::Bytes(b"\x1b[99;0u".to_vec())]
+            );
+            let malformed_with_etx = codec
+                .feed(b"\x1b[99;\x03u")
+                .expect("malformed CSI-u containing ETX is preserved");
+            assert_eq!(
+                malformed_with_etx,
+                vec![HostInputEvent::Bytes(b"\x1b[99;\x03u".to_vec())],
+                "an ETX inside a malformed framed sequence must not be guessed as a copy key"
+            );
+            assert_eq!(
+                codec.feed(b"a\x03b").expect("legacy bytes decode"),
+                vec![
+                    HostInputEvent::Bytes(b"a".to_vec()),
+                    HostInputEvent::LegacyCtrlC,
+                    HostInputEvent::Bytes(b"b".to_vec()),
+                ]
+            );
+
+            let oversized = [b"\x1b[".as_slice(), &[b'1'; HOST_SEQUENCE_BOUND]].concat();
+            let drained = codec
+                .feed(&oversized)
+                .expect("oversized host sequence drains safely");
+            assert!(!drained.is_empty());
+        }
+
+        #[test]
+        fn enhanced_keyboard_router_copies_once_and_preserves_forwarding_contracts() {
+            let flags_seven = zterm_core::terminal::TerminalKeyboardFlags::from_bits(7)
+                .expect("protocol-complete local copy mode");
+            let child_legacy = TerminalModes::default();
+
+            let press =
+                EnhancedKey::parse(b"\x1b[99:67;6:1u".to_vec()).expect("Ctrl+Shift+C press");
+            let repeat =
+                EnhancedKey::parse(b"\x1b[99:67;6:2u".to_vec()).expect("Ctrl+Shift+C repeat");
+            let release =
+                EnhancedKey::parse(b"\x1b[99:67;6:3u".to_vec()).expect("Ctrl+Shift+C release");
+            let mut lease = CopyKeyLease::default();
+            assert!(matches!(
+                route_enhanced_input(&press, child_legacy, flags_seven, true, &mut lease),
+                KeyboardRoute::Copy
+            ));
+            assert!(matches!(
+                route_enhanced_input(&repeat, child_legacy, flags_seven, true, &mut lease),
+                KeyboardRoute::Consume
+            ));
+            assert!(matches!(
+                route_enhanced_input(&release, child_legacy, flags_seven, true, &mut lease),
+                KeyboardRoute::Consume
+            ));
+
+            let super_copy = EnhancedKey::parse(b"\x1b[99;9:1u".to_vec()).expect("Super+C press");
+            assert!(matches!(
+                route_enhanced_input(
+                    &super_copy,
+                    child_legacy,
+                    flags_seven,
+                    true,
+                    &mut CopyKeyLease::default(),
+                ),
+                KeyboardRoute::Copy
+            ));
+
+            let raw = b"\x1b[120;5:1u";
+            let ctrl_x = EnhancedKey::parse(raw.to_vec()).expect("Ctrl+X");
+            let child_enhanced = TerminalModes {
+                keyboard_flags: flags_seven,
+                ..TerminalModes::default()
+            };
+            let KeyboardRoute::Forward {
+                bytes,
+                clear_selection,
+                reinterpret_legacy,
+            } = route_enhanced_input(
+                &ctrl_x,
+                child_enhanced,
+                flags_seven,
+                true,
+                &mut CopyKeyLease::default(),
+            )
+            else {
+                panic!("matching modes must forward a non-copy key");
+            };
+            assert_eq!(bytes, raw);
+            assert!(clear_selection);
+            assert!(!reinterpret_legacy);
+
+            let KeyboardRoute::Forward {
+                bytes,
+                clear_selection,
+                reinterpret_legacy,
+            } = route_enhanced_input(
+                &ctrl_x,
+                child_legacy,
+                flags_seven,
+                true,
+                &mut CopyKeyLease::default(),
+            )
+            else {
+                panic!("temporary local elevation must downgrade a non-copy key");
+            };
+            assert_eq!(bytes, vec![0x18]);
+            assert!(clear_selection);
+            assert!(reinterpret_legacy);
+
+            let raw_unknown = b"\x1b[57358;1:2u";
+            let unknown = EnhancedKey::parse(raw_unknown.to_vec()).expect("unknown key");
+            let KeyboardRoute::Forward {
+                bytes,
+                reinterpret_legacy,
+                ..
+            } = route_enhanced_input(
+                &unknown,
+                child_legacy,
+                flags_seven,
+                true,
+                &mut CopyKeyLease::default(),
+            )
+            else {
+                panic!("unknown input must remain forwardable");
+            };
+            assert_eq!(bytes, raw_unknown);
+            assert!(reinterpret_legacy);
+            assert_eq!(
+                host_events_from_legacy_bytes(bytes),
+                vec![HostInputEvent::Bytes(raw_unknown.to_vec())]
+            );
+
+            let child_enhanced = TerminalModes {
+                keyboard_flags: zterm_core::terminal::TerminalKeyboardFlags::from_bits(9)
+                    .expect("valid child keyboard flags"),
+                ..TerminalModes::default()
+            };
+            let KeyboardRoute::Forward {
+                bytes,
+                reinterpret_legacy,
+                ..
+            } = route_enhanced_input(
+                &ctrl_x,
+                child_enhanced,
+                zterm_core::terminal::TerminalKeyboardFlags::default(),
+                false,
+                &mut CopyKeyLease::default(),
+            )
+            else {
+                panic!("an arbitrary physical/child mismatch remains byte preserving");
+            };
+            assert_eq!(bytes, raw);
+            assert!(!reinterpret_legacy);
+        }
+
+        fn sgr_mouse(raw: &[u8]) -> SgrMouse {
+            SgrMouse::parse(raw.to_vec()).expect("valid SGR mouse fixture")
+        }
+
+        #[test]
+        fn pointer_router_selects_exactly_one_owner_for_selection_child_history_and_gutter() {
+            let physical = TerminalSize::new(3, 8);
+            let layout = ChromeLayout::new(physical, false, ActiveScreen::Main);
+            let snapshot = test_snapshot(layout.child, ActiveScreen::Main, Revision::new(7));
+            let mut surface =
+                AttachmentSurface::from_snapshot(&snapshot).expect("valid pointer surface");
+            let mut viewport =
+                ViewportController::with_layout(layout, snapshot.surface.scroll_metrics);
+            let mut selection = SelectionController::default();
+
+            assert!(matches!(
+                route_pointer(
+                    &sgr_mouse(b"\x1b[<0;1;1M"),
+                    &mut viewport,
+                    &surface,
+                    &mut selection,
+                    true,
+                )
+                .expect("route selection press"),
+                PointerRoute::SelectionChanged
+            ));
+            assert!(matches!(
+                route_pointer(
+                    &sgr_mouse(b"\x1b[<32;3;1M"),
+                    &mut viewport,
+                    &surface,
+                    &mut selection,
+                    true,
+                )
+                .expect("route selection motion"),
+                PointerRoute::SelectionChanged
+            ));
+            assert!(matches!(
+                route_pointer(
+                    &sgr_mouse(b"\x1b[<0;3;1m"),
+                    &mut viewport,
+                    &surface,
+                    &mut selection,
+                    true,
+                )
+                .expect("route selection release"),
+                PointerRoute::SelectionChanged
+            ));
+            assert!(selection.is_finalized());
+
+            assert!(matches!(
+                route_pointer(
+                    &sgr_mouse(b"\x1b[<64;2;2M"),
+                    &mut viewport,
+                    &surface,
+                    &mut selection,
+                    true,
+                )
+                .expect("route history wheel"),
+                PointerRoute::Viewport(_)
+            ));
+            assert!(!selection.is_finalized());
+
+            surface.surface.modes.mouse_mode = TerminalMouseMode::PressRelease;
+            surface.surface.modes.mouse_encoding = TerminalMouseEncoding::Sgr;
+            let child_raw = b"\x1b[<0;2;2M";
+            assert!(matches!(
+                route_pointer(
+                    &sgr_mouse(child_raw),
+                    &mut viewport,
+                    &surface,
+                    &mut selection,
+                    true,
+                )
+                .expect("route child press after local selection"),
+                PointerRoute::Ignore
+            ));
+
+            let mut viewport =
+                ViewportController::with_layout(layout, snapshot.surface.scroll_metrics);
+            let mut selection = SelectionController::default();
+            assert!(matches!(
+                route_pointer(
+                    &sgr_mouse(child_raw),
+                    &mut viewport,
+                    &surface,
+                    &mut selection,
+                    true,
+                )
+                .expect("route child press"),
+                PointerRoute::Child(bytes) if bytes == child_raw
+            ));
+
+            surface.surface.modes = TerminalModes::default();
+            let gutter = layout.gutter_column.expect("main layout gutter");
+            assert!(matches!(
+                route_pointer(
+                    &sgr_mouse(format!("\x1b[<0;{gutter};2M").as_bytes()),
+                    &mut viewport,
+                    &surface,
+                    &mut selection,
+                    true,
+                )
+                .expect("route gutter press"),
+                PointerRoute::Viewport(_)
+            ));
+            assert!(viewport.gutter_drag_active());
+            assert!(matches!(
+                route_pointer(
+                    &sgr_mouse(b"\x1b[<32;1;1M"),
+                    &mut viewport,
+                    &surface,
+                    &mut selection,
+                    true,
+                )
+                .expect("route captured gutter motion"),
+                PointerRoute::Viewport(_)
+            ));
+        }
+
+        #[test]
+        fn pointer_router_preserves_modified_native_selection_and_cancelled_drag_capture() {
+            let physical = TerminalSize::new(2, 7);
+            let layout = ChromeLayout::new(physical, false, ActiveScreen::Main);
+            let snapshot = test_snapshot(layout.child, ActiveScreen::Main, Revision::new(3));
+            let surface =
+                AttachmentSurface::from_snapshot(&snapshot).expect("valid pointer surface");
+            let mut viewport =
+                ViewportController::with_layout(layout, snapshot.surface.scroll_metrics);
+            let mut selection = SelectionController::default();
+
+            assert!(matches!(
+                route_pointer(
+                    &sgr_mouse(b"\x1b[<4;1;1M"),
+                    &mut viewport,
+                    &surface,
+                    &mut selection,
+                    true,
+                )
+                .expect("route modified native selection"),
+                PointerRoute::Ignore
+            ));
+            assert!(matches!(
+                route_pointer(
+                    &sgr_mouse(b"\x1b[<0;1;1M"),
+                    &mut viewport,
+                    &surface,
+                    &mut selection,
+                    true,
+                )
+                .expect("route cancellable selection press"),
+                PointerRoute::SelectionChanged
+            ));
+            selection.reconcile(None);
+            assert!(selection.owns_pointer_sequence());
+            assert!(matches!(
+                route_pointer(
+                    &sgr_mouse(b"\x1b[<0;1;1m"),
+                    &mut viewport,
+                    &surface,
+                    &mut selection,
+                    true,
+                )
+                .expect("route cancelled selection release"),
+                PointerRoute::SelectionChanged
+            ));
+            assert!(!selection.owns_pointer_sequence());
+        }
+
+        #[test]
+        fn pointer_router_invalidates_a_pinned_selection_before_history_navigation() {
+            let physical = TerminalSize::new(3, 8);
+            let layout = ChromeLayout::new(physical, false, ActiveScreen::Main);
+            let snapshot = test_snapshot(layout.child, ActiveScreen::Main, Revision::new(7));
+            let surface =
+                AttachmentSurface::from_snapshot(&snapshot).expect("valid history surface");
+            let mut viewport =
+                ViewportController::with_layout(layout, snapshot.surface.scroll_metrics);
+            let ViewportEffect::RequestHistoryWindow(query) = viewport.navigate(true, 1) else {
+                panic!("initial history navigation requests a window");
+            };
+            let shape = query
+                .response_shape(query.anchor)
+                .expect("valid query shape");
+            let rows = (0..shape.row_count)
+                .map(|index| {
+                    test_row(
+                        query.anchor.viewport.columns,
+                        &format!("history-{index}"),
+                        TerminalStyle::default(),
+                    )
+                })
+                .collect();
+            assert!(matches!(
+                viewport
+                    .apply_view_history_window(TerminalSurfaceHistoryWindowResult::Frame(
+                        TerminalSurfaceHistoryWindowFrame {
+                            disposition: shape.disposition,
+                            anchor: query.anchor,
+                            target_offset_from_bottom: shape.target_offset_from_bottom,
+                            first_row_from_live_top: shape.first_row_from_live_top,
+                            rows,
+                        },
+                    ))
+                    .expect("install history fixture"),
+                ViewportEffect::Render | ViewportEffect::RenderAndRequestHistoryWindow(_)
+            ));
+            viewport.observe_presentation();
+
+            let source = viewport
+                .selection_source_identity(&surface)
+                .expect("presented history identity");
+            let rows = viewport
+                .selection_rows(&surface)
+                .expect("presented history rows");
+            let mut selection = SelectionController::default();
+            selection
+                .begin(source, TerminalTextPoint::new(0, 0), rows)
+                .expect("begin history selection");
+            selection
+                .update(source, TerminalTextPoint::new(0, 1), rows)
+                .expect("extend history selection");
+            selection.finish();
+            assert!(selection.is_finalized());
+
+            assert!(matches!(
+                route_pointer(
+                    &sgr_mouse(b"\x1b[<64;2;2M"),
+                    &mut viewport,
+                    &surface,
+                    &mut selection,
+                    true,
+                )
+                .expect("route pinned history wheel"),
+                PointerRoute::Viewport(_)
+            ));
+            assert!(
+                !selection.is_finalized(),
+                "viewport navigation must retire coordinates from the previously presented slice"
+            );
+        }
+
+        #[test]
         fn generic_nested_tui_wheel_update_preserves_the_styled_rightmost_cell() {
             let size = TerminalSize::new(1, 5);
             let child_mouse = TerminalModes {
@@ -4405,7 +6374,7 @@ mod unix {
             let mut presenter = DesktopPresenter::default();
             let mut output = ViewportFrameWriter::default();
             presenter
-                .present(&mut output, initial)
+                .present(&mut output, initial, None)
                 .expect("present initial right-edge cell");
 
             let wheel_raw = b"\x1b[<64;5;1M";
@@ -4435,7 +6404,7 @@ mod unix {
             .expect("compose child-owned wheel update");
             output = ViewportFrameWriter::default();
             presenter
-                .present(&mut output, updated)
+                .present(&mut output, updated, None)
                 .expect("present child-owned wheel update");
             assert_eq!((output.writes, output.flushes), (1, 1));
             assert!(find_bytes(&output.bytes, b"\x1b[1;5H").is_some());

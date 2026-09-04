@@ -23,5 +23,8 @@ pub const MAX_CONTROL_SEQUENCE_BYTES: usize = 256;
 /// Maximum bytes retained for one OSC/DCS/APC/PM/SOS string before containment.
 pub const MAX_CONTROL_STRING_BYTES: usize = 1_024;
 
+/// Maximum canonical padded Base64 bytes accepted for one OSC 52 write.
+pub const MAX_OSC52_BASE64_BYTES: usize = 699_052;
+
 /// Maximum canonical reply bytes emitted by one ingest update.
 pub const MAX_REPLY_BYTES_PER_UPDATE: usize = 64 * 1024;
