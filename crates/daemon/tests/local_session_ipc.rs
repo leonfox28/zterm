@@ -30,7 +30,7 @@ use zterm_platform::local_unix::{
     DaemonLock, bind_daemon_socket, bind_owned_daemon_socket, remove_own_socket,
 };
 use zterm_platform::pty::{ExplicitPtyCommand, PtyHost, PtySize};
-use zterm_proto::{DecodedFrame, FrameDecoder, WireKind, encode_message, v1};
+use zterm_proto::{DecodedFrame, FrameDecoder, WireKind, encode_message, v2};
 
 use state_fixture::TestState;
 
@@ -121,7 +121,7 @@ async fn unary_mutations_and_duplex_reconnect_share_one_live_registry() -> Resul
     .await
     .map_err(session_fixture::display)?;
     assert_eq!(reattached.session_id(), session_id);
-    assert!(snapshot_contains(
+    assert!(initial_snapshot_contains(
         reattached.initial_snapshot(),
         b"SOCKET-RECONNECT-MARKER"
     ));
@@ -141,17 +141,17 @@ async fn unary_mutations_and_duplex_reconnect_share_one_live_registry() -> Resul
             .map_err(|error| format!("natural-exit attachment event failed: {error}"))?
         {
             LocalAttachmentEvent::Delta(delta) => {
-                saw_final_output |= contains(&delta.ansi, b"SOCKET-FINAL-MARKER");
+                saw_final_output |= semantic_delta_contains(&delta, b"SOCKET-FINAL-MARKER");
             }
             LocalAttachmentEvent::Snapshot(snapshot) => {
-                saw_final_output |= snapshot_contains(&snapshot, b"SOCKET-FINAL-MARKER");
+                saw_final_output |= semantic_snapshot_contains(&snapshot, b"SOCKET-FINAL-MARKER");
             }
             LocalAttachmentEvent::SyncRequired(_) => {}
             LocalAttachmentEvent::TransportState(_) => {}
             LocalAttachmentEvent::SessionEnded(ended) => {
                 assert_eq!(
                     ended.reason,
-                    zterm_proto::v1::TerminalSessionEndReason::NaturalExit as i32
+                    zterm_proto::v2::TerminalSessionEndReason::NaturalExit as i32
                 );
                 break;
             }
@@ -161,10 +161,7 @@ async fn unary_mutations_and_duplex_reconnect_share_one_live_registry() -> Resul
             LocalAttachmentEvent::Takeover(_) => {
                 return Err("unexpected takeover response before natural exit".into());
             }
-            LocalAttachmentEvent::ConnectionStatus(_)
-            | LocalAttachmentEvent::HistoryPage(_)
-            | LocalAttachmentEvent::ViewportFrame(_)
-            | LocalAttachmentEvent::HistoryWindowFrame(_) => {
+            LocalAttachmentEvent::ConnectionStatus(_) | LocalAttachmentEvent::HistoryWindow(_) => {
                 return Err("unexpected remote terminal metadata before natural exit".into());
             }
         }
@@ -203,17 +200,14 @@ async fn unary_mutations_and_duplex_reconnect_share_one_live_registry() -> Resul
             LocalAttachmentEvent::Takeover(_) => {
                 return Err("unexpected takeover response during daemon stop".into());
             }
-            LocalAttachmentEvent::ConnectionStatus(_)
-            | LocalAttachmentEvent::HistoryPage(_)
-            | LocalAttachmentEvent::ViewportFrame(_)
-            | LocalAttachmentEvent::HistoryWindowFrame(_) => {
+            LocalAttachmentEvent::ConnectionStatus(_) | LocalAttachmentEvent::HistoryWindow(_) => {
                 return Err("unexpected remote terminal metadata during daemon stop".into());
             }
         }
     };
     assert_eq!(
         ended.reason,
-        zterm_proto::v1::TerminalSessionEndReason::DaemonStop as i32
+        zterm_proto::v2::TerminalSessionEndReason::DaemonStop as i32
     );
     server
         .await
@@ -249,14 +243,14 @@ async fn mutation_response_loss_replays_the_exact_completed_result_on_a_new_sock
         WireKind::SessionOperationLeaseRequest,
         89,
         5_000,
-        &v1::SessionOperationLeaseRequest {
+        &v2::SessionOperationLeaseRequest {
             target: Some(local_target()),
         },
     )
     .map_err(session_fixture::display)?;
     let lease_frame = raw_unary(state.paths.socket(), &lease_request).await?;
     let lease: zterm_core::OperationLease = lease_frame
-        .decode_message::<v1::SessionOperationLeaseResponse>(
+        .decode_message::<v2::SessionOperationLeaseResponse>(
             WireKind::SessionOperationLeaseResponse,
         )
         .map_err(session_fixture::display)?
@@ -264,7 +258,7 @@ async fn mutation_response_loss_replays_the_exact_completed_result_on_a_new_sock
         .ok_or_else(|| "lease response omitted lease".to_owned())?
         .try_into()
         .map_err(session_fixture::display)?;
-    let operation_id: v1::OperationId = zterm_core::OperationId { lease, sequence: 9 }.into();
+    let operation_id: v2::OperationId = zterm_core::OperationId { lease, sequence: 9 }.into();
     let first_request = session_create_bytes(90, operation_id.clone(), "response-loss")?;
     let mut abandoned = tokio::net::UnixStream::connect(state.paths.socket())
         .await
@@ -299,7 +293,7 @@ async fn mutation_response_loss_replays_the_exact_completed_result_on_a_new_sock
     let retry = session_create_bytes(91, operation_id.clone(), "response-loss")?;
     let frame = raw_unary(state.paths.socket(), &retry).await?;
     assert_eq!(frame.kind, WireKind::SessionMutateResponse);
-    let response: v1::SessionMutateResponse = frame
+    let response: v2::SessionMutateResponse = frame
         .decode_message(WireKind::SessionMutateResponse)
         .map_err(session_fixture::display)?;
     let replayed = response
@@ -325,7 +319,7 @@ async fn mutation_response_loss_replays_the_exact_completed_result_on_a_new_sock
     let mismatch = session_create_bytes(92, operation_id, "must-not-run")?;
     let mismatch = raw_unary(state.paths.socket(), &mismatch).await?;
     assert_eq!(mismatch.kind, WireKind::ServiceErrorResponse);
-    let mismatch: v1::ServiceError = mismatch
+    let mismatch: v2::ServiceError = mismatch
         .decode_message(WireKind::ServiceErrorResponse)
         .map_err(session_fixture::display)?;
     assert_eq!(
@@ -489,7 +483,7 @@ async fn blocked_pty_input_does_not_stall_the_socket_runtime_or_an_unrelated_ses
         LocalAttachmentClient::connect_main(state.paths.socket(), Some(TerminalSize::new(24, 80)))
             .await
             .map_err(session_fixture::display)?;
-    let ready_in_initial = snapshot_contains(blocked.initial_snapshot(), b"BLOCK-READY");
+    let ready_in_initial = initial_snapshot_contains(blocked.initial_snapshot(), b"BLOCK-READY");
     synchronize(&mut blocked).await?;
     if !ready_in_initial {
         blocked
@@ -587,7 +581,7 @@ async fn failed_bounded_stop_keeps_the_listener_available_until_session_ownershi
             .attachment
             .sync_latest(Revision::ZERO)
             .map_err(session_fixture::display)?;
-        if snapshot_contains_domain(&snapshot, b"STOP-READY") {
+        if semantic_snapshot_contains(&snapshot, b"STOP-READY") {
             break;
         }
         if Instant::now() >= ready_deadline {
@@ -833,17 +827,17 @@ async fn fatal_listener_exit_rebinds_actual_daemon_loop_until_owned_child_can_st
 
 fn session_create_bytes(
     request_id: u64,
-    operation_id: v1::OperationId,
+    operation_id: v2::OperationId,
     name: &str,
 ) -> Result<Vec<u8>, String> {
     encode_message(
         WireKind::SessionCreateRequest,
         request_id,
         5_000,
-        &v1::SessionCreateRequest {
+        &v2::SessionCreateRequest {
             operation_id: Some(operation_id),
-            target: Some(v1::TargetSelector {
-                target: Some(v1::target_selector::Target::Local(true)),
+            target: Some(v2::TargetSelector {
+                target: Some(v2::target_selector::Target::Local(true)),
             }),
             name: name.to_owned(),
             working_directory: String::new(),
@@ -853,9 +847,9 @@ fn session_create_bytes(
     .map_err(session_fixture::display)
 }
 
-fn local_target() -> v1::TargetSelector {
-    v1::TargetSelector {
-        target: Some(v1::target_selector::Target::Local(true)),
+fn local_target() -> v2::TargetSelector {
+    v2::TargetSelector {
+        target: Some(v2::target_selector::Target::Local(true)),
     }
 }
 
@@ -897,7 +891,7 @@ fn shell_path() -> Result<PathBuf, String> {
 }
 
 async fn synchronize(client: &mut LocalAttachmentClient) -> Result<(), String> {
-    let mut revision = Revision::new(client.initial_snapshot().revision);
+    let mut revision = client.initial_snapshot().revision;
     loop {
         client
             .snapshot_applied(revision)
@@ -912,7 +906,7 @@ async fn synchronize(client: &mut LocalAttachmentClient) -> Result<(), String> {
                 else {
                     return Err("sync-required was not followed by a snapshot".into());
                 };
-                revision = Revision::new(snapshot.revision);
+                revision = snapshot.revision;
             }
             Ok(LocalAttachmentEvent::Delta(_)) => return Ok(()),
             Err(error) if error.kind() == zterm_core::DomainErrorKind::DeadlineExceeded => {
@@ -935,8 +929,12 @@ async fn wait_for_wire_text(
             .await
             .map_err(session_fixture::display)?
         {
-            LocalAttachmentEvent::Delta(delta) if contains(&delta.ansi, needle) => return Ok(()),
-            LocalAttachmentEvent::Snapshot(snapshot) if snapshot_contains(&snapshot, needle) => {
+            LocalAttachmentEvent::Delta(delta) if semantic_delta_contains(&delta, needle) => {
+                return Ok(());
+            }
+            LocalAttachmentEvent::Snapshot(snapshot)
+                if semantic_snapshot_contains(&snapshot, needle) =>
+            {
                 return Ok(());
             }
             LocalAttachmentEvent::SyncRequired(_) => {}
@@ -967,9 +965,7 @@ async fn wait_for_lease_lost(client: &mut LocalAttachmentClient) -> Result<(), S
             | LocalAttachmentEvent::TransportState(_)
             | LocalAttachmentEvent::Takeover(_)
             | LocalAttachmentEvent::ConnectionStatus(_)
-            | LocalAttachmentEvent::HistoryPage(_)
-            | LocalAttachmentEvent::ViewportFrame(_)
-            | LocalAttachmentEvent::HistoryWindowFrame(_) => {}
+            | LocalAttachmentEvent::HistoryWindow(_) => {}
             LocalAttachmentEvent::SessionEnded(_) => {
                 return Err("session ended while waiting for controller lease loss".into());
             }
@@ -977,15 +973,37 @@ async fn wait_for_lease_lost(client: &mut LocalAttachmentClient) -> Result<(), S
     }
 }
 
-fn snapshot_contains(snapshot: &zterm_proto::v1::TerminalSnapshot, needle: &[u8]) -> bool {
-    contains(&snapshot.screen_ansi, needle) || contains(&snapshot.recent_history_ansi, needle)
-}
-
-fn snapshot_contains_domain(
-    snapshot: &zterm_core::terminal::TerminalSnapshot,
+fn initial_snapshot_contains(
+    snapshot: &zterm_core::terminal::TerminalSurfaceSnapshot,
     needle: &[u8],
 ) -> bool {
-    contains(&snapshot.screen_ansi, needle) || contains(&snapshot.recent_history_ansi, needle)
+    semantic_snapshot_contains(snapshot, needle)
+}
+
+fn semantic_snapshot_contains(
+    snapshot: &zterm_core::terminal::TerminalSurfaceSnapshot,
+    needle: &[u8],
+) -> bool {
+    semantic_rows_contain(&snapshot.surface.rows, needle)
+}
+
+fn semantic_delta_contains(
+    delta: &zterm_core::terminal::TerminalSurfaceDelta,
+    needle: &[u8],
+) -> bool {
+    delta
+        .row_patches
+        .iter()
+        .any(|patch| semantic_rows_contain(std::slice::from_ref(&patch.replacement), needle))
+}
+
+fn semantic_rows_contain(rows: &[zterm_core::terminal::TerminalSurfaceRow], needle: &[u8]) -> bool {
+    let contents = rows
+        .iter()
+        .flat_map(|row| row.cells.iter())
+        .flat_map(|cell| cell.contents.as_bytes().iter().copied())
+        .collect::<Vec<_>>();
+    contains(&contents, needle)
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {

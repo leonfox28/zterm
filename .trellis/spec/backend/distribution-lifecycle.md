@@ -142,6 +142,14 @@ workspace version.
   binary and must not add a separately distributed terminal dynamic library.
   `zterm-core` and `zterm-proto` remain engine-free for remote/mobile clients;
   this isolation is not a claim of mobile local-PTY support.
+- Wire-major-two releases are coordinated cutovers. Every node that may connect
+  to another node must run the same release before terminal traffic resumes;
+  ALPN `zterm/2` and `zterm-pair/2`, protobuf package `zterm.v2`, and semantic
+  terminal kinds are one atomic compatibility boundary. The product ships no
+  mixed-version adapter, downgrade, presentation negotiation, or old terminal
+  kind fallback. If rollback is required before reopening user traffic, roll
+  back the whole participating release set and accept that Sessions ended by a
+  forced update are not resurrected.
 - Containerized native jobs must add only the exact quoted `$GITHUB_WORKSPACE`
   as Git `safe.directory` after checkout and before Git-backed source-policy
   checks. A wildcard or broader trusted path is forbidden. Tool paths must be
@@ -182,6 +190,7 @@ workspace version.
 | Fetch timeout/status/redirect/size failure from fixed origin | `release_unavailable`; errors contain no URL query/body |
 | Noncanonical tag, same version, or downgrade | `update_rejected` |
 | Running daemon version/wire/schema differs | `update_rejected`; do not stop it |
+| a v1 or mixed-version peer reaches a v2 ALPN/wire boundary | explicit incompatibility; do not downgrade, translate terminal representation, or partially activate the attachment |
 | Active Sessions and no `--force` | `update_rejected`; no stop/activation |
 | Stop or lifecycle ownership release fails | Preserve installed binary; return typed lifecycle error |
 | Activation/post-check/metadata fails | Restore retained executable; report ended Sessions as ended |
@@ -199,6 +208,9 @@ workspace version.
 - Good: signed newer target archive verifies, zero Sessions are active, daemon
   stops, candidate activates/post-checks, metadata commits, daemon remains
   stopped, and the rollback file is removed.
+- Good: every participating node is upgraded to the same wire-major-two release
+  before reconnecting, then local/direct/Relay smoke evidence is collected on
+  the new semantic protocol.
 - Base: install through an existing writable mode-`0775` default
   `~/.local/bin`, observe no `~/.zterm`, then run setup separately; pre-setup
   uninstall removes only that executable.
@@ -210,6 +222,9 @@ workspace version.
   parser or printing the seed so that shell tooling can reuse it.
 - Bad: requiring a tool merely because one hosted runner image happens to
   provide it, or silently skipping the lint when the tool is absent.
+- Bad: keep a hidden v1 listener, terminal-kind translator, or capability
+  fallback so nodes can be upgraded independently after the coordinated
+  cutover.
 - Bad: treating a socket bound on numeric loopback as proof that a framework
   will not resolve a hostname before listening, or hiding that lookup behind a
   longer fixture timeout.

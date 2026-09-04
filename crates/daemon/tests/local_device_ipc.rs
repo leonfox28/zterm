@@ -51,7 +51,7 @@ use zterm_daemon::store::{RelayRouteCache, StateStore, StoreActor};
 #[cfg(unix)]
 use zterm_platform::local_unix::{DaemonLock, bind_daemon_socket, remove_own_socket};
 #[cfg(unix)]
-use zterm_proto::{DecodedFrame, FrameDecoder, WireKind, encode_message, v1};
+use zterm_proto::{DecodedFrame, FrameDecoder, WireKind, encode_message, v2};
 
 #[cfg(unix)]
 use session_fixture::Fixture as SessionFixture;
@@ -438,7 +438,7 @@ async fn alias_selector_and_strict_unary_failures_are_connection_local() {
         WireKind::LocalDeviceRenameRequest,
         51,
         100,
-        &v1::LocalDeviceRenameRequest {
+        &v2::LocalDeviceRenameRequest {
             device_id: Some(device_one.into()),
             alias: "local".to_owned(),
         },
@@ -455,8 +455,8 @@ async fn alias_selector_and_strict_unary_failures_are_connection_local() {
         WireKind::LocalDeviceRevokeRequest,
         52,
         100,
-        &v1::LocalDeviceRevokeRequest {
-            device_id: Some(v1::DeviceId { value: vec![1] }),
+        &v2::LocalDeviceRevokeRequest {
+            device_id: Some(v2::DeviceId { value: vec![1] }),
         },
     )
     .expect("invalid selector request");
@@ -471,14 +471,14 @@ async fn alias_selector_and_strict_unary_failures_are_connection_local() {
         WireKind::LocalDeviceListRequest,
         53,
         100,
-        &v1::LocalDeviceListRequest {},
+        &v2::LocalDeviceListRequest {},
     )
     .expect("first list request");
     let second = encode_message(
         WireKind::LocalDeviceListRequest,
         54,
         100,
-        &v1::LocalDeviceListRequest {},
+        &v2::LocalDeviceListRequest {},
     )
     .expect("second list request");
     let mut extra = first;
@@ -496,7 +496,7 @@ async fn alias_selector_and_strict_unary_failures_are_connection_local() {
         WireKind::LocalDeviceListRequest,
         55,
         50,
-        &v1::LocalDeviceListRequest {},
+        &v2::LocalDeviceListRequest {},
     )
     .expect("no-EOF request");
     let mut stream = tokio::net::UnixStream::connect(harness.state.paths.socket())
@@ -655,7 +655,7 @@ async fn read_response(stream: &mut tokio::net::UnixStream) -> DecodedFrame {
 #[cfg(unix)]
 fn assert_service_error(frame: &DecodedFrame, expected: DomainErrorKind) {
     assert_eq!(frame.kind, WireKind::ServiceErrorResponse);
-    let error: v1::ServiceError = frame
+    let error: v2::ServiceError = frame
         .decode_message(WireKind::ServiceErrorResponse)
         .expect("service error response");
     assert_eq!(error.code, expected.code());

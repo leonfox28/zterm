@@ -22,7 +22,7 @@ use zterm_daemon::service::DaemonService;
 #[cfg(unix)]
 use zterm_platform::local_unix::{DaemonLock, bind_daemon_socket, remove_own_socket};
 #[cfg(unix)]
-use zterm_proto::{WireKind, encode_message, v1};
+use zterm_proto::{WireKind, encode_message, v2};
 
 #[cfg(unix)]
 use state_fixture::TestState;
@@ -76,7 +76,7 @@ fn cross_uid_client(socket: &str) {
         WireKind::LocalReadinessRequest,
         1,
         0,
-        &v1::LocalReadinessRequest {},
+        &v2::LocalReadinessRequest {},
     )
     .expect("readiness frame");
     match stream.write_all(&request) {

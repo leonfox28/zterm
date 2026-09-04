@@ -90,28 +90,17 @@ pub fn wait_for_text(driver: &TerminalDriver, needle: &str) -> Result<(), String
     }
 }
 
-pub fn snapshot_text(snapshot: &zterm_core::terminal::TerminalSnapshot) -> Result<String, String> {
-    let mut client = TerminalModel::new(snapshot.size, SCROLLBACK_ROWS).map_err(display_error)?;
-    client
-        .ingest(&snapshot.recent_history_ansi)
-        .map_err(display_error)?;
-    client
-        .ingest(&snapshot.screen_ansi)
-        .map_err(display_error)?;
-    Ok(state_text(&client))
-}
-
-pub fn state_text(model: &TerminalModel) -> String {
-    let state = model.state();
-    let columns = usize::from(state.size.columns);
+pub fn snapshot_text(
+    snapshot: &zterm_core::terminal::TerminalSurfaceSnapshot,
+) -> Result<String, String> {
     let mut text = String::new();
-    for row in state.cells.chunks(columns) {
-        for cell in row {
+    for row in &snapshot.surface.rows {
+        for cell in &row.cells {
             text.push_str(&cell.contents);
         }
         text.push('\n');
     }
-    text
+    Ok(text)
 }
 
 pub fn wait_for_natural_exit(driver: &TerminalDriver) -> Result<(), String> {

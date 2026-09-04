@@ -2,6 +2,8 @@
 
 > 本文只在用户批准本任务最终计划后执行。批准前不得运行 `task.py start`，不得修改产品
 > 代码。本计划完全取代旧 Ghostty wrapper/FFI 方案。
+> Phases 0–8 retain completed history. The direct-cutover revisions in Phases 9–15 supersede every
+> earlier fixed-wire/ANSI/fallback statement.
 
 ## Guardrails
 
@@ -11,8 +13,9 @@
   `unsafe impl Send/Sync` 或绕过 workspace lint。
 - `portable-pty` 仍是唯一 PTY/process owner；一个 Session 仍对应一个 PTY、一个 root child、
   一个 authoritative model。
-- 保留当前 protobuf/wire major、attachment/session 生命周期和 no-drop PTY drain；任何
-  Alacritty type 都不得穿过 `zterm-terminal` 私有边界。
+- 协调升级 product wire major 与 normal/pair ALPN，删除 presentation compatibility；保留
+  attachment/session 生命周期和 no-drop PTY drain。任何 Alacritty type 都不得穿过
+  `zterm-terminal` 私有边界。
 - production binary 不同时运行两个 parser，不提供 runtime fallback。最终 tests 也不保留
   `vt100` 作为 oracle。
 - 本任务不新增或运行 throughput、latency、CPU、RSS、build-time、binary-size 对比 benchmark，
@@ -677,3 +680,729 @@ Hosted PR follow-up evidence (2026-09-03):
 
 - [x] 用户已批准 desktop/mobile 共用 client-owned viewport cache，并明确要求按该方案实施
   （2026-09-03）。
+
+## Post-release follow-up: live-bottom gutter flicker (2026-09-03)
+
+### 1. Root Cause Category
+
+- **Category**: D — Test Coverage Gap, with B — Cross-Layer Contract.
+- **Specific cause**: returning from history enters `ResumePending`. The old
+  implementation returned no scroll metrics in that state, so the
+  `SyncRequired` chrome transaction and replacement snapshot each cleared the
+  gutter before `Active` redrew the live thumb. Legacy viewport coalescing also
+  stored an intermediate response that was never painted, conflating received
+  state with presentation authority.
+
+### 2. Why the first anti-flicker fix was incomplete
+
+1. It correctly kept history content unchanged while a replacement was pending,
+   but tested `write_history` rather than every chrome frame in the event loop.
+2. DEC 2026 made each individual write atomic, but could not make three separate
+   transactions atomic as a group; the blank gutter transaction remained real.
+3. The state model distinguished desired and cached offsets, but the legacy
+   fallback still treated the latest received frame as if it had been rendered.
+
+### 3. Prevention Mechanisms
+
+| Priority | Mechanism | Specific action | Status |
+| --- | --- | --- | --- |
+| P0 | Architecture | Preserve validated last-painted metrics in `ResumePending`; switch to replacement live metrics only after snapshot observation | DONE |
+| P0 | Architecture | Do not replace legacy presentation state with a coalesced intermediate frame that immediately schedules another request | DONE |
+| P0 | Tests | Assert every frame in `History -> ResumePending -> SyncRequired -> Snapshot -> Active`, including nonblank old and offset-zero final chrome | DONE |
+| P1 | Invalidation | Clear mismatched metrics on resize and clear both live/presented identity on true reconnect | DONE |
+| P1 | Knowledge | Record received/desired/presented separation in local IPC spec and cross-layer checklist | DONE |
+
+### 4. Systematic Expansion
+
+- **Similar issues**: Android must not promote a fetched window to visible
+  scroll state until the UI frame containing it commits; latest-wins transport
+  state and presentation state remain distinct.
+- **Design improvement**: model last-painted chrome explicitly at transition
+  boundaries instead of deriving it from the newest response object.
+- **Process improvement**: rendering regressions must enumerate intermediate
+  output transactions, not merely compare the initial and final reducers.
+
+### 5. Verification
+
+- `cargo +1.98.0 test -p zterm-cli --all-features`: 56 passed, 3 ignored.
+- `cargo +1.98.0 clippy -p zterm-cli --all-targets --all-features -- -D warnings`: passed.
+- `cargo +1.98.0 fmt --all -- --check`, `sh tests/source-policy.sh`, and
+  `git diff --check`: passed.
+- Independent `trellis-check` found and fixed reconnect identity and unpainted
+  legacy-coalescing gaps, then passed the complete CLI suite, format, Clippy,
+  type-check, and source policy.
+- Real Ghostty observation remains the user-owned acceptance step; no claim is
+  made from byte-level tests that every outer-terminal implementation paints
+  synchronized updates identically.
+
+## Post-smoke follow-up: remote status-row flash and return-live pause (2026-09-03)
+
+### 1. Root Cause Category
+
+- **Category**: D — Test Coverage Gap, with B — Cross-Layer Contract and E —
+  Implicit Assumption.
+- **Specific cause**: the CLI treated every non-`Active` transport state as if
+  the last observed connection path/RTT were invalid. Return-to-live is an
+  in-epoch visual synchronization, however, so its
+  `Synchronizing -> Snapshot -> Active` sequence painted `-- | --`, restored
+  direct/relay + RTT, and then issued an unchanged Active repaint. That leaked
+  internal coordination into the status row and added avoidable writes/flushes.
+- **Discriminating evidence**: the prior probabilities were 55% intermediate
+  transition frames, 25% a stale 16 ms cadence deadline, and 20% host-terminal
+  composition. A deterministic writer trace reproduced the path as
+  `direct -> -- -> direct` with extra transactions while showing the cadence
+  timer was cancelled. This raises the intermediate-frame cause above 95%; a
+  real Ghostty smoke remains necessary only for host-compositor confirmation.
+
+### 2. Why the prior fixes were incomplete
+
+1. The first return-live regression asserted content and scrollbar geometry,
+   but did not assert the remote status row in every stdout transaction.
+2. DEC 2026 makes one transaction atomic; it cannot hide a false status frame
+   or an unchanged Active repaint emitted as separate transactions.
+3. Transport synchronization and connection-observation validity were modeled
+   implicitly through one `Active` comparison, so an in-epoch snapshot repair
+   looked indistinguishable from a true reconnect to the status renderer.
+
+### 3. Prevention Mechanisms
+
+| Priority | Mechanism | Specific action | Status |
+| --- | --- | --- | --- |
+| P0 | Architecture | Preserve validated path/RTT through same-epoch synchronization; clear it only at a true reconnect epoch boundary | DONE |
+| P0 | Presentation | Retain the complete history frame until one replacement Snapshot atomically paints live content, bottom thumb, and status | DONE |
+| P0 | State transition | Let post-Snapshot Active complete input/resize state without repainting an unchanged visual result | DONE |
+| P0 | Tests | Enumerate actual DEC-2026 transactions and assert content, gutter, status, writes, and flushes across the full resume sequence | DONE |
+| P1 | Knowledge | Record the separate transport, connection-observation, and presentation authorities in code-spec and review checklist | DONE |
+
+### 4. Systematic Expansion
+
+- **Similar issues**: any future title/tab/badge, Android connection indicator,
+  cursor overlay, or selection chrome can flicker if derived directly from a
+  transient synchronization state instead of its own validity epoch.
+- **Design improvement**: transition handlers decide separately whether state
+  work, observation invalidation, and visual presentation are required. A
+  visually complete replacement Snapshot is presentation authority even though
+  the later Active event still owns input fencing and resize completion.
+- **Process improvement**: transition tests must inspect the sequence and count
+  of externally written frames, including every Zterm-owned chrome region,
+  rather than checking only reducer endpoints or one component.
+
+### 5. Knowledge Capture
+
+- [x] Update `.trellis/spec/backend/local-daemon-ipc.md` with executable
+  preservation/reset rules, matrix cases, tests, and wrong/correct examples.
+- [x] Update the cross-layer terminal-presentation checklist to include
+  connection-observation authority, the status row, and transaction count.
+- [x] Add same-epoch direct/relay preservation and true-reconnect isolation
+  regressions at the real composed-frame writer boundary.
+- [x] Verify this product repository has no `src/templates/markdown/spec/`
+  mirror, so there is no generated spec counterpart to synchronize.
+- [ ] Confirm the reviewed debug binary in real Ghostty by returning to live
+  repeatedly with wheel and scrollbar drag; this is user-owned acceptance.
+
+### 6. Verification
+
+- The regression first failed on the old `remote | -- | --` Synchronizing
+  frame. The fixed sequence contains exactly the retained history transaction
+  and one authoritative live Snapshot transaction; both retain direct/relay +
+  RTT, DEC 2026 boundaries, host capture, one write, and one flush.
+- Independent `trellis-check` found no production-code defect. It expanded the
+  tests to Relay + RTT and to a true reconnect's full replacement Snapshot, so
+  stale Direct/RTT cannot hide behind a chrome-only test.
+- Focused tests and the complete `zterm-cli` suite passed with 64 library tests
+  and 3 intentional isolated-process helpers ignored; main/integration tests,
+  workspace all-target/all-feature check and Clippy with `-D warnings`, format,
+  source policy, and `git diff --check` passed.
+- The repository-level `just check` passed after the production, regression,
+  task, and spec changes, including all workspace tests/docs, policy and secret
+  checks, cargo-deny, and Relay static/upstream verification. The reviewed
+  `target/debug/zterm` was then rebuilt with all CLI features.
+- Real Ghostty/macOS/Linux composition remains the explicit smoke boundary;
+  byte-level tests prove what Zterm emits, not when each host compositor paints.
+
+## Phase 8 — Herdr-style Host Viewport Presentation Cadence (Planning)
+
+### 1. Isolate timing state
+
+- [x] Add a small desktop-CLI-owned pacer with a 16 ms minimum interval, one dirty flag, and at most
+  one pending deadline. Keep it free of protocol, Alacritty, row, and terminal-writer ownership.
+- [x] Provide deterministic mark-presented, mark-dirty, due, deadline, and cancel transitions that
+  can be tested with supplied `Instant` values; do not introduce an always-running interval.
+
+### 2. Separate state/request work from presentation
+
+- [x] Refactor host-owned viewport effect handling so wheel/gutter/Page navigation updates desired
+  state immediately and history-window request/prefetch effects remain immediate, while eligible
+  cached rendering can be marked dirty instead of flushed per report.
+- [x] Reduce every `HostInputEvent` from one stdin delivery before making the batch's presentation
+  decision. Preserve one-row-per-wheel-report and exact checked final offset.
+- [x] Leave child-owned mouse and alternate-scroll byte forwarding completely outside the pacer.
+  Preserve the existing 33 ms scrollbar-drag request pacing and force the final release position to
+  be presented when complete.
+
+### 3. Drive and invalidate the pending frame
+
+- [x] Add one guarded viewport-deadline branch to the active terminal `tokio::select!`; on expiry,
+  present only the latest complete host-owned history slice in the existing DEC 2026 transaction.
+- [x] Treat an immediate render containing the current viewport as satisfying pending work.
+- [x] Cancel pending presentation before return-live/resume, authoritative snapshot/resync,
+  resize/reflow, true reconnect, replacement transport state, detach, and cleanup. Do not cancel a
+  compatible pinned-history frame solely because a background live delta advanced.
+
+### 4. Regression tests
+
+- [x] Prove three same-direction reports delivered together move exactly three rows and emit one
+  history/chrome transaction; prove multiple deliveries inside 16 ms emit at most the latest due
+  frame and retain the final offset.
+- [x] Cover a burst crossing the cadence boundary, reverse direction, top/live clamp, cache miss with
+  immediate request, and a deadline firing after the view has been invalidated.
+- [x] Prove child-owned Herdr/PiAgent-style mouse modes still forward every report immediately and
+  receive no host history repaint; prove final thumb release is not stranded.
+- [x] Re-run existing resume/gutter/DEC-2026 byte-order, reconnect, resize, local-cache, fallback, and
+  cleanup tests so cadence cannot reintroduce the fixed blank-gutter frame.
+
+### 5. Validation and user smoke
+
+- [x] Run focused CLI tests, full `zterm-cli` tests, format, all-target/all-feature CLI Clippy with
+  `-D warnings`, source policy, and `git diff --check`.
+- [x] Run the repository-prescribed broader gate once required by the active task, followed by an
+  independent `trellis-check` review and spec synchronization.
+- [x] Build the reviewed debug binary at `target/debug/zterm`.
+- [ ] Complete real Ghostty verification: slow wheel, rapid wheel, trackpad, reverse direction,
+  scrollbar drag/release, return-live, and nested Herdr/PiAgent fullscreen mode.
+
+### Phase 8 completion gate
+
+- [x] Desktop host-owned cached viewport presentation is event-driven and no faster than the chosen
+  16 ms cadence, without a global PTY-output scheduler.
+- [x] Every input report still affects the exact final offset; only intermediate presentation is
+  coalesced, and requests remain immediate/latest-target correct.
+- [x] Child-owned input, one-Session/one-PTY ownership, wire compatibility, Alacritty model, Android
+  scope, and product-code unsafe prohibition are unchanged.
+- [x] No stale timed frame can repaint after an authoritative state transition or cleanup.
+
+### Phase 8 authorization
+
+- [x] Final planning summary presented and subsequently approved by the user on 2026-09-03.
+
+### Phase 8 implementation and review evidence (2026-09-03, macOS arm64)
+
+- The CLI now reduces every host-owned event from one stdin delivery before a presentation
+  decision, uses one event-driven/non-sliding 16 ms deadline, and keeps requests immediate. Normal
+  PTY deltas and child-owned mouse/alternate-scroll do not enter the pacer.
+- Independent review found that `ViewportCache` can advance its locally presentable offset before a
+  paced stdout frame commits. The fix adds a CLI-only last-successfully-presented metrics baseline,
+  advances it only after the complete outer transaction succeeds, and retains that baseline across
+  cache miss/resume instead of preserving an unseen target. Review also fixed a sliding cold
+  deadline and added same-epoch background-growth coverage.
+- `cargo +1.98.0 test -p zterm-cli --all-features` passed 62 library tests with 3 intentional
+  isolated-process helpers ignored; main and integration tests passed. CLI all-target/all-feature
+  check and Clippy with `-D warnings`, format, source policy, and `git diff --check` passed.
+- The single repository-level `just check` passed: source/version/dependency/release policy,
+  workspace all-target/all-feature Clippy, secret scans, all workspace tests and docs, cargo-deny,
+  and Relay static/upstream checks. Expected macOS skips remain Linux cross-UID, explicit-only
+  terminal blackbox, and Linux-only real Iroh loopback; no performance/RSS benchmark was run.
+- Real Ghostty perceived-cadence smoke remains the user-owned acceptance step. A burst that crosses
+  a 16 ms boundary may intentionally produce two normally spaced frames; final offset must remain
+  exact and no back-to-back per-report flush may return.
+
+## Post-smoke follow-up: nested Herdr scrollbar erased (2026-09-03)
+
+### 1. Root Cause Category
+
+- **Category**: B — Cross-Layer Contract, with D — Test Coverage Gap and E —
+  Implicit Assumption.
+- **Specific cause**: a Main-to-Alternate transition transferred Zterm's final
+  gutter column back to the child, but `write_scrollbar` still appended spaces
+  for the former gutter after the authoritative child snapshot. Herdr rendered
+  its own pane scrollbar in that rightmost column, so the later Zterm chrome
+  bytes erased it inside the same otherwise-atomic DEC-2026 transaction.
+- **Discriminating evidence**: the initial hypotheses were 55% stale host
+  chrome, 25% terminal-model/rightmost-cell projection, and 20% Herdr mode or
+  configuration. Herdr's pinned source confirmed it owns the outer alternate
+  screen and draws pane chrome in the pane's final column. An exact-byte red
+  regression then showed child `▐` followed by Zterm CUP-plus-space writes to
+  the same column, raising stale chrome above 95%. Projection tests confirmed
+  that the model and ANSI encoder preserve the rightmost child cell.
+
+### 2. Why Earlier Scrollbar Tests Missed It
+
+1. Layout tests proved that Alternate had no Zterm gutter and received the full
+   width, but did not assert the final writer of the reclaimed physical column.
+2. Clearing an old gutter is correct for Main-to-Main relocation, so that rule
+   was incorrectly generalized to a transition where the region changed owner.
+3. DEC 2026 prevents partial visual presentation of one transaction; it cannot
+   repair a transaction whose final byte order itself overwrites child content.
+4. The original stale state followed the most recently requested layout rather
+   than the last successfully painted layout, leaving consecutive resize and
+   failed-write cases underspecified.
+
+### 3. Prevention Mechanisms
+
+| Priority | Mechanism | Specific action | Status |
+| --- | --- | --- | --- |
+| P0 | Ownership | When Main transfers the gutter to Alternate or width `<=4`, never clear that reclaimed child column after child output | DONE |
+| P0 | Presentation | Track the last successfully presented gutter independently from desired layout and commit it only after write plus flush succeed | DONE |
+| P0 | Ordering | For Main-to-Main relocation, clear the committed old column first and draw the final desired gutter last to repair right-margin clamp | DONE |
+| P0 | Tests | Assert exact bytes/write/flush for child-column preservation, grow/shrink, multiple layouts, removal, and write/flush failure retry | DONE |
+| P1 | Knowledge | Record region ownership transfer and last-writer rules in design, local IPC spec, and cross-layer checklist | DONE |
+
+### 4. Systematic Expansion
+
+- **Similar issues**: tmux, PiAgent, editors, and any future nested TUI may draw
+  a border or scrollbar in the final alternate-screen column. Process-name
+  handling would hide this bug for only known applications, so routing remains
+  mode/layout based.
+- **Design improvement**: every status row, gutter, selection, title, overlay,
+  and future Android chrome region needs an explicit owner per state plus an
+  explicit final writer during ownership transfer.
+- **Process improvement**: transition regressions must start from a committed
+  prior frame and compare the full composed byte transaction, including output
+  failures and retries, rather than infer presentation from desired layout.
+
+### 5. Knowledge Capture
+
+- [x] Update `.trellis/spec/backend/local-daemon-ipc.md` with gutter ownership,
+  presentation authority, validation matrix, tests, and wrong/correct examples.
+- [x] Update the cross-layer checklist with region ownership, final-writer, and
+  failed-transaction rules.
+- [x] Correct this task's design wording: the child snapshot or physical resize
+  replaces/clips a reclaimed gutter; Zterm does not clear it afterward.
+- [x] Verify that this product repository has no
+  `src/templates/markdown/spec/` mirror to synchronize.
+- [ ] Confirm the reviewed debug binary in real Ghostty with a Herdr pane that
+  has enough retained output for its own scrollbar to be visible.
+
+### 6. Verification
+
+- The regression first failed with an exact transaction containing Herdr's
+  rightmost `▐` followed by Zterm spaces at that same column. The corrected
+  Alternate transaction contains child content, host capture, and DEC-2026 end
+  with no reclaimed-column cleanup.
+- Independent review found and fixed consecutive-layout and failed-transaction
+  authority gaps. `zterm-cli` passed 69 library tests with 3 intentional
+  isolated-process helpers ignored; CLI main/integration tests, check, Clippy
+  with `-D warnings`, format, source policy, and `git diff --check` passed.
+- The repository-level `just check` passed, including all workspace tests and
+  docs, policy/secret checks, cargo-deny, and Relay verification.
+- The pinned Herdr 0.8.2 terminal-model black box passed alternate-screen,
+  resize, detached progress, resync, bounded pending work, and cleanup. It does
+  not replace the remaining real Ghostty compositor smoke.
+- The reviewed all-features debug binary was rebuilt at `target/debug/zterm`
+  after the final repository gate.
+
+## Phase 9 — Freeze the Presentation Failure Class
+
+> The user confirmed one complete semantic-presentation migration with one release boundary. These
+> ordered phases are internal checkpoints, not independently releasable feature slices. Product code
+> remains frozen until the reconverged summary is followed by a new explicit implementation approval.
+> The later direct-cutover decision supersedes every mixed-version/fallback item below: implementation
+> resumes only after this plan removes the ANSI family, obsolete history protocols, and negotiation.
+
+### Step 9.0 — Preserve baseline and classification
+
+- [x] Record implementation-start commit, branch, dirty task/spec files, Rust/Cargo versions, current
+  advertised capabilities, wire numbers through 318, and the focused terminal/daemon/CLI baseline.
+- [x] Preserve all user and prior follow-up changes. Do not rewrite completed Phase 6–8 evidence or
+  collapse unrelated worktree state into this migration.
+- [x] Record the two-level diagnosis in the implementation log: split physical ownership is an
+  architecture/boundary defect; unconditional full-width `EL0` is a local legacy-adapter defect.
+- [x] Enumerate every active stdout/physical-mode writer and every current presentation baseline.
+  The list becomes the final no-bypass audit; discovering another owner updates design before code.
+
+Implementation-start evidence (2026-09-03, macOS arm64):
+
+- Baseline commit `941877281135697b114692d4a643b593cbf632e5` on
+  `fix/live-bottom-scrollbar-flicker`; Rust/Cargo are both 1.98.0. The dirty tree contains only the
+  already reviewed task/spec changes listed by `git status --short`; no product source was dirty.
+- The stable registry ends at history-window kinds 317/318 and capability bit 20. Production has no
+  semantic-cell kind or advertised capability at this baseline.
+- Focused baseline passed: core 43 unit + 10 pairing-vector tests; proto 10 unit + 16 compatibility
+  tests; terminal 23 unit + 10 security + 5 corpus + 5 snapshot/delta tests; daemon 202 library
+  tests; CLI terminal UI 58 passed with 3 intentional isolated helpers ignored.
+- Root-cause classification is deliberately two-level. Multiple independent active writers and
+  separately committed content/chrome baselines make the lost-cell/flicker family an
+  **architecture / boundary defect**. The legacy row adapter's unconditional `EL0` after a
+  full-width row is independently a **local implementation defect** against the existing
+  replacement contract.
+- The active raw-mode physical writers are: `TerminalGuard` entry/restoration; `TerminalRenderer`
+  snapshot/delta output; `StatusRenderer`; history, scrollbar, and transport-state render helpers,
+  all wrapped individually by `present_atomic`. Normal-mode completion/error output in `main.rs`
+  remains outside the active presenter lifecycle. Current committed presentation authorities are
+  split across `TerminalRenderer` revision/screen/modes, `StatusRenderer::previous_row`,
+  `ViewportController` presented gutter and scroll metrics, and the viewport pacer's last-presented
+  instant. This list is the Phase 14 no-bypass audit baseline.
+
+### Step 9.1 — Add application-neutral failing contracts
+
+- [x] Add a generic alternate-screen nested-TUI fixture that paints a styled final-column cell and
+  updates it after a child-owned wheel report. Prove the Alacritty projection retains the cell while
+  the current final physical transaction loses it in a strict pending-wrap/inclusive-erase oracle.
+- [x] Add sibling regressions for status/gutter ownership transfer, history-to-live composition, and
+  failed write/flush baseline. These should describe complete desired output, not Herdr glyph bytes.
+- [x] Freeze wire-major-1 rejection fixtures and the wire-major-2 semantic kind registry before
+  deleting old payloads. Old nodes must fail at readiness/ALPN/Hello rather than attachment rendering.
+- [x] Add source/test guardrails rejecting application/process/title/theme/terminal-brand detection,
+  a second CLI terminal parser, new unsafe code, and semantic messages containing ANSI payloads.
+
+Rollback point: task evidence and red/contract tests only; resume implementation only after the
+direct-cutover planning gate is approved.
+
+## Phase 10 — Add the Semantic Core and Wire Contract
+
+### Step 10.1 — Implement core semantic values
+
+- [x] Add `TerminalSurfaceRow`, `TerminalSurface`, `TerminalSurfaceSnapshot`,
+  `TerminalSurfaceRowPatch`, `TerminalSurfaceDelta`, and semantic history-window result values in
+  `zterm-core`, reusing existing cell/style/cursor/mode/size/anchor values.
+- [x] Centralize structural validation: exact rectangular shape, dimension limits, advancing
+  revisions, sorted unique patch rows, cursor/metrics consistency, 22-byte control-free cell text,
+  valid wide head/continuation pairs, and content-redacted `Debug`.
+- [x] Remove presentation-only `TerminalState`/ANSI snapshot-delta DTOs once all semantic consumers
+  compile. Keep only domain values with a current semantic/lifecycle consumer.
+- [x] Instantiate the existing generic cache with semantic rows in focused tests; preserve all
+  anchoring, slice, prefetch, invalidation, and maximum-240-row behavior.
+
+### Step 10.2 — Define the wire-major-2 semantic protocol
+
+- [x] Move protobuf sources/package and generated Rust module from `proto/zterm/v1` / `zterm.v1` /
+  `zterm_proto::v1` directly to `proto/zterm/v2` / `zterm.v2` / `zterm_proto::v2`. Delete the v1
+  generated module and do not compile dual schema generations. Preserve unchanged independently
+  versioned persistent/ticket message shapes without retaining a wire-v1 transport.
+- [x] Add protobuf color/style/cell/row/surface/cursor messages plus semantic snapshot, delta,
+  full-row patch, and semantic history-window messages. Generated `Debug` for content-bearing values
+  must be overridden/redacted exactly like current ANSI frames.
+- [x] Increment product wire major and normal/pair ALPN identifiers. Reassign canonical content kinds
+  301/302/318 to semantic snapshot/delta/history-window under the new major; keep request 317.
+- [x] Delete bit 21, presentation encoding/preference, legacy payload messages, temporary 319..321,
+  pager 312/313, viewport 315/316, and their generated/conversion/allowlist code.
+- [x] Implement conversion/validation with exact row/cell counts, color/style ranges, wide structure,
+  revision/anchor binding, control-free content, request correlation, max-size checks, and sentinel-
+  redacted errors/debug output.
+- [x] Prove a maximum legal viewport and maximum 240-row semantic window encode below 8 MiB. This is
+  a correctness bound, not an RSS/performance benchmark or aggregate memory admission.
+
+Rollback point: core/proto cutover commit; rollback requires reverting the whole wire-major slice.
+
+## Phase 11 — Make Semantic Projection the Primary Model Output
+
+### Step 11.1 — Project exact surfaces and full-row patches
+
+- [x] Preserve private `ProjectedScreen`/inline cell storage, add exact conversion including wrapped
+  rows, and produce semantic snapshots directly from one model lock/revision.
+- [x] Compare checkpoint and latest projection once. Compatible updates emit complete metadata plus
+  sorted full-row replacements; size/screen/format/future mismatch emits a semantic snapshot.
+- [x] Preserve revision-only/no-visible-row transitions and current scroll metrics. Prove applying
+  any accepted patch yields byte-for-byte equal semantic state to a fresh snapshot.
+- [x] Add semantic history-window projection from the same row projector and existing coordinate
+  formula. It must not mutate display offset, revision, checkpoint, history identity, or another
+  attachment.
+
+### Step 11.2 — Make the driver boundary semantic-only
+
+- [x] Return semantic snapshot/delta/window types directly while retaining the semantic
+  `TerminalCheckpoint`; remove presentation-family wrappers and selection state.
+- [x] Delete `encode_full`, `encode_delta`, row/history ANSI, `recent_history_ansi`, their module/API,
+  and all presentation-only byte tests; no recent-history stream exists in a snapshot.
+- [x] Preserve the one model-owner thread, no-drop PTY queue, latest-only revision watch, reply order,
+  resize transaction, final drain, and model/checkpoint lifecycle. Do not add an actor or parser.
+
+### Step 11.3 — Delete the legacy model adapter
+
+- [x] Remove the legacy ANSI encoder, old snapshots/deltas/history projections, extent-only fix, and
+  strict compatibility oracle after semantic equivalence tests own all right-edge/wide/blank cases.
+- [x] Prove no daemon/model source constructs terminal presentation ANSI and no CLI parser is added.
+
+Rollback point: model semantic producer and ANSI deletion are one source slice.
+
+## Phase 12 — Carry the Semantic Contract Through Session and Transport
+
+### Step 12.1 — Use semantic values for the attachment lifecycle
+
+- [x] Return semantic initial snapshot/resume delta directly. Use semantic values for acknowledgement
+  replacement, next/final update, sync request, reconnect, takeover, and history-window response.
+- [x] Preserve controller generation, pending takeover, resume view identity, latest-only update,
+  input/resize fences, detach, zero-attachment drain, and one-Session/one-PTY behavior.
+- [x] Permit exact checkpoint resume; incompatible revision/shape produces a complete semantic
+  snapshot. Delete family-change and cross-encoding state.
+
+### Step 12.2 — Enforce semantic local and remote paths
+
+- [x] Local server/client accept only the wire-major-2 semantic content kinds; attach carries no
+  presentation preference and no family state.
+- [x] Remote connection establishment rejects the old ALPN/wire major. The bridge forwards semantic
+  payloads without negotiation, translation, or ANSI synthesis.
+- [x] Update local/direct/relay allowlists, decoder state machines, correlation, deadline,
+  stream-loss Gap, redaction, and content/control size classification for canonical 301/302/318.
+
+### Step 12.3 — Prove coordinated cutover and reconnect behavior
+
+- [x] Test latest/latest semantic and explicit local/network rejection of the previous wire major/ALPN.
+- [x] Cover initial full and resume delta, wrong semantic kind, wrong attachment/revision, ack mismatch,
+  sync-required, final drained update, takeover, and true reconnect.
+- [x] Add source/registry assertions that legacy payloads, 312/313, 315/316, 319..321, bit21,
+  wire-v1 generated modules, presentation encoding, and downgrade branches are absent.
+
+Rollback point: revert the whole wire-major transport slice; Session, PTY, trust, and persistent data
+still require no migration.
+
+## Phase 13 — Build the Client Surface and One Composed Frame
+
+### Step 13.1 — Split explicit presentation owners
+
+- [x] Extract focused private CLI modules for `AttachmentSurface`, composition/regions, and the
+  semantic ANSI presenter. Keep event orchestration/input routing in `terminal_ui.rs`; do not
+  introduce a new crate when a module has only a desktop consumer.
+- [x] Make `AttachmentSurface` validate/install full snapshots and transactionally apply exact
+  contiguous row patches. On gap/malformed input, retain the last complete frame, request sync, and
+  never partially promote desired/received state to presented state.
+- [x] Use one semantic viewport cache over the generic reducer. Reset only at documented
+  identity/resize/reconnect boundaries.
+
+### Step 13.2 — Compose live/history plus chrome before encoding
+
+- [x] Refactor status and scrollbar from ANSI writers into pure cell contributors. Allocate child,
+  gutter, and status regions through `ChromeLayout` before any painting and reject overlap/out-of-
+  bounds composition.
+- [x] Build a bounded sparse absolute-row `ComposedFrame` from a complete visible source. Bound its
+  owned cells by product content plus one status row; never allocate the full arbitrary physical
+  `u16 rows * columns` rectangle.
+- [x] Live uses `AttachmentSurface` and its cursor. History uses one complete cached semantic slice,
+  Main/gutter layout, and hidden cursor while the live surface keeps advancing in the background.
+- [x] Preserve Main `N-1 + gutter`, Alternate full `N`, remote status final row, narrow widths,
+  viewport caps, resize coalescing, pinned-history mode ownership, one-line wheel, 16 ms latest-frame
+  cadence, and 33 ms drag request pacing.
+- [x] Make reconnect/path/RTT a chrome state input. Remove semantic-mode standalone newline/loading/
+  status writes; cache miss and sync keep the last complete composed frame visible.
+
+### Step 13.3 — Verify ownership transitions without a backend
+
+- [x] Test Main-to-Alternate, Alternate-to-Main, gutter move/removal, status row move/removal,
+  physical grow/shrink, live-to-history/return-live, background screen switch while pinned, and
+  chrome-only updates as complete desired-frame comparisons.
+- [x] Test rightmost styled cells, default/styled blanks, combining and old/new wide-span ownership,
+  cursor clipping/visibility, huge physical row numbers, maximum status width, and region errors.
+- [x] Add a test-only ownership audit showing every active semantic visual/mode change enters the
+  `ComposedFrame`; no contributor receives a stdout writer.
+
+Rollback point: semantic surface/compositor remains disconnected from the CLI until presenter cutover.
+
+## Phase 14 — Cut Over to the Sole Semantic Desktop Presenter
+
+### Step 14.1 — Implement exact physical transitions
+
+- [x] Retain the last successfully flushed `ComposedFrame`. Diff the union of old/new owned cells,
+  expand changes through both wide spans, batch safe equal-style runs, and start every run with
+  absolute `CUP`.
+- [x] Emit explicit default-style spaces for removals. Do not use incremental `EL0`/`EL2`, saved-
+  cursor side channels, relative cursor assumptions, or pending-wrap state; always restore final
+  cursor with absolute positioning.
+- [x] Derive application cursor/keypad, bracketed paste, and focus observation from child semantics;
+  keep physical mouse in Zterm-owned `1003/1006` capture and use child mouse/alternate-scroll only in
+  the existing one-owner input router.
+- [x] Build one complete buffer with DEC 2026 begin/end, cell transition, cursor, and modes; perform
+  exactly one `write_all` and one `flush`. Commit baseline only afterward; unchanged frames do no I/O.
+
+### Step 14.2 — Define full resync and failure truth
+
+- [x] On missing/unknown baseline, physical resize, screen/layout identity change, representation
+  change, or prior I/O failure, reset/clear and repaint the complete composed frame.
+- [x] On partial write or flush error, mark baseline unknown, best-effort end DEC 2026, preserve the
+  original error, and prove the next successful transition is full. Never advance revision/frame/
+  chrome authority speculatively.
+- [x] Keep `TerminalGuard` as the only pre/post-active lifecycle writer. During active semantic mode,
+  route snapshot, delta, history cadence, status, reconnect, gutter, cursor, and modes only through
+  `DesktopPresenter`.
+
+### Step 14.3 — Integrate and remove compatibility
+
+- [x] Connect the CLI only to semantic snapshots/deltas/history. No preference, capability, family
+  variant, or legacy renderer remains.
+- [x] Delete old ANSI snapshot/delta/history, pager/viewport fallback, atomic chrome side writers,
+  conversions, helpers, and tests once the sole presenter owns their behavior.
+- [x] Remove every module, public alias, generated artifact, Cargo feature/dependency, error branch,
+  and fixture made unreachable by the cutover. Use compiler/Clippy, inverse dependency inspection,
+  and a source/registry audit; do not retain deprecated shims or commented fallback code.
+- [x] Audit every event-loop branch and stdout helper. Delete semantic-mode independent status,
+  reconnect, scrollbar, history, capture, and cursor writers; reject future bypass in tests/spec.
+- [x] Run the generic nested-TUI flow across first/continuous/reverse child-owned wheel, resize,
+  Alternate exit/re-entry, history pin/return-live, reconnect, and write/flush retry. No fixture or
+  production branch may contain Herdr/PiAgent identity.
+
+Rollback point: revert the complete presenter + wire-major slice before release. There is no runtime
+fallback switch or interim release.
+
+### Phase 9–14 implementation evidence (2026-09-03, macOS arm64)
+
+- The coordinated cutover now has one schema and representation: product wire major 2,
+  `zterm/2` / `zterm-pair/2`, protobuf package/module `zterm.v2` / `zterm_proto::v2`, and canonical
+  semantic terminal kinds 301/302/317/318. The v1 source generation, ANSI terminal DTOs/encoders,
+  representation selection, family/capability state, pager/viewport fallbacks, and retired kind
+  numbers 312/313/315/316/319–321 are absent from product source.
+- `zterm-terminal` projects exact semantic snapshots, full-row deltas, and history windows from the
+  one Alacritty model. Rightmost cells, wide spans, combining contents, and styled blanks are owned
+  by semantic projection/composition tests; no legacy ANSI oracle remains.
+- Session, local IPC, and remote attachment paths carry only semantic values. During this cutover an
+  existing takeover ordering race was isolated and fixed with epoch-local `takeover_ready` state:
+  a takeover response may clear pending state before the current snapshot acknowledgement, but
+  activation still requires both events in the current epoch. Response-before-ack,
+  ack-before-response, and reconnect epoch invalidation regressions pass. This preserves the
+  lifecycle gate rather than relaxing it.
+- `TerminalAttachment::sync_changed` returns `None` for an equal checkpoint, a delta or complete
+  resync for a behind checkpoint, and a mandatory resync for ahead/divergent state. Initial attach
+  and reconnect still send a complete mandatory synchronization. This prevents a snapshot-ack
+  notification loop without adding a compatibility branch.
+- The desktop path is split into private `terminal_ui/surface.rs`, `composition.rs`, and
+  `ansi_presenter.rs` owners. `AttachmentSurface` applies semantic updates transactionally;
+  `ChromeLayout`/`ComposedFrame` own live/history rows, gutter, status, cursor, and modes; only
+  `DesktopPresenter` encodes the active frame, with one DEC 2026 buffer, one `write_all`, one
+  `flush`, and post-flush baseline commit. `TerminalGuard` remains the pre/post-active writer.
+- The application-neutral nested-TUI regression routes child-owned wheel input without changing the
+  host viewport, updates a styled rightmost Alternate-screen cell through the sole presenter, and
+  rejects `EL0`/`EL2` cleanup. The cross-process autospawn regression observes termios, daemon
+  revision, complete presentation transactions, and cleanup/process lifecycle rather than treating
+  incremental ANSI bytes as a screen snapshot. Its history fixture waits for a bounded quiescent
+  model/presentation boundary; the resize/scroll/detach sequence passed 10 consecutive isolated
+  runs after that synchronization fix.
+- Revision and history epoch identify an ordered update sequence; they are not content-equivalence
+  hashes. Chunk/corpus equivalence therefore compares complete observable surfaces, replies, and
+  events while lifecycle tests separately enforce revision/epoch ordering and invalidation.
+- Focused suites pass for core, proto, terminal, daemon, and CLI. CLI has exactly three pre-existing
+  ignored isolated-child helpers: `terminal_ui::unix::tests::panic_hook_child`,
+  `terminal_ui::unix::tests::panic_restore_child`, and
+  `terminal_ui::unix::tests::signal_restore_child`; their parent process tests execute each helper
+  explicitly. No ignore was added for this migration.
+- Source-policy and manual audits reject legacy presentation identifiers/kinds, a v1 protobuf tree,
+  direct CLI engine/parser dependencies, application/terminal-brand detection, and Zterm-owned
+  unsafe code. The only `zterm/1` references are explicit ALPN rejection tests; wire-major value 1
+  remains only in explicit old-major rejection fixtures (protobuf field tag `= 1` is not a value).
+- No throughput, latency, CPU, RSS, or candidate-comparison benchmark was run, and this evidence
+  makes no migration performance claim. Linux/other-macOS-architecture/Windows hosted checks and
+  real Ghostty/second-terminal/Linux connection smokes remain Phase 15 external evidence.
+
+Final implementer handoff validation on the same macOS arm64 worktree passed:
+
+- `sh tests/source-policy.sh`
+- `cargo fmt --all -- --check`
+- `cargo check --workspace --all-targets --all-features`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo test --workspace --all-targets --all-features`
+- `cargo doc --workspace --no-deps`
+- `just check` (including secret/release/workflow/shell policies, Cargo deny for the workspace and
+  isolated relay probe, and the locally available relay static/publication/upstream checks)
+- `git diff --check`
+- `python3 .trellis/scripts/task.py validate .trellis/tasks/09-02-migrate-alacritty-terminal`
+
+The task validator emitted only non-fatal context-injection size warnings for
+`local-daemon-ipc.md` and `transport-auth.md`; both manifests otherwise validated. A final manual
+source audit found zero product occurrences of the deleted DTO/family/encoding identifiers, retired
+kind numbers, v1 protobuf files, direct core/proto/CLI terminal-engine dependencies, Rust `unsafe`
+constructs, or application-name detection. Remaining text matches are intentional: the source-policy
+guard contains the banned-name pattern, platform tests exercise terminal-environment pass-through,
+Alacritty exposes a standard `kitty_keyboard` protocol mode, and old ALPN/wire-major values occur in
+negative rejection fixtures. Active-mode stdout acquisitions all feed `ComposedFrame` into
+`DesktopPresenter`; the other writers are pre/post-active `TerminalGuard`, normal-mode prompts and
+diagnostics, command output, or test infrastructure.
+
+Independent Trellis review and final automated closure on 2026-09-03 added/fixed the following:
+
+- Proto Changed/Gap history decoding now rejects `current_epoch > current_revision` and any
+  `current_revision` older than the saved query anchor; malformed content-free outcomes cannot
+  bypass request identity.
+- Presenter failure coverage includes partial-write-then-error as well as flush failure, proving the
+  original error survives, DEC 2026 end is best-effort, the committed baseline is cleared, and the
+  next successful attempt is a full repaint.
+- The unused public `TerminalState` compatibility value and its self-only fixtures were deleted;
+  source policy now bans its return with the other retired presentation DTOs.
+- Current Trellis contracts were synchronized for terminal model/driver/Session, semantic wire v2,
+  local IPC/remote structural bridge, transport ALPN, attachment cache/composition/presenter,
+  cross-layer/cross-platform reasoning, coordinated distribution, and Relay ALPN. README now points
+  at `proto/zterm/v2`; historical research explicitly marks the rejected mixed-version route as
+  non-authoritative.
+- The final post-spec `just check`, format, source policy, task-context validation, and
+  `git diff --check` all pass. Cargo deny reports only allowed duplicate-dependency warnings; task
+  validation reports only the known non-fatal context-injection size warnings for
+  `local-daemon-ipc.md` and `transport-auth.md`.
+
+Automated acceptance is complete on this macOS arm64 worktree. Real Ghostty plus a second terminal,
+macOS direct/Relay, Linux local/direct/Relay, hosted Windows/other architectures, and formal release
+artifact evidence remain external Phase 15.2 work. Android UI/touch rendering remains intentionally
+deferred, and no performance/RSS claim was measured.
+
+## Phase 15 — Close Quality, Platform, Knowledge, and Release Gates
+
+### Step 15.1 — Focused and repository verification
+
+- [x] Run focused core/terminal/proto/daemon/CLI tests for semantic validation, projection, transport,
+  surface, cache, compositor, presenter, old-major rejection, input ownership, and all failure transitions.
+- [x] Run format, all-target/all-feature check and Clippy with `-D warnings`, workspace tests/docs,
+  source/secret/dependency policies, cargo-deny, relay checks, and the repository-prescribed final
+  `just check`. Do not run performance/RSS benchmarks or use test durations as performance evidence.
+- [x] Perform an independent Trellis review across model -> Session -> proto -> local/remote bridge ->
+  client surface/cache -> compositor -> presenter. Fix every verified issue and repeat affected
+  owner-level gates.
+- [x] Run a final source/behavior audit proving product Rust remains unsafe-forbidden, no second
+  parser/renderer or application detection exists, all semantic content is redacted/bounded, and
+  only one active semantic presenter writes the physical terminal.
+
+### Step 15.2 — Cross-platform and real-terminal acceptance
+
+- [ ] On macOS, verify local/direct/relay with the reviewed binary in Ghostty and at least one other
+  available terminal. Exercise shell history, generic nested TUI, Herdr entry/first/continuous/reverse
+  wheel, resize, screen exit/re-entry, return-live, reconnect, detach, and cleanup.
+- [ ] On Linux, separately verify local/direct/relay with the generic styled right-margin/wide-cell
+  nested-TUI fixture, resize/screen/history/reconnect/detach/cleanup. Hosted Linux evidence cannot be
+  inferred from macOS; unavailable external smoke remains a release blocker rather than a claim.
+- [ ] Run existing hosted macOS/Linux/Windows shared-boundary and four native release-readiness jobs;
+  record artifact architecture/floor/SBOM/license/source/dynamic-dependency results without expanding
+  Windows or mobile runtime claims.
+
+### Step 15.3 — Persist the implemented architecture
+
+- [x] Use `trellis-update-spec` to update terminal-model, terminal-driver, session-service,
+  core-wire-domain, local-daemon-IPC, transport-auth, cross-layer, cross-platform, distribution,
+  development, and persistent-session knowledge with actual implemented contracts and tests.
+- [x] Re-run task context validation and `git diff --check`; ensure no generated spec/template mirror
+  is stale and task research records any design deviation with evidence.
+- [x] Produce one final acceptance report distinguishing automated, macOS, Linux, hosted, deferred
+  Android, and explicitly unmeasured performance evidence. Do not mark the task complete because the
+  Herdr fixture alone passes.
+- [ ] Only after every completion item passes may the reviewed commits proceed through the user's
+  requested push/PR/CI/merge/release workflow. No Phase 9–14 checkpoint is an interim release.
+
+### Semantic migration completion gate
+
+- [x] Current live and history presentation is semantic end to end; no ANSI is constructed, parsed,
+  or translated on that attachment before the sole desktop backend encodes the composed frame.
+- [x] One retained attachment surface, one complete composed frame, and one successfully committed
+  physical baseline cover terminal, history, status, gutter, cursor, and host modes.
+- [ ] Generic nested TUI/right-margin, ownership transitions, reconnect, old-major rejection, and failed-
+  output recovery pass the complete automated and macOS/Linux acceptance matrix.
+- [x] Legacy presentation code and negotiation are absent; an old binary is rejected before attachment.
+- [x] Product unsafe prohibition, one-Session/one-PTY/model, no-performance-test decision, bounds,
+  specs, quality gates, and single-release boundary all remain satisfied.
+
+### Requirement traceability
+
+| Requirement / invariant | Owning implementation phases | Closing evidence |
+| --- | --- | --- |
+| R21 exact semantic surface | 10, 11 | core/proto/model shape, replay, bounds, redaction tests |
+| R22 mandatory wire cutover | 10, 12, 14 | wire-major/ALPN rejection plus canonical semantic registry |
+| R23 one model/semantic attachment | 11, 12 | checkpoint, resume, ack, final-drain, no-ANSI source tests |
+| R24 complete client composition | 13 | surface transaction, cache, region, history/live transition tests |
+| R25 sole presenter/commit truth | 14 | no-bypass audit, exact diff, one write/flush, failed-output retry tests |
+| R26 obsolete-path deletion | 10–14 | source/registry audit and semantic-only integration tests |
+| R27 quality/platform/release | 15 | repository gates plus distinct macOS/Linux evidence and final report |
+| No application-specific patches | 9, 13, 15 | generic nested-TUI fixture plus source/ownership audit |
+| Android-ready seam, not Android UI | 10, 13, 15 | core/proto graph and semantic-cache tests; explicit deferred list |
+
+No phase may be skipped because a later row in this table appears green. In particular, passing a
+Herdr smoke does not satisfy the semantic-only source, ownership, and wire cutover contracts.
+
+### Semantic migration authorization
+
+- [x] User confirmed the full semantic-presentation scope and one user-visible release boundary.
+- [x] User explicitly removed mixed-version compatibility and will upgrade all nodes together.
+- [x] PRD, design, research, implementation phases, and task context were reconverged for the direct cutover.
+- [x] The revised final planning summary was presented and the user explicitly approved implementation
+  afterward. Product-code work may resume under Phases 9–15.

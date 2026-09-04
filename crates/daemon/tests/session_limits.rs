@@ -153,7 +153,7 @@ fn current_controller_resize_survives_an_in_flight_snapshot() -> Result<(), Stri
     else {
         return Err("resize during synchronization did not require one latest snapshot".into());
     };
-    assert_eq!(replacement.size, resized);
+    assert_eq!(replacement.surface.size, resized);
     assert!(
         attached
             .attachment

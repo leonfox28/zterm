@@ -78,15 +78,20 @@ matrix explicit:
   cleanup disables it on every exit path. Correctness must not depend on whether
   the outer application is Ghostty, kitty, Alacritty, Terminal.app, or another
   conforming terminal.
-- Continuous interaction uses the renderer-neutral `ViewportCache<Row>` in
+- Continuous interaction uses the renderer-neutral
+  `ViewportCache<TerminalSurfaceRow>` in
   core: wheel, Page, mouse drag, and future touch gestures update a local
-  desired offset and present a complete cached slice immediately. Network
-  window reads are bounded miss/low-water prefetch, never the per-gesture
-  animation loop; one in-flight request coalesces to the latest target.
-- DEC 2026 synchronized presentation, ANSI rows, SGR mouse reports, the
-  33-millisecond desktop drag request pace, and the one-column text gutter are
-  Unix CLI adapter policy. They are not core cache semantics and must not leak
-  into Android/iOS code or the current 317/318 wire contract.
+  desired offset immediately. The desktop CLI presents only the latest complete
+  cached slice through an event-driven 16 ms minimum interval; Android should
+  use native display vsync rather than inherit that constant. Network window
+  reads are bounded miss/low-water prefetch, never the per-gesture animation
+  loop; one in-flight request coalesces to the latest target.
+- Semantic rows, anchors, deltas, and history windows are the canonical v2 wire
+  contract. Only the final desktop `DesktopPresenter` turns a composed semantic
+  frame into DEC 2026 synchronized ANSI output. SGR mouse reports, the
+  33-millisecond desktop drag request pace, the 16-millisecond presentation
+  cadence, and the one-column text gutter are Unix CLI adapter policy; they are
+  not core cache semantics and must not leak into Android/iOS code.
 - Native macOS and Linux each require local, direct-Iroh, and Relay smoke
   evidence for shell scrolling, main/alternate transition, child mouse
   ownership, resize, detach, and reconnect. Pure fake-stream/unit tests and a
@@ -96,12 +101,13 @@ matrix explicit:
   test on macOS, a macOS local PTY fixture, or old release evidence must remain
   visibly pending for the path it did not execute.
 - Android remains a remote renderer/controller consumer. It may reuse the
-  anchor/range/cache reducer and independently tune pixel/touch physics, but
-  it needs a separately negotiated semantic-cell row adapter rather than
-  parsing the desktop path's canonical ANSI rows. It must not link the host
-  Alacritty model, local PTY, or Unix CLI chrome. Begin Android implementation
-  only after the macOS/Linux local/direct/relay matrix above is recorded, so
-  mobile work does not hide a host transport or nested-TUI regression.
+  existing v2 semantic surface/delta/history protocol, anchor/range/cache
+  reducer, and independently tune pixel/touch physics against native display
+  vsync. It does not negotiate another row representation and never parses
+  desktop ANSI. It must not link the host Alacritty model, local PTY, Unix CLI
+  chrome, compositor, or desktop presenter. Begin Android implementation only
+  after the macOS/Linux local/direct/relay matrix above is recorded, so mobile
+  work does not hide a host transport or nested-TUI regression.
 
 ## Incident: Windows Rust Formatting Failure
 

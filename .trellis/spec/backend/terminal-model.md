@@ -8,16 +8,17 @@ events, snapshots/checkpoints/deltas, history windows, or PTY-output safety
 bounds.
 
 `zterm-terminal` owns the only terminal parser/grid/state engine. The daemon
-owns one model per Session; controllers consume Zterm-owned values and
-allowlisted ANSI and never own an upstream terminal type.
+owns one model per Session; every downstream boundary consumes exact
+Zterm-owned semantic values and never owns an upstream terminal type. Only the
+desktop CLI's final `DesktopPresenter` may encode those values as ANSI.
 
 ## 2. Ownership and Signatures
 
 `zterm-core::terminal` owns only transport-neutral values:
 
 - size, screen, cell/style/cursor, modes, events, and updates;
-- snapshot, delta/resync, and history values;
-- screen-selection metadata and the final snapshot byte limiter.
+- snapshot, delta/resync, and history-window values;
+- exact semantic validation and renderer-neutral viewport-cache values.
 
 `zterm-terminal` owns the host-only engine boundary:
 
@@ -31,21 +32,12 @@ TerminalModel::preflight_resize(&self, size: TerminalSize)
 TerminalModel::resize(&mut self, size: TerminalSize)
     -> Result<TerminalUpdate, TerminalError>
 TerminalModel::checkpoint(&self) -> TerminalCheckpoint
-TerminalModel::snapshot(&self) -> TerminalSnapshot
+TerminalModel::snapshot(&self) -> TerminalSurfaceSnapshot
 TerminalModel::delta_or_resync(&self, checkpoint: &TerminalCheckpoint)
-    -> TerminalDeltaResult
-TerminalModel::state(&self) -> TerminalState
-TerminalModel::history_page(direction, cursor, maximum_rows)
-    -> Result<TerminalHistoryResult, TerminalError>
+    -> TerminalSurfaceDeltaResult
 TerminalModel::live_scroll_metrics(&self) -> Option<TerminalScrollMetrics>
-TerminalModel::scroll_viewport(
-    &self,
-    previous: Option<TerminalScrollMetrics>,
-    action: TerminalScrollAction,
-) -> TerminalViewportResult
 TerminalModel::history_window(query: TerminalHistoryWindowQuery)
-    -> TerminalHistoryWindowResult
-TerminalSnapshot::limit_ansi_payload(&mut self, maximum_bytes: usize) -> bool
+    -> TerminalSurfaceHistoryWindowResult
 ```
 
 `TerminalCheckpoint` is opaque and content-redacted. No public signature or
@@ -154,47 +146,35 @@ released when the Session model is dropped.
   inverse, wide head/spacer, cursor, and supported input modes. Hyperlinks,
   strike, hidden, underline color/style detail, palette state, Kitty keyboard,
   and graphics are not advertised.
-- Only the Zterm allowlisted encoder creates client ANSI. Its vocabulary is
-  printable UTF-8, reviewed SGR, CUP, ED2, EL2, home, cursor visibility,
-  supported input modes, and the two top-level Zterm screen selectors. It emits
-  no OSC/DCS/APC/PM/SOS or arbitrary upstream bytes.
-- A full snapshot contains recent main history first and the complete latest
-  active screen second. The core 8 MiB limiter removes only oldest complete
-  history lines and never truncates the active screen.
+- Projection produces only exact semantic rows/cells, cursor, modes, active
+  screen, and optional main-screen scroll metrics. Model, driver, Session,
+  protobuf, local IPC, and remote bridge construct no presentation ANSI.
+- A full snapshot contains the complete latest active screen only. Retained
+  main history is fetched separately through the bounded stateless semantic
+  history-window contract; it is never replayed as snapshot bytes.
 - A checkpoint retains format, revision, size, active-screen identity, and one
   fixed projected active viewport. It retains neither Alacritty state, inactive
   screen, nor history; capacity is exactly `rows * columns` cells.
-- Delta compares owned rows, redraws only changed rows, and restores
-  cursor/modes. Future revision, format/size/screen mismatch, every-row change,
-  or delta ANSI not smaller than full ANSI returns `Resync`. A newer revision
-  whose complete projected state is identical returns a revision-only delta
-  with empty ANSI. Each changed row is emitted as `CUP -> RESET -> new content
-  -> RESET -> EL0`: replacement bytes arrive before a stale suffix is cleared,
-  and the clear cannot inherit the last cell's background.
+- Delta compares owned rows and returns sorted, unique, complete row
+  replacements plus the latest cursor, modes, screen, size, and metrics.
+  Future/equal revision at this low-level comparison or any
+  format/size/screen mismatch returns `Resync`. The driver-level
+  `sync_changed` suppresses the exact-equal no-op before calling this method.
+  A newer revision whose visible rows are unchanged remains a valid semantic
+  delta with zero row patches because revision/cursor/modes/metrics are still
+  part of the attachment contract.
 - A valid `TerminalScrollMetrics` has nonzero `viewport_rows`,
   `epoch <= revision`, and `offset_from_bottom <= max_offset_from_bottom`.
   Snapshot and delta expose live main-screen metrics with offset zero; the
   field is absent on the alternate screen rather than inventing an extent.
-- `TerminalScrollAction::ScrollByLines` is signed: positive moves toward older
-  rows and negative moves toward the live bottom. `ScrollToOffset` is absolute.
-  Both saturate and clamp to `0..=max_offset_from_bottom`; offset zero returns
-  `Live`, and a positive offset returns one complete full-height frame.
-- For offset `N`, the frame is projected top-to-bottom from
-  `Line(-N)..Line(rows-N-1)` through the existing bounded row projector and
-  allowlisted encoder. Projection never calls Alacritty `scroll_display`, never
-  changes `display_offset`, and does not mutate revision, checkpoint, or state.
-- A previous baseline from the same epoch and height anchors content while new
-  rows append: first add the increase in `max_offset_from_bottom`, then apply
-  the requested action. A different epoch/height or decreased extent returns
-  the closest clamped frame as `Rebased`. Structurally invalid or future
-  metrics return `HistoryGap`; an alternate-screen request returns
-  `HistoryChanged`.
+- Scroll motion, desired offset, request coalescing, and presentation cadence
+  are client/cache concerns. The model stores no attachment display offset and
+  exposes no stateful viewport action API.
 
 ## 8. History Contract
 
 - Main history is read oldest-to-newest through Alacritty negative-line
   indexing without changing display offset, revision, checkpoint, or viewport.
-- A page retains at most `MAX_HISTORY_PAGE_ROWS = 80` formatted rows.
 - Monotonic append below capacity preserves epoch. Resize, clear/decrease,
   capacity eviction, or identity ambiguity advances epoch and returns Changed
   or Gap instead of splicing unverifiable rows.
@@ -214,7 +194,7 @@ released when the Session model is dropped.
   extent decrease returns one complete `Rebased` window; a malformed/future
   query returns `HistoryGap`, and alternate screen returns `HistoryChanged`.
 - Window projection reads one immutable model revision through the existing
-  bounded projector and allowlisted row encoder. It never calls
+  bounded semantic row projector. It never calls
   `scroll_display` and never mutates display offset, revision, checkpoint,
   attachment state, or retained history.
 
@@ -226,18 +206,12 @@ released when the Session model is dropped.
 | checked `rows * columns`/history arithmetic overflow | `TerminalError::AllocationOverflow`; no allocation |
 | revision would exceed `u64::MAX` | `TerminalError::RevisionOverflow`; no mutation |
 | canonical replies exceed 64 KiB/update | `TerminalError::ReplyOverflow`; driver fails closed |
-| history row request is zero or over 80 | `InvalidHistoryPageSize`; no mutation |
-| stale/invalid history cursor | Changed or Gap; never mixed rows |
-| alternate screen history request | Changed |
-| viewport metrics have zero rows, epoch after revision, offset past maximum, or a future revision | `HistoryGap`; no model mutation |
-| viewport baseline identity/height changed or retained extent decreased | closest bounded full frame with `Rebased`, or `Live` if clamped to zero |
-| viewport requested while alternate is active | `HistoryChanged`; no alternate history is invented |
 | history-window anchor/query is invalid, from the future, or has an unrepresentable exact range | `HistoryGap`; no row is returned and the model is unchanged |
 | history-window identity/size changed or retained extent decreased | one complete request-shaped `Rebased` frame, never mixed old/new rows |
 | history-window requested while alternate is active | `HistoryChanged`; no alternate history is invented |
 | event/title/control/combining cap reached | bounded summary/classification; no payload leak |
-| future/incompatible/inefficient checkpoint | one full `Resync` |
-| active screen alone exceeds requested frame budget | preserve screen, clear history, return `false` |
+| equal/future/incompatible checkpoint passed to `delta_or_resync` | one full semantic `Resync`; `sync_changed` owns equal-revision suppression |
+| semantic surface or row patch has invalid size/shape/text/wide pair/cursor/metrics/revision | reject transactionally before forwarding or installing it |
 | CI forces colored Cargo output | dependency-tree policy overrides color to `never` before byte comparison |
 
 ## 10. Required Evidence
@@ -252,9 +226,6 @@ released when the Session model is dropped.
   checkpoint remains usable and engine/history-free.
 - Daemon driver/session and real-PTY tests remain required for drain, reply
   ordering, resize, detach/reconnect, and lifecycle ownership.
-- Viewport tests cover offsets 0/1/3/max/over-max, mixed history/live rows,
-  same-epoch anchoring, epoch/height rebase, future/invalid metrics, alternate
-  screen, wide/styled Unicode, and unchanged state/revision/checkpoint.
 - History-window tests cover live/middle/oldest clipping, exact request-shaped
   ranges and the 240-row cap, same-epoch append pinning, complete rebase,
   invalid/future/alternate outcomes, Unicode/wide/style preservation, and
@@ -287,15 +258,12 @@ Correct:
 ```rust
 let checkpoint = model.checkpoint();
 match model.delta_or_resync(&checkpoint) {
-    TerminalDeltaResult::Delta(delta) => apply(delta.ansi),
-    TerminalDeltaResult::Resync(snapshot) => replace_with(snapshot),
+    TerminalSurfaceDeltaResult::Delta(delta) => apply_semantic_rows(delta),
+    TerminalSurfaceDeltaResult::Resync(snapshot) => replace_semantic_surface(snapshot),
 }
 
-let result = model.scroll_viewport(previous_attachment_metrics, action);
-// Read-only projection; the attachment owns the returned baseline.
-
 let result = model.history_window(query);
-// Read-only request-shaped rows; neither model nor attachment owns a scroll offset.
+// Read-only request-shaped semantic rows; the client cache owns scroll intent.
 ```
 
 Keep one host-authoritative model, expose only Zterm-owned contracts, bound

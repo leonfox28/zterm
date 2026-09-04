@@ -249,7 +249,9 @@ fn protocol_error(error: ProtocolError) -> DaemonError {
         | ProtocolError::MalformedProtobuf(_)
         | ProtocolError::UnexpectedKind { .. }
         | ProtocolError::InvalidIdentifier(_)
-        | ProtocolError::InvalidTerminalSize { .. } => DomainErrorKind::MalformedFrame,
+        | ProtocolError::InvalidTerminalSize { .. }
+        | ProtocolError::InvalidTerminalSurface(_)
+        | ProtocolError::InvalidTerminalSemanticField(_) => DomainErrorKind::MalformedFrame,
     };
     DaemonError::new(kind, error.to_string())
 }
@@ -300,7 +302,7 @@ mod tests {
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use zterm_core::{DomainErrorKind, MAX_PAIR_HANDSHAKE_BYTES, MAX_PAIR_HELLO_FRAME_BYTES};
-    use zterm_proto::{WireKind, encode_message, v1};
+    use zterm_proto::{WireKind, encode_message, v2};
 
     use super::PairFraming;
 
@@ -320,8 +322,8 @@ mod tests {
         .expect("production pairing framing limits are valid")
     }
 
-    fn begin(name: &str) -> v1::PairBegin {
-        v1::PairBegin {
+    fn begin(name: &str) -> v2::PairBegin {
+        v2::PairBegin {
             offer_id: vec![7; 16],
             controller_name: name.to_owned(),
             controller_nonce: vec![9; 32],
@@ -329,8 +331,8 @@ mod tests {
         }
     }
 
-    fn proof(bytes: &[u8]) -> v1::PairProof {
-        v1::PairProof {
+    fn proof(bytes: &[u8]) -> v2::PairProof {
+        v2::PairProof {
             controller_proof: bytes.to_vec(),
         }
     }
@@ -359,7 +361,7 @@ mod tests {
         };
         let read = async {
             let mut framing = framing(total_deadline);
-            let decoded: v1::PairBegin = framing
+            let decoded: v2::PairBegin = framing
                 .read_message(&mut receiver, WireKind::PairBegin, total_deadline)
                 .await
                 .expect("partial frame decodes after completion");
@@ -381,11 +383,11 @@ mod tests {
         let mut input = bytes.as_slice();
         let mut framing = framing(total_deadline);
 
-        let decoded_begin: v1::PairBegin = framing
+        let decoded_begin: v2::PairBegin = framing
             .read_message(&mut input, WireKind::PairBegin, total_deadline)
             .await
             .expect("first coalesced frame decodes");
-        let decoded_proof: v1::PairProof = framing
+        let decoded_proof: v2::PairProof = framing
             .read_message(&mut input, WireKind::PairProof, total_deadline)
             .await
             .expect("queued second frame decodes");
@@ -404,12 +406,12 @@ mod tests {
         let mut input = bytes.as_slice();
         let mut framing = framing(total_deadline);
 
-        let _: v1::PairBegin = framing
+        let _: v2::PairBegin = framing
             .read_message(&mut input, WireKind::PairBegin, total_deadline)
             .await
             .expect("first frame has the expected kind");
         let error = framing
-            .read_message::<_, v1::PairProof>(&mut input, WireKind::PairProof, total_deadline)
+            .read_message::<_, v2::PairProof>(&mut input, WireKind::PairProof, total_deadline)
             .await
             .expect_err("queued extra kind must be rejected");
 
@@ -429,7 +431,7 @@ mod tests {
             .expect("test pair message encodes");
             let mut input = bytes.as_slice();
             let error = framing(total_deadline)
-                .read_message::<_, v1::PairBegin>(&mut input, WireKind::PairBegin, total_deadline)
+                .read_message::<_, v2::PairBegin>(&mut input, WireKind::PairBegin, total_deadline)
                 .await
                 .expect_err("pairing metadata must remain zero");
             assert_eq!(error.kind(), DomainErrorKind::MalformedFrame);
@@ -442,7 +444,7 @@ mod tests {
         let (_sender, mut receiver) = tokio::io::duplex(64);
         let mut framing = framing(total_deadline);
         let error = framing
-            .read_message::<_, v1::ConnectionHello>(
+            .read_message::<_, v2::ConnectionHello>(
                 &mut receiver,
                 WireKind::ConnectionHello,
                 total_deadline,
@@ -458,7 +460,7 @@ mod tests {
             .write_message(
                 &mut writer,
                 WireKind::ConnectionHello,
-                &v1::ConnectionHello::default(),
+                &v2::ConnectionHello::default(),
                 total_deadline,
             )
             .await
@@ -479,7 +481,7 @@ mod tests {
         let total_deadline = Instant::now() + Duration::from_secs(60);
         let (_sender, mut receiver) = tokio::io::duplex(64);
         let error = framing(total_deadline)
-            .read_message::<_, v1::PairBegin>(&mut receiver, WireKind::PairBegin, Instant::now())
+            .read_message::<_, v2::PairBegin>(&mut receiver, WireKind::PairBegin, Instant::now())
             .await
             .expect_err("elapsed first-frame deadline must not await input");
 
@@ -522,7 +524,7 @@ mod tests {
         let mut framing = framing(total_deadline);
 
         let error = framing
-            .read_message::<_, v1::PairBegin>(&mut input, WireKind::PairBegin, total_deadline)
+            .read_message::<_, v2::PairBegin>(&mut input, WireKind::PairBegin, total_deadline)
             .await
             .expect_err("partial EOF must be rejected as truncation");
 
@@ -535,7 +537,7 @@ mod tests {
         let total_deadline = deadline();
         let mut input = &[][..];
         let error = framing(total_deadline)
-            .read_message::<_, v1::PairBegin>(&mut input, WireKind::PairBegin, total_deadline)
+            .read_message::<_, v2::PairBegin>(&mut input, WireKind::PairBegin, total_deadline)
             .await
             .expect_err("clean EOF cannot satisfy an expected pair frame");
 
@@ -551,7 +553,7 @@ mod tests {
             .expect("small nonzero injected frame limit is valid");
 
         let error = framing
-            .read_message::<_, v1::PairBegin>(&mut input, WireKind::PairBegin, total_deadline)
+            .read_message::<_, v2::PairBegin>(&mut input, WireKind::PairBegin, total_deadline)
             .await
             .expect_err("oversized pair body must be rejected");
 
@@ -562,7 +564,7 @@ mod tests {
     async fn inbound_and_outbound_bytes_share_one_budget() {
         let total_deadline = deadline();
         let inbound_message = begin("controller");
-        let outbound_message = v1::PairChallenge {
+        let outbound_message = v2::PairChallenge {
             host_nonce: vec![3; 32],
             selected_version: 1,
             ticket_expiry_unix: 42,
@@ -573,7 +575,7 @@ mod tests {
         let mut input = inbound.as_slice();
         let mut framing = PairFraming::new(MAX_PAIR_HELLO_FRAME_BYTES, maximum, total_deadline)
             .expect("injected cumulative budget is valid");
-        let _: v1::PairBegin = framing
+        let _: v2::PairBegin = framing
             .read_message(&mut input, WireKind::PairBegin, total_deadline)
             .await
             .expect("inbound frame fits by itself");
@@ -604,7 +606,7 @@ mod tests {
     #[tokio::test]
     async fn encoded_write_is_exact_and_shutdown_is_bounded() {
         let total_deadline = deadline();
-        let message = v1::PairChallenge {
+        let message = v2::PairChallenge {
             host_nonce: vec![3; 32],
             selected_version: 1,
             ticket_expiry_unix: 42,
@@ -644,7 +646,7 @@ mod tests {
         bytes.extend_from_slice(&encoded(WireKind::PairProof, &proof(SECRET_SENTINEL)));
         let mut input = bytes.as_slice();
         let mut framing = framing(total_deadline);
-        let _: v1::PairBegin = framing
+        let _: v2::PairBegin = framing
             .read_message(&mut input, WireKind::PairBegin, total_deadline)
             .await
             .expect("first coalesced frame decodes");

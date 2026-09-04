@@ -114,8 +114,9 @@ asserted that the production map is disjoint from `RelayMode::Staging` and does
 not contain `relay.zenithconsulting.cn`. The n0 DNS/Pkarr publisher, resolver,
 and DNS lookup remain installed; publication remains relay-only; port mapping
 remains enabled; and the Foundation Gate accepted its then-temporary
-`zterm-gate/1` ALPN. M3 subsequently replaced it with product ALPN `zterm/1`
-when the versioned wire contract landed. An isolated child
+`zterm-gate/1` ALPN. M3 subsequently replaced it with the first product ALPN;
+the coordinated semantic cutover now uses `zterm/2` and `zterm-pair/2` only.
+An isolated child
 process regression also confirmed that setting `IROH_FORCE_STAGING_RELAYS`
 does not change any production lookup URL, DNS origin, or Relay entry.
 Identities were generated in memory and were not written to `~/.zterm`.

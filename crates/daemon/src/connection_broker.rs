@@ -9,8 +9,6 @@ use std::future::pending;
 use std::pin::Pin;
 #[cfg(unix)]
 use std::sync::OnceLock;
-#[cfg(unix)]
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -27,7 +25,7 @@ use zterm_core::{
     ConnectionCandidateKey, ConnectionHello, ConnectionWelcome, DeviceDisplayName, DeviceId,
     DomainErrorKind, RelayHint, TransportLimits, designated_primary,
 };
-use zterm_proto::{DecodedFrame, FrameDecoder, WireKind, encode_message, v1};
+use zterm_proto::{DecodedFrame, FrameDecoder, WireKind, encode_message, v2};
 
 use crate::authorization::AuthorizationRegistry;
 use crate::error::DaemonError;
@@ -114,10 +112,7 @@ impl ConnectionIdentity {
             Capabilities::from_bits_retain(
                 Capabilities::LOCAL_LIFECYCLE
                     | Capabilities::SESSION_SERVICE
-                    | Capabilities::TERMINAL_SERVICE
-                    | Capabilities::HISTORY_PAGING
-                    | Capabilities::TERMINAL_VIEWPORT
-                    | Capabilities::TERMINAL_HISTORY_WINDOW,
+                    | Capabilities::TERMINAL_SERVICE,
             ),
         )
     }
@@ -457,8 +452,6 @@ struct Candidate {
     cancel: watch::Sender<bool>,
     actor_started: AtomicBool,
     primary: AtomicBool,
-    #[cfg(unix)]
-    remote_capabilities: AtomicU64,
     admission: CandidateAdmission,
     metrics: Arc<BrokerMetrics>,
     _connection_permit: OwnedSemaphorePermit,
@@ -513,8 +506,8 @@ pub(crate) struct SelectedPathObservation {
 
 /// Address-free observations bound to the exact candidate that opened a
 /// service stream. Keeping this handle with the stream prevents a later
-/// primary replacement from changing the capabilities or path reported for an
-/// already-open epoch.
+/// primary replacement from changing the path reported for an already-open
+/// epoch.
 #[cfg(unix)]
 #[derive(Clone)]
 pub(crate) struct SelectedCandidateObserver {
@@ -538,11 +531,6 @@ impl SelectedCandidateObserver {
                     rtt_ms: Some(round_rtt_millis(path.rtt())),
                 }
             })
-    }
-
-    /// Returns whether this exact candidate advertised an optional capability.
-    pub(crate) fn supports(&self, capability: u64) -> bool {
-        self.candidate.supports(capability)
     }
 }
 
@@ -575,7 +563,7 @@ impl AuthorizationConfirmation {
     }
 }
 
-/// Short-lived, fully TLS-authenticated `zterm-pair/1` connection.
+/// Short-lived, fully TLS-authenticated `zterm-pair/2` connection.
 ///
 /// This owner intentionally exposes stream operations rather than the raw
 /// Endpoint or normal peer registry. Its admission permit remains held until
@@ -1988,7 +1976,7 @@ impl ConnectionBroker {
             write_handshake_message(
                 &mut send,
                 WireKind::ConnectionHello,
-                &v1::ConnectionHello::from(&hello),
+                &v2::ConnectionHello::from(&hello),
                 deadline,
             )
             .await?;
@@ -2015,7 +2003,7 @@ impl ConnectionBroker {
                     )
                 }
             })?;
-            let wire: v1::ConnectionWelcome = frame
+            let wire: v2::ConnectionWelcome = frame
                 .decode_message(WireKind::ConnectionWelcome)
                 .map_err(protocol_error)?;
             let welcome = ConnectionWelcome::try_from(wire).map_err(|error| {
@@ -2030,8 +2018,6 @@ impl ConnectionBroker {
                     "remote selected an incompatible wire major",
                 ));
             }
-            #[cfg(unix)]
-            candidate.set_remote_capabilities(welcome.capabilities());
             {
                 let mut state = slot.state.lock().await;
                 state.remote_acceptance = Some(welcome.accepted_authorization_generation());
@@ -2075,7 +2061,7 @@ impl ConnectionBroker {
         .inspect_err(|_| {
             close_connection(&connection, CLOSE_INCOMPATIBLE, b"invalid handshake");
         })?;
-        let wire: v1::ConnectionHello = frame
+        let wire: v2::ConnectionHello = frame
             .decode_message(WireKind::ConnectionHello)
             .map_err(protocol_error)?;
         let hello = ConnectionHello::try_from(wire).map_err(|error| {
@@ -2106,8 +2092,6 @@ impl ConnectionBroker {
             Arc::clone(&self.inner.metrics),
             self.inner.limits,
         )?;
-        #[cfg(unix)]
-        candidate.set_remote_capabilities(hello.capabilities());
         let slot = self.peer_slot(remote);
         self.register_candidate(&slot, Arc::clone(&candidate))
             .await?;
@@ -2146,7 +2130,7 @@ impl ConnectionBroker {
         if let Err(error) = write_handshake_message(
             &mut send,
             WireKind::ConnectionWelcome,
-            &v1::ConnectionWelcome::from(&welcome),
+            &v2::ConnectionWelcome::from(&welcome),
             deadline,
         )
         .await
@@ -2404,7 +2388,7 @@ impl ConnectionBroker {
             reject_stream(&mut send, &mut recv, b"invalid service kind");
             return;
         }
-        let response = v1::ServiceError {
+        let response = v2::ServiceError {
             code: DomainErrorKind::ServiceNotImplemented.code().to_owned(),
             message: "remote Session service is not implemented in M5-M6".to_owned(),
         };
@@ -2562,8 +2546,6 @@ impl Candidate {
             cancel,
             actor_started: AtomicBool::new(false),
             primary: AtomicBool::new(false),
-            #[cfg(unix)]
-            remote_capabilities: AtomicU64::new(0),
             admission: CandidateAdmission::new(limits),
             metrics,
             _connection_permit: connection_permit,
@@ -2587,18 +2569,6 @@ impl Candidate {
             self.metrics.remove_path(self.remote);
         }
         self.metrics.publish();
-    }
-
-    #[cfg(unix)]
-    fn set_remote_capabilities(&self, capabilities: Capabilities) {
-        self.remote_capabilities
-            .store(capabilities.bits(), Ordering::Release);
-    }
-
-    #[cfg(unix)]
-    fn supports(&self, capability: u64) -> bool {
-        Capabilities::from_bits_retain(self.remote_capabilities.load(Ordering::Acquire))
-            .contains(capability)
     }
 
     fn cancel(&self, reason: ConnectionCloseReason) {
@@ -2859,7 +2829,7 @@ fn is_remote_service_kind(kind: WireKind) -> bool {
             | WireKind::TerminalDetach
             | WireKind::TerminalSnapshotApplied
             | WireKind::TerminalSyncRequest
-            | WireKind::TerminalHistoryRequest
+            | WireKind::TerminalHistoryWindowRequest
     )
 }
 
@@ -3265,7 +3235,9 @@ fn protocol_error(error: zterm_proto::ProtocolError) -> DaemonError {
         | ProtocolError::MalformedProtobuf(_)
         | ProtocolError::UnexpectedKind { .. }
         | ProtocolError::InvalidIdentifier(_)
-        | ProtocolError::InvalidTerminalSize { .. } => DomainErrorKind::MalformedFrame,
+        | ProtocolError::InvalidTerminalSize { .. }
+        | ProtocolError::InvalidTerminalSurface(_)
+        | ProtocolError::InvalidTerminalSemanticField(_) => DomainErrorKind::MalformedFrame,
     };
     DaemonError::new(kind, error.to_string())
 }
@@ -3774,7 +3746,7 @@ mod tests {
             WireKind::SessionListRequest,
             1,
             0,
-            &v1::SessionListRequest { target: None },
+            &v2::SessionListRequest { target: None },
         )
         .expect("bounded service frame");
         let mut oversized = valid_bytes.as_slice();
@@ -3804,7 +3776,7 @@ mod tests {
             WireKind::SessionListRequest,
             2,
             0,
-            &v1::SessionListRequest { target: None },
+            &v2::SessionListRequest { target: None },
         )
         .expect("bounded service frame");
         let mut healthy_peer = healthy_bytes.as_slice();

@@ -4,15 +4,12 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::Line;
 use zterm_core::Revision;
 use zterm_core::terminal::{
-    ActiveScreen, MAX_HISTORY_PAGE_ROWS, TerminalDelta, TerminalDeltaResult, TerminalHistoryCursor,
-    TerminalHistoryDirection, TerminalHistoryPage, TerminalHistoryResult,
-    TerminalHistoryWindowAnchor, TerminalHistoryWindowFrame, TerminalHistoryWindowQuery,
-    TerminalHistoryWindowResult, TerminalScrollAction, TerminalScrollMetrics, TerminalSize,
-    TerminalSnapshot, TerminalState, TerminalUpdate, TerminalViewportDisposition,
-    TerminalViewportFrame, TerminalViewportResult,
+    ActiveScreen, TerminalHistoryWindowAnchor, TerminalHistoryWindowQuery, TerminalScrollMetrics,
+    TerminalSize, TerminalSurfaceDelta, TerminalSurfaceDeltaResult,
+    TerminalSurfaceHistoryWindowFrame, TerminalSurfaceHistoryWindowResult, TerminalSurfaceRowPatch,
+    TerminalSurfaceSnapshot, TerminalUpdate,
 };
 
-use crate::ansi::{encode_delta, encode_full, encode_history_row};
 use crate::engine::AlacrittyEngine;
 use crate::ingress::{IngressError, TerminalIngressPolicy, UpdateCollector};
 use crate::projection::{CHECKPOINT_FORMAT_VERSION, ProjectedScreen, project, project_row};
@@ -75,13 +72,6 @@ pub enum TerminalError {
     RevisionOverflow,
     /// Canonical terminal replies exceeded the per-update security bound.
     ReplyOverflow,
-    /// A history page requested zero rows or exceeded the fixed page bound.
-    InvalidHistoryPageSize {
-        /// Requested number of rows.
-        requested: usize,
-        /// Product maximum for one page.
-        maximum: usize,
-    },
 }
 
 impl fmt::Display for TerminalError {
@@ -102,10 +92,6 @@ impl fmt::Display for TerminalError {
             ),
             Self::RevisionOverflow => write!(formatter, "terminal revision overflow"),
             Self::ReplyOverflow => write!(formatter, "terminal reply output exceeded its bound"),
-            Self::InvalidHistoryPageSize { requested, maximum } => write!(
-                formatter,
-                "terminal history page size {requested} is outside 1..={maximum}",
-            ),
         }
     }
 }
@@ -210,82 +196,56 @@ impl TerminalModel {
         }
     }
 
-    /// Captures a full reconnect snapshot of the latest active state.
+    /// Captures a complete exact semantic surface without constructing ANSI.
     #[must_use]
-    pub fn snapshot(&self) -> TerminalSnapshot {
+    pub fn snapshot(&self) -> TerminalSurfaceSnapshot {
         let projection = project(&self.engine);
-        TerminalSnapshot {
+        TerminalSurfaceSnapshot {
             revision: self.revision,
-            size: projection.size,
-            active_screen: projection.active_screen,
-            screen_ansi: encode_full(&projection),
-            recent_history_ansi: self.recent_history_ansi(),
-            modes: projection.modes,
-            scroll_metrics: self.live_scroll_metrics(),
+            surface: projection.to_surface(self.live_scroll_metrics()),
         }
     }
 
-    /// Produces one merged latest-state delta or a full resynchronization.
+    /// Produces one merged semantic row update or a complete semantic replacement.
     #[must_use]
-    pub fn delta_or_resync(&self, checkpoint: &TerminalCheckpoint) -> TerminalDeltaResult {
+    pub fn delta_or_resync(&self, checkpoint: &TerminalCheckpoint) -> TerminalSurfaceDeltaResult {
         let latest = project(&self.engine);
-        let snapshot = || TerminalSnapshot {
+        let snapshot = || TerminalSurfaceSnapshot {
             revision: self.revision,
-            size: latest.size,
-            active_screen: latest.active_screen,
-            screen_ansi: encode_full(&latest),
-            recent_history_ansi: self.recent_history_ansi(),
-            modes: latest.modes,
-            scroll_metrics: self.live_scroll_metrics(),
+            surface: latest.to_surface(self.live_scroll_metrics()),
         };
-        if checkpoint.revision > self.revision
+        if checkpoint.revision >= self.revision
             || checkpoint.projection.version != CHECKPOINT_FORMAT_VERSION
             || checkpoint.projection.size != latest.size
             || checkpoint.projection.active_screen != latest.active_screen
         {
-            return TerminalDeltaResult::Resync(snapshot());
+            return TerminalSurfaceDeltaResult::Resync(snapshot());
         }
 
-        let changed_rows = checkpoint
+        let row_patches = checkpoint
             .projection
             .rows
             .iter()
             .zip(&latest.rows)
-            .filter(|(before, after)| before != after)
-            .count();
-        if !latest.rows.is_empty() && changed_rows == latest.rows.len() {
-            return TerminalDeltaResult::Resync(snapshot());
-        }
-        // A revision can advance without changing any client-visible terminal
-        // semantics (for example, a successful same-size resize). Preserve the
-        // revision edge, but do not manufacture cursor/mode ANSI when the
-        // complete projected state is already identical.
-        let ansi = if checkpoint.projection == latest {
-            Vec::new()
-        } else {
-            encode_delta(&checkpoint.projection, &latest)
-        };
-        let delta = TerminalDelta {
+            .enumerate()
+            .filter(|(_, (before, after))| before != after)
+            .map(|(row, (_, replacement))| TerminalSurfaceRowPatch {
+                row: u16::try_from(row).unwrap_or(u16::MAX),
+                replacement: replacement.to_surface_row(),
+            })
+            .collect();
+        let delta = TerminalSurfaceDelta {
             from_revision: checkpoint.revision,
             to_revision: self.revision,
             size: latest.size,
             active_screen: latest.active_screen,
-            ansi,
+            row_patches,
+            cursor: latest.cursor,
             modes: latest.modes,
             scroll_metrics: self.live_scroll_metrics(),
         };
-        let full = snapshot();
-        if delta.ansi_payload_len() >= full.ansi_payload_len() {
-            TerminalDeltaResult::Resync(full)
-        } else {
-            TerminalDeltaResult::Delta(delta)
-        }
-    }
-
-    /// Returns a zterm-owned semantic projection of the visible state.
-    #[must_use]
-    pub fn state(&self) -> TerminalState {
-        project(&self.engine).to_state()
+        debug_assert!(delta.validate().is_ok());
+        TerminalSurfaceDeltaResult::Delta(delta)
     }
 
     /// Returns the live main-screen scroll extent without changing terminal state.
@@ -300,90 +260,12 @@ impl TerminalModel {
         })
     }
 
-    /// Applies one attachment-local scroll action and projects a complete viewport.
-    ///
-    /// The supplied metrics are an attachment-owned baseline. This method never
-    /// mutates Alacritty's shared display offset, model revision, or checkpoint.
+    /// Projects one semantic history window without constructing ANSI.
     #[must_use]
-    pub fn scroll_viewport(
+    pub fn history_window(
         &self,
-        previous: Option<TerminalScrollMetrics>,
-        action: TerminalScrollAction,
-    ) -> TerminalViewportResult {
-        let Some(mut metrics) = self.live_scroll_metrics() else {
-            return TerminalViewportResult::HistoryChanged {
-                epoch: self.history_epoch,
-                revision: self.revision,
-            };
-        };
-        if previous
-            .is_some_and(|previous| !previous.is_valid() || previous.revision > self.revision)
-        {
-            return TerminalViewportResult::HistoryGap {
-                epoch: metrics.epoch,
-                revision: metrics.revision,
-            };
-        }
-
-        let mut disposition = TerminalViewportDisposition::Exact;
-        let mut offset = 0_u64;
-        if let Some(previous) = previous {
-            if previous.epoch == metrics.epoch
-                && previous.viewport_rows == metrics.viewport_rows
-                && previous.max_offset_from_bottom <= metrics.max_offset_from_bottom
-            {
-                let appended = metrics
-                    .max_offset_from_bottom
-                    .saturating_sub(previous.max_offset_from_bottom);
-                offset = previous
-                    .offset_from_bottom
-                    .saturating_add(appended)
-                    .min(metrics.max_offset_from_bottom);
-            } else {
-                disposition = TerminalViewportDisposition::Rebased;
-                offset = previous
-                    .offset_from_bottom
-                    .min(metrics.max_offset_from_bottom);
-            }
-        }
-
-        offset = match action {
-            TerminalScrollAction::ScrollByLines(lines) if lines >= 0 => offset
-                .saturating_add(u64::from(lines.unsigned_abs()))
-                .min(metrics.max_offset_from_bottom),
-            TerminalScrollAction::ScrollByLines(lines) => {
-                offset.saturating_sub(u64::from(lines.unsigned_abs()))
-            }
-            TerminalScrollAction::ScrollToOffset(target) => {
-                target.min(metrics.max_offset_from_bottom)
-            }
-        };
-        metrics.offset_from_bottom = offset;
-        if offset == 0 {
-            return TerminalViewportResult::Live(metrics);
-        }
-
-        let offset = i32::try_from(offset).unwrap_or(i32::MAX);
-        let rows = (0..metrics.viewport_rows)
-            .map(|row| {
-                let line = i32::from(row).saturating_sub(offset);
-                encode_history_row(&project_row(&self.engine, Line(line)))
-            })
-            .collect();
-        TerminalViewportResult::Frame(TerminalViewportFrame {
-            disposition,
-            metrics,
-            rows,
-        })
-    }
-
-    /// Projects one stateless bounded contiguous history-and-live row window.
-    ///
-    /// The query is expressed in a client-owned anchor. Projection takes place
-    /// against one immutable model revision and never changes the shared grid's
-    /// display offset, revision, checkpoint, or attachment state.
-    #[must_use]
-    pub fn history_window(&self, query: TerminalHistoryWindowQuery) -> TerminalHistoryWindowResult {
+        query: TerminalHistoryWindowQuery,
+    ) -> TerminalSurfaceHistoryWindowResult {
         let current = TerminalHistoryWindowAnchor {
             epoch: self.history_epoch,
             revision: self.revision,
@@ -391,32 +273,32 @@ impl TerminalModel {
             viewport: self.size(),
         };
         if !query.is_valid() || query.anchor.revision > self.revision {
-            return TerminalHistoryWindowResult::HistoryGap {
+            return TerminalSurfaceHistoryWindowResult::HistoryGap {
                 epoch: current.epoch,
                 revision: current.revision,
             };
         }
         if self.engine.active_screen() != ActiveScreen::Main {
-            return TerminalHistoryWindowResult::HistoryChanged {
+            return TerminalSurfaceHistoryWindowResult::HistoryChanged {
                 epoch: current.epoch,
                 revision: current.revision,
             };
         }
 
         let Some(shape) = query.response_shape(current) else {
-            return TerminalHistoryWindowResult::HistoryGap {
+            return TerminalSurfaceHistoryWindowResult::HistoryGap {
                 epoch: current.epoch,
                 revision: current.revision,
             };
         };
         let Ok(row_count) = i64::try_from(shape.row_count) else {
-            return TerminalHistoryWindowResult::HistoryGap {
+            return TerminalSurfaceHistoryWindowResult::HistoryGap {
                 epoch: current.epoch,
                 revision: current.revision,
             };
         };
         let Some(end_row_exclusive) = shape.first_row_from_live_top.checked_add(row_count) else {
-            return TerminalHistoryWindowResult::HistoryGap {
+            return TerminalSurfaceHistoryWindowResult::HistoryGap {
                 epoch: current.epoch,
                 revision: current.revision,
             };
@@ -425,102 +307,24 @@ impl TerminalModel {
             .map(|line| i32::try_from(line).ok())
             .collect::<Option<Vec<_>>>()
         else {
-            return TerminalHistoryWindowResult::HistoryGap {
+            return TerminalSurfaceHistoryWindowResult::HistoryGap {
                 epoch: current.epoch,
                 revision: current.revision,
             };
         };
-        let ansi_rows = lines
+        let rows = lines
             .into_iter()
-            .map(|line| encode_history_row(&project_row(&self.engine, Line(line))))
+            .map(|line| project_row(&self.engine, Line(line)).to_surface_row())
             .collect();
-        TerminalHistoryWindowResult::Frame(TerminalHistoryWindowFrame {
+        let frame = TerminalSurfaceHistoryWindowFrame {
             disposition: shape.disposition,
             anchor: current,
             target_offset_from_bottom: shape.target_offset_from_bottom,
             first_row_from_live_top: shape.first_row_from_live_top,
-            ansi_rows,
-        })
-    }
-
-    /// Returns one bounded, revision-aware page from retained main history.
-    pub fn history_page(
-        &self,
-        direction: TerminalHistoryDirection,
-        cursor: Option<TerminalHistoryCursor>,
-        maximum_rows: usize,
-    ) -> Result<TerminalHistoryResult, TerminalError> {
-        if maximum_rows == 0 || maximum_rows > MAX_HISTORY_PAGE_ROWS {
-            return Err(TerminalError::InvalidHistoryPageSize {
-                requested: maximum_rows,
-                maximum: MAX_HISTORY_PAGE_ROWS,
-            });
-        }
-        if self.engine.active_screen() != ActiveScreen::Main {
-            return Ok(TerminalHistoryResult::HistoryChanged {
-                epoch: self.history_epoch,
-                revision: self.revision,
-            });
-        }
-
-        let total = self.retained_history_rows;
-        let total_u64 = u64::try_from(total).unwrap_or(u64::MAX);
-        let start = match direction {
-            TerminalHistoryDirection::Newest => total.saturating_sub(maximum_rows),
-            TerminalHistoryDirection::Older | TerminalHistoryDirection::Newer => {
-                let Some(cursor) = cursor else {
-                    return Ok(TerminalHistoryResult::HistoryGap {
-                        epoch: self.history_epoch,
-                        revision: self.revision,
-                    });
-                };
-                if cursor.epoch != self.history_epoch {
-                    return Ok(TerminalHistoryResult::HistoryChanged {
-                        epoch: self.history_epoch,
-                        revision: self.revision,
-                    });
-                }
-                let end = cursor.start_row.checked_add(u64::from(cursor.row_count));
-                if cursor.oldest_row != 0
-                    || cursor.start_row < cursor.oldest_row
-                    || end.is_none_or(|end| end > cursor.newest_row)
-                    || cursor.newest_row > total_u64
-                {
-                    return Ok(TerminalHistoryResult::HistoryGap {
-                        epoch: self.history_epoch,
-                        revision: self.revision,
-                    });
-                }
-                match direction {
-                    TerminalHistoryDirection::Older => usize::try_from(cursor.start_row)
-                        .unwrap_or(usize::MAX)
-                        .saturating_sub(maximum_rows),
-                    TerminalHistoryDirection::Newer => {
-                        usize::try_from(end.unwrap_or(total_u64)).unwrap_or(usize::MAX)
-                    }
-                    TerminalHistoryDirection::Newest => unreachable!(),
-                }
-            }
-        };
-        if start > total {
-            return Ok(TerminalHistoryResult::HistoryGap {
-                epoch: self.history_epoch,
-                revision: self.revision,
-            });
-        }
-        let count = maximum_rows.min(total - start);
-        let rows = self.formatted_history_rows(total, start, count);
-        Ok(TerminalHistoryResult::Page(TerminalHistoryPage {
-            cursor: TerminalHistoryCursor {
-                epoch: self.history_epoch,
-                revision: self.revision,
-                start_row: u64::try_from(start).unwrap_or(u64::MAX),
-                row_count: u32::try_from(rows.len()).unwrap_or(u32::MAX),
-                oldest_row: 0,
-                newest_row: total_u64,
-            },
             rows,
-        }))
+        };
+        debug_assert!(frame.validate_for(query).is_ok());
+        TerminalSurfaceHistoryWindowResult::Frame(frame)
     }
 
     fn next_revision(&self) -> Result<Revision, TerminalError> {
@@ -541,33 +345,6 @@ impl TerminalModel {
             self.history_epoch = self.revision;
         }
         self.retained_history_rows = retained;
-    }
-
-    fn formatted_history_rows(&self, total: usize, start: usize, count: usize) -> Vec<Vec<u8>> {
-        (start..start.saturating_add(count))
-            .map(|index| {
-                let distance = total.saturating_sub(index);
-                let line = Line(-i32::try_from(distance).unwrap_or(i32::MAX));
-                encode_history_row(&project_row(&self.engine, line))
-            })
-            .collect()
-    }
-
-    fn recent_history_ansi(&self) -> Vec<u8> {
-        if self.engine.active_screen() != ActiveScreen::Main || self.retained_history_rows == 0 {
-            return Vec::new();
-        }
-        let mut output = b"\x1b[m".to_vec();
-        for row in
-            self.formatted_history_rows(self.retained_history_rows, 0, self.retained_history_rows)
-        {
-            output.extend_from_slice(&row);
-            output.extend_from_slice(b"\r\n");
-        }
-        for _ in 1..self.size().rows {
-            output.extend_from_slice(b"\r\n");
-        }
-        output
     }
 }
 
@@ -595,24 +372,22 @@ fn validate_allocation(size: TerminalSize, scrollback_rows: usize) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ansi::uses_only_allowlisted_ansi;
-    use zterm_core::terminal::MAX_HISTORY_WINDOW_ROWS;
 
     #[test]
     fn revision_overflow_never_mutates_terminal_state() {
         let mut model = TerminalModel::new(TerminalSize::new(2, 8), 0).expect("valid model");
         model.revision = Revision::new(u64::MAX);
-        let before = model.state();
+        let before = model.snapshot();
         assert_eq!(
             model.ingest(b"not rendered"),
             Err(TerminalError::RevisionOverflow)
         );
-        assert_eq!(model.state(), before);
+        assert_eq!(model.snapshot(), before);
         assert_eq!(
             model.resize(TerminalSize::new(3, 9)),
             Err(TerminalError::RevisionOverflow)
         );
-        assert_eq!(model.state(), before);
+        assert_eq!(model.snapshot(), before);
     }
 
     #[test]
@@ -640,539 +415,101 @@ mod tests {
     }
 
     #[test]
-    fn history_pages_are_ordered_revision_bound_and_non_mutating() {
-        let mut model =
-            TerminalModel::new(TerminalSize::new(2, 12), 8).expect("bounded history terminal");
+    fn semantic_snapshot_delta_replay_matches_one_fresh_projection() {
+        let mut model = TerminalModel::new(TerminalSize::new(3, 8), 8).expect("semantic model");
         model
-            .ingest(b"one\r\ntwo\r\nthree\r\nfour\r\nfive")
-            .expect("seed history");
-        let before = model.state();
-        let TerminalHistoryResult::Page(page) = model
-            .history_page(TerminalHistoryDirection::Newest, None, 2)
-            .expect("newest page")
-        else {
-            panic!("newest history must be available");
-        };
-        assert_eq!(page.rows.len(), 2);
-        assert!(String::from_utf8_lossy(&page.rows[0]).contains("two"));
-        assert!(String::from_utf8_lossy(&page.rows[1]).contains("three"));
-        assert_eq!(model.state(), before, "paging must not mutate live state");
+            .ingest("old\r\n\x1b[31m界\x1b[0m".as_bytes())
+            .expect("seed semantic surface");
+        let checkpoint = model.checkpoint();
+        let mut applied = model.snapshot();
+        applied.validate().expect("valid semantic snapshot");
 
-        model.ingest(b"\r\nsix").expect("append below capacity");
-        let TerminalHistoryResult::Page(newer) = model
-            .history_page(
-                TerminalHistoryDirection::Newer,
-                Some(page.cursor),
-                MAX_HISTORY_PAGE_ROWS,
-            )
-            .expect("newer page after monotonic append")
-        else {
-            panic!("monotonic append keeps the history epoch");
+        model
+            .ingest(b"\x1b[2;4H!\x1b[3;8H#")
+            .expect("change multiple exact cells");
+        let TerminalSurfaceDeltaResult::Delta(delta) = model.delta_or_resync(&checkpoint) else {
+            panic!("compatible semantic geometry must produce row patches");
         };
-        assert_eq!(newer.cursor.epoch, page.cursor.epoch);
         assert!(
-            newer
-                .rows
-                .iter()
-                .any(|row| String::from_utf8_lossy(row).contains("four"))
+            delta
+                .row_patches
+                .windows(2)
+                .all(|rows| rows[0].row < rows[1].row)
         );
+        delta
+            .apply_to(applied.revision, &mut applied.surface)
+            .expect("semantic delta applies transactionally");
+        applied.revision = delta.to_revision;
+        assert_eq!(applied, model.snapshot());
 
         model
-            .resize(TerminalSize::new(3, 12))
-            .expect("resize invalidates row identity");
+            .ingest(b"\x1b[?1049hfull-screen")
+            .expect("switch active screen");
         assert!(matches!(
-            model
-                .history_page(TerminalHistoryDirection::Older, Some(page.cursor), 2)
-                .expect("typed stale result"),
-            TerminalHistoryResult::HistoryChanged { .. }
-        ));
-        assert!(matches!(
-            model.history_page(TerminalHistoryDirection::Newest, None, 0),
-            Err(TerminalError::InvalidHistoryPageSize { .. })
-        ));
-    }
-
-    #[test]
-    fn history_eviction_and_alternate_screen_fail_conservatively() {
-        let mut model = TerminalModel::new(TerminalSize::new(2, 10), 2)
-            .expect("small bounded history terminal");
-        model.ingest(b"one\r\ntwo\r\nthree").expect("fill history");
-        let TerminalHistoryResult::Page(page) = model
-            .history_page(TerminalHistoryDirection::Newest, None, 2)
-            .expect("initial page")
-        else {
-            panic!("initial page must exist");
-        };
-        model
-            .ingest(b"\r\nfour\r\nfive")
-            .expect("evict old history");
-        assert!(matches!(
-            model
-                .history_page(TerminalHistoryDirection::Older, Some(page.cursor), 2)
-                .expect("typed eviction result"),
-            TerminalHistoryResult::HistoryChanged { .. }
-        ));
-
-        model
-            .ingest(b"\x1b[?1049h")
-            .expect("enter alternate screen");
-        assert!(matches!(
-            model
-                .history_page(TerminalHistoryDirection::Newest, None, 2)
-                .expect("typed alternate result"),
-            TerminalHistoryResult::HistoryChanged { .. }
+            model.delta_or_resync(&checkpoint),
+            TerminalSurfaceDeltaResult::Resync(_)
         ));
     }
 
     #[test]
-    fn scroll_viewport_projects_full_rows_and_clamps_at_both_ends() {
-        let mut model =
-            TerminalModel::new(TerminalSize::new(4, 12), 8).expect("bounded history terminal");
-        model
-            .ingest(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven")
-            .expect("seed history and live rows");
-        let before = model.state();
-
-        let TerminalViewportResult::Frame(oldest) =
-            model.scroll_viewport(None, TerminalScrollAction::ScrollToOffset(u64::MAX))
-        else {
-            panic!("non-empty history must produce a frame");
-        };
-        assert_eq!(oldest.metrics.offset_from_bottom, 3);
-        assert_eq!(oldest.rows.len(), 4);
-        assert!(String::from_utf8_lossy(&oldest.rows[0]).contains("one"));
-        assert!(String::from_utf8_lossy(&oldest.rows[1]).contains("two"));
-        assert!(String::from_utf8_lossy(&oldest.rows[2]).contains("three"));
-        assert!(String::from_utf8_lossy(&oldest.rows[3]).contains("four"));
-        assert_eq!(
-            model.state(),
-            before,
-            "viewport projection must not mutate live state"
-        );
-
-        let TerminalViewportResult::Live(live) = model.scroll_viewport(
-            Some(oldest.metrics),
-            TerminalScrollAction::ScrollByLines(i32::MIN),
-        ) else {
-            panic!("large downward motion must clamp at the live bottom");
-        };
-        assert_eq!(live.offset_from_bottom, 0);
-    }
-
-    #[test]
-    fn scroll_viewport_anchors_same_epoch_growth_before_relative_motion() {
-        let mut model =
-            TerminalModel::new(TerminalSize::new(2, 12), 8).expect("bounded history terminal");
-        model
-            .ingest(b"one\r\ntwo\r\nthree")
-            .expect("seed one history row");
-        let TerminalViewportResult::Frame(pinned) =
-            model.scroll_viewport(None, TerminalScrollAction::ScrollByLines(1))
-        else {
-            panic!("history must produce a frame");
-        };
-        assert!(String::from_utf8_lossy(&pinned.rows[0]).contains("one"));
-
-        model.ingest(b"\r\nfour").expect("grow below capacity");
-        let TerminalViewportResult::Frame(anchored) =
-            model.scroll_viewport(Some(pinned.metrics), TerminalScrollAction::ScrollByLines(0))
-        else {
-            panic!("same-epoch growth keeps a pinned frame");
-        };
-        assert_eq!(anchored.disposition, TerminalViewportDisposition::Exact);
-        assert_eq!(anchored.metrics.offset_from_bottom, 2);
-        assert!(String::from_utf8_lossy(&anchored.rows[0]).contains("one"));
-    }
-
-    #[test]
-    fn scroll_viewport_baselines_are_caller_owned_and_independent() {
-        let mut model =
-            TerminalModel::new(TerminalSize::new(4, 12), 8).expect("bounded history terminal");
-        model
-            .ingest(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven")
-            .expect("seed history for two callers");
-        let before = model.state();
-
-        let TerminalViewportResult::Frame(first) =
-            model.scroll_viewport(None, TerminalScrollAction::ScrollByLines(1))
-        else {
-            panic!("the first caller must receive one row of history");
-        };
-        let TerminalViewportResult::Frame(second) =
-            model.scroll_viewport(None, TerminalScrollAction::ScrollByLines(3))
-        else {
-            panic!("the second caller must receive three rows of history");
-        };
-        assert_eq!(first.metrics.offset_from_bottom, 1);
-        assert_eq!(second.metrics.offset_from_bottom, 3);
-
-        let TerminalViewportResult::Frame(first_advanced) =
-            model.scroll_viewport(Some(first.metrics), TerminalScrollAction::ScrollByLines(1))
-        else {
-            panic!("the first caller advances from its own baseline");
-        };
-        let TerminalViewportResult::Frame(second_unchanged) =
-            model.scroll_viewport(Some(second.metrics), TerminalScrollAction::ScrollByLines(0))
-        else {
-            panic!("the second caller retains its independent baseline");
-        };
-        assert_eq!(first_advanced.metrics.offset_from_bottom, 2);
-        assert_eq!(second_unchanged.metrics.offset_from_bottom, 3);
-        assert_eq!(model.state(), before, "neither caller mutates live state");
-    }
-
-    #[test]
-    fn scroll_viewport_rebases_after_resize_eviction_and_history_clear() {
-        let mut model =
-            TerminalModel::new(TerminalSize::new(2, 12), 2).expect("small history terminal");
-        model
-            .ingest(b"one\r\ntwo\r\nthree\r\nfour")
-            .expect("fill retained history");
-        let TerminalViewportResult::Frame(before_eviction) =
-            model.scroll_viewport(None, TerminalScrollAction::ScrollByLines(1))
-        else {
-            panic!("history must be available before eviction");
-        };
-
-        model.ingest(b"\r\nfive").expect("evict one retained row");
-        let TerminalViewportResult::Frame(after_eviction) = model.scroll_viewport(
-            Some(before_eviction.metrics),
-            TerminalScrollAction::ScrollByLines(0),
-        ) else {
-            panic!("bounded retained history remains after eviction");
-        };
-        assert_eq!(
-            after_eviction.disposition,
-            TerminalViewportDisposition::Rebased
-        );
-
-        model
-            .resize(TerminalSize::new(3, 12))
-            .expect("resize changes viewport identity");
-        match model.scroll_viewport(
-            Some(after_eviction.metrics),
-            TerminalScrollAction::ScrollByLines(0),
-        ) {
-            TerminalViewportResult::Frame(frame) => {
-                assert_eq!(frame.disposition, TerminalViewportDisposition::Rebased);
-                assert_eq!(frame.rows.len(), 3);
-            }
-            TerminalViewportResult::Live(metrics) => {
-                assert_eq!(metrics.offset_from_bottom, 0);
-                assert_eq!(metrics.viewport_rows, 3);
-            }
-            other => panic!("resize must rebase to a current frame or live state: {other:?}"),
-        }
-
-        let previous = model.live_scroll_metrics().expect("main-screen metrics");
-        model.ingest(b"\x1b[3J").expect("clear saved history");
-        let TerminalViewportResult::Live(cleared) =
-            model.scroll_viewport(Some(previous), TerminalScrollAction::ScrollByLines(0))
-        else {
-            panic!("cleared history must clamp the viewport to live");
-        };
-        assert_eq!(cleared.offset_from_bottom, 0);
-        assert_eq!(cleared.max_offset_from_bottom, 0);
-    }
-
-    #[test]
-    fn scroll_viewport_preserves_styled_wide_unicode_rows_through_allowlisted_ansi() {
-        let mut model =
-            TerminalModel::new(TerminalSize::new(2, 12), 4).expect("Unicode history terminal");
-        model
-            .ingest("\x1b[31m界\x1b[0m\r\nplain\r\nlive".as_bytes())
-            .expect("seed styled wide history row");
-        let before = model.state();
-        let TerminalViewportResult::Frame(frame) =
-            model.scroll_viewport(None, TerminalScrollAction::ScrollToOffset(1))
-        else {
-            panic!("retained Unicode row must produce a frame");
-        };
-        assert_eq!(frame.rows.len(), 2);
-        assert!(
-            frame.rows[0]
-                .windows("界".len())
-                .any(|bytes| bytes == "界".as_bytes())
-        );
-        assert!(uses_only_allowlisted_ansi(&frame.rows[0], false));
-        assert_eq!(model.state(), before);
-    }
-
-    #[test]
-    fn scroll_viewport_rebases_stale_epoch_and_rejects_invalid_or_alternate_baselines() {
-        let mut model =
-            TerminalModel::new(TerminalSize::new(2, 12), 8).expect("bounded history terminal");
-        model.ingest(b"one\r\ntwo\r\nthree").expect("seed history");
-        let TerminalViewportResult::Frame(pinned) =
-            model.scroll_viewport(None, TerminalScrollAction::ScrollByLines(1))
-        else {
-            panic!("history must produce a frame");
-        };
-
-        let mut stale_epoch = pinned.metrics;
-        stale_epoch.epoch = Revision::new(stale_epoch.epoch.get().saturating_add(1));
-        let TerminalViewportResult::Frame(rebased) =
-            model.scroll_viewport(Some(stale_epoch), TerminalScrollAction::ScrollByLines(0))
-        else {
-            panic!("current history can replace a stale viewport");
-        };
-        assert_eq!(rebased.disposition, TerminalViewportDisposition::Rebased);
-        assert_eq!(rebased.rows.len(), 2);
-
-        let mut invalid = rebased.metrics;
-        invalid.offset_from_bottom = invalid.max_offset_from_bottom.saturating_add(1);
+    fn equal_or_future_checkpoint_never_fabricates_a_delta() {
+        let current = TerminalModel::new(TerminalSize::new(2, 8), 0).expect("current model");
+        let equal = current.checkpoint();
         assert!(matches!(
-            model.scroll_viewport(Some(invalid), TerminalScrollAction::ScrollByLines(1)),
-            TerminalViewportResult::HistoryGap { .. }
+            current.delta_or_resync(&equal),
+            TerminalSurfaceDeltaResult::Resync(_)
         ));
 
-        let mut future_epoch = rebased.metrics;
-        future_epoch.epoch = Revision::new(future_epoch.revision.get().saturating_add(1));
+        let mut future_source =
+            TerminalModel::new(TerminalSize::new(2, 8), 0).expect("future source");
+        future_source
+            .ingest(b"future")
+            .expect("advance future source");
+        let future = future_source.checkpoint();
+        assert!(future.revision() > current.revision());
         assert!(matches!(
-            model.scroll_viewport(Some(future_epoch), TerminalScrollAction::ScrollByLines(0)),
-            TerminalViewportResult::HistoryGap { .. }
-        ));
-
-        model
-            .ingest(b"\x1b[?1049h")
-            .expect("enter alternate screen");
-        assert!(matches!(
-            model.scroll_viewport(None, TerminalScrollAction::ScrollByLines(1)),
-            TerminalViewportResult::HistoryChanged { .. }
+            current.delta_or_resync(&future),
+            TerminalSurfaceDeltaResult::Resync(_)
         ));
     }
 
     #[test]
-    fn history_window_projects_mixed_rows_and_clips_both_edges_without_mutation() {
+    fn semantic_history_window_preserves_exact_cells_without_mutation() {
         let mut model =
-            TerminalModel::new(TerminalSize::new(4, 12), 8).expect("bounded history terminal");
+            TerminalModel::new(TerminalSize::new(2, 8), 8).expect("semantic history model");
         model
-            .ingest(b"one\r\n\x1b[31m\xe7\x95\x8c\x1b[0m\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven")
-            .expect("seed history and live rows");
-        let before_state = model.state();
+            .ingest("\x1b[32m界\x1b[0m\r\nplain\r\nlive".as_bytes())
+            .expect("seed semantic history");
+        let before_state = model.snapshot();
         let before_checkpoint = model.checkpoint();
         let anchor = TerminalHistoryWindowAnchor {
             epoch: model.history_epoch,
             revision: model.revision(),
-            max_offset_from_bottom: 3,
+            max_offset_from_bottom: u64::try_from(model.retained_history_rows)
+                .expect("bounded history"),
             viewport: model.size(),
         };
         let query = TerminalHistoryWindowQuery {
             anchor,
             target_offset_from_bottom: 1,
-            older_margin_rows: 8,
-            newer_margin_rows: 0,
+            older_margin_rows: 1,
+            newer_margin_rows: 1,
         };
-        let TerminalHistoryWindowResult::Frame(frame) = model.history_window(query) else {
-            panic!("valid main history must produce a window");
+        let TerminalSurfaceHistoryWindowResult::Frame(frame) = model.history_window(query) else {
+            panic!("semantic history is available");
         };
-        assert!(frame.is_valid_for(query));
-        assert_eq!(frame.disposition, TerminalViewportDisposition::Exact);
-        assert_eq!(frame.first_row_from_live_top, -3);
-        assert_eq!(frame.ansi_rows.len(), 6);
-        assert!(
-            frame
-                .ansi_rows
+        frame.validate_for(query).expect("request-shaped frame");
+        assert!(frame.rows.iter().any(|row| {
+            row.cells
                 .iter()
-                .any(|row| row.windows(3).any(|bytes| bytes == b"\xe7\x95\x8c"))
-        );
-        assert_eq!(
-            frame
-                .ansi_rows
+                .any(|cell| cell.contents == "界" && cell.wide)
+        }));
+        assert!(frame.rows.iter().any(|row| {
+            row.cells
                 .iter()
-                .flat_map(|row| row.windows("界".len()))
-                .filter(|bytes| *bytes == "界".as_bytes())
-                .count(),
-            1,
-            "the wide-cell continuation must not duplicate the glyph"
-        );
-        assert!(
-            frame
-                .ansi_rows
-                .iter()
-                .any(|row| { String::from_utf8_lossy(row).contains("\x1b[0;38;5;1;49m") })
-        );
-        assert!(
-            frame
-                .ansi_rows
-                .iter()
-                .all(|row| uses_only_allowlisted_ansi(row, false))
-        );
-        assert!(String::from_utf8_lossy(&frame.ansi_rows[2]).contains("three"));
-        assert!(String::from_utf8_lossy(&frame.ansi_rows[3]).contains("four"));
-        assert_eq!(model.state(), before_state);
-        assert_eq!(model.revision(), before_checkpoint.revision());
-
-        let TerminalHistoryWindowResult::Frame(oldest) =
-            model.history_window(TerminalHistoryWindowQuery {
-                anchor,
-                target_offset_from_bottom: 3,
-                older_margin_rows: 0,
-                newer_margin_rows: 8,
-            })
-        else {
-            panic!("oldest target must remain projectable");
-        };
-        assert_eq!(oldest.first_row_from_live_top, -3);
-        assert_eq!(oldest.ansi_rows.len(), 7);
-        let TerminalHistoryWindowResult::Frame(live) =
-            model.history_window(TerminalHistoryWindowQuery {
-                anchor,
-                target_offset_from_bottom: 0,
-                older_margin_rows: 8,
-                newer_margin_rows: 0,
-            })
-        else {
-            panic!("zero target must include one complete live screen");
-        };
-        assert_eq!(live.target_offset_from_bottom, 0);
-        assert_eq!(live.ansi_rows.len(), 7);
-        assert_eq!(model.state(), before_state);
-        let after_checkpoint = model.checkpoint();
-        assert_eq!(after_checkpoint.revision(), before_checkpoint.revision());
-        assert_eq!(
-            after_checkpoint.retained_cell_capacity(),
-            before_checkpoint.retained_cell_capacity()
-        );
-    }
-
-    #[test]
-    fn history_window_enforces_the_three_screen_row_cap() {
-        let mut model =
-            TerminalModel::new(TerminalSize::new(80, 4), 200).expect("maximum-height model");
-        let mut input = Vec::new();
-        for _ in 0..280 {
-            input.extend_from_slice(b"x\r\n");
-        }
-        input.push(b'x');
-        model.ingest(&input).expect("seed maximum bounded history");
-        let anchor = TerminalHistoryWindowAnchor {
-            epoch: model.history_epoch,
-            revision: model.revision(),
-            max_offset_from_bottom: u64::try_from(model.retained_history_rows)
-                .expect("bounded history extent"),
-            viewport: model.size(),
-        };
-        let TerminalHistoryWindowResult::Frame(frame) =
-            model.history_window(TerminalHistoryWindowQuery {
-                anchor,
-                target_offset_from_bottom: 80,
-                older_margin_rows: 80,
-                newer_margin_rows: 80,
-            })
-        else {
-            panic!("three-screen query must produce a bounded frame");
-        };
-        assert_eq!(frame.ansi_rows.len(), MAX_HISTORY_WINDOW_ROWS);
-    }
-
-    #[test]
-    fn history_window_pins_append_rebases_identity_and_rejects_invalid_or_alternate() {
-        let mut model =
-            TerminalModel::new(TerminalSize::new(2, 12), 8).expect("bounded history terminal");
-        model.ingest(b"one\r\ntwo\r\nthree").expect("seed history");
-        let anchor = TerminalHistoryWindowAnchor {
-            epoch: model.history_epoch,
-            revision: model.revision(),
-            max_offset_from_bottom: 1,
-            viewport: model.size(),
-        };
-        model.ingest(b"\r\nfour").expect("append one row");
-        let TerminalHistoryWindowResult::Frame(pinned) =
-            model.history_window(TerminalHistoryWindowQuery {
-                anchor,
-                target_offset_from_bottom: 1,
-                older_margin_rows: 2,
-                newer_margin_rows: 2,
-            })
-        else {
-            panic!("same epoch append must produce a window");
-        };
-        assert_eq!(pinned.disposition, TerminalViewportDisposition::Exact);
-        assert_eq!(pinned.target_offset_from_bottom, 2);
-        assert!(String::from_utf8_lossy(&pinned.ansi_rows[0]).contains("one"));
-
-        model
-            .resize(TerminalSize::new(3, 12))
-            .expect("resize changes identity");
-        let TerminalHistoryWindowResult::Frame(rebased) =
-            model.history_window(TerminalHistoryWindowQuery {
-                anchor,
-                target_offset_from_bottom: 1,
-                older_margin_rows: 2,
-                newer_margin_rows: 2,
-            })
-        else {
-            panic!("resize must return a complete replacement window");
-        };
-        assert_eq!(rebased.disposition, TerminalViewportDisposition::Rebased);
-        assert_eq!(rebased.anchor.viewport.rows, 3);
-
-        let mut future = anchor;
-        future.revision = Revision::new(model.revision().get().saturating_add(1));
-        assert!(matches!(
-            model.history_window(TerminalHistoryWindowQuery {
-                anchor: future,
-                target_offset_from_bottom: 1,
-                older_margin_rows: 0,
-                newer_margin_rows: 0,
-            }),
-            TerminalHistoryWindowResult::HistoryGap { .. }
-        ));
-        model.ingest(b"\x1b[?1049h").expect("enter alternate");
-        assert!(matches!(
-            model.history_window(TerminalHistoryWindowQuery {
-                anchor: rebased.anchor,
-                target_offset_from_bottom: 0,
-                older_margin_rows: 0,
-                newer_margin_rows: 0,
-            }),
-            TerminalHistoryWindowResult::HistoryChanged { .. }
-        ));
-    }
-
-    #[test]
-    fn every_model_authored_ansi_surface_uses_the_allowlist() {
-        let mut model = TerminalModel::new(TerminalSize::new(3, 12), 4).expect("valid model");
-        model
-            .ingest(b"history-one\r\nhistory-two\r\nvisible")
-            .expect("initial state");
-        let snapshot = model.snapshot();
-        assert!(
-            uses_only_allowlisted_ansi(&snapshot.screen_ansi, true),
-            "snapshot ANSI: {:?}",
-            String::from_utf8_lossy(&snapshot.screen_ansi),
-        );
-        assert!(uses_only_allowlisted_ansi(
-            &snapshot.recent_history_ansi,
-            false,
-        ));
-
-        let checkpoint = model.checkpoint();
-        model.ingest(b"\x1b[2;2H!").expect("small change");
-        match model.delta_or_resync(&checkpoint) {
-            TerminalDeltaResult::Delta(delta) => {
-                assert!(uses_only_allowlisted_ansi(&delta.ansi, false));
-            }
-            TerminalDeltaResult::Resync(snapshot) => {
-                assert!(uses_only_allowlisted_ansi(&snapshot.screen_ansi, true));
-                assert!(uses_only_allowlisted_ansi(
-                    &snapshot.recent_history_ansi,
-                    false,
-                ));
-            }
-        }
-
-        let TerminalHistoryResult::Page(page) = model
-            .history_page(TerminalHistoryDirection::Newest, None, 2)
-            .expect("history page")
-        else {
-            panic!("history remains available");
-        };
-        assert!(
-            page.rows
-                .iter()
-                .all(|row| uses_only_allowlisted_ansi(row, false))
-        );
+                .any(|cell| cell.wide_continuation && cell.contents.is_empty())
+        }));
+        assert_eq!(model.snapshot(), before_state);
+        assert_eq!(model.checkpoint().revision(), before_checkpoint.revision());
     }
 }

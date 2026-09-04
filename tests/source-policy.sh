@@ -63,6 +63,39 @@ if grep -E 'alacritty_terminal|zterm-terminal|^[[:space:]]*vte[[:space:]]*=' cra
     echo "zterm-cli must not directly depend on the terminal engine" >&2
     exit 1
 fi
+legacy_v1_proto=$(find proto/zterm/v1 -type f -print 2>/dev/null || true)
+if [ -n "$legacy_v1_proto" ] || [ ! -f proto/zterm/v2/wire.proto ]; then
+    echo "terminal transport must compile only the zterm.v2 protobuf source tree" >&2
+    exit 1
+fi
+if ! grep -Fqx 'package zterm.v2;' proto/zterm/v2/wire.proto; then
+    echo "wire protobuf package must be exactly zterm.v2" >&2
+    exit 1
+fi
+legacy_terminal_presentation=$(find crates proto -type f \( -name '*.rs' -o -name '*.proto' \) -exec grep -nHE 'LegacyAnsi|SemanticCellsV1|TerminalState|TerminalPresentationEncoding|presentation_(encoding|family|preference|capability)|recent_history_ansi|screen_ansi|ansi_rows|TerminalHistory(Cursor|Direction|Page|Result|WindowResult|WindowFrame)|TerminalViewport(Result|Frame)|TerminalScrollAction' {} + || true)
+if [ -n "$legacy_terminal_presentation" ]; then
+    echo "legacy terminal presentation compatibility must stay deleted:" >&2
+    printf '%s\n' "$legacy_terminal_presentation" >&2
+    exit 1
+fi
+legacy_terminal_kinds=$(grep -nE '= (312|313|315|316|319|320|321);' proto/zterm/v2/wire.proto || true)
+if [ -n "$legacy_terminal_kinds" ]; then
+    echo "retired terminal wire kinds must stay absent from wire major 2:" >&2
+    printf '%s\n' "$legacy_terminal_kinds" >&2
+    exit 1
+fi
+client_terminal_engine=$(find crates/cli/src -type f -name '*.rs' -exec grep -nHE 'alacritty_terminal|(^|[^[:alnum:]_])vte::|vt100' {} + || true)
+if [ -n "$client_terminal_engine" ]; then
+    echo "zterm-cli must consume semantic surfaces without a second terminal parser:" >&2
+    printf '%s\n' "$client_terminal_engine" >&2
+    exit 1
+fi
+application_detection=$(find crates/cli/src -type f -name '*.rs' -exec grep -niHE 'herdr|piagent|pi[[:space:]_-]*agent|ghostty|kitty|TERM_PROGRAM' {} + || true)
+if [ -n "$application_detection" ]; then
+    echo "terminal presentation must remain application- and terminal-brand-neutral:" >&2
+    printf '%s\n' "$application_detection" >&2
+    exit 1
+fi
 forbidden_alacritty_api=$(find crates -type f -name '*.rs' -exec grep -nHE 'alacritty_terminal::(tty|event_loop)' {} + || true)
 if [ -n "$forbidden_alacritty_api" ]; then
     echo "zterm must keep PTY/process ownership out of the Alacritty boundary" >&2

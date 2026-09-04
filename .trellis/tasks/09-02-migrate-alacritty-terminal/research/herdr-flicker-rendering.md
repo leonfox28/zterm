@@ -111,6 +111,39 @@ Zterm 已有一些正确的基础：滚动条 absolute target、每次只有一�
 
 Herdr 的完整 cell diff 值得长期借鉴，但不能直接复制进 Zterm：Herdr 的最终 presenter 拥有 `FrameData` / Ratatui cell buffer；Zterm CLI 当前收到的是 daemon-authored canonical ANSI rows。可以先做 row-level retained baseline，或将协议演进为 semantic cells / patches，再做可靠的 style-aware cell diff。对于滚动导致几乎每个同位置 cell 都变化的帧，DEC 2026 比 diff 更直接地解决闪烁，故不应为了本次修复先扩张 wire protocol。
 
+### Follow-up: 三个 wheel reports 的视觉批次为何不稳定
+
+2026-09-03 的实机反馈确认总位移已经稳定为三行，但三份 host SGR wheel report 仍可能被看成
+一次三行跳转，也可能被看成很快的一行加两行。Zterm 的 `HostInputCodec::feed` 会从一个
+4 KiB stdin chunk 解出多份 `HostInputEvent::Mouse`，主循环随后逐个调用 `navigate(..., 1)` 和
+`render_view_stdout`。因此三份报告会产生三次独立 DEC-2026 transaction / `write_all` / flush；
+DEC 2026 只能原子化每一帧，不能把三帧合成一帧。host 的刷新时机决定用户是否看见中间帧。
+
+Herdr 没有可依赖的“物理滚轮动作 ID”。它仍按单个 Crossterm `MouseEvent` 处理输入，并把
+配置的 `mouse_scroll_lines`（默认三行）随事件传给 pane。它解决视觉批次的层次在 renderer：
+
+- `RenderSignal` 将重复 dirty 请求折叠为一个 pending signal 和 source set；
+- `MIN_RENDER_INTERVAL = 16 ms` 同时限制 render/presentation cadence；
+- 每客户端只有一个 render slot；slot 满时不排队中间帧，而是安排最新 full recovery；
+- 只有成功入队的帧才成为新的 presentation baseline。
+
+所以可借鉴的是“状态立即累计、呈现最多约 60 Hz、只画最新完整状态”，不是照搬 Herdr 的
+三行步长。Zterm 必须继续保持一份完整 SGR report 等于一逻辑行，否则 Ghostty 当前的一次
+三-report burst 会重新放大成九行。
+
+对 Zterm 的最小安全方案是只给 host-owned cached viewport repaint 加 16 ms cadence：每份报告
+立即更新本地 desired offset，网络 prefetch/child-owned input 仍立即处理，timer 只提交当时
+最新的完整缓存切片。返回 live、snapshot/resync、resize/reconnect 和普通输入必须取消或吸收
+pending repaint。不要在本轮给所有 PTY delta 引入全局 60 Hz scheduler。
+
+该方案消除无上限的快速微帧，但由于 SGR mouse protocol 没有 gesture boundary，一个 burst
+恰好跨过 16 ms 边界时仍可能形成两张节奏正常的帧。若产品要求“一次物理动作永远只见一次
+三行跳转”，只能增加短 trailing debounce；这会延迟首帧，并使连续触控板滚动更黏滞。
+
+产品决定（2026-09-03）：desktop 采用 Herdr-style 16 ms、event-driven latest-frame cadence，
+接受高刷新率未充分利用、最多一帧额外等待和极少数跨边界两步显示；不采用 trailing
+debounce。Android 后续复用 coalescing 原则，但由 native vsync 决定实际刷新节奏。
+
 ### Current upstream drift
 
 [固定提交到当前 HEAD 的比较](https://github.com/herdrdev/herdr/compare/cc88b3b8e5bb9f7d9f23ed6ae85a52fd7b5b9ed6...94f6d9c0d9bb9cf9ffae99d8bbfb09e9bf2fc9e0)显示：

@@ -13,11 +13,11 @@ use iroh::{
 
 use crate::config::ValidatedInfrastructure;
 
-/// Product protocol identifier for wire major one.
-pub const ZTERM_ALPN: &[u8] = b"zterm/1";
+/// Product protocol identifier for wire major two.
+pub const ZTERM_ALPN: &[u8] = b"zterm/2";
 
-/// Short-lived pairing protocol identifier for format/protocol major one.
-pub const ZTERM_PAIR_ALPN: &[u8] = b"zterm-pair/1";
+/// Short-lived pairing protocol identifier for format/protocol major two.
+pub const ZTERM_PAIR_ALPN: &[u8] = b"zterm-pair/2";
 
 /// Effective configuration of one Relay entry.
 #[derive(Clone, Eq, PartialEq)]

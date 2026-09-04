@@ -50,8 +50,8 @@ before adding another infrastructure profile or validation layer.
   the `iroh-relay` server feature as dev dependencies. Those features exist
   only to observe redacted QAD facts and run a disposable controlled
   Relay/QAD; they must not enter the normal production dependency graph.
-- The endpoint accepts exactly the normal `zterm/1` and short-lived pairing
-  `zterm-pair/1` ALPNs. Adding pairing must not create a second endpoint or a
+- The endpoint accepts exactly the normal `zterm/2` and short-lived pairing
+  `zterm-pair/2` ALPNs. Adding pairing must not create a second endpoint or a
   second infrastructure profile.
 - n0 DNS/Pkarr lookup and port mapping remain enabled. Address lookup
   publication is relay-only; peers still exchange and test direct candidates

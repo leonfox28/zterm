@@ -2,8 +2,8 @@
 
 use zterm_core::terminal::{
     ActiveScreen, MAX_SIDE_EVENTS_PER_UPDATE, MAX_TITLE_BYTES, RejectedEffect, TerminalColor,
-    TerminalDeltaResult, TerminalMouseEncoding, TerminalMouseMode, TerminalSideEvent, TerminalSize,
-    TerminalState, UnsupportedSequenceKind,
+    TerminalMouseEncoding, TerminalMouseMode, TerminalSideEvent, TerminalSize, TerminalSurface,
+    UnsupportedSequenceKind,
 };
 use zterm_terminal::TerminalModel;
 
@@ -19,7 +19,7 @@ enum Chunking {
 
 #[derive(Debug, Eq, PartialEq)]
 struct Run {
-    state: TerminalState,
+    state: TerminalSurface,
     replies: Vec<u8>,
     events: Vec<TerminalSideEvent>,
 }
@@ -59,10 +59,50 @@ fn run(bytes: &[u8], chunking: Chunking) -> Run {
         events.extend(update.events);
     }
     Run {
-        state: model.state(),
+        state: model.snapshot().surface,
         replies,
         events,
     }
+}
+
+fn scroll_geometry(surface: &TerminalSurface) -> Option<(u64, u64, u16)> {
+    surface.scroll_metrics.map(|metrics| {
+        (
+            metrics.offset_from_bottom,
+            metrics.max_offset_from_bottom,
+            metrics.viewport_rows,
+        )
+    })
+}
+
+fn assert_run_equivalent(actual: &Run, expected: &Run, chunking: Chunking) {
+    assert_eq!(
+        actual.state.size, expected.state.size,
+        "chunking {chunking:?}"
+    );
+    assert_eq!(
+        actual.state.active_screen, expected.state.active_screen,
+        "chunking {chunking:?}"
+    );
+    assert_eq!(
+        actual.state.rows, expected.state.rows,
+        "chunking {chunking:?}"
+    );
+    assert_eq!(
+        actual.state.cursor, expected.state.cursor,
+        "chunking {chunking:?}"
+    );
+    assert_eq!(
+        actual.state.modes, expected.state.modes,
+        "chunking {chunking:?}"
+    );
+    assert_eq!(
+        scroll_geometry(&actual.state),
+        scroll_geometry(&expected.state),
+        "chunking {chunking:?}"
+    );
+    assert_eq!(actual.replies, expected.replies, "chunking {chunking:?}");
+    assert_eq!(actual.events, expected.events, "chunking {chunking:?}");
 }
 
 fn assert_chunk_invariant(bytes: &[u8]) -> Run {
@@ -72,7 +112,7 @@ fn assert_chunk_invariant(bytes: &[u8]) -> Run {
         Chunking::Fixed(5),
         Chunking::PseudoRandom,
     ] {
-        assert_eq!(run(bytes, chunking), expected, "chunking {chunking:?}");
+        assert_run_equivalent(&run(bytes, chunking), &expected, chunking);
     }
     expected
 }
@@ -90,20 +130,42 @@ fn fixed_ansi_corpus_is_chunk_boundary_invariant() {
         .as_bytes(),
     );
     assert_eq!(screen.state.active_screen, ActiveScreen::Main);
-    assert!(screen.state.cells.iter().any(|cell| cell.wide));
     assert!(
         screen
             .state
-            .cells
+            .rows
             .iter()
+            .flat_map(|row| &row.cells)
+            .any(|cell| cell.wide)
+    );
+    assert!(
+        screen
+            .state
+            .rows
+            .iter()
+            .flat_map(|row| &row.cells)
             .any(|cell| cell.contents == "e\u{301}")
     );
-    assert!(screen.state.cells.iter().any(|cell| {
-        cell.style.foreground == TerminalColor::Indexed(196) && cell.contents.contains("i")
-    }));
-    assert!(screen.state.cells.iter().any(|cell| {
-        cell.style.background == TerminalColor::Rgb(1, 2, 3) && !cell.contents.is_empty()
-    }));
+    assert!(
+        screen
+            .state
+            .rows
+            .iter()
+            .flat_map(|row| &row.cells)
+            .any(|cell| {
+                cell.style.foreground == TerminalColor::Indexed(196) && cell.contents.contains("i")
+            })
+    );
+    assert!(
+        screen
+            .state
+            .rows
+            .iter()
+            .flat_map(|row| &row.cells)
+            .any(|cell| {
+                cell.style.background == TerminalColor::Rgb(1, 2, 3) && !cell.contents.is_empty()
+            })
+    );
 
     let alternate = assert_chunk_invariant(
         concat!(
@@ -131,8 +193,9 @@ fn fixed_ansi_corpus_is_chunk_boundary_invariant() {
     assert_eq!(restored.state.active_screen, ActiveScreen::Main);
     let visible: String = restored
         .state
-        .cells
+        .rows
         .iter()
+        .flat_map(|row| &row.cells)
         .map(|cell| cell.contents.as_str())
         .collect();
     assert!(visible.contains("main-restored!"));
@@ -197,22 +260,16 @@ fn allowed_side_events_are_bounded_and_unsafe_effects_are_contained() {
     assert!(run.replies.is_empty());
 
     let mut model = TerminalModel::new(SIZE, 32).expect("corpus size is valid");
-    let checkpoint = model.checkpoint();
     let update = model.ingest(bytes).expect("safety corpus ingests");
     let snapshot = model.snapshot();
-    let delta_ansi = match model.delta_or_resync(&checkpoint) {
-        TerminalDeltaResult::Delta(delta) => delta.ansi,
-        TerminalDeltaResult::Resync(snapshot) => snapshot.screen_ansi,
-    };
-    let serialized = format!(
-        "{state:?}{events:?}{replies:?}{screen:?}{history:?}{delta:?}",
-        state = model.state(),
-        events = update.events,
-        replies = update.replies,
-        screen = snapshot.screen_ansi,
-        history = snapshot.recent_history_ansi,
-        delta = delta_ansi,
-    );
+    let visible = snapshot
+        .surface
+        .rows
+        .iter()
+        .flat_map(|row| &row.cells)
+        .map(|cell| cell.contents.as_str())
+        .collect::<String>();
+    let serialized = format!("{snapshot:?}{:?}{:?}", update.events, update.replies);
     for secret in [
         "secret-bytes",
         "c2VjcmV0LWJ5dGVz",
@@ -221,7 +278,7 @@ fn allowed_side_events_are_bounded_and_unsafe_effects_are_contained() {
         "unknown-apc-secret",
     ] {
         assert!(
-            !serialized.contains(secret),
+            !serialized.contains(secret) && !visible.contains(secret),
             "unsafe payload leaked: {secret}"
         );
     }
@@ -278,7 +335,7 @@ fn repeated_resize_preserves_chunk_independent_state() {
             }
         }
         Run {
-            state: model.state(),
+            state: model.snapshot().surface,
             replies,
             events,
         }
@@ -290,7 +347,7 @@ fn repeated_resize_preserves_chunk_independent_state() {
         Chunking::Fixed(4),
         Chunking::PseudoRandom,
     ] {
-        assert_eq!(resized_run(chunking), expected, "chunking {chunking:?}");
+        assert_run_equivalent(&resized_run(chunking), &expected, chunking);
     }
     assert_eq!(expected.state.size, TerminalSize::new(3, 9));
 }

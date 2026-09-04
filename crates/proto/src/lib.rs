@@ -7,10 +7,12 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use prost::Message;
 use zeroize::{Zeroize, Zeroizing};
 use zterm_core::terminal::{
-    ActiveScreen, TerminalDelta, TerminalHistoryCursor, TerminalHistoryPage, TerminalHistoryResult,
-    TerminalHistoryWindowAnchor, TerminalHistoryWindowFrame, TerminalHistoryWindowResult,
-    TerminalModes, TerminalMouseEncoding, TerminalMouseMode, TerminalScrollMetrics, TerminalSize,
-    TerminalSnapshot, TerminalViewportDisposition, TerminalViewportFrame, TerminalViewportResult,
+    ActiveScreen, TerminalCell, TerminalColor, TerminalCursor, TerminalHistoryWindowAnchor,
+    TerminalHistoryWindowQuery, TerminalModes, TerminalMouseEncoding, TerminalMouseMode,
+    TerminalScrollMetrics, TerminalSize, TerminalStyle, TerminalSurface, TerminalSurfaceDelta,
+    TerminalSurfaceError, TerminalSurfaceHistoryWindowFrame, TerminalSurfaceHistoryWindowResult,
+    TerminalSurfaceRow, TerminalSurfaceRowPatch, TerminalSurfaceSnapshot,
+    TerminalViewportDisposition,
 };
 use zterm_core::{
     AttachmentId, AuthGeneration, AuthorizationStatus, Capabilities, ConnectionAttemptId,
@@ -22,13 +24,13 @@ use zterm_core::{
     ResumeViewId, SessionId,
 };
 
-/// Generated version-one protocol DTOs.
-pub mod v1 {
+/// Generated version-two protocol DTOs.
+pub mod v2 {
     #![allow(missing_docs)]
-    include!(concat!(env!("OUT_DIR"), "/zterm.v1.rs"));
+    include!(concat!(env!("OUT_DIR"), "/zterm.v2.rs"));
 }
 
-impl fmt::Debug for v1::WireFrame {
+impl fmt::Debug for v2::WireFrame {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("WireFrame")
@@ -42,59 +44,102 @@ impl fmt::Debug for v1::WireFrame {
     }
 }
 
-impl fmt::Debug for v1::TerminalHistoryPage {
+impl fmt::Debug for v2::TerminalCell {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("TerminalHistoryPage")
-            .field("attachment_id_present", &self.attachment_id.is_some())
-            .field("outcome", &self.outcome)
+            .debug_struct("TerminalCell")
+            .field("contents", &"[REDACTED]")
+            .field("contents_len", &self.contents.len())
+            .field("wide", &self.wide)
+            .field("wide_continuation", &self.wide_continuation)
+            .field("style", &self.style)
+            .finish()
+    }
+}
+
+impl fmt::Debug for v2::TerminalSurfaceRow {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalSurfaceRow")
+            .field("cell_count", &self.cells.len())
+            .field("wrapped", &self.wrapped)
+            .finish()
+    }
+}
+
+impl fmt::Debug for v2::TerminalSurface {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalSurface")
+            .field("row_count", &self.row_count)
+            .field("column_count", &self.column_count)
+            .field("active_screen", &self.active_screen)
+            .field("encoded_rows", &self.rows.len())
             .field("cursor", &self.cursor)
-            .field("row_count", &self.rows.len())
-            .field("ansi_bytes", &self.rows.iter().map(Vec::len).sum::<usize>())
-            .field("current_epoch", &self.current_epoch)
-            .field("current_revision", &self.current_revision)
+            .field("modes", &self.modes)
+            .field("scroll_metrics", &self.scroll_metrics)
             .finish()
     }
 }
 
-impl fmt::Debug for v1::TerminalViewportFrame {
+impl fmt::Debug for v2::TerminalSemanticSnapshot {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("TerminalViewportFrame")
+            .debug_struct("TerminalSemanticSnapshot")
+            .field("session_id_present", &self.session_id.is_some())
             .field("attachment_id_present", &self.attachment_id.is_some())
-            .field("outcome", &self.outcome)
-            .field("disposition", &self.disposition)
-            .field("metrics", &self.metrics)
-            .field("row_count", &self.rows.len())
-            .field("ansi_bytes", &self.rows.iter().map(Vec::len).sum::<usize>())
-            .field("current_epoch", &self.current_epoch)
-            .field("current_revision", &self.current_revision)
+            .field("revision", &self.revision)
+            .field("surface", &self.surface)
             .finish()
     }
 }
 
-impl fmt::Debug for v1::TerminalHistoryWindowFrame {
+impl fmt::Debug for v2::TerminalSemanticRowPatch {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("TerminalHistoryWindowFrame")
+            .debug_struct("TerminalSemanticRowPatch")
+            .field("row", &self.row)
+            .field("replacement", &self.replacement)
+            .finish()
+    }
+}
+
+impl fmt::Debug for v2::TerminalSemanticDelta {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalSemanticDelta")
+            .field("attachment_id_present", &self.attachment_id.is_some())
+            .field("from_revision", &self.from_revision)
+            .field("to_revision", &self.to_revision)
+            .field("row_count", &self.row_count)
+            .field("column_count", &self.column_count)
+            .field("active_screen", &self.active_screen)
+            .field("row_patch_count", &self.row_patches.len())
+            .field("cursor", &self.cursor)
+            .field("modes", &self.modes)
+            .field("scroll_metrics", &self.scroll_metrics)
+            .finish()
+    }
+}
+
+impl fmt::Debug for v2::TerminalSemanticHistoryWindowFrame {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalSemanticHistoryWindowFrame")
             .field("attachment_id_present", &self.attachment_id.is_some())
             .field("outcome", &self.outcome)
             .field("disposition", &self.disposition)
             .field("anchor", &self.anchor)
             .field("target_offset_from_bottom", &self.target_offset_from_bottom)
             .field("first_row_from_live_top", &self.first_row_from_live_top)
-            .field("row_count", &self.ansi_rows.len())
-            .field(
-                "ansi_bytes",
-                &self.ansi_rows.iter().map(Vec::len).sum::<usize>(),
-            )
+            .field("row_count", &self.rows.len())
             .field("current_epoch", &self.current_epoch)
             .field("current_revision", &self.current_revision)
             .finish()
     }
 }
 
-impl fmt::Debug for v1::PairTicketV1 {
+impl fmt::Debug for v2::PairTicketV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PairTicketV1")
@@ -109,7 +154,7 @@ impl fmt::Debug for v1::PairTicketV1 {
     }
 }
 
-impl fmt::Debug for v1::PairBegin {
+impl fmt::Debug for v2::PairBegin {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PairBegin")
@@ -121,7 +166,7 @@ impl fmt::Debug for v1::PairBegin {
     }
 }
 
-impl fmt::Debug for v1::PairChallenge {
+impl fmt::Debug for v2::PairChallenge {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PairChallenge")
@@ -132,7 +177,7 @@ impl fmt::Debug for v1::PairChallenge {
     }
 }
 
-impl fmt::Debug for v1::PairProof {
+impl fmt::Debug for v2::PairProof {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PairProof")
@@ -141,7 +186,7 @@ impl fmt::Debug for v1::PairProof {
     }
 }
 
-impl fmt::Debug for v1::PairAccepted {
+impl fmt::Debug for v2::PairAccepted {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PairAccepted")
@@ -152,7 +197,7 @@ impl fmt::Debug for v1::PairAccepted {
     }
 }
 
-impl fmt::Debug for v1::LocalPairCreateResponse {
+impl fmt::Debug for v2::LocalPairCreateResponse {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("LocalPairCreateResponse")
@@ -161,7 +206,7 @@ impl fmt::Debug for v1::LocalPairCreateResponse {
     }
 }
 
-impl fmt::Debug for v1::LocalPairAcceptRequest {
+impl fmt::Debug for v2::LocalPairAcceptRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("LocalPairAcceptRequest")
@@ -173,7 +218,7 @@ impl fmt::Debug for v1::LocalPairAcceptRequest {
     }
 }
 
-impl fmt::Debug for v1::LocalSessionUnaryRequest {
+impl fmt::Debug for v2::LocalSessionUnaryRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("LocalSessionUnaryRequest")
@@ -184,7 +229,7 @@ impl fmt::Debug for v1::LocalSessionUnaryRequest {
     }
 }
 
-impl fmt::Debug for v1::LocalStatusResponse {
+impl fmt::Debug for v2::LocalStatusResponse {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("LocalStatusResponse")
@@ -218,7 +263,7 @@ impl fmt::Debug for v1::LocalStatusResponse {
     }
 }
 
-impl fmt::Debug for v1::LocalValidateSetupRequest {
+impl fmt::Debug for v2::LocalValidateSetupRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("LocalValidateSetupRequest")
@@ -230,7 +275,7 @@ impl fmt::Debug for v1::LocalValidateSetupRequest {
     }
 }
 
-impl fmt::Debug for v1::RelayRouteCacheV1 {
+impl fmt::Debug for v2::RelayRouteCacheV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RelayRouteCacheV1")
@@ -240,7 +285,7 @@ impl fmt::Debug for v1::RelayRouteCacheV1 {
     }
 }
 
-impl fmt::Debug for v1::SessionSummary {
+impl fmt::Debug for v2::SessionSummary {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SessionSummary")
@@ -255,7 +300,7 @@ impl fmt::Debug for v1::SessionSummary {
     }
 }
 
-impl fmt::Debug for v1::SessionCreateRequest {
+impl fmt::Debug for v2::SessionCreateRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SessionCreateRequest")
@@ -269,13 +314,13 @@ impl fmt::Debug for v1::SessionCreateRequest {
     }
 }
 
-impl fmt::Debug for v1::ResumeViewId {
+impl fmt::Debug for v2::ResumeViewId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("ResumeViewId([REDACTED])")
     }
 }
 
-impl fmt::Debug for v1::TerminalAttachRequest {
+impl fmt::Debug for v2::TerminalAttachRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("TerminalAttachRequest")
@@ -294,45 +339,7 @@ impl fmt::Debug for v1::TerminalAttachRequest {
     }
 }
 
-impl fmt::Debug for v1::TerminalSnapshot {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("TerminalSnapshot")
-            .field("session_id", &self.session_id)
-            .field("attachment_id", &self.attachment_id)
-            .field("revision", &self.revision)
-            .field("rows", &self.rows)
-            .field("columns", &self.columns)
-            .field("screen_ansi", &"[REDACTED]")
-            .field("screen_ansi_len", &self.screen_ansi.len())
-            .field("recent_history_ansi", &"[REDACTED]")
-            .field("recent_history_ansi_len", &self.recent_history_ansi.len())
-            .field("active_screen", &self.active_screen)
-            .field("modes", &self.modes)
-            .field("scroll_metrics", &self.scroll_metrics)
-            .finish()
-    }
-}
-
-impl fmt::Debug for v1::TerminalDelta {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("TerminalDelta")
-            .field("from_revision", &self.from_revision)
-            .field("to_revision", &self.to_revision)
-            .field("ansi", &"[REDACTED]")
-            .field("ansi_len", &self.ansi.len())
-            .field("rows", &self.rows)
-            .field("columns", &self.columns)
-            .field("active_screen", &self.active_screen)
-            .field("modes", &self.modes)
-            .field("attachment_id", &self.attachment_id)
-            .field("scroll_metrics", &self.scroll_metrics)
-            .finish()
-    }
-}
-
-impl fmt::Debug for v1::TerminalInput {
+impl fmt::Debug for v2::TerminalInput {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("TerminalInput")
@@ -344,7 +351,7 @@ impl fmt::Debug for v1::TerminalInput {
     }
 }
 
-/// Product wire major shared by local IPC, `zterm/1`, and `zterm-pair/1`.
+/// Product wire major shared by local IPC, `zterm/2`, and `zterm-pair/2`.
 pub const WIRE_MAJOR: u32 = zterm_core::WIRE_MAJOR;
 /// Current persistent-state schema exposed in readiness/status.
 pub const STATE_SCHEMA_VERSION: u32 = zterm_core::STATE_SCHEMA_VERSION;
@@ -354,7 +361,6 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_CONTROL_PAYLOAD_BYTES: usize = 1024 * 1024;
 /// Maximum bytes in an unsigned 64-bit varint prefix.
 pub const MAX_VARINT_BYTES: usize = 10;
-const TERMINAL_SNAPSHOT_FRAME_HEADROOM: usize = 4 * 1024;
 
 /// Stable validated wire message kind.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -440,10 +446,10 @@ pub enum WireKind {
     SessionOperationLeaseResponse = 208,
     /// Terminal attach request.
     TerminalAttachRequest = 300,
-    /// Terminal full snapshot.
-    TerminalSnapshot = 301,
-    /// Terminal merged delta.
-    TerminalDelta = 302,
+    /// Complete exact semantic terminal surface.
+    TerminalSemanticSnapshot = 301,
+    /// Merged exact semantic terminal row replacements.
+    TerminalSemanticDelta = 302,
     /// Terminal input.
     TerminalInput = 303,
     /// Terminal resize.
@@ -462,20 +468,12 @@ pub enum WireKind {
     TerminalSessionEnded = 310,
     /// Latest daemon-owned remote attachment transport state for one local view.
     TerminalTransportStateEvent = 311,
-    /// Requests one bounded daemon-authored history page.
-    TerminalHistoryRequest = 312,
-    /// Returns one correlated daemon-authored history page or stale outcome.
-    TerminalHistoryPage = 313,
     /// Same-UID-only selected connection path and RTT projection.
     TerminalConnectionStatusEvent = 314,
-    /// Applies one attachment-local semantic viewport action.
-    TerminalViewportRequest = 315,
-    /// Returns one complete attachment-local viewport outcome.
-    TerminalViewportFrame = 316,
     /// Requests one stateless bounded contiguous history window.
     TerminalHistoryWindowRequest = 317,
-    /// Returns one correlated history-window outcome.
-    TerminalHistoryWindowFrame = 318,
+    /// Correlated semantic-cell history-window outcome.
+    TerminalSemanticHistoryWindowFrame = 318,
 }
 
 impl WireKind {
@@ -484,11 +482,9 @@ impl WireKind {
     pub const fn is_control(self) -> bool {
         !matches!(
             self,
-            Self::TerminalSnapshot
-                | Self::TerminalDelta
-                | Self::TerminalHistoryPage
-                | Self::TerminalViewportFrame
-                | Self::TerminalHistoryWindowFrame
+            Self::TerminalSemanticSnapshot
+                | Self::TerminalSemanticDelta
+                | Self::TerminalSemanticHistoryWindowFrame
         )
     }
 
@@ -562,8 +558,8 @@ impl TryFrom<u32> for WireKind {
             207 => Self::SessionOperationLeaseRequest,
             208 => Self::SessionOperationLeaseResponse,
             300 => Self::TerminalAttachRequest,
-            301 => Self::TerminalSnapshot,
-            302 => Self::TerminalDelta,
+            301 => Self::TerminalSemanticSnapshot,
+            302 => Self::TerminalSemanticDelta,
             303 => Self::TerminalInput,
             304 => Self::TerminalResize,
             305 => Self::TerminalDetach,
@@ -573,13 +569,9 @@ impl TryFrom<u32> for WireKind {
             309 => Self::TerminalLeaseLost,
             310 => Self::TerminalSessionEnded,
             311 => Self::TerminalTransportStateEvent,
-            312 => Self::TerminalHistoryRequest,
-            313 => Self::TerminalHistoryPage,
             314 => Self::TerminalConnectionStatusEvent,
-            315 => Self::TerminalViewportRequest,
-            316 => Self::TerminalViewportFrame,
             317 => Self::TerminalHistoryWindowRequest,
-            318 => Self::TerminalHistoryWindowFrame,
+            318 => Self::TerminalSemanticHistoryWindowFrame,
             unknown => return Err(ProtocolError::UnknownKind(unknown)),
         };
         Ok(kind)
@@ -666,6 +658,10 @@ pub enum ProtocolError {
         /// Wire column count.
         columns: u32,
     },
+    /// A semantic surface violated its content-free structural contract.
+    InvalidTerminalSurface(TerminalSurfaceError),
+    /// A terminal enum or required semantic field used an unsupported value.
+    InvalidTerminalSemanticField(&'static str),
 }
 
 impl fmt::Display for ProtocolError {
@@ -697,6 +693,10 @@ impl fmt::Display for ProtocolError {
             Self::InvalidIdentifier(error) => error.fmt(formatter),
             Self::InvalidTerminalSize { rows, columns } => {
                 write!(formatter, "invalid terminal viewport {columns}x{rows}")
+            }
+            Self::InvalidTerminalSurface(error) => error.fmt(formatter),
+            Self::InvalidTerminalSemanticField(field) => {
+                write!(formatter, "invalid semantic terminal field {field}")
             }
         }
     }
@@ -844,7 +844,7 @@ pub fn encode_payload(
     payload: Vec<u8>,
 ) -> Result<Vec<u8>, ProtocolError> {
     validate_payload_limit(kind, payload.len())?;
-    let wire = v1::WireFrame {
+    let wire = v2::WireFrame {
         wire_major: WIRE_MAJOR,
         kind: kind as u32,
         payload,
@@ -862,7 +862,7 @@ pub fn encode_payload(
 }
 
 fn decode_wire_frame(body: &[u8]) -> Result<DecodedFrame, ProtocolError> {
-    let wire = v1::WireFrame::decode(body).map_err(ProtocolError::MalformedProtobuf)?;
+    let wire = v2::WireFrame::decode(body).map_err(ProtocolError::MalformedProtobuf)?;
     if wire.wire_major != WIRE_MAJOR {
         return Err(ProtocolError::WireMajorMismatch {
             expected: WIRE_MAJOR,
@@ -917,7 +917,7 @@ fn decode_varint(bytes: &[u8]) -> Result<u64, ProtocolError> {
     Err(ProtocolError::MalformedVarint)
 }
 
-impl From<DeviceId> for v1::DeviceId {
+impl From<DeviceId> for v2::DeviceId {
     fn from(value: DeviceId) -> Self {
         Self {
             value: value.to_bytes().to_vec(),
@@ -925,15 +925,15 @@ impl From<DeviceId> for v1::DeviceId {
     }
 }
 
-impl TryFrom<v1::DeviceId> for DeviceId {
+impl TryFrom<v2::DeviceId> for DeviceId {
     type Error = ProtocolError;
 
-    fn try_from(value: v1::DeviceId) -> Result<Self, Self::Error> {
+    fn try_from(value: v2::DeviceId) -> Result<Self, Self::Error> {
         Self::from_bytes(&value.value).map_err(ProtocolError::InvalidIdentifier)
     }
 }
 
-impl From<SessionId> for v1::SessionId {
+impl From<SessionId> for v2::SessionId {
     fn from(value: SessionId) -> Self {
         Self {
             value: value.to_bytes().to_vec(),
@@ -941,15 +941,15 @@ impl From<SessionId> for v1::SessionId {
     }
 }
 
-impl TryFrom<v1::SessionId> for SessionId {
+impl TryFrom<v2::SessionId> for SessionId {
     type Error = ProtocolError;
 
-    fn try_from(value: v1::SessionId) -> Result<Self, Self::Error> {
+    fn try_from(value: v2::SessionId) -> Result<Self, Self::Error> {
         Self::from_bytes(&value.value).map_err(ProtocolError::InvalidIdentifier)
     }
 }
 
-impl From<AttachmentId> for v1::AttachmentId {
+impl From<AttachmentId> for v2::AttachmentId {
     fn from(value: AttachmentId) -> Self {
         Self {
             value: value.to_bytes().to_vec(),
@@ -957,15 +957,15 @@ impl From<AttachmentId> for v1::AttachmentId {
     }
 }
 
-impl TryFrom<v1::AttachmentId> for AttachmentId {
+impl TryFrom<v2::AttachmentId> for AttachmentId {
     type Error = ProtocolError;
 
-    fn try_from(value: v1::AttachmentId) -> Result<Self, Self::Error> {
+    fn try_from(value: v2::AttachmentId) -> Result<Self, Self::Error> {
         Self::from_bytes(&value.value).map_err(ProtocolError::InvalidIdentifier)
     }
 }
 
-impl From<ResumeViewId> for v1::ResumeViewId {
+impl From<ResumeViewId> for v2::ResumeViewId {
     fn from(value: ResumeViewId) -> Self {
         Self {
             value: value.to_bytes().to_vec(),
@@ -973,15 +973,15 @@ impl From<ResumeViewId> for v1::ResumeViewId {
     }
 }
 
-impl TryFrom<v1::ResumeViewId> for ResumeViewId {
+impl TryFrom<v2::ResumeViewId> for ResumeViewId {
     type Error = ProtocolError;
 
-    fn try_from(value: v1::ResumeViewId) -> Result<Self, Self::Error> {
+    fn try_from(value: v2::ResumeViewId) -> Result<Self, Self::Error> {
         Self::from_bytes(&value.value).map_err(ProtocolError::InvalidIdentifier)
     }
 }
 
-impl From<OperationId> for v1::OperationId {
+impl From<OperationId> for v2::OperationId {
     fn from(value: OperationId) -> Self {
         Self {
             lease_ordinal: value.lease.ordinal,
@@ -991,10 +991,10 @@ impl From<OperationId> for v1::OperationId {
     }
 }
 
-impl TryFrom<v1::OperationId> for OperationId {
+impl TryFrom<v2::OperationId> for OperationId {
     type Error = ProtocolError;
 
-    fn try_from(value: v1::OperationId) -> Result<Self, Self::Error> {
+    fn try_from(value: v2::OperationId) -> Result<Self, Self::Error> {
         Ok(Self {
             lease: OperationLease {
                 daemon_incarnation: DaemonIncarnation::from_bytes(&value.daemon_incarnation)
@@ -1006,7 +1006,7 @@ impl TryFrom<v1::OperationId> for OperationId {
     }
 }
 
-impl From<OperationLease> for v1::OperationLease {
+impl From<OperationLease> for v2::OperationLease {
     fn from(value: OperationLease) -> Self {
         Self {
             daemon_incarnation: value.daemon_incarnation.to_bytes().to_vec(),
@@ -1015,10 +1015,10 @@ impl From<OperationLease> for v1::OperationLease {
     }
 }
 
-impl TryFrom<v1::OperationLease> for OperationLease {
+impl TryFrom<v2::OperationLease> for OperationLease {
     type Error = ProtocolError;
 
-    fn try_from(value: v1::OperationLease) -> Result<Self, Self::Error> {
+    fn try_from(value: v2::OperationLease) -> Result<Self, Self::Error> {
         Ok(Self {
             daemon_incarnation: DaemonIncarnation::from_bytes(&value.daemon_incarnation)
                 .map_err(ProtocolError::InvalidIdentifier)?,
@@ -1027,7 +1027,7 @@ impl TryFrom<v1::OperationLease> for OperationLease {
     }
 }
 
-impl From<TerminalSize> for v1::TerminalViewport {
+impl From<TerminalSize> for v2::TerminalViewport {
     fn from(value: TerminalSize) -> Self {
         Self {
             rows: u32::from(value.rows),
@@ -1036,10 +1036,10 @@ impl From<TerminalSize> for v1::TerminalViewport {
     }
 }
 
-impl TryFrom<v1::TerminalViewport> for TerminalSize {
+impl TryFrom<v2::TerminalViewport> for TerminalSize {
     type Error = ProtocolError;
 
-    fn try_from(value: v1::TerminalViewport) -> Result<Self, Self::Error> {
+    fn try_from(value: v2::TerminalViewport) -> Result<Self, Self::Error> {
         let rows = u16::try_from(value.rows).map_err(|_| ProtocolError::InvalidTerminalSize {
             rows: value.rows,
             columns: value.columns,
@@ -1059,7 +1059,7 @@ impl TryFrom<v1::TerminalViewport> for TerminalSize {
     }
 }
 
-impl From<ActiveScreen> for v1::TerminalActiveScreen {
+impl From<ActiveScreen> for v2::TerminalActiveScreen {
     fn from(value: ActiveScreen) -> Self {
         match value {
             ActiveScreen::Main => Self::Main,
@@ -1068,7 +1068,7 @@ impl From<ActiveScreen> for v1::TerminalActiveScreen {
     }
 }
 
-impl From<TerminalModes> for v1::TerminalModes {
+impl From<TerminalModes> for v2::TerminalModes {
     fn from(value: TerminalModes) -> Self {
         Self {
             application_keypad: value.application_keypad,
@@ -1092,20 +1092,198 @@ impl From<TerminalModes> for v1::TerminalModes {
     }
 }
 
-impl From<TerminalHistoryCursor> for v1::TerminalHistoryCursor {
-    fn from(value: TerminalHistoryCursor) -> Self {
-        Self {
-            epoch: value.epoch.get(),
-            revision: value.revision.get(),
-            start_row: value.start_row,
-            row_count: value.row_count,
-            oldest_row: value.oldest_row,
-            newest_row: value.newest_row,
+impl TryFrom<v2::TerminalModes> for TerminalModes {
+    type Error = ProtocolError;
+
+    fn try_from(value: v2::TerminalModes) -> Result<Self, Self::Error> {
+        let mouse_mode = match value.mouse_mode {
+            0 => TerminalMouseMode::None,
+            1 => TerminalMouseMode::Press,
+            2 => TerminalMouseMode::PressRelease,
+            3 => TerminalMouseMode::ButtonMotion,
+            4 => TerminalMouseMode::AnyMotion,
+            _ => return Err(ProtocolError::InvalidTerminalSemanticField("mouse_mode")),
+        };
+        let mouse_encoding = match value.mouse_encoding {
+            0 => TerminalMouseEncoding::Default,
+            1 => TerminalMouseEncoding::Utf8,
+            2 => TerminalMouseEncoding::Sgr,
+            _ => {
+                return Err(ProtocolError::InvalidTerminalSemanticField(
+                    "mouse_encoding",
+                ));
+            }
+        };
+        Ok(Self {
+            application_keypad: value.application_keypad,
+            application_cursor: value.application_cursor,
+            bracketed_paste: value.bracketed_paste,
+            focus_reporting: value.focus_reporting,
+            alternate_scroll: value.alternate_scroll,
+            mouse_mode,
+            mouse_encoding,
+        })
+    }
+}
+
+impl From<TerminalColor> for v2::TerminalColor {
+    fn from(value: TerminalColor) -> Self {
+        use v2::terminal_color::Value;
+        let value = match value {
+            TerminalColor::Default => Value::DefaultColor(true),
+            TerminalColor::Indexed(index) => Value::Indexed(u32::from(index)),
+            TerminalColor::Rgb(red, green, blue) => Value::Rgb(v2::TerminalRgbColor {
+                red: u32::from(red),
+                green: u32::from(green),
+                blue: u32::from(blue),
+            }),
+        };
+        Self { value: Some(value) }
+    }
+}
+
+impl TryFrom<v2::TerminalColor> for TerminalColor {
+    type Error = ProtocolError;
+
+    fn try_from(value: v2::TerminalColor) -> Result<Self, Self::Error> {
+        use v2::terminal_color::Value;
+        match value.value {
+            Some(Value::DefaultColor(true)) => Ok(Self::Default),
+            Some(Value::DefaultColor(false)) | None => Err(
+                ProtocolError::InvalidTerminalSemanticField("terminal_color"),
+            ),
+            Some(Value::Indexed(index)) => u8::try_from(index)
+                .map(Self::Indexed)
+                .map_err(|_| ProtocolError::InvalidTerminalSemanticField("indexed_color")),
+            Some(Value::Rgb(rgb)) => Ok(Self::Rgb(
+                u8::try_from(rgb.red)
+                    .map_err(|_| ProtocolError::InvalidTerminalSemanticField("rgb_red"))?,
+                u8::try_from(rgb.green)
+                    .map_err(|_| ProtocolError::InvalidTerminalSemanticField("rgb_green"))?,
+                u8::try_from(rgb.blue)
+                    .map_err(|_| ProtocolError::InvalidTerminalSemanticField("rgb_blue"))?,
+            )),
         }
     }
 }
 
-impl From<TerminalScrollMetrics> for v1::TerminalScrollMetrics {
+impl From<TerminalStyle> for v2::TerminalStyle {
+    fn from(value: TerminalStyle) -> Self {
+        Self {
+            foreground: Some(value.foreground.into()),
+            background: Some(value.background.into()),
+            bold: value.bold,
+            dim: value.dim,
+            italic: value.italic,
+            underline: value.underline,
+            inverse: value.inverse,
+        }
+    }
+}
+
+impl TryFrom<v2::TerminalStyle> for TerminalStyle {
+    type Error = ProtocolError;
+
+    fn try_from(value: v2::TerminalStyle) -> Result<Self, Self::Error> {
+        Ok(Self {
+            foreground: value
+                .foreground
+                .ok_or(ProtocolError::InvalidTerminalSemanticField("foreground"))?
+                .try_into()?,
+            background: value
+                .background
+                .ok_or(ProtocolError::InvalidTerminalSemanticField("background"))?
+                .try_into()?,
+            bold: value.bold,
+            dim: value.dim,
+            italic: value.italic,
+            underline: value.underline,
+            inverse: value.inverse,
+        })
+    }
+}
+
+impl From<TerminalCell> for v2::TerminalCell {
+    fn from(value: TerminalCell) -> Self {
+        Self {
+            contents: value.contents,
+            wide: value.wide,
+            wide_continuation: value.wide_continuation,
+            style: Some(value.style.into()),
+        }
+    }
+}
+
+impl TryFrom<v2::TerminalCell> for TerminalCell {
+    type Error = ProtocolError;
+
+    fn try_from(value: v2::TerminalCell) -> Result<Self, Self::Error> {
+        Ok(Self {
+            contents: value.contents,
+            wide: value.wide,
+            wide_continuation: value.wide_continuation,
+            style: value
+                .style
+                .ok_or(ProtocolError::InvalidTerminalSemanticField("cell_style"))?
+                .try_into()?,
+        })
+    }
+}
+
+impl From<TerminalSurfaceRow> for v2::TerminalSurfaceRow {
+    fn from(value: TerminalSurfaceRow) -> Self {
+        Self {
+            cells: value.cells.into_iter().map(Into::into).collect(),
+            wrapped: value.wrapped,
+        }
+    }
+}
+
+impl TryFrom<v2::TerminalSurfaceRow> for TerminalSurfaceRow {
+    type Error = ProtocolError;
+
+    fn try_from(value: v2::TerminalSurfaceRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            cells: value
+                .cells
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+            wrapped: value.wrapped,
+        })
+    }
+}
+
+impl From<TerminalCursor> for v2::TerminalCursor {
+    fn from(value: TerminalCursor) -> Self {
+        Self {
+            row: u32::from(value.row),
+            column: u32::from(value.column),
+            visible: value.visible,
+            style: Some(value.style.into()),
+        }
+    }
+}
+
+impl TryFrom<v2::TerminalCursor> for TerminalCursor {
+    type Error = ProtocolError;
+
+    fn try_from(value: v2::TerminalCursor) -> Result<Self, Self::Error> {
+        Ok(Self {
+            row: u16::try_from(value.row)
+                .map_err(|_| ProtocolError::InvalidTerminalSemanticField("cursor_row"))?,
+            column: u16::try_from(value.column)
+                .map_err(|_| ProtocolError::InvalidTerminalSemanticField("cursor_column"))?,
+            visible: value.visible,
+            style: value
+                .style
+                .ok_or(ProtocolError::InvalidTerminalSemanticField("cursor_style"))?
+                .try_into()?,
+        })
+    }
+}
+
+impl From<TerminalScrollMetrics> for v2::TerminalScrollMetrics {
     fn from(value: TerminalScrollMetrics) -> Self {
         Self {
             epoch: value.epoch.get(),
@@ -1117,7 +1295,7 @@ impl From<TerminalScrollMetrics> for v1::TerminalScrollMetrics {
     }
 }
 
-impl From<TerminalHistoryWindowAnchor> for v1::TerminalHistoryWindowAnchor {
+impl From<TerminalHistoryWindowAnchor> for v2::TerminalHistoryWindowAnchor {
     fn from(value: TerminalHistoryWindowAnchor) -> Self {
         Self {
             epoch: value.epoch.get(),
@@ -1129,148 +1307,248 @@ impl From<TerminalHistoryWindowAnchor> for v1::TerminalHistoryWindowAnchor {
     }
 }
 
-/// Projects one bounded history result into a content-redacted wire message.
-#[must_use]
-pub fn terminal_history_page_message(
-    attachment_id: AttachmentId,
-    result: TerminalHistoryResult,
-) -> v1::TerminalHistoryPage {
-    match result {
-        TerminalHistoryResult::Page(TerminalHistoryPage { cursor, rows }) => {
-            v1::TerminalHistoryPage {
-                attachment_id: Some(attachment_id.into()),
-                outcome: v1::TerminalHistoryOutcome::Ok as i32,
-                cursor: Some(cursor.into()),
-                rows,
-                current_epoch: cursor.epoch.get(),
-                current_revision: cursor.revision.get(),
-            }
+fn terminal_active_screen(value: i32) -> Result<ActiveScreen, ProtocolError> {
+    match v2::TerminalActiveScreen::try_from(value).ok() {
+        Some(v2::TerminalActiveScreen::Main) => Ok(ActiveScreen::Main),
+        Some(v2::TerminalActiveScreen::Alternate) => Ok(ActiveScreen::Alternate),
+        Some(v2::TerminalActiveScreen::Unspecified) | None => {
+            Err(ProtocolError::InvalidTerminalSemanticField("active_screen"))
         }
-        TerminalHistoryResult::HistoryChanged { epoch, revision } => v1::TerminalHistoryPage {
-            attachment_id: Some(attachment_id.into()),
-            outcome: v1::TerminalHistoryOutcome::Changed as i32,
-            cursor: None,
-            rows: Vec::new(),
-            current_epoch: epoch.get(),
-            current_revision: revision.get(),
-        },
-        TerminalHistoryResult::HistoryGap { epoch, revision } => v1::TerminalHistoryPage {
-            attachment_id: Some(attachment_id.into()),
-            outcome: v1::TerminalHistoryOutcome::Gap as i32,
-            cursor: None,
-            rows: Vec::new(),
-            current_epoch: epoch.get(),
-            current_revision: revision.get(),
-        },
     }
 }
 
-/// Projects one attachment-local semantic viewport result into a wire message.
-#[must_use]
-pub fn terminal_viewport_frame_message(
-    attachment_id: AttachmentId,
-    result: TerminalViewportResult,
-) -> v1::TerminalViewportFrame {
-    match result {
-        TerminalViewportResult::Frame(TerminalViewportFrame {
-            disposition,
-            metrics,
-            rows,
-        }) => v1::TerminalViewportFrame {
-            attachment_id: Some(attachment_id.into()),
-            outcome: v1::TerminalViewportOutcome::Frame as i32,
-            disposition: match disposition {
-                TerminalViewportDisposition::Exact => v1::TerminalViewportDisposition::Exact as i32,
-                TerminalViewportDisposition::Rebased => {
-                    v1::TerminalViewportDisposition::Rebased as i32
-                }
-            },
-            metrics: Some(metrics.into()),
-            rows,
-            current_epoch: metrics.epoch.get(),
-            current_revision: metrics.revision.get(),
-        },
-        TerminalViewportResult::Live(metrics) => v1::TerminalViewportFrame {
-            attachment_id: Some(attachment_id.into()),
-            outcome: v1::TerminalViewportOutcome::Live as i32,
-            disposition: v1::TerminalViewportDisposition::Unspecified as i32,
-            metrics: Some(metrics.into()),
-            rows: Vec::new(),
-            current_epoch: metrics.epoch.get(),
-            current_revision: metrics.revision.get(),
-        },
-        TerminalViewportResult::HistoryChanged { epoch, revision } => v1::TerminalViewportFrame {
-            attachment_id: Some(attachment_id.into()),
-            outcome: v1::TerminalViewportOutcome::Changed as i32,
-            disposition: v1::TerminalViewportDisposition::Unspecified as i32,
-            metrics: None,
-            rows: Vec::new(),
-            current_epoch: epoch.get(),
-            current_revision: revision.get(),
-        },
-        TerminalViewportResult::HistoryGap { epoch, revision } => v1::TerminalViewportFrame {
-            attachment_id: Some(attachment_id.into()),
-            outcome: v1::TerminalViewportOutcome::Gap as i32,
-            disposition: v1::TerminalViewportDisposition::Unspecified as i32,
-            metrics: None,
-            rows: Vec::new(),
-            current_epoch: epoch.get(),
-            current_revision: revision.get(),
-        },
+fn terminal_scroll_metrics(
+    value: v2::TerminalScrollMetrics,
+) -> Result<TerminalScrollMetrics, ProtocolError> {
+    Ok(TerminalScrollMetrics {
+        epoch: zterm_core::Revision::new(value.epoch),
+        revision: zterm_core::Revision::new(value.revision),
+        offset_from_bottom: value.offset_from_bottom,
+        max_offset_from_bottom: value.max_offset_from_bottom,
+        viewport_rows: u16::try_from(value.viewport_rows).map_err(|_| {
+            ProtocolError::InvalidTerminalSemanticField("scroll_metrics_viewport_rows")
+        })?,
+    })
+}
+
+fn terminal_surface_message(surface: TerminalSurface) -> v2::TerminalSurface {
+    v2::TerminalSurface {
+        row_count: u32::from(surface.size.rows),
+        column_count: u32::from(surface.size.columns),
+        active_screen: v2::TerminalActiveScreen::from(surface.active_screen) as i32,
+        rows: surface.rows.into_iter().map(Into::into).collect(),
+        cursor: Some(surface.cursor.into()),
+        modes: Some(surface.modes.into()),
+        scroll_metrics: surface.scroll_metrics.map(Into::into),
     }
 }
 
-/// Projects one stateless history-window result into a content-redacted wire message.
+fn terminal_surface_from_message(
+    value: v2::TerminalSurface,
+    revision: zterm_core::Revision,
+) -> Result<TerminalSurface, ProtocolError> {
+    let size = TerminalSize::try_from(v2::TerminalViewport {
+        rows: value.row_count,
+        columns: value.column_count,
+    })?;
+    let surface = TerminalSurface {
+        size,
+        active_screen: terminal_active_screen(value.active_screen)?,
+        rows: value
+            .rows
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<_, _>>()?,
+        cursor: value
+            .cursor
+            .ok_or(ProtocolError::InvalidTerminalSemanticField("cursor"))?
+            .try_into()?,
+        modes: value
+            .modes
+            .ok_or(ProtocolError::InvalidTerminalSemanticField("modes"))?
+            .try_into()?,
+        scroll_metrics: value
+            .scroll_metrics
+            .map(terminal_scroll_metrics)
+            .transpose()?,
+    };
+    surface
+        .validate(revision)
+        .map_err(ProtocolError::InvalidTerminalSurface)?;
+    Ok(surface)
+}
+
+/// Projects one exact semantic snapshot into its content-redacted wire message.
 #[must_use]
-pub fn terminal_history_window_frame_message(
+pub fn terminal_surface_snapshot_message(
+    session_id: SessionId,
     attachment_id: AttachmentId,
-    result: TerminalHistoryWindowResult,
-) -> v1::TerminalHistoryWindowFrame {
+    snapshot: TerminalSurfaceSnapshot,
+) -> v2::TerminalSemanticSnapshot {
+    v2::TerminalSemanticSnapshot {
+        session_id: Some(session_id.into()),
+        attachment_id: Some(attachment_id.into()),
+        revision: snapshot.revision.get(),
+        surface: Some(terminal_surface_message(snapshot.surface)),
+    }
+}
+
+/// Validates and converts one exact semantic snapshot wire message.
+pub fn terminal_surface_snapshot_from_message(
+    value: v2::TerminalSemanticSnapshot,
+) -> Result<(SessionId, AttachmentId, TerminalSurfaceSnapshot), ProtocolError> {
+    let session_id = value
+        .session_id
+        .ok_or(ProtocolError::InvalidTerminalSemanticField("session_id"))?
+        .try_into()?;
+    let attachment_id = value
+        .attachment_id
+        .ok_or(ProtocolError::InvalidTerminalSemanticField("attachment_id"))?
+        .try_into()?;
+    let revision = zterm_core::Revision::new(value.revision);
+    let surface = terminal_surface_from_message(
+        value
+            .surface
+            .ok_or(ProtocolError::InvalidTerminalSemanticField("surface"))?,
+        revision,
+    )?;
+    Ok((
+        session_id,
+        attachment_id,
+        TerminalSurfaceSnapshot { revision, surface },
+    ))
+}
+
+/// Projects one exact semantic delta into its content-redacted wire message.
+#[must_use]
+pub fn terminal_surface_delta_message(
+    attachment_id: AttachmentId,
+    delta: TerminalSurfaceDelta,
+) -> v2::TerminalSemanticDelta {
+    v2::TerminalSemanticDelta {
+        attachment_id: Some(attachment_id.into()),
+        from_revision: delta.from_revision.get(),
+        to_revision: delta.to_revision.get(),
+        row_count: u32::from(delta.size.rows),
+        column_count: u32::from(delta.size.columns),
+        active_screen: v2::TerminalActiveScreen::from(delta.active_screen) as i32,
+        row_patches: delta
+            .row_patches
+            .into_iter()
+            .map(|patch| v2::TerminalSemanticRowPatch {
+                row: u32::from(patch.row),
+                replacement: Some(patch.replacement.into()),
+            })
+            .collect(),
+        cursor: Some(delta.cursor.into()),
+        modes: Some(delta.modes.into()),
+        scroll_metrics: delta.scroll_metrics.map(Into::into),
+    }
+}
+
+/// Validates and converts one exact semantic delta wire message.
+pub fn terminal_surface_delta_from_message(
+    value: v2::TerminalSemanticDelta,
+) -> Result<(AttachmentId, TerminalSurfaceDelta), ProtocolError> {
+    let attachment_id = value
+        .attachment_id
+        .ok_or(ProtocolError::InvalidTerminalSemanticField("attachment_id"))?
+        .try_into()?;
+    let delta = TerminalSurfaceDelta {
+        from_revision: zterm_core::Revision::new(value.from_revision),
+        to_revision: zterm_core::Revision::new(value.to_revision),
+        size: TerminalSize::try_from(v2::TerminalViewport {
+            rows: value.row_count,
+            columns: value.column_count,
+        })?,
+        active_screen: terminal_active_screen(value.active_screen)?,
+        row_patches: value
+            .row_patches
+            .into_iter()
+            .map(|patch| {
+                Ok(TerminalSurfaceRowPatch {
+                    row: u16::try_from(patch.row).map_err(|_| {
+                        ProtocolError::InvalidTerminalSemanticField("row_patch_index")
+                    })?,
+                    replacement: patch
+                        .replacement
+                        .ok_or(ProtocolError::InvalidTerminalSemanticField(
+                            "row_patch_replacement",
+                        ))?
+                        .try_into()?,
+                })
+            })
+            .collect::<Result<_, ProtocolError>>()?,
+        cursor: value
+            .cursor
+            .ok_or(ProtocolError::InvalidTerminalSemanticField("cursor"))?
+            .try_into()?,
+        modes: value
+            .modes
+            .ok_or(ProtocolError::InvalidTerminalSemanticField("modes"))?
+            .try_into()?,
+        scroll_metrics: value
+            .scroll_metrics
+            .map(terminal_scroll_metrics)
+            .transpose()?,
+    };
+    delta
+        .validate()
+        .map_err(ProtocolError::InvalidTerminalSurface)?;
+    Ok((attachment_id, delta))
+}
+
+/// Projects one semantic history-window result into a content-redacted wire message.
+#[must_use]
+pub fn terminal_surface_history_window_frame_message(
+    attachment_id: AttachmentId,
+    result: TerminalSurfaceHistoryWindowResult,
+) -> v2::TerminalSemanticHistoryWindowFrame {
     match result {
-        TerminalHistoryWindowResult::Frame(TerminalHistoryWindowFrame {
+        TerminalSurfaceHistoryWindowResult::Frame(TerminalSurfaceHistoryWindowFrame {
             disposition,
             anchor,
             target_offset_from_bottom,
             first_row_from_live_top,
-            ansi_rows,
-        }) => v1::TerminalHistoryWindowFrame {
+            rows,
+        }) => v2::TerminalSemanticHistoryWindowFrame {
             attachment_id: Some(attachment_id.into()),
-            outcome: v1::TerminalHistoryWindowOutcome::Frame as i32,
+            outcome: v2::TerminalHistoryWindowOutcome::Frame as i32,
             disposition: match disposition {
-                TerminalViewportDisposition::Exact => v1::TerminalViewportDisposition::Exact as i32,
+                TerminalViewportDisposition::Exact => v2::TerminalViewportDisposition::Exact as i32,
                 TerminalViewportDisposition::Rebased => {
-                    v1::TerminalViewportDisposition::Rebased as i32
+                    v2::TerminalViewportDisposition::Rebased as i32
                 }
             },
             anchor: Some(anchor.into()),
             target_offset_from_bottom,
             first_row_from_live_top,
-            ansi_rows,
+            rows: rows.into_iter().map(Into::into).collect(),
             current_epoch: anchor.epoch.get(),
             current_revision: anchor.revision.get(),
         },
-        TerminalHistoryWindowResult::HistoryChanged { epoch, revision } => {
-            v1::TerminalHistoryWindowFrame {
+        TerminalSurfaceHistoryWindowResult::HistoryChanged { epoch, revision } => {
+            v2::TerminalSemanticHistoryWindowFrame {
                 attachment_id: Some(attachment_id.into()),
-                outcome: v1::TerminalHistoryWindowOutcome::Changed as i32,
-                disposition: v1::TerminalViewportDisposition::Unspecified as i32,
+                outcome: v2::TerminalHistoryWindowOutcome::Changed as i32,
+                disposition: v2::TerminalViewportDisposition::Unspecified as i32,
                 anchor: None,
                 target_offset_from_bottom: 0,
                 first_row_from_live_top: 0,
-                ansi_rows: Vec::new(),
+                rows: Vec::new(),
                 current_epoch: epoch.get(),
                 current_revision: revision.get(),
             }
         }
-        TerminalHistoryWindowResult::HistoryGap { epoch, revision } => {
-            v1::TerminalHistoryWindowFrame {
+        TerminalSurfaceHistoryWindowResult::HistoryGap { epoch, revision } => {
+            v2::TerminalSemanticHistoryWindowFrame {
                 attachment_id: Some(attachment_id.into()),
-                outcome: v1::TerminalHistoryWindowOutcome::Gap as i32,
-                disposition: v1::TerminalViewportDisposition::Unspecified as i32,
+                outcome: v2::TerminalHistoryWindowOutcome::Gap as i32,
+                disposition: v2::TerminalViewportDisposition::Unspecified as i32,
                 anchor: None,
                 target_offset_from_bottom: 0,
                 first_row_from_live_top: 0,
-                ansi_rows: Vec::new(),
+                rows: Vec::new(),
                 current_epoch: epoch.get(),
                 current_revision: revision.get(),
             }
@@ -1278,45 +1556,106 @@ pub fn terminal_history_window_frame_message(
     }
 }
 
-/// Projects one host snapshot into its wire message without reparsing ANSI.
-#[must_use]
-pub fn terminal_snapshot_message(
-    session_id: SessionId,
-    attachment_id: AttachmentId,
-    mut snapshot: TerminalSnapshot,
-) -> v1::TerminalSnapshot {
-    let _ = snapshot.limit_ansi_payload(MAX_FRAME_BYTES - TERMINAL_SNAPSHOT_FRAME_HEADROOM);
-    v1::TerminalSnapshot {
-        session_id: Some(session_id.into()),
-        attachment_id: Some(attachment_id.into()),
-        revision: snapshot.revision.get(),
-        rows: u32::from(snapshot.size.rows),
-        columns: u32::from(snapshot.size.columns),
-        screen_ansi: snapshot.screen_ansi,
-        recent_history_ansi: snapshot.recent_history_ansi,
-        active_screen: v1::TerminalActiveScreen::from(snapshot.active_screen) as i32,
-        modes: Some(snapshot.modes.into()),
-        scroll_metrics: snapshot.scroll_metrics.map(Into::into),
-    }
-}
-
-/// Projects one merged host delta into its wire message.
-#[must_use]
-pub fn terminal_delta_message(
-    attachment_id: AttachmentId,
-    delta: TerminalDelta,
-) -> v1::TerminalDelta {
-    v1::TerminalDelta {
-        from_revision: delta.from_revision.get(),
-        to_revision: delta.to_revision.get(),
-        ansi: delta.ansi,
-        rows: u32::from(delta.size.rows),
-        columns: u32::from(delta.size.columns),
-        active_screen: v1::TerminalActiveScreen::from(delta.active_screen) as i32,
-        modes: Some(delta.modes.into()),
-        attachment_id: Some(attachment_id.into()),
-        scroll_metrics: delta.scroll_metrics.map(Into::into),
-    }
+/// Validates and converts one request-bound semantic history-window response.
+pub fn terminal_surface_history_window_from_message(
+    value: v2::TerminalSemanticHistoryWindowFrame,
+    query: TerminalHistoryWindowQuery,
+) -> Result<(AttachmentId, TerminalSurfaceHistoryWindowResult), ProtocolError> {
+    let attachment_id = value
+        .attachment_id
+        .ok_or(ProtocolError::InvalidTerminalSemanticField("attachment_id"))?
+        .try_into()?;
+    let outcome = v2::TerminalHistoryWindowOutcome::try_from(value.outcome)
+        .map_err(|_| ProtocolError::InvalidTerminalSemanticField("history_window_outcome"))?;
+    let result = match outcome {
+        v2::TerminalHistoryWindowOutcome::Frame => {
+            let disposition = match v2::TerminalViewportDisposition::try_from(value.disposition)
+                .ok()
+            {
+                Some(v2::TerminalViewportDisposition::Exact) => TerminalViewportDisposition::Exact,
+                Some(v2::TerminalViewportDisposition::Rebased) => {
+                    TerminalViewportDisposition::Rebased
+                }
+                _ => {
+                    return Err(ProtocolError::InvalidTerminalSemanticField(
+                        "history_window_disposition",
+                    ));
+                }
+            };
+            let anchor = value
+                .anchor
+                .ok_or(ProtocolError::InvalidTerminalSemanticField(
+                    "history_window_anchor",
+                ))?;
+            let anchor = TerminalHistoryWindowAnchor {
+                epoch: zterm_core::Revision::new(anchor.epoch),
+                revision: zterm_core::Revision::new(anchor.revision),
+                max_offset_from_bottom: anchor.max_offset_from_bottom,
+                viewport: TerminalSize::try_from(v2::TerminalViewport {
+                    rows: anchor.viewport_rows,
+                    columns: anchor.viewport_columns,
+                })?,
+            };
+            if value.current_epoch != anchor.epoch.get()
+                || value.current_revision != anchor.revision.get()
+            {
+                return Err(ProtocolError::InvalidTerminalSemanticField(
+                    "history_window_current_revision",
+                ));
+            }
+            let frame = TerminalSurfaceHistoryWindowFrame {
+                disposition,
+                anchor,
+                target_offset_from_bottom: value.target_offset_from_bottom,
+                first_row_from_live_top: value.first_row_from_live_top,
+                rows: value
+                    .rows
+                    .into_iter()
+                    .map(TryInto::try_into)
+                    .collect::<Result<_, _>>()?,
+            };
+            frame
+                .validate_for(query)
+                .map_err(ProtocolError::InvalidTerminalSurface)?;
+            TerminalSurfaceHistoryWindowResult::Frame(frame)
+        }
+        v2::TerminalHistoryWindowOutcome::Changed | v2::TerminalHistoryWindowOutcome::Gap => {
+            if value.disposition != v2::TerminalViewportDisposition::Unspecified as i32
+                || value.anchor.is_some()
+                || value.target_offset_from_bottom != 0
+                || value.first_row_from_live_top != 0
+                || !value.rows.is_empty()
+                || value.current_epoch > value.current_revision
+                || value.current_revision < query.anchor.revision.get()
+            {
+                return Err(ProtocolError::InvalidTerminalSurface(
+                    TerminalSurfaceError::InvalidHistoryWindow,
+                ));
+            }
+            let fields = {
+                let epoch = zterm_core::Revision::new(value.current_epoch);
+                let revision = zterm_core::Revision::new(value.current_revision);
+                (epoch, revision)
+            };
+            if outcome == v2::TerminalHistoryWindowOutcome::Changed {
+                TerminalSurfaceHistoryWindowResult::HistoryChanged {
+                    epoch: fields.0,
+                    revision: fields.1,
+                }
+            } else {
+                TerminalSurfaceHistoryWindowResult::HistoryGap {
+                    epoch: fields.0,
+                    revision: fields.1,
+                }
+            }
+        }
+        v2::TerminalHistoryWindowOutcome::Unspecified => {
+            return Err(ProtocolError::InvalidTerminalSemanticField(
+                "history_window_outcome",
+            ));
+        }
+    };
+    Ok((attachment_id, result))
 }
 
 /// Fixed text prefix before the base64url-no-pad ticket payload.
@@ -1433,7 +1772,7 @@ impl fmt::Display for RouteCacheError {
 
 impl std::error::Error for RouteCacheError {}
 
-impl From<(&PairTicketFields, &PairSecret)> for v1::PairTicketV1 {
+impl From<(&PairTicketFields, &PairSecret)> for v2::PairTicketV1 {
     fn from((fields, secret): (&PairTicketFields, &PairSecret)) -> Self {
         Self {
             format_version: fields.format_version(),
@@ -1451,11 +1790,11 @@ impl From<(&PairTicketFields, &PairSecret)> for v1::PairTicketV1 {
     }
 }
 
-impl TryFrom<v1::PairTicketV1> for (PairTicketFields, PairSecret) {
+impl TryFrom<v2::PairTicketV1> for (PairTicketFields, PairSecret) {
     type Error = TicketTextError;
 
-    fn try_from(value: v1::PairTicketV1) -> Result<Self, Self::Error> {
-        let v1::PairTicketV1 {
+    fn try_from(value: v2::PairTicketV1) -> Result<Self, Self::Error> {
+        let v2::PairTicketV1 {
             format_version,
             host_device_id,
             host_name,
@@ -1499,7 +1838,7 @@ impl TryFrom<v1::PairTicketV1> for (PairTicketFields, PairSecret) {
 /// text (the caller's bearer value) is produced.
 #[must_use]
 pub fn encode_pair_ticket(fields: &PairTicketFields, secret: &PairSecret) -> String {
-    let mut message = v1::PairTicketV1::from((fields, secret));
+    let mut message = v2::PairTicketV1::from((fields, secret));
     let encoded: Zeroizing<Vec<u8>> = Zeroizing::new(message.encode_to_vec());
     message.secret.zeroize();
     // The base64 string is a second bearer copy; zeroize it once copied out.
@@ -1528,7 +1867,7 @@ pub fn decode_pair_ticket(text: &str) -> Result<(PairTicketFields, PairSecret), 
             .map_err(TicketTextError::InvalidBase64)?,
     );
     let message =
-        v1::PairTicketV1::decode(decoded.as_slice()).map_err(TicketTextError::InvalidProtobuf)?;
+        v2::PairTicketV1::decode(decoded.as_slice()).map_err(TicketTextError::InvalidProtobuf)?;
     (message).try_into()
 }
 
@@ -1540,7 +1879,7 @@ pub fn encode_relay_route_cache(urls: &[RelayHint]) -> Result<Vec<u8>, RouteCach
     if urls.len() > zterm_core::MAX_RELAY_HINTS {
         return Err(RouteCacheError::TooManyUrls { actual: urls.len() });
     }
-    Ok(v1::RelayRouteCacheV1 {
+    Ok(v2::RelayRouteCacheV1 {
         format_version: RELAY_ROUTE_CACHE_VERSION,
         relay_urls: urls.iter().map(|hint| hint.as_str().to_owned()).collect(),
     }
@@ -1556,7 +1895,7 @@ pub fn decode_relay_route_cache(bytes: &[u8]) -> Result<Vec<RelayHint>, RouteCac
             actual: bytes.len(),
         });
     }
-    let cache = v1::RelayRouteCacheV1::decode(bytes).map_err(RouteCacheError::Malformed)?;
+    let cache = v2::RelayRouteCacheV1::decode(bytes).map_err(RouteCacheError::Malformed)?;
     if cache.format_version != RELAY_ROUTE_CACHE_VERSION {
         return Err(RouteCacheError::UnsupportedVersion {
             actual: cache.format_version,
@@ -1623,10 +1962,10 @@ impl fmt::Display for WireFieldError {
 
 impl std::error::Error for WireFieldError {}
 
-impl TryFrom<v1::PairBegin> for PairBegin {
+impl TryFrom<v2::PairBegin> for PairBegin {
     type Error = WireFieldError;
 
-    fn try_from(value: v1::PairBegin) -> Result<Self, Self::Error> {
+    fn try_from(value: v2::PairBegin) -> Result<Self, Self::Error> {
         let offer_id =
             PairOfferId::from_bytes(&value.offer_id).map_err(WireFieldError::InvalidIdentifier)?;
         let controller_nonce = PairNonce::from_bytes(&value.controller_nonce)
@@ -1641,7 +1980,7 @@ impl TryFrom<v1::PairBegin> for PairBegin {
     }
 }
 
-impl From<&PairBegin> for v1::PairBegin {
+impl From<&PairBegin> for v2::PairBegin {
     fn from(value: &PairBegin) -> Self {
         Self {
             offer_id: value.offer_id().to_bytes().to_vec(),
@@ -1652,10 +1991,10 @@ impl From<&PairBegin> for v1::PairBegin {
     }
 }
 
-impl TryFrom<v1::PairChallenge> for PairChallenge {
+impl TryFrom<v2::PairChallenge> for PairChallenge {
     type Error = WireFieldError;
 
-    fn try_from(value: v1::PairChallenge) -> Result<Self, Self::Error> {
+    fn try_from(value: v2::PairChallenge) -> Result<Self, Self::Error> {
         let host_nonce =
             PairNonce::from_bytes(&value.host_nonce).map_err(WireFieldError::InvalidIdentifier)?;
         PairChallenge::new(host_nonce, value.selected_version, value.ticket_expiry_unix)
@@ -1663,7 +2002,7 @@ impl TryFrom<v1::PairChallenge> for PairChallenge {
     }
 }
 
-impl From<&PairChallenge> for v1::PairChallenge {
+impl From<&PairChallenge> for v2::PairChallenge {
     fn from(value: &PairChallenge) -> Self {
         Self {
             host_nonce: value.host_nonce().to_bytes().to_vec(),
@@ -1673,16 +2012,16 @@ impl From<&PairChallenge> for v1::PairChallenge {
     }
 }
 
-impl TryFrom<v1::PairProof> for PairProof {
+impl TryFrom<v2::PairProof> for PairProof {
     type Error = WireFieldError;
 
-    fn try_from(value: v1::PairProof) -> Result<Self, Self::Error> {
+    fn try_from(value: v2::PairProof) -> Result<Self, Self::Error> {
         let proof = Zeroizing::new(value.controller_proof);
         PairProof::from_slice(&proof).map_err(WireFieldError::InvalidIdentifier)
     }
 }
 
-impl From<&PairProof> for v1::PairProof {
+impl From<&PairProof> for v2::PairProof {
     fn from(value: &PairProof) -> Self {
         Self {
             controller_proof: value.as_bytes().to_vec(),
@@ -1690,11 +2029,11 @@ impl From<&PairProof> for v1::PairProof {
     }
 }
 
-impl TryFrom<v1::PairAccepted> for PairAccepted {
+impl TryFrom<v2::PairAccepted> for PairAccepted {
     type Error = WireFieldError;
 
-    fn try_from(value: v1::PairAccepted) -> Result<Self, Self::Error> {
-        let v1::PairAccepted {
+    fn try_from(value: v2::PairAccepted) -> Result<Self, Self::Error> {
+        let v2::PairAccepted {
             authorization_generation,
             host_confirmation_proof,
             host_diagnostic_version,
@@ -1711,7 +2050,7 @@ impl TryFrom<v1::PairAccepted> for PairAccepted {
     }
 }
 
-impl From<&PairAccepted> for v1::PairAccepted {
+impl From<&PairAccepted> for v2::PairAccepted {
     fn from(value: &PairAccepted) -> Self {
         Self {
             authorization_generation: value.authorization_generation().get(),
@@ -1721,10 +2060,10 @@ impl From<&PairAccepted> for v1::PairAccepted {
     }
 }
 
-impl TryFrom<v1::ConnectionHello> for ConnectionHello {
+impl TryFrom<v2::ConnectionHello> for ConnectionHello {
     type Error = WireFieldError;
 
-    fn try_from(value: v1::ConnectionHello) -> Result<Self, Self::Error> {
+    fn try_from(value: v2::ConnectionHello) -> Result<Self, Self::Error> {
         let attempt_id = ConnectionAttemptId::from_bytes(&value.attempt_id)
             .map_err(WireFieldError::InvalidIdentifier)?;
         ConnectionHello::new(
@@ -1740,7 +2079,7 @@ impl TryFrom<v1::ConnectionHello> for ConnectionHello {
     }
 }
 
-impl From<&ConnectionHello> for v1::ConnectionHello {
+impl From<&ConnectionHello> for v2::ConnectionHello {
     fn from(value: &ConnectionHello) -> Self {
         Self {
             min_wire_major: value.min_wire_major(),
@@ -1754,10 +2093,10 @@ impl From<&ConnectionHello> for v1::ConnectionHello {
     }
 }
 
-impl TryFrom<v1::ConnectionWelcome> for ConnectionWelcome {
+impl TryFrom<v2::ConnectionWelcome> for ConnectionWelcome {
     type Error = WireFieldError;
 
-    fn try_from(value: v1::ConnectionWelcome) -> Result<Self, Self::Error> {
+    fn try_from(value: v2::ConnectionWelcome) -> Result<Self, Self::Error> {
         let generation = AuthGeneration::new(value.accepted_authorization_generation).ok_or(
             WireFieldError::InvalidGeneration {
                 actual: value.accepted_authorization_generation,
@@ -1775,7 +2114,7 @@ impl TryFrom<v1::ConnectionWelcome> for ConnectionWelcome {
     }
 }
 
-impl From<&ConnectionWelcome> for v1::ConnectionWelcome {
+impl From<&ConnectionWelcome> for v2::ConnectionWelcome {
     fn from(value: &ConnectionWelcome) -> Self {
         Self {
             wire_major: value.wire_major(),
@@ -1788,10 +2127,10 @@ impl From<&ConnectionWelcome> for v1::ConnectionWelcome {
     }
 }
 
-impl TryFrom<v1::LocalDeviceRenameRequest> for (DeviceId, DeviceAlias) {
+impl TryFrom<v2::LocalDeviceRenameRequest> for (DeviceId, DeviceAlias) {
     type Error = WireFieldError;
 
-    fn try_from(value: v1::LocalDeviceRenameRequest) -> Result<Self, Self::Error> {
+    fn try_from(value: v2::LocalDeviceRenameRequest) -> Result<Self, Self::Error> {
         let device_bytes = value.device_id.unwrap_or_default().value;
         let device_id =
             DeviceId::from_bytes(&device_bytes).map_err(WireFieldError::InvalidIdentifier)?;
@@ -1800,19 +2139,19 @@ impl TryFrom<v1::LocalDeviceRenameRequest> for (DeviceId, DeviceAlias) {
     }
 }
 
-impl TryFrom<v1::LocalDeviceRevokeRequest> for DeviceId {
+impl TryFrom<v2::LocalDeviceRevokeRequest> for DeviceId {
     type Error = WireFieldError;
 
-    fn try_from(value: v1::LocalDeviceRevokeRequest) -> Result<Self, Self::Error> {
+    fn try_from(value: v2::LocalDeviceRevokeRequest) -> Result<Self, Self::Error> {
         let device_bytes = value.device_id.unwrap_or_default().value;
         DeviceId::from_bytes(&device_bytes).map_err(WireFieldError::InvalidIdentifier)
     }
 }
 
-impl TryFrom<v1::DeviceSummary> for DeviceSummary {
+impl TryFrom<v2::DeviceSummary> for DeviceSummary {
     type Error = WireFieldError;
 
-    fn try_from(value: v1::DeviceSummary) -> Result<Self, Self::Error> {
+    fn try_from(value: v2::DeviceSummary) -> Result<Self, Self::Error> {
         let device_bytes = value.device_id.unwrap_or_default().value;
         let device_id =
             DeviceId::from_bytes(&device_bytes).map_err(WireFieldError::InvalidIdentifier)?;
@@ -1825,11 +2164,11 @@ impl TryFrom<v1::DeviceSummary> for DeviceSummary {
         } else {
             Some(DeviceAlias::new(value.alias).map_err(WireFieldError::InvalidAlias)?)
         };
-        let auth_status = match v1::DeviceAuthStatus::try_from(value.auth_status) {
-            Ok(v1::DeviceAuthStatus::None) => AuthorizationStatus::None,
-            Ok(v1::DeviceAuthStatus::Authorized) => AuthorizationStatus::Authorized,
-            Ok(v1::DeviceAuthStatus::Revoked) => AuthorizationStatus::Revoked,
-            Ok(v1::DeviceAuthStatus::Unspecified) | Err(_) => {
+        let auth_status = match v2::DeviceAuthStatus::try_from(value.auth_status) {
+            Ok(v2::DeviceAuthStatus::None) => AuthorizationStatus::None,
+            Ok(v2::DeviceAuthStatus::Authorized) => AuthorizationStatus::Authorized,
+            Ok(v2::DeviceAuthStatus::Revoked) => AuthorizationStatus::Revoked,
+            Ok(v2::DeviceAuthStatus::Unspecified) | Err(_) => {
                 return Err(WireFieldError::InvalidAuthStatus {
                     actual: value.auth_status,
                 });
@@ -1853,7 +2192,7 @@ impl TryFrom<v1::DeviceSummary> for DeviceSummary {
     }
 }
 
-impl From<&DeviceSummary> for v1::DeviceSummary {
+impl From<&DeviceSummary> for v2::DeviceSummary {
     fn from(value: &DeviceSummary) -> Self {
         Self {
             device_id: Some(value.device_id().into()),
@@ -1864,9 +2203,9 @@ impl From<&DeviceSummary> for v1::DeviceSummary {
             remote_name: value.remote_name().to_owned(),
             route_verified: value.route_verified(),
             auth_status: match value.auth_status() {
-                AuthorizationStatus::None => v1::DeviceAuthStatus::None as i32,
-                AuthorizationStatus::Authorized => v1::DeviceAuthStatus::Authorized as i32,
-                AuthorizationStatus::Revoked => v1::DeviceAuthStatus::Revoked as i32,
+                AuthorizationStatus::None => v2::DeviceAuthStatus::None as i32,
+                AuthorizationStatus::Authorized => v2::DeviceAuthStatus::Authorized as i32,
+                AuthorizationStatus::Revoked => v2::DeviceAuthStatus::Revoked as i32,
             },
             generation: value.generation().get(),
             paired_at_unix: value.paired_at_unix(),
@@ -1939,13 +2278,13 @@ mod tests {
 
     #[test]
     fn frame_round_trip_and_unknown_fields_are_compatible() {
-        let message = v1::LocalStatusRequest {};
+        let message = v2::LocalStatusRequest {};
         let mut bytes = encode_message(WireKind::LocalStatusRequest, 17, 5_000, &message)
             .expect("bounded status frame");
         assert_eq!(
             bytes,
-            [0x09, 0x08, 0x01, 0x10, 0x03, 0x20, 0x11, 0x28, 0x88, 0x27],
-            "language-neutral v1 empty-status golden frame"
+            [0x09, 0x08, 0x02, 0x10, 0x03, 0x20, 0x11, 0x28, 0x88, 0x27],
+            "language-neutral v2 empty-status golden frame"
         );
         let body_length = bytes[0] as usize;
         assert!(body_length < 0x80, "fixture keeps one-byte prefix");
@@ -1958,7 +2297,7 @@ mod tests {
             .expect("unknown protobuf field ignored");
         decoder.finish().expect("complete frame boundary");
         assert_eq!(frames.len(), 1);
-        let decoded: v1::LocalStatusRequest = frames[0]
+        let decoded: v2::LocalStatusRequest = frames[0]
             .decode_message(WireKind::LocalStatusRequest)
             .expect("typed payload");
         assert_eq!(decoded, message);
@@ -1967,8 +2306,8 @@ mod tests {
 
     #[test]
     fn decoder_rejects_unknown_major_kind_and_incomplete_or_malformed_lengths() {
-        let unknown_major = v1::WireFrame {
-            wire_major: 2,
+        let unknown_major = v2::WireFrame {
+            wire_major: 1,
             kind: WireKind::LocalStatusRequest as u32,
             payload: Vec::new(),
             request_id: 1,
@@ -1980,10 +2319,10 @@ mod tests {
         bytes.extend_from_slice(&body);
         assert!(matches!(
             FrameDecoder::new().feed(&bytes),
-            Err(ProtocolError::WireMajorMismatch { actual: 2, .. })
+            Err(ProtocolError::WireMajorMismatch { actual: 1, .. })
         ));
 
-        let unknown_kind = v1::WireFrame {
+        let unknown_kind = v2::WireFrame {
             wire_major: WIRE_MAJOR,
             kind: 65_535,
             payload: Vec::new(),
@@ -2042,7 +2381,7 @@ mod tests {
     #[test]
     fn local_session_forward_envelope_round_trips_and_redacts_inner_bytes() {
         const SENTINEL: &[u8] = b"REMOTE-SESSION-INNER-FRAME-SENTINEL";
-        let message = v1::LocalSessionUnaryRequest {
+        let message = v2::LocalSessionUnaryRequest {
             target_device_id: Some(DeviceId::from_array([7; 32]).into()),
             frame: SENTINEL.to_vec(),
         };
@@ -2051,7 +2390,7 @@ mod tests {
         assert!(debug.contains("frame_len"));
         assert_message_round_trip(WireKind::LocalSessionUnaryRequest, message);
 
-        let bounded_tunnel = v1::LocalSessionUnaryRequest {
+        let bounded_tunnel = v2::LocalSessionUnaryRequest {
             target_device_id: Some(DeviceId::from_array([8; 32]).into()),
             frame: vec![0; MAX_CONTROL_PAYLOAD_BYTES],
         };
@@ -2086,7 +2425,7 @@ mod tests {
             ),
             Err(ProtocolError::ControlPayloadTooLarge(_))
         ));
-        let oversized_control = v1::WireFrame {
+        let oversized_control = v2::WireFrame {
             wire_major: WIRE_MAJOR,
             kind: WireKind::LocalStatusResponse as u32,
             payload: vec![0; MAX_CONTROL_PAYLOAD_BYTES + 1],
@@ -2102,7 +2441,7 @@ mod tests {
             Err(ProtocolError::ControlPayloadTooLarge(_))
         ));
         let terminal = encode_payload(
-            WireKind::TerminalSnapshot,
+            WireKind::TerminalSemanticSnapshot,
             1,
             0,
             vec![0; MAX_CONTROL_PAYLOAD_BYTES + 1],
@@ -2126,40 +2465,12 @@ mod tests {
     }
 
     #[test]
-    fn terminal_snapshot_conversion_crops_only_history_to_fit_one_frame() {
-        let screen = b"host-screen".to_vec();
-        let mut history = b"\x1b[m".to_vec();
-        while history.len() <= MAX_FRAME_BYTES + 1024 {
-            history.extend_from_slice(b"complete-history-line\r\n");
-        }
-        let message = terminal_snapshot_message(
-            SessionId::from_array([1; 16]),
-            AttachmentId::from_array([2; 16]),
-            TerminalSnapshot {
-                revision: zterm_core::Revision::new(7),
-                size: TerminalSize::new(2, 20),
-                active_screen: ActiveScreen::Main,
-                screen_ansi: screen.clone(),
-                recent_history_ansi: history,
-                modes: TerminalModes::default(),
-                scroll_metrics: None,
-            },
-        );
-        assert_eq!(message.screen_ansi, screen);
-        assert!(message.recent_history_ansi.starts_with(b"\x1b[m"));
-        assert!(message.recent_history_ansi.ends_with(b"\r\n"));
-        let frame = encode_message(WireKind::TerminalSnapshot, 1, 0, &message)
-            .expect("bounded snapshot frame");
-        assert!(frame.len() <= MAX_FRAME_BYTES + MAX_VARINT_BYTES);
-    }
-
-    #[test]
     fn fixed_width_domain_ids_validate_once_at_proto_boundary() {
         let device = DeviceId::from_array([42; 32]);
-        let decoded = DeviceId::try_from(v1::DeviceId::from(device)).expect("valid device id");
+        let decoded = DeviceId::try_from(v2::DeviceId::from(device)).expect("valid device id");
         assert_eq!(decoded, device);
         assert!(matches!(
-            DeviceId::try_from(v1::DeviceId { value: vec![0; 31] }),
+            DeviceId::try_from(v2::DeviceId { value: vec![0; 31] }),
             Err(ProtocolError::InvalidIdentifier(_))
         ));
     }
@@ -2169,226 +2480,210 @@ mod tests {
         let kinds = [
             (
                 WireKind::LocalReadinessRequest,
-                v1::MessageKind::LocalReadinessRequest as u32,
+                v2::MessageKind::LocalReadinessRequest as u32,
             ),
             (
                 WireKind::LocalReadinessResponse,
-                v1::MessageKind::LocalReadinessResponse as u32,
+                v2::MessageKind::LocalReadinessResponse as u32,
             ),
             (
                 WireKind::LocalStatusRequest,
-                v1::MessageKind::LocalStatusRequest as u32,
+                v2::MessageKind::LocalStatusRequest as u32,
             ),
             (
                 WireKind::LocalStatusResponse,
-                v1::MessageKind::LocalStatusResponse as u32,
+                v2::MessageKind::LocalStatusResponse as u32,
             ),
             (
                 WireKind::LocalValidateSetupRequest,
-                v1::MessageKind::LocalValidateSetupRequest as u32,
+                v2::MessageKind::LocalValidateSetupRequest as u32,
             ),
             (
                 WireKind::LocalValidateSetupResponse,
-                v1::MessageKind::LocalValidateSetupResponse as u32,
+                v2::MessageKind::LocalValidateSetupResponse as u32,
             ),
             (
                 WireKind::LocalStopRequest,
-                v1::MessageKind::LocalStopRequest as u32,
+                v2::MessageKind::LocalStopRequest as u32,
             ),
             (
                 WireKind::LocalStopResponse,
-                v1::MessageKind::LocalStopResponse as u32,
+                v2::MessageKind::LocalStopResponse as u32,
             ),
             (
                 WireKind::LocalUpdatePreflightRequest,
-                v1::MessageKind::LocalUpdatePreflightRequest as u32,
+                v2::MessageKind::LocalUpdatePreflightRequest as u32,
             ),
             (
                 WireKind::LocalUpdatePreflightResponse,
-                v1::MessageKind::LocalUpdatePreflightResponse as u32,
+                v2::MessageKind::LocalUpdatePreflightResponse as u32,
             ),
             (
                 WireKind::ServiceErrorResponse,
-                v1::MessageKind::ServiceErrorResponse as u32,
+                v2::MessageKind::ServiceErrorResponse as u32,
             ),
             (
                 WireKind::LocalPairCreateRequest,
-                v1::MessageKind::LocalPairCreateRequest as u32,
+                v2::MessageKind::LocalPairCreateRequest as u32,
             ),
             (
                 WireKind::LocalPairCreateResponse,
-                v1::MessageKind::LocalPairCreateResponse as u32,
+                v2::MessageKind::LocalPairCreateResponse as u32,
             ),
             (
                 WireKind::LocalPairAcceptRequest,
-                v1::MessageKind::LocalPairAcceptRequest as u32,
+                v2::MessageKind::LocalPairAcceptRequest as u32,
             ),
             (
                 WireKind::LocalPairAcceptResponse,
-                v1::MessageKind::LocalPairAcceptResponse as u32,
+                v2::MessageKind::LocalPairAcceptResponse as u32,
             ),
             (
                 WireKind::LocalDeviceListRequest,
-                v1::MessageKind::LocalDeviceListRequest as u32,
+                v2::MessageKind::LocalDeviceListRequest as u32,
             ),
             (
                 WireKind::LocalDeviceListResponse,
-                v1::MessageKind::LocalDeviceListResponse as u32,
+                v2::MessageKind::LocalDeviceListResponse as u32,
             ),
             (
                 WireKind::LocalDeviceRenameRequest,
-                v1::MessageKind::LocalDeviceRenameRequest as u32,
+                v2::MessageKind::LocalDeviceRenameRequest as u32,
             ),
             (
                 WireKind::LocalDeviceRenameResponse,
-                v1::MessageKind::LocalDeviceRenameResponse as u32,
+                v2::MessageKind::LocalDeviceRenameResponse as u32,
             ),
             (
                 WireKind::LocalDeviceRevokeRequest,
-                v1::MessageKind::LocalDeviceRevokeRequest as u32,
+                v2::MessageKind::LocalDeviceRevokeRequest as u32,
             ),
             (
                 WireKind::LocalDeviceRevokeResponse,
-                v1::MessageKind::LocalDeviceRevokeResponse as u32,
+                v2::MessageKind::LocalDeviceRevokeResponse as u32,
             ),
             (
                 WireKind::LocalTargetResolveRequest,
-                v1::MessageKind::LocalTargetResolveRequest as u32,
+                v2::MessageKind::LocalTargetResolveRequest as u32,
             ),
             (
                 WireKind::LocalTargetResolveResponse,
-                v1::MessageKind::LocalTargetResolveResponse as u32,
+                v2::MessageKind::LocalTargetResolveResponse as u32,
             ),
             (
                 WireKind::LocalSessionUnaryRequest,
-                v1::MessageKind::LocalSessionUnaryRequest as u32,
+                v2::MessageKind::LocalSessionUnaryRequest as u32,
             ),
-            (WireKind::PairBegin, v1::MessageKind::PairBegin as u32),
+            (WireKind::PairBegin, v2::MessageKind::PairBegin as u32),
             (
                 WireKind::PairChallenge,
-                v1::MessageKind::PairChallenge as u32,
+                v2::MessageKind::PairChallenge as u32,
             ),
-            (WireKind::PairProof, v1::MessageKind::PairProof as u32),
-            (WireKind::PairAccepted, v1::MessageKind::PairAccepted as u32),
+            (WireKind::PairProof, v2::MessageKind::PairProof as u32),
+            (WireKind::PairAccepted, v2::MessageKind::PairAccepted as u32),
             (
                 WireKind::ConnectionHello,
-                v1::MessageKind::ConnectionHello as u32,
+                v2::MessageKind::ConnectionHello as u32,
             ),
             (
                 WireKind::ConnectionWelcome,
-                v1::MessageKind::ConnectionWelcome as u32,
+                v2::MessageKind::ConnectionWelcome as u32,
             ),
             (
                 WireKind::SessionListRequest,
-                v1::MessageKind::SessionListRequest as u32,
+                v2::MessageKind::SessionListRequest as u32,
             ),
             (
                 WireKind::SessionListResponse,
-                v1::MessageKind::SessionListResponse as u32,
+                v2::MessageKind::SessionListResponse as u32,
             ),
             (
                 WireKind::SessionCreateRequest,
-                v1::MessageKind::SessionCreateRequest as u32,
+                v2::MessageKind::SessionCreateRequest as u32,
             ),
             (
                 WireKind::SessionMutateResponse,
-                v1::MessageKind::SessionMutateResponse as u32,
+                v2::MessageKind::SessionMutateResponse as u32,
             ),
             (
                 WireKind::SessionRenameRequest,
-                v1::MessageKind::SessionRenameRequest as u32,
+                v2::MessageKind::SessionRenameRequest as u32,
             ),
             (
                 WireKind::SessionCloseRequest,
-                v1::MessageKind::SessionCloseRequest as u32,
+                v2::MessageKind::SessionCloseRequest as u32,
             ),
             (
                 WireKind::SessionTakeoverRequest,
-                v1::MessageKind::SessionTakeoverRequest as u32,
+                v2::MessageKind::SessionTakeoverRequest as u32,
             ),
             (
                 WireKind::SessionOperationLeaseRequest,
-                v1::MessageKind::SessionOperationLeaseRequest as u32,
+                v2::MessageKind::SessionOperationLeaseRequest as u32,
             ),
             (
                 WireKind::SessionOperationLeaseResponse,
-                v1::MessageKind::SessionOperationLeaseResponse as u32,
+                v2::MessageKind::SessionOperationLeaseResponse as u32,
             ),
             (
                 WireKind::TerminalAttachRequest,
-                v1::MessageKind::TerminalAttachRequest as u32,
-            ),
-            (
-                WireKind::TerminalSnapshot,
-                v1::MessageKind::TerminalSnapshot as u32,
-            ),
-            (
-                WireKind::TerminalDelta,
-                v1::MessageKind::TerminalDelta as u32,
+                v2::MessageKind::TerminalAttachRequest as u32,
             ),
             (
                 WireKind::TerminalInput,
-                v1::MessageKind::TerminalInput as u32,
+                v2::MessageKind::TerminalInput as u32,
             ),
             (
                 WireKind::TerminalResize,
-                v1::MessageKind::TerminalResize as u32,
+                v2::MessageKind::TerminalResize as u32,
             ),
             (
                 WireKind::TerminalDetach,
-                v1::MessageKind::TerminalDetach as u32,
+                v2::MessageKind::TerminalDetach as u32,
             ),
             (
                 WireKind::TerminalSnapshotApplied,
-                v1::MessageKind::TerminalSnapshotApplied as u32,
+                v2::MessageKind::TerminalSnapshotApplied as u32,
             ),
             (
                 WireKind::TerminalSyncRequest,
-                v1::MessageKind::TerminalSyncRequest as u32,
+                v2::MessageKind::TerminalSyncRequest as u32,
             ),
             (
                 WireKind::TerminalSyncRequired,
-                v1::MessageKind::TerminalSyncRequired as u32,
+                v2::MessageKind::TerminalSyncRequired as u32,
             ),
             (
                 WireKind::TerminalLeaseLost,
-                v1::MessageKind::TerminalLeaseLost as u32,
+                v2::MessageKind::TerminalLeaseLost as u32,
             ),
             (
                 WireKind::TerminalSessionEnded,
-                v1::MessageKind::TerminalSessionEnded as u32,
+                v2::MessageKind::TerminalSessionEnded as u32,
             ),
             (
                 WireKind::TerminalTransportStateEvent,
-                v1::MessageKind::TerminalTransportStateEvent as u32,
-            ),
-            (
-                WireKind::TerminalHistoryRequest,
-                v1::MessageKind::TerminalHistoryRequest as u32,
-            ),
-            (
-                WireKind::TerminalHistoryPage,
-                v1::MessageKind::TerminalHistoryPage as u32,
+                v2::MessageKind::TerminalTransportStateEvent as u32,
             ),
             (
                 WireKind::TerminalConnectionStatusEvent,
-                v1::MessageKind::TerminalConnectionStatusEvent as u32,
-            ),
-            (
-                WireKind::TerminalViewportRequest,
-                v1::MessageKind::TerminalViewportRequest as u32,
-            ),
-            (
-                WireKind::TerminalViewportFrame,
-                v1::MessageKind::TerminalViewportFrame as u32,
+                v2::MessageKind::TerminalConnectionStatusEvent as u32,
             ),
             (
                 WireKind::TerminalHistoryWindowRequest,
-                v1::MessageKind::TerminalHistoryWindowRequest as u32,
+                v2::MessageKind::TerminalHistoryWindowRequest as u32,
             ),
             (
-                WireKind::TerminalHistoryWindowFrame,
-                v1::MessageKind::TerminalHistoryWindowFrame as u32,
+                WireKind::TerminalSemanticSnapshot,
+                v2::MessageKind::TerminalSemanticSnapshot as u32,
+            ),
+            (
+                WireKind::TerminalSemanticDelta,
+                v2::MessageKind::TerminalSemanticDelta as u32,
+            ),
+            (
+                WireKind::TerminalSemanticHistoryWindowFrame,
+                v2::MessageKind::TerminalSemanticHistoryWindowFrame as u32,
             ),
         ];
 
@@ -2403,22 +2698,22 @@ mod tests {
 
     #[test]
     fn session_and_terminal_contract_shapes_round_trip() {
-        let operation_id = Some(v1::OperationId {
+        let operation_id = Some(v2::OperationId {
             lease_ordinal: 7,
             sequence: 11,
             daemon_incarnation: vec![9; 16],
         });
-        let target = Some(v1::TargetSelector {
-            target: Some(v1::target_selector::Target::Device(v1::DeviceId {
+        let target = Some(v2::TargetSelector {
+            target: Some(v2::target_selector::Target::Device(v2::DeviceId {
                 value: vec![7; DeviceId::LENGTH],
             })),
         });
-        let session_id = Some(v1::SessionId { value: vec![3; 16] });
-        let attachment_id = Some(v1::AttachmentId { value: vec![5; 16] });
+        let session_id = Some(v2::SessionId { value: vec![3; 16] });
+        let attachment_id = Some(v2::AttachmentId { value: vec![5; 16] });
 
         assert_message_round_trip(
             WireKind::SessionRenameRequest,
-            v1::SessionRenameRequest {
+            v2::SessionRenameRequest {
                 operation_id: operation_id.clone(),
                 target: target.clone(),
                 session_id: session_id.clone(),
@@ -2427,7 +2722,7 @@ mod tests {
         );
         assert_message_round_trip(
             WireKind::SessionCloseRequest,
-            v1::SessionCloseRequest {
+            v2::SessionCloseRequest {
                 operation_id: operation_id.clone(),
                 target: target.clone(),
                 session_id: session_id.clone(),
@@ -2435,23 +2730,23 @@ mod tests {
         );
         assert_message_round_trip(
             WireKind::TerminalAttachRequest,
-            v1::TerminalAttachRequest {
+            v2::TerminalAttachRequest {
                 target: target.clone(),
                 session_id: session_id.clone(),
                 takeover: true,
                 session_name: String::new(),
                 create_main: false,
-                viewport: Some(v1::TerminalViewport {
+                viewport: Some(v2::TerminalViewport {
                     rows: 40,
                     columns: 120,
                 }),
-                resume_view_id: Some(v1::ResumeViewId { value: vec![6; 16] }),
+                resume_view_id: Some(v2::ResumeViewId { value: vec![6; 16] }),
                 known_revision: Some(12),
             },
         );
         assert_message_round_trip(
             WireKind::SessionTakeoverRequest,
-            v1::SessionTakeoverRequest {
+            v2::SessionTakeoverRequest {
                 operation_id,
                 target,
                 session_id,
@@ -2460,127 +2755,58 @@ mod tests {
         );
         assert_message_round_trip(
             WireKind::TerminalSnapshotApplied,
-            v1::TerminalSnapshotApplied {
+            v2::TerminalSnapshotApplied {
                 attachment_id: attachment_id.clone(),
                 revision: 13,
             },
         );
         assert_message_round_trip(
             WireKind::TerminalSyncRequest,
-            v1::TerminalSyncRequest {
+            v2::TerminalSyncRequest {
                 attachment_id: attachment_id.clone(),
                 known_revision: 13,
             },
         );
         assert_message_round_trip(
-            WireKind::TerminalDelta,
-            v1::TerminalDelta {
-                from_revision: 12,
-                to_revision: 13,
-                ansi: b"safe fixture".to_vec(),
-                rows: 40,
-                columns: 120,
-                active_screen: v1::TerminalActiveScreen::Main as i32,
-                modes: Some(v1::TerminalModes::default()),
-                attachment_id: attachment_id.clone(),
-                scroll_metrics: None,
-            },
-        );
-        assert_message_round_trip(
             WireKind::TerminalSyncRequired,
-            v1::TerminalSyncRequired {
+            v2::TerminalSyncRequired {
                 attachment_id: attachment_id.clone(),
                 latest_revision: 17,
             },
         );
         assert_message_round_trip(
             WireKind::TerminalLeaseLost,
-            v1::TerminalLeaseLost {
-                attachment_id: Some(v1::AttachmentId { value: vec![5; 16] }),
+            v2::TerminalLeaseLost {
+                attachment_id: Some(v2::AttachmentId { value: vec![5; 16] }),
                 generation: 3,
             },
         );
         assert_message_round_trip(
             WireKind::TerminalSessionEnded,
-            v1::TerminalSessionEnded {
-                session_id: Some(v1::SessionId { value: vec![3; 16] }),
-                attachment_id: Some(v1::AttachmentId { value: vec![5; 16] }),
-                reason: v1::TerminalSessionEndReason::NaturalExit as i32,
+            v2::TerminalSessionEnded {
+                session_id: Some(v2::SessionId { value: vec![3; 16] }),
+                attachment_id: Some(v2::AttachmentId { value: vec![5; 16] }),
+                reason: v2::TerminalSessionEndReason::NaturalExit as i32,
                 exit_code: 0,
                 signal: String::new(),
             },
         );
         assert_message_round_trip(
             WireKind::TerminalTransportStateEvent,
-            v1::TerminalTransportStateEvent {
-                attachment_id: Some(v1::AttachmentId { value: vec![5; 16] }),
-                state: v1::TerminalTransportState::Reconnecting as i32,
-            },
-        );
-        let history_cursor = v1::TerminalHistoryCursor {
-            epoch: 3,
-            revision: 17,
-            start_row: 4,
-            row_count: 2,
-            oldest_row: 0,
-            newest_row: 9,
-        };
-        assert_message_round_trip(
-            WireKind::TerminalHistoryRequest,
-            v1::TerminalHistoryRequest {
-                attachment_id: attachment_id.clone(),
-                direction: v1::TerminalHistoryDirection::Older as i32,
-                cursor: Some(history_cursor),
-                maximum_rows: 64,
-            },
-        );
-        assert_message_round_trip(
-            WireKind::TerminalHistoryPage,
-            v1::TerminalHistoryPage {
-                attachment_id: attachment_id.clone(),
-                outcome: v1::TerminalHistoryOutcome::Ok as i32,
-                cursor: Some(history_cursor),
-                rows: vec![b"older".to_vec(), b"newer".to_vec()],
-                current_epoch: 3,
-                current_revision: 17,
+            v2::TerminalTransportStateEvent {
+                attachment_id: Some(v2::AttachmentId { value: vec![5; 16] }),
+                state: v2::TerminalTransportState::Reconnecting as i32,
             },
         );
         assert_message_round_trip(
             WireKind::TerminalConnectionStatusEvent,
-            v1::TerminalConnectionStatusEvent {
+            v2::TerminalConnectionStatusEvent {
                 attachment_id: attachment_id.clone(),
-                path: v1::TerminalConnectionPath::Direct as i32,
+                path: v2::TerminalConnectionPath::Direct as i32,
                 rtt_ms: Some(42),
             },
         );
-        assert_message_round_trip(
-            WireKind::TerminalViewportRequest,
-            v1::TerminalViewportRequest {
-                attachment_id: attachment_id.clone(),
-                action: Some(v1::TerminalViewportAction {
-                    action: Some(v1::terminal_viewport_action::Action::ScrollByLines(3)),
-                }),
-            },
-        );
-        assert_message_round_trip(
-            WireKind::TerminalViewportFrame,
-            v1::TerminalViewportFrame {
-                attachment_id: attachment_id.clone(),
-                outcome: v1::TerminalViewportOutcome::Frame as i32,
-                disposition: v1::TerminalViewportDisposition::Exact as i32,
-                metrics: Some(v1::TerminalScrollMetrics {
-                    epoch: 3,
-                    revision: 17,
-                    offset_from_bottom: 3,
-                    max_offset_from_bottom: 9,
-                    viewport_rows: 2,
-                }),
-                rows: vec![b"older".to_vec(), b"newer".to_vec()],
-                current_epoch: 3,
-                current_revision: 17,
-            },
-        );
-        let window_anchor = v1::TerminalHistoryWindowAnchor {
+        let window_anchor = v2::TerminalHistoryWindowAnchor {
             epoch: 3,
             revision: 17,
             max_offset_from_bottom: 9,
@@ -2589,7 +2815,7 @@ mod tests {
         };
         assert_message_round_trip(
             WireKind::TerminalHistoryWindowRequest,
-            v1::TerminalHistoryWindowRequest {
+            v2::TerminalHistoryWindowRequest {
                 attachment_id: attachment_id.clone(),
                 anchor: Some(window_anchor),
                 target_offset_from_bottom: 3,
@@ -2597,36 +2823,17 @@ mod tests {
                 newer_margin_rows: 2,
             },
         );
-        assert_message_round_trip(
-            WireKind::TerminalHistoryWindowFrame,
-            v1::TerminalHistoryWindowFrame {
-                attachment_id,
-                outcome: v1::TerminalHistoryWindowOutcome::Frame as i32,
-                disposition: v1::TerminalViewportDisposition::Exact as i32,
-                anchor: Some(window_anchor),
-                target_offset_from_bottom: 3,
-                first_row_from_live_top: -5,
-                ansi_rows: vec![
-                    b"oldest".to_vec(),
-                    b"older".to_vec(),
-                    b"visible".to_vec(),
-                    b"newer".to_vec(),
-                ],
-                current_epoch: 3,
-                current_revision: 17,
-            },
-        );
         assert_eq!(
-            ResumeViewId::try_from(v1::ResumeViewId { value: vec![6; 16] })
+            ResumeViewId::try_from(v2::ResumeViewId { value: vec![6; 16] })
                 .expect("fixed-width resume view ID"),
             ResumeViewId::from_array([6; 16])
         );
         assert!(matches!(
-            ResumeViewId::try_from(v1::ResumeViewId { value: vec![6; 15] }),
+            ResumeViewId::try_from(v2::ResumeViewId { value: vec![6; 15] }),
             Err(ProtocolError::InvalidIdentifier(_))
         ));
         assert_eq!(
-            TerminalSize::try_from(v1::TerminalViewport {
+            TerminalSize::try_from(v2::TerminalViewport {
                 rows: 40,
                 columns: 120,
             })
@@ -2634,7 +2841,7 @@ mod tests {
             TerminalSize::new(40, 120)
         );
         assert!(matches!(
-            TerminalSize::try_from(v1::TerminalViewport {
+            TerminalSize::try_from(v2::TerminalViewport {
                 rows: 0,
                 columns: 120,
             }),
@@ -2642,142 +2849,259 @@ mod tests {
         ));
     }
 
+    fn semantic_row(columns: u16, contents: &str) -> TerminalSurfaceRow {
+        TerminalSurfaceRow {
+            cells: (0..columns)
+                .map(|_| TerminalCell {
+                    contents: contents.to_owned(),
+                    style: TerminalStyle {
+                        foreground: TerminalColor::Rgb(1, 2, 3),
+                        background: TerminalColor::Rgb(4, 5, 6),
+                        bold: true,
+                        dim: true,
+                        italic: true,
+                        underline: true,
+                        inverse: true,
+                    },
+                    ..TerminalCell::default()
+                })
+                .collect(),
+            wrapped: true,
+        }
+    }
+
     #[test]
-    fn history_frames_keep_content_and_control_limits_and_reject_malformed_payloads() {
-        assert!(WireKind::TerminalHistoryRequest.is_control());
-        assert!(!WireKind::TerminalHistoryPage.is_control());
-        assert!(WireKind::TerminalViewportRequest.is_control());
-        assert!(!WireKind::TerminalViewportFrame.is_control());
+    fn semantic_surface_messages_round_trip_validate_and_redact_content() {
+        const SENTINEL: &str = "SEMANTIC_57c1";
+        let session_id = SessionId::from_array([3; 16]);
+        let attachment_id = AttachmentId::from_array([4; 16]);
+        let revision = zterm_core::Revision::new(7);
+        let snapshot = TerminalSurfaceSnapshot {
+            revision,
+            surface: TerminalSurface {
+                size: TerminalSize::new(2, 3),
+                active_screen: ActiveScreen::Main,
+                rows: vec![semantic_row(3, SENTINEL), semantic_row(3, "x")],
+                cursor: TerminalCursor {
+                    row: 1,
+                    column: 2,
+                    visible: true,
+                    style: TerminalStyle::default(),
+                },
+                modes: TerminalModes::default(),
+                scroll_metrics: Some(TerminalScrollMetrics {
+                    epoch: zterm_core::Revision::new(1),
+                    revision,
+                    offset_from_bottom: 0,
+                    max_offset_from_bottom: 5,
+                    viewport_rows: 2,
+                }),
+            },
+        };
+        let message =
+            terminal_surface_snapshot_message(session_id, attachment_id, snapshot.clone());
+        let debug = format!("{message:?}");
+        assert!(!debug.contains(SENTINEL));
+        let (decoded_session, decoded_attachment, decoded) =
+            terminal_surface_snapshot_from_message(message.clone()).expect("valid snapshot");
+        assert_eq!(decoded_session, session_id);
+        assert_eq!(decoded_attachment, attachment_id);
+        assert_eq!(decoded, snapshot);
+        assert_message_round_trip(WireKind::TerminalSemanticSnapshot, message);
+
+        let delta = TerminalSurfaceDelta {
+            from_revision: revision,
+            to_revision: zterm_core::Revision::new(8),
+            size: snapshot.surface.size,
+            active_screen: ActiveScreen::Main,
+            row_patches: vec![TerminalSurfaceRowPatch {
+                row: 1,
+                replacement: semantic_row(3, "y"),
+            }],
+            cursor: snapshot.surface.cursor,
+            modes: snapshot.surface.modes,
+            scroll_metrics: Some(TerminalScrollMetrics {
+                revision: zterm_core::Revision::new(8),
+                ..snapshot.surface.scroll_metrics.expect("metrics")
+            }),
+        };
+        let message = terminal_surface_delta_message(attachment_id, delta.clone());
+        let (decoded_attachment, decoded) =
+            terminal_surface_delta_from_message(message.clone()).expect("valid delta");
+        assert_eq!(decoded_attachment, attachment_id);
+        assert_eq!(decoded, delta);
+        assert_message_round_trip(WireKind::TerminalSemanticDelta, message);
+
+        let mut malformed = terminal_surface_snapshot_message(session_id, attachment_id, snapshot);
+        malformed.surface.as_mut().expect("surface").rows[0].cells[0].contents =
+            "bad\u{1b}cell".to_owned();
+        assert!(matches!(
+            terminal_surface_snapshot_from_message(malformed),
+            Err(ProtocolError::InvalidTerminalSurface(
+                TerminalSurfaceError::InvalidCellText
+            ))
+        ));
+    }
+
+    #[test]
+    fn maximum_semantic_frames_fit_the_existing_eight_mib_bound() {
+        let attachment_id = AttachmentId::from_array([9; 16]);
+        let session_id = SessionId::from_array([8; 16]);
+        let revision = zterm_core::Revision::new(11);
+        let size = TerminalSize::new(80, 240);
+        let row = semantic_row(size.columns, "abcdefghijklmnopqrstuv");
+        let surface = TerminalSurface {
+            size,
+            active_screen: ActiveScreen::Main,
+            rows: vec![row.clone(); usize::from(size.rows)],
+            cursor: TerminalCursor {
+                row: 79,
+                column: 239,
+                visible: true,
+                style: TerminalStyle::default(),
+            },
+            modes: TerminalModes::default(),
+            scroll_metrics: Some(TerminalScrollMetrics {
+                epoch: zterm_core::Revision::new(1),
+                revision,
+                offset_from_bottom: 0,
+                max_offset_from_bottom: 240,
+                viewport_rows: 80,
+            }),
+        };
+        let snapshot = terminal_surface_snapshot_message(
+            session_id,
+            attachment_id,
+            TerminalSurfaceSnapshot { revision, surface },
+        );
+        let encoded = encode_message(WireKind::TerminalSemanticSnapshot, 1, 0, &snapshot)
+            .expect("maximum legal semantic snapshot fits");
+        assert!(encoded.len() <= MAX_FRAME_BYTES + MAX_VARINT_BYTES);
+
+        let query = TerminalHistoryWindowQuery {
+            anchor: TerminalHistoryWindowAnchor {
+                epoch: zterm_core::Revision::new(1),
+                revision,
+                max_offset_from_bottom: 240,
+                viewport: size,
+            },
+            target_offset_from_bottom: 160,
+            older_margin_rows: 80,
+            newer_margin_rows: 80,
+        };
+        let frame = TerminalSurfaceHistoryWindowFrame {
+            disposition: TerminalViewportDisposition::Exact,
+            anchor: query.anchor,
+            target_offset_from_bottom: 160,
+            first_row_from_live_top: -240,
+            rows: vec![row; zterm_core::terminal::MAX_HISTORY_WINDOW_ROWS],
+        };
+        frame.validate_for(query).expect("maximum window shape");
+        let message = terminal_surface_history_window_frame_message(
+            attachment_id,
+            TerminalSurfaceHistoryWindowResult::Frame(frame),
+        );
+        let encoded = encode_message(WireKind::TerminalSemanticHistoryWindowFrame, 2, 0, &message)
+            .expect("maximum legal semantic history window fits");
+        assert!(encoded.len() <= MAX_FRAME_BYTES + MAX_VARINT_BYTES);
+    }
+
+    #[test]
+    fn semantic_history_frames_keep_content_and_control_limits_and_reject_malformed_payloads() {
         assert!(WireKind::TerminalHistoryWindowRequest.is_control());
-        assert!(!WireKind::TerminalHistoryWindowFrame.is_control());
+        assert!(!WireKind::TerminalSemanticSnapshot.is_control());
+        assert!(!WireKind::TerminalSemanticDelta.is_control());
+        assert!(!WireKind::TerminalSemanticHistoryWindowFrame.is_control());
         assert!(WireKind::TerminalConnectionStatusEvent.is_control());
 
         let content = vec![0_u8; MAX_CONTROL_PAYLOAD_BYTES + 1];
-        let encoded = encode_payload(WireKind::TerminalHistoryPage, 7, 0, content)
-            .expect("history content may use the ordinary frame ceiling");
+        let encoded = encode_payload(
+            WireKind::TerminalSemanticHistoryWindowFrame,
+            7,
+            0,
+            content.clone(),
+        )
+        .expect("semantic history content may use the ordinary frame ceiling");
         assert_eq!(
             FrameDecoder::new()
                 .feed(&encoded)
-                .expect("bounded history content frame")
+                .expect("bounded semantic history content frame")
                 .len(),
             1
         );
         assert!(matches!(
-            encode_payload(
-                WireKind::TerminalHistoryRequest,
-                7,
-                0,
-                vec![0_u8; MAX_CONTROL_PAYLOAD_BYTES + 1]
-            ),
-            Err(ProtocolError::ControlPayloadTooLarge(_))
-        ));
-        let viewport_content = vec![0_u8; MAX_CONTROL_PAYLOAD_BYTES + 1];
-        assert!(
-            encode_payload(
-                WireKind::TerminalViewportFrame,
-                9,
-                0,
-                viewport_content.clone(),
-            )
-            .is_ok()
-        );
-        assert!(matches!(
-            encode_payload(WireKind::TerminalViewportRequest, 9, 0, viewport_content),
-            Err(ProtocolError::ControlPayloadTooLarge(_))
-        ));
-        let window_content = vec![0_u8; MAX_CONTROL_PAYLOAD_BYTES + 1];
-        assert!(
-            encode_payload(
-                WireKind::TerminalHistoryWindowFrame,
-                10,
-                0,
-                window_content.clone(),
-            )
-            .is_ok()
-        );
-        assert!(matches!(
-            encode_payload(
-                WireKind::TerminalHistoryWindowRequest,
-                10,
-                0,
-                window_content,
-            ),
+            encode_payload(WireKind::TerminalHistoryWindowRequest, 7, 0, content),
             Err(ProtocolError::ControlPayloadTooLarge(_))
         ));
 
-        let malformed = encode_payload(WireKind::TerminalHistoryPage, 8, 0, vec![0x80])
-            .expect("malformed concrete protobuf still has a valid outer frame");
+        let malformed = encode_payload(
+            WireKind::TerminalSemanticHistoryWindowFrame,
+            8,
+            0,
+            vec![0x80],
+        )
+        .expect("malformed concrete protobuf still has a valid outer frame");
         let frame = FrameDecoder::new()
             .feed(&malformed)
             .expect("outer frame decodes")
             .pop()
             .expect("one malformed concrete payload");
         assert!(matches!(
-            frame.decode_message::<v1::TerminalHistoryPage>(WireKind::TerminalHistoryPage),
+            frame.decode_message::<v2::TerminalSemanticHistoryWindowFrame>(
+                WireKind::TerminalSemanticHistoryWindowFrame
+            ),
             Err(ProtocolError::MalformedProtobuf(_))
         ));
 
-        const SENTINEL: &[u8] = b"HISTORY-ROW-CONTENT-SENTINEL";
-        let page = v1::TerminalHistoryPage {
-            attachment_id: Some(AttachmentId::from_array([0x45; 16]).into()),
-            outcome: v1::TerminalHistoryOutcome::Ok as i32,
-            cursor: Some(v1::TerminalHistoryCursor {
-                epoch: 1,
-                revision: 2,
-                start_row: 0,
-                row_count: 1,
-                oldest_row: 0,
-                newest_row: 1,
-            }),
-            rows: vec![SENTINEL.to_vec()],
-            current_epoch: 1,
-            current_revision: 2,
-        };
-        let debug = format!("{page:?}");
-        assert!(!debug.contains(std::str::from_utf8(SENTINEL).expect("ASCII sentinel")));
-        assert!(debug.contains("row_count: 1"));
-        assert!(debug.contains(&format!("ansi_bytes: {}", SENTINEL.len())));
-
-        const WINDOW_SENTINEL: &[u8] = b"WINDOW_ROW_SENTINEL_742f";
-        let window = v1::TerminalHistoryWindowFrame {
-            attachment_id: Some(AttachmentId::from_array([0x47; 16]).into()),
-            outcome: v1::TerminalHistoryWindowOutcome::Frame as i32,
-            disposition: v1::TerminalViewportDisposition::Exact as i32,
-            anchor: Some(v1::TerminalHistoryWindowAnchor {
-                epoch: 1,
-                revision: 2,
+        const SENTINEL: &str = "SECRET742f";
+        let query = TerminalHistoryWindowQuery {
+            anchor: TerminalHistoryWindowAnchor {
+                epoch: zterm_core::Revision::new(1),
+                revision: zterm_core::Revision::new(2),
                 max_offset_from_bottom: 1,
-                viewport_rows: 1,
-                viewport_columns: 8,
-            }),
+                viewport: TerminalSize::new(1, 8),
+            },
             target_offset_from_bottom: 1,
-            first_row_from_live_top: -1,
-            ansi_rows: vec![WINDOW_SENTINEL.to_vec()],
-            current_epoch: 1,
-            current_revision: 2,
+            older_margin_rows: 0,
+            newer_margin_rows: 0,
         };
-        let debug = format!("{window:?}");
-        assert!(
-            !debug.contains(std::str::from_utf8(WINDOW_SENTINEL).expect("ASCII window sentinel"))
+        let message = terminal_surface_history_window_frame_message(
+            AttachmentId::from_array([0x47; 16]),
+            TerminalSurfaceHistoryWindowResult::Frame(TerminalSurfaceHistoryWindowFrame {
+                disposition: TerminalViewportDisposition::Exact,
+                anchor: query.anchor,
+                target_offset_from_bottom: 1,
+                first_row_from_live_top: -1,
+                rows: vec![semantic_row(8, SENTINEL)],
+            }),
         );
-        assert!(debug.contains("row_count: 1"));
-        assert!(debug.contains(&format!("ansi_bytes: {}", WINDOW_SENTINEL.len())));
+        let debug = format!("{message:?}");
+        assert!(!debug.contains(SENTINEL));
+        let (_, decoded) =
+            terminal_surface_history_window_from_message(message, query).expect("valid window");
+        assert!(matches!(
+            decoded,
+            TerminalSurfaceHistoryWindowResult::Frame(_)
+        ));
 
-        const VIEWPORT_SENTINEL: &[u8] = b"VIEWPORT_ROW_SENTINEL_5b2e";
-        let viewport = v1::TerminalViewportFrame {
-            attachment_id: Some(AttachmentId::from_array([0x46; 16]).into()),
-            outcome: v1::TerminalViewportOutcome::Frame as i32,
-            disposition: v1::TerminalViewportDisposition::Exact as i32,
-            metrics: None,
-            rows: vec![VIEWPORT_SENTINEL.to_vec()],
-            current_epoch: 1,
-            current_revision: 2,
-        };
-        let debug = format!("{viewport:?}");
-        assert!(
-            !debug
-                .contains(std::str::from_utf8(VIEWPORT_SENTINEL).expect("ASCII viewport sentinel"))
-        );
-        assert!(debug.contains("row_count: 1"));
+        for (current_epoch, current_revision) in [(3, 2), (0, 0)] {
+            let malformed = v2::TerminalSemanticHistoryWindowFrame {
+                attachment_id: Some(AttachmentId::from_array([0x48; 16]).into()),
+                outcome: v2::TerminalHistoryWindowOutcome::Gap as i32,
+                disposition: v2::TerminalViewportDisposition::Unspecified as i32,
+                anchor: None,
+                target_offset_from_bottom: 0,
+                first_row_from_live_top: 0,
+                rows: Vec::new(),
+                current_epoch,
+                current_revision,
+            };
+            assert!(matches!(
+                terminal_surface_history_window_from_message(malformed, query),
+                Err(ProtocolError::InvalidTerminalSurface(
+                    TerminalSurfaceError::InvalidHistoryWindow
+                ))
+            ));
+        }
     }
 }

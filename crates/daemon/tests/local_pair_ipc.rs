@@ -16,7 +16,7 @@ use zterm_core::{
 };
 use zterm_daemon::local_ipc::LocalPairingClient;
 use zterm_daemon::pairing::{PairOfferRequest, PairTicketText, PairingManager};
-use zterm_proto::{DecodedFrame, FrameDecoder, WireKind, encode_message, v1};
+use zterm_proto::{DecodedFrame, FrameDecoder, WireKind, encode_message, v2};
 
 const HOST: DeviceId = DeviceId::from_array([0x31; 32]);
 
@@ -31,7 +31,7 @@ async fn create_uses_default_fingerprint_and_pair_deadline() {
         let (_bytes, frame) = read_request(&mut stream).await;
         assert_eq!(frame.kind, WireKind::LocalPairCreateRequest);
         assert_eq!(frame.deadline_ms, 15_000);
-        let request: v1::LocalPairCreateRequest = frame
+        let request: v2::LocalPairCreateRequest = frame
             .decode_message(WireKind::LocalPairCreateRequest)
             .expect("decode create request");
         assert_eq!(
@@ -45,7 +45,7 @@ async fn create_uses_default_fingerprint_and_pair_deadline() {
                 .as_bytes()
                 .as_slice()
         );
-        let mut response = v1::LocalPairCreateResponse {
+        let mut response = v2::LocalPairCreateResponse {
             ticket: response_ticket,
         };
         let bytes = Zeroizing::new(
@@ -108,7 +108,7 @@ async fn accept_retries_byte_identical_and_decodes_directional_device() {
         let (mut second, _) = listener.accept().await.expect("accept retry");
         let (second_bytes, mut second_frame) = read_request(&mut second).await;
         assert_eq!(&*first_bytes, &*second_bytes);
-        let mut request: v1::LocalPairAcceptRequest = second_frame
+        let mut request: v2::LocalPairAcceptRequest = second_frame
             .decode_message(WireKind::LocalPairAcceptRequest)
             .expect("decode accept request");
         assert_eq!(
@@ -127,7 +127,7 @@ async fn accept_retries_byte_identical_and_decodes_directional_device() {
         let request_id = second_frame.request_id;
         second_frame.payload.zeroize();
 
-        let response = v1::LocalPairAcceptResponse {
+        let response = v2::LocalPairAcceptResponse {
             device: Some((&response_device).into()),
         };
         let bytes = Zeroizing::new(

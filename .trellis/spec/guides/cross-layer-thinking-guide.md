@@ -343,23 +343,58 @@ Treat these as separate state machines even though one event may affect all of
 them: physical outer-terminal capture, child-declared input modes,
 attachment-local presentation, and transport/controller synchronization.
 
-- [ ] Map one repaint as bytes -> Zterm chrome -> host capture -> one flush;
-      never assume child mode output preserves the physical capture state.
+- [ ] Trace one terminal update as semantic model rows -> driver -> Session ->
+      wire -> structural bridge -> `AttachmentSurface` -> `ComposedFrame` ->
+      sole platform presenter. Only that final presenter may encode physical
+      terminal ANSI, restore host capture, perform one write, and flush once.
+- [ ] For every screen/layout transition, assign ownership of status rows,
+      gutters, overlays, and reclaimed cells before ordering writers. Stale
+      cleanup is valid only while the current layout still assigns that region
+      to Zterm; after ownership transfers to the child, child output must be the
+      final writer. Test growth, shrink/clamp, removal, and multiple desired
+      layouts against the last successfully presented layout.
 - [ ] Route each wheel report from authoritative screen/modes and hit geometry,
       not process names or screen contents; assert exactly one owner.
-- [ ] Store scroll position at the attachment boundary and pass it as a typed
-      baseline into a read-only model projection; never mutate a shared engine
-      display offset for one client.
+- [ ] Store desired scroll position and cached semantic windows in the CLI
+      attachment view. Send stateless typed history-window queries to the model;
+      never store one client's target in Session/model state or mutate a shared
+      engine display offset.
 - [ ] Distinguish an in-epoch replacement snapshot from a true reconnect. State
       which presentation values survive each transition and which are reset.
+- [ ] Treat transport synchronization, connection-path observation, and visual
+      presentation as separate authorities. Same-epoch sync must not invent a
+      disconnect; true reconnect must not leak old direct/relay/RTT data.
+- [ ] Distinguish received, desired, and actually presented state. A coalesced
+      response that immediately schedules a newer target is not allowed to
+      replace presentation metrics until its complete frame is painted.
+- [ ] When presentation is paced, update desired state and issue independent
+      requests immediately, but advance the presented baseline only after the
+      outer write succeeds. One dirty bit/deadline should reference current
+      state rather than retain intermediate frame payloads.
+- [ ] Treat chrome geometry as presented state too. Frame construction and
+      failed write/flush attempts must not advance its baseline; retries must
+      clear an unknown presenter baseline and perform a complete repaint.
+- [ ] Test cadence cancellation at every authority change. Resume, cache miss,
+      snapshot/resync, resize, reconnect, detach, and cleanup must not let a
+      stale timer promote an unseen desired offset into painted chrome.
+- [ ] Trace transition bugs through every externally emitted frame, not only
+      endpoint state. For terminal return-to-live, cover `History ->
+      ResumePending -> SyncRequired -> Snapshot -> Active` and assert that
+      content, scrollbar, status row, cursor/capture, and transaction count
+      never pass through an empty, stale, or redundant intermediate.
 - [ ] For full-duplex races, record both current synchronization state and
       whether this exact controller was previously Active. Never carry that
       fact into a new stream epoch or takeover.
 - [ ] Complete pending read-only controls once with a correlated typed outcome
       before publishing reconnect; do not convert expected epoch loss into a
       fatal uncorrelated UI error.
-- [ ] Test the composition at model, Session, wire, bridge, CLI byte stream, and
-      real outer-PTY boundaries. A green unit test at only one layer is not
+- [ ] Test the composition at model, driver, Session, wire, bridge,
+      `AttachmentSurface`, compositor, presenter, and real outer-PTY boundaries.
+      Tests below the presenter assert typed revisions, correlations, semantic
+      rows, and state transitions—not raw ANSI substrings or arbitrary flush
+      counts. Presenter tests own exact transaction/write/flush behavior; real
+      PTY tests observe completed protocol/revision/presentation boundaries, not
+      application text markers. A green unit test at only one layer is not
       evidence that capture, correlation, and redraw ordering compose.
 
 ---

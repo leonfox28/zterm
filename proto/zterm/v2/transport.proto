@@ -1,8 +1,8 @@
 syntax = "proto3";
 
-package zterm.v1;
+package zterm.v2;
 
-// First authenticated frame on a normal `zterm/1` connection.
+// First authenticated frame on a normal `zterm/2` connection.
 message ConnectionHello {
   uint32 min_wire_major = 1;
   uint32 max_wire_major = 2;

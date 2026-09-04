@@ -1,5 +1,9 @@
 # Technical Design: `alacritty_terminal` Host Engine
 
+> Sections 1–31 retain the implemented engine/scroll evolution. Where they describe ANSI wire,
+> fixed wire major, capability fallback, or legacy presentation, Section 32 direct cutover is the
+> authoritative final architecture.
+
 ## 1. Design Summary
 
 本设计用一个 host-only `zterm-terminal` crate包住官方 `alacritty_terminal 0.26.0`。Alacritty
@@ -26,15 +30,20 @@ portable-pty reader ── fixed no-drop queue ── TerminalDriver model threa
                                                 │
                               ┌─────────────────┼─────────────────┐
                               ▼                 ▼                 ▼
-                       ProjectedScreen    history encoder    modes/events
+                       ProjectedScreen   semantic history   modes/events
                               │
                     snapshot / row delta / checkpoint
-                              │ Zterm-owned values + allowlisted ANSI
+                              │ Zterm-owned semantic values
                               ▼
-                  SessionService → local/remote attachment → CLI/UI
+                  SessionService → local/remote attachment
+                              │
+                    AttachmentSurface + compositor
+                              │ allowlisted desktop ANSI
+                              ▼
+                         sole presenter
 ```
 
-外层 Ghostty/kitty/Alacritty只显示上述 Zterm ANSI。它与 daemon 的 Alacritty `Term` 是两个独立
+外层 Ghostty/kitty/Alacritty只显示 sole presenter 最终编码的 ANSI。它与 daemon 的 Alacritty `Term` 是两个独立
 状态机；没有库对象嵌套、FFI嵌套或共享 PTY ownership。
 
 ## 2. Fixed Decisions
@@ -46,10 +55,10 @@ portable-pty reader ── fixed no-drop queue ── TerminalDriver model threa
 | Safety | All Zterm crates inherit `unsafe_code = "forbid"` |
 | PTY | Keep `portable-pty`; do not call Alacritty `tty`/`event_loop` |
 | Session | One Session = one PTY = one model; no pane tree |
-| Wire | Keep current protobuf/wire major and Zterm ANSI projection |
+| Wire | Coordinated next-major/ALPN cutover; semantic surface/history only |
 | Threading | Reuse existing ordered model thread and model mutex |
 | Client isolation | Move engine owner out of `zterm-core` into `zterm-terminal` |
-| Snapshot/delta | Zterm-owned canonical ANSI encoder + owned row checkpoints |
+| Snapshot/delta | Zterm-owned semantic surfaces/full-row patches + owned row checkpoints |
 | Security | Streaming allowlist before engine; no arbitrary upstream formatter/event reply |
 | Rollback | Source revert; no runtime fallback or dual parser |
 | Performance | No benchmark, comparison, SLO, RSS requalification or performance claim |
@@ -67,11 +76,10 @@ Retains transport-neutral types and behavior:
 
 - `TerminalSize`, `ActiveScreen`, `TerminalColor`, `TerminalStyle`, `TerminalCell`,
   `TerminalCursor`, `TerminalModes`;
-- history direction/cursor/page/result;
+- history-window anchors/results and generic viewport cache;
 - bounded side events and `TerminalUpdate`;
-- `TerminalSnapshot`, `TerminalDelta`, `TerminalDeltaResult`;
-- `MAIN_SCREEN_SELECTION_ANSI`, `ALTERNATE_SCREEN_SELECTION_ANSI`;
-- `TerminalSnapshot::limit_ansi_payload` and redacted `Debug` implementations.
+- `TerminalSurfaceSnapshot`, `TerminalSurfaceDelta`, semantic history-window results;
+- centralized semantic validation and content-redacted `Debug` implementations.
 
 It deletes `vt100` and has no dependency on `zterm-terminal`, Alacritty or `vte`.
 
@@ -733,8 +741,16 @@ absolute target on motion, and ends on release/capture loss.
 
 In live main, the gutter stays reserved even if a child has mouse reporting. Deliberate input in the
 visible gutter is host chrome; input in the `N-1` child columns follows child modes. In alternate,
-the gutter is cleared before the full `N` columns are handed to the child and no scrollbar hit target
-exists.
+the full `N` columns are handed to the child and no scrollbar hit target exists. The authoritative
+alternate snapshot, composed before Zterm chrome, owns and repaints the reclaimed column; Zterm must
+not append a stale-gutter clear afterward. A physical shrink to four columns or fewer similarly clips
+the former gutter instead of clearing through a coordinate that could clamp onto child content.
+
+The CLI records the last successfully presented gutter separately from current desired layout. If
+Main retains ownership while the gutter moves, it clears the committed old column before drawing the
+final desired gutter last in the same transaction. Multiple layout changes before presentation still
+compare against that committed baseline, and failed writes/flushes do not advance it. Alternate-to-
+Main draws the newly Zterm-owned gutter after child content.
 
 The effective presentation screen remains Main while a Zterm history frame is pinned, even if a
 background child delta declares Alternate. This prevents a hidden child state transition from
@@ -946,3 +962,475 @@ Tests are layered by owner:
 No benchmark or fixed latency assertion is part of acceptance. The observable contract is that a
 cache hit renders locally without a viewport request and that an unavailable target never exposes a
 partial/blank frame.
+
+## 30. Host-owned Viewport Presentation Cadence
+
+The desktop CLI adopts Herdr's event-driven latest-frame pattern only for Zterm-owned cached
+viewport presentation. `MIN_VIEWPORT_PRESENT_INTERVAL` is 16 ms. This is a minimum interval between
+eligible presentations, not a periodic 60 Hz task and not a claim of compositor/vsync alignment.
+When idle, no timer remains active and no frame is emitted. The constant belongs to the desktop CLI;
+the generic cache reducer and future Android renderer remain clock- and refresh-rate-neutral.
+
+Each decoded host wheel report still applies one checked row to the desired offset immediately.
+All reports decoded from one stdin delivery are reduced before presentation is considered, so the
+usual Ghostty three-report delivery can produce one latest frame without treating byte chunking as a
+gesture contract. If multiple deliveries arrive inside the 16 ms interval, the CLI keeps one dirty
+bit and one deadline; when eligible it presents the newest complete cached slice exactly once.
+Reports split across the interval may produce two frames, but never an unbounded series of
+back-to-back writes. Intermediate offsets may be skipped visually; accumulated offset and final
+direction may not be skipped.
+
+The pacer owns presentation timing only. It does not own input semantics, cache coordinates, remote
+requests, or render bytes. A host interaction first mutates the existing `ViewportController`, then
+executes any history-window request/prefetch immediately, and finally marks the current complete
+slice dirty. Child-owned mouse reports and alternate-scroll translations bypass the pacer and are
+written to the PTY one-for-one. The existing 33 ms drag request pacing stays independent; a final
+thumb release must flush the latest complete local position rather than leave it waiting behind a
+timer.
+
+One pending deadline is added to the active terminal `tokio::select!`. The deadline carries no frame
+or scroll offset: the controller remains the single source of latest desired state. On expiry, the
+CLI renders only if the view is still host-owned history and a complete slice is available. Any
+immediate render that already contains the latest viewport marks the dirty state presented and
+cancels the deadline. Return-live/resume, authoritative snapshot or resync, resize/reflow, true
+reconnect, transport-state replacement, detach, and cleanup cancel pending work before a stale
+history frame can be emitted. A live delta observed behind a still-pinned compatible history view
+does not cancel a valid pending local presentation merely because the model revision advanced.
+
+Presentation remains one DEC 2026 transaction through the existing rendering path. There is no
+global PTY-output frame scheduler, no extra framebuffer, no physical wheel-gesture heuristic, and no
+change to the Alacritty model, protocol, daemon, one-Session/one-PTY ownership, or unsafe policy.
+
+Verification uses a controllable clock/pure pacer where possible and byte-level CLI integration
+tests for side effects. It covers same-delivery three-report reduction, cross-delivery coalescing,
+deadline expiry, opposite directions, clamp/cache miss and immediate prefetch, final drag release,
+child-owned forwarding, and cancellation by every authoritative transition. Real Ghostty smoke
+confirms perceived pacing, while tests assert exact offsets and transaction counts rather than an
+OS scheduler's wall-clock precision.
+
+## 31. Cross-Emulator Right-Margin-Safe Delta Encoding
+
+This section specifies a necessary compatibility-path invariant, not the complete presentation
+architecture. The user subsequently clarified that an extent-only repair must not be treated as the
+final solution while daemon-authored ANSI and attachment-local chrome remain separate physical
+writers. Section 32 now specifies the confirmed full migration. This section remains mandatory for
+the mixed-version adapter, but neither section is authorized until the reconverged final summary is
+followed by a new explicit implementation approval.
+
+The canonical ANSI delta contract is a row replacement, not a terminal-cursor simulation shortcut.
+For a terminal width `W`, a replacement row has a visual extent `E` in grid cells. Cells `[0, E)` are
+painted by the replacement and cells `[E, W)` are stale suffix only when `E < W`. The encoder may
+erase exactly that suffix; it must never emit an inclusive erase when `E == W`.
+
+The changed-row sequence becomes:
+
+```text
+CUP(row, 1)
+SGR reset
+encode replacement content and return visual extent E
+SGR reset
+if E < W:
+    CUP(row, E + 1)       # physical, one-based column of first stale cell
+    EL0                   # clears only [E, W)
+restore final cursor and terminal modes as before
+```
+
+`E` is measured in projected terminal cells, not UTF-8 bytes, scalar values, grapheme count, or the
+outer terminal's observed cursor. A trailing wide continuation belongs to its leading wide glyph;
+if that glyph reaches the right margin, `E == W`. A wrapped row is encoded through the full grid
+width and likewise has no suffix clear. Styled/default-background cells already considered visually
+significant by projection remain part of the extent. An empty replacement has `E == 0` and explicitly
+clears from physical column 1.
+
+This does not add an extent cache or another projection pass. The existing row encoder already
+computes this exact `end` to omit trailing default cells; it now returns the value to its caller.
+The one branch represents an unavoidable protocol distinction: ECMA `EL0` has no zero-length form,
+so an empty suffix must not issue it.
+
+The explicit second `CUP` is intentional even when the encoder believes it knows the current cursor.
+Printing the final physical cell can leave an emulator in pending-wrap with the cursor logically on
+that cell. Ghostty's erase-right includes the current cell, whereas Alacritty/tmux accepting the old
+sequence made the defect invisible to replay-only tests. Positioning by semantic extent eliminates
+that cross-emulator dependency for ASCII, combining sequences, wide glyphs and autowrap states.
+
+No new long-lived presentation state or failure transition is introduced. The encoder still builds
+one byte buffer before the CLI writes it; existing write/flush success remains the only commit point
+for outer chrome authority. Content remains before suffix cleanup, and the containing CLI frame
+remains one DEC 2026 transaction. Main/Alternate region ownership, child mouse forwarding, host
+history cadence, capture/status composition and final cursor restoration do not move into the
+terminal model.
+
+This design deliberately does not forward child DECAWM or nested DEC 2026 modes to the physical
+terminal. Zterm virtualizes child output into an authoritative model and emits canonical outer ANSI;
+forwarding private rendering state would couple two terminal state machines and would not make an
+inclusive zero-length suffix erase correct. Application/glyph/theme detection and forced full-frame
+repaints are also forbidden.
+
+Herdr reaches a different final-output contract because it owns a complete semantic `FrameData` at
+the presenter. A nested Pi/TUI is parsed into pane cells, Herdr chrome is overlaid into the same
+buffer, and a retained-frame encoder compares cells and writes literal blanks for removed glyphs.
+That removes row-tail erasure but requires per-cell comparisons, narrow/wide overlap invalidation,
+style/run batching and host-autowrap lifecycle. Section 32 adopts that owning invariant through
+Zterm-native semantic types and an explicit desktop presenter; this Section 31 encoder remains only
+the compatibility implementation for peers that cannot negotiate the new path.
+
+Verification is layered:
+
+- terminal encoder byte tests establish that a full-width replacement has no `EL0`, while a short or
+  empty replacement explicitly positions and clears the exact suffix in default rendition;
+- semantic replay tests cover full-width ASCII, styled final cells, combining content, a wide glyph
+  ending at the margin, wrapped rows, minimum width and resize, using a strict Ghostty-like
+  pending-wrap/erase oracle in addition to Alacritty replay;
+- CLI transaction tests start from committed Main and Alternate frames, inject a generic child-owned
+  right-edge cell plus incremental update/wheel path, and assert final-writer ordering, one
+  write/flush, capture/status coexistence and failed-write retry;
+- real Ghostty smoke uses Herdr as one external fixture, while Linux verification uses a generic
+  right-margin fixture so acceptance never depends on detecting that application.
+
+Nested child synchronized-output boundaries remain a separately testable optimization. They may be
+specified only if a new failing test demonstrates tearing after this row-replacement invariant is
+correct; they are not bundled into the right-margin fix.
+
+## 32. Semantic Composition and Single Presenter Direct Cutover (Approved)
+
+### 32.1 Root cause and owning invariant
+
+The right-margin symptom exposed a local legacy-encoder error, but that obsolete path is deleted by
+the direct cutover. The repeated gutter, status,
+return-live, and nested-TUI defects reveal a broader ownership failure. The current system has one
+authoritative child model but several independent physical writers. Joining their byte fragments in
+one DEC 2026 envelope provides batching, not a complete desired state or a shared commit point.
+
+The owning invariant is therefore:
+
+> During an active semantic attachment, every visible cell, cursor decision, and physical input mode
+> is derived from one complete `ComposedFrame`; exactly one presenter may transition the outer
+> terminal, and its baseline advances only after the whole transition is written and flushed.
+
+```text
+child PTY bytes
+      |
+      v
+one daemon Alacritty model + private ProjectedScreen
+      |
+      | bounded semantic snapshot / full-row patch / history rows
+      v
+client AttachmentSurface + ViewportCache<TerminalSurfaceRow>
+      |
+      | choose complete live or history source
+      v
+ChromeLayout + compositor(status, gutter, cursor, host modes)
+      |
+      v
+one complete sparse ComposedFrame
+      |
+      v
+DesktopPresenter(last successfully flushed frame)
+      |
+      | DEC 2026 + exact cell runs + cursor/modes; one write + flush
+      v
+outer terminal (Ghostty, Kitty, Alacritty, or another VT consumer)
+```
+
+Herdr and PiAgent do not appear in any decision branch. Their behavior is explained by standard
+active-screen, mouse-mode, surface, and layout state. The project-wide classification process is
+recorded in `root-cause-and-architecture-thinking-guide.md`; new contradictory evidence reopens this
+design rather than adding a compensating application or repaint rule.
+
+### 32.2 Core semantic values
+
+`zterm-core::terminal` owns one renderer-neutral terminal presentation contract:
+
+```rust
+pub struct TerminalSurfaceRow {
+    pub cells: Vec<TerminalCell>,
+    pub wrapped: bool,
+}
+
+pub struct TerminalSurface {
+    pub size: TerminalSize,
+    pub active_screen: ActiveScreen,
+    pub rows: Vec<TerminalSurfaceRow>,
+    pub cursor: TerminalCursor,
+    pub modes: TerminalModes,
+}
+
+pub struct TerminalSurfaceSnapshot {
+    pub revision: Revision,
+    pub surface: TerminalSurface,
+    pub scroll_metrics: Option<TerminalScrollMetrics>,
+}
+
+pub struct TerminalSurfaceRowPatch {
+    pub row_index: u16,
+    pub row: TerminalSurfaceRow,
+}
+
+pub struct TerminalSurfaceDelta {
+    pub from_revision: Revision,
+    pub to_revision: Revision,
+    pub size: TerminalSize,
+    pub active_screen: ActiveScreen,
+    pub cursor: TerminalCursor,
+    pub modes: TerminalModes,
+    pub rows: Vec<TerminalSurfaceRowPatch>,
+    pub scroll_metrics: Option<TerminalScrollMetrics>,
+}
+```
+
+Snapshot rows and cells are rectangular and exact. A delta is a set of unique, increasing,
+full-width row replacements plus the complete resulting cursor/mode/metrics metadata. It applies
+only to the exact revision, size, and active screen. Size, screen, projection-format, or checkpoint
+mismatch produces a full semantic snapshot. A revision-only transition may carry zero changed rows;
+it is not discarded when other semantic metadata changes.
+
+Semantic history-window values reuse Section 26's anchor, target, disposition, and coordinate math,
+but contain `TerminalSurfaceRow` rather than ANSI bytes. `ViewportCache<Row>` stays generic, so no
+second cache state machine is introduced.
+
+Validation is performed before values reach a renderer:
+
+- non-zero dimensions within existing product limits;
+- exactly `size.rows` rows and `size.columns` cells per row;
+- valid advancing revisions, ordered/in-range delta rows, in-range cursor, and metrics consistent
+  with snapshot revision/height/screen;
+- valid UTF-8 strings no longer than the existing 22-byte cell cap and containing no C0/C1/ESC;
+- every wide head followed by one empty continuation, every continuation preceded by its head, and
+  no head beginning in the final column;
+- content-frame size at or below 8 MiB and content-redacted `Debug` at core/proto/daemon boundaries.
+
+The source model's wide flags are authoritative. The desktop backend never infers its next cursor
+from Unicode display width, so a host's width-table difference cannot propagate into later runs.
+
+### 32.3 Proto encoding and coordinated wire cutover
+
+Semantic presentation is mandatory, not negotiated. The release increments the product wire major
+and its normal/pair ALPN identifiers. Local readiness and authenticated network handshakes reject an
+older binary before it can open an attachment. No presentation preference or feature capability is
+needed.
+
+The protobuf source/package and generated Rust module move directly from `proto/zterm/v1`,
+`zterm.v1`, and `zterm_proto::v1` to `proto/zterm/v2`, `zterm.v2`, and `zterm_proto::v2`. The build
+does not generate or expose both schema majors. Independently versioned data messages such as
+`PairTicketV1` may keep their names and unchanged binary shapes; that does not preserve a wire-v1
+transport path or require migrating trusted-device state.
+
+Within the new wire major the canonical terminal content kinds are:
+
+```text
+kind 301  TerminalSemanticSnapshot             (content)
+kind 302  TerminalSemanticDelta                (content)
+kind 317  TerminalHistoryWindowRequest         (control)
+kind 318  TerminalSemanticHistoryWindowFrame   (content)
+```
+
+The old ANSI payloads at 301/302/318, pager 312/313, stateful viewport 315/316, temporary semantic
+kinds 319..321, capability bits 17/19/20/21, and `TerminalPresentationEncoding` field/enum are
+removed. Reusing the primary content numbers is safe because the wire major and ALPN differ. Unknown
+or old peers fail explicitly; there is no fallback matrix.
+
+The remote bridge decodes only enough protobuf envelope metadata to validate session/attachment
+identity, revision, request correlation, and frame bounds before replacing its private attachment
+ID and forwarding. It does not convert terminal cells, construct ANSI, or choose a representation.
+
+### 32.4 Model, checkpoint, session, and resume flow
+
+`ProjectedScreen` and its inline cells remain private to `zterm-terminal`. The model projects once
+under its existing lock and converts the projection and changed rows directly into semantic values.
+`encode_full`, `encode_delta`, row ANSI encoding, `recent_history_ansi`, and their DTOs are deleted.
+A semantic snapshot intentionally has no recent-history stream; the bounded
+history-window/cache path is the scroll source of truth on desktop and mobile.
+
+`TerminalCheckpoint` remains a semantic projected screen. Every initial update, snapshot
+acknowledgement, latest/final update, sync-required response, and history-window response uses the
+semantic type directly; `ActorAttachment` stores no presentation-family state. An exact remote
+checkpoint may resume with a delta.
+
+This changes presentation only. The existing one-Session/one-PTY/model rule, ordered model thread,
+fixed no-drop PTY queue, shared revision watermark, query-reply ordering, controller/takeover rules,
+read-only history lock, detach/reconnect behavior, and final drain remain the lifecycle authority.
+
+### 32.5 Client attachment state and visible source
+
+The client owns one `AttachmentSurface` with the latest validated complete surface and
+revision. It performs transactional updates:
+
+1. validate a snapshot or validate a delta against the existing baseline;
+2. build/install the replacement surface or row set without touching the committed physical frame;
+3. expose one complete desired source to the compositor;
+4. request resync on a gap while retaining the last complete presentation.
+
+History uses one `ViewportCache<TerminalSurfaceRow>`, retaining the already implemented
+anchor translation, bounded prefetch, one-in-flight/latest-target behavior, 16 ms desktop
+presentation cadence, 33 ms drag-request pacing, and one complete SGR wheel report per host-owned
+line.
+
+When pinned in history, live deltas continue advancing `AttachmentSurface`, but the compositor uses
+the complete cached main-screen slice and hides the child cursor. A background child transition to
+Alternate does not seize wheel ownership or replace the pinned source. Return-live switches once to
+the latest complete live surface and then reconciles layout/PTY size through the existing resize
+coalescer.
+
+### 32.6 Region layout and compositor
+
+Layout assigns ownership before painting:
+
+```text
+Main:      [ child columns 1..N-1 ][ Zterm gutter N ]
+Alternate: [ child columns 1..N                     ]
+Remote:    content regions above + status at physical final row
+```
+
+The gutter condition (`Main` and usable width greater than four), status-row condition, viewport
+caps, and Main/Alternate resize behavior stay unchanged. What changes is that clearing or drawing a
+region is no longer a post-child operation. The compositor always starts from a complete retained
+visible row source and writes each region into one desired frame. A transferred gutter column is
+therefore simply a child cell in the next Alternate frame.
+
+Conceptually:
+
+```rust
+struct ComposedFrame {
+    physical_size: TerminalSize,
+    rows: BTreeMap<u16, ComposedRow>,
+    cursor: ComposedCursor,
+    host_modes: HostModeState,
+    layout_identity: LayoutIdentity,
+}
+```
+
+Rows use absolute one-based physical coordinates and contain only explicitly owned cells. This
+sparse shape prevents an allocation proportional to arbitrary `u16 rows * columns`; owned content is
+bounded by the product child rectangle plus one optional status row. Composition rejects overlapping
+regions, cells outside the physical viewport, malformed wide spans, and unbounded status output.
+Coordinates owned by the previous frame but no longer owned by the next become default blank during
+the presenter diff, unless a resize already invalidates the whole baseline.
+
+Status text, connection path/RTT, reconnect state, scrollbar track/thumb, cursor visibility, and host
+mode policy are pure contributors. They cannot write stdout. The compositor hides the cursor for
+history, clamps a live child cursor to the allocated child region, and keeps remote status outside
+child coordinates.
+
+### 32.7 Desktop presenter and physical mode policy
+
+The lifecycle `TerminalGuard` remains the only writer before/after the active phase: it establishes
+raw mode and the outer alternate screen, then always disables modes/restores the screen on exit. It
+hands the active phase to one `DesktopPresenter`; child Main/Alternate never toggles the outer
+screen.
+
+For a known baseline, `DesktopPresenter`:
+
+1. diffs absolute cells in the union of old/new owned coordinates;
+2. expands every change through old and new wide-character spans;
+3. groups adjacent cells where safe, starts each run with absolute `CUP`, and emits allowlisted SGR;
+4. writes explicit default-style blanks for removals and never uses incremental `EL0`/`EL2`;
+5. positions the desired cursor with absolute `CUP`, applies visibility/style and one host-mode
+   transition, then ends the synchronized update.
+
+Writing the final physical column may leave the host in pending-wrap, but the next run/cursor is
+always absolutely positioned. Pending wrap is never used as state and cannot turn a zero-length
+suffix into an erase.
+
+`HostModeState` derives application cursor/keypad, bracketed paste, and focus observation from child
+semantics where required for input fidelity. Physical mouse ownership is always Zterm SGR
+any-motion capture (`1003` + `1006`); child mouse mode/encoding and alternate-scroll are consumed only
+by the input router, which emits exactly one child event or host scroll action.
+
+Missing baseline, resize, screen/layout identity change, or prior I/O
+failure triggers full presentation: reset style, clear the outer alternate screen, and paint the
+complete desired frame. A complete transition is first built in memory, enclosed by one DEC 2026
+begin/end, then sent through exactly one `write_all` and one `flush`. Only success commits the cloned
+frame. On either failure, the baseline becomes unknown and a best-effort DEC 2026 end is attempted
+without replacing the original error; the next attempt is necessarily full.
+
+Connection-status and reconnect changes go through the same compositor/presenter. The standalone
+`RECONNECTING_STATUS` newline writer and independent active status/gutter render entry points are
+removed. Unchanged composed frames produce no physical write.
+
+### 32.8 Superseded-path deletion contract
+
+The direct cutover deletes, rather than repairs or isolates, every ANSI presentation producer and
+consumer: core snapshot/delta DTOs, terminal encoders, driver/session family wrappers, proto
+messages/conversions, local/remote negotiation, CLI renderer/history byte cache, and their tests.
+The pager and stateful viewport protocols are also removed because their only remaining purpose was
+fallback for peers without the stateless semantic history window.
+
+Deletion is reachability-based and includes modules, public aliases, generated artifacts, Cargo
+features/dependencies, errors, and fixtures left without a current consumer. Generic snapshot
+acknowledgement, resync, input, resize, detach, controller/takeover, final-drain, terminal guard,
+history coordinates, and the generic cache remain because the semantic architecture still consumes
+them. Removed numeric capability bits remain unassigned; removed kind numbers are either canonical
+semantic kinds in wire major two or absent. No deprecated shim or dual-schema module is retained.
+Source-policy tests reject reintroduction of ANSI presentation or family/downgrade branches.
+
+### 32.9 Module boundaries
+
+No new third-party renderer, Ratatui dependency, terminal parser, or speculative shared crate is
+introduced:
+
+```text
+zterm-core     semantic rows/surfaces/patches/validation + generic cache
+zterm-proto    semantic protobuf/wire conversion, bounds, redacted Debug
+zterm-terminal private Alacritty projection + semantic producer
+zterm-daemon   Session ownership + local/remote semantic forwarding
+zterm-cli      terminal_ui.rs orchestration/input
+               terminal_ui/surface.rs       AttachmentSurface / visible source
+               terminal_ui/composition.rs   regions, chrome, ComposedFrame
+               terminal_ui/ansi_presenter.rs sole semantic desktop presenter
+```
+
+Exact filenames may be consolidated when a module would otherwise be trivial, but ownership cannot
+be folded back into independent stdout writers. `zterm-core` and `zterm-proto` remain free of
+Alacritty and desktop ANSI dependencies, so Android can consume semantic surfaces and cache
+coordinates. Android-specific layout, font/glyph rendering, IME, touch/fling, and vsync are deferred.
+
+### 32.10 Verification, rollback, and release
+
+Verification is contract-oriented rather than application-oriented:
+
+- core/proto: round trips, exact rectangular shape, revisions, malformed controls/wide pairs,
+  cursor/metrics, max dimensions/frame size, fixed existing numbers, redacted content;
+- terminal: semantic snapshot/patch equivalence for whole/fragmented input, styles, Unicode,
+  combining, wide/wrapped rows, screen/resize, history, and absence of ANSI presentation code;
+- session/transport: initial snapshot and resume delta, ack/resync, final drain, takeover, reconnect,
+  local/direct/relay, and explicit rejection of the previous wire major;
+- client: transactional surface apply, history/live source choice, cache invalidation, region
+  non-overlap, gutter/status transfer, cursor/modes, no active writer outside the presenter;
+- presenter: strict desired-frame oracle, rightmost/wide/styled-blank transitions, one DEC 2026
+  transaction/write/flush, unchanged no-op, partial failure then full retry;
+- source deletion: no wire-v1 generated module, legacy DTO/encoder/kind/capability/preference/fallback,
+  unreachable cutover residue, or secondary active writer;
+- system: application-neutral nested TUI fixture plus Herdr as a real Ghostty/macOS smoke, and
+  separately recorded macOS/Linux local/direct/relay evidence.
+
+Each internal phase has a source rollback point and may be committed for review. Rollback before
+release means reverting the complete wire-major cutover; there is no runtime compatibility switch.
+There is no extent-only release and no declaration of completion until the semantic path, explicit
+old-major rejection, quality gates, spec synchronization, and macOS/Linux acceptance all pass.
+
+The user explicitly excluded throughput, latency, CPU, RSS, and comparative performance benchmarks.
+Existing dimension/content safety bounds remain; the removed aggregate memory admission does not
+return. Product code continues to inherit `unsafe_code = "forbid"`.
+
+### 32.11 Rejected alternatives
+
+- **Herdr/application detection**: treats evidence as scope and fails the next equivalent TUI.
+- **Repeated/full repaint after wheel**: hides one symptom, adds latency/flicker, and leaves ownership
+  split.
+- **Daemon-only exact ANSI diff**: still cannot include attachment-local status/gutter or serve a
+  native mobile renderer.
+- **CLI reparse of daemon ANSI**: creates a second terminal state machine and untrusted parser while
+  preserving a desktop-only boundary.
+- **Daemon-owned final chrome**: mixes per-session model state with per-attachment/platform layout.
+- **More `ReplaceRow`/`ClearRange` commands**: grows a pseudo-terminal protocol instead of
+  transporting complete domain semantics.
+- **Global PTY frame scheduler or child DEC 2026 passthrough**: changes timing but cannot establish a
+  correct final desired frame.
+- **Immediate shared presentation crate**: no current Android UI/layout implementation proves a
+  stable shared compositor API; core semantic values/cache are the justified reusable seam.
+
+### 32.12 Authorization boundary
+
+The direct-cutover scope and one-release decision are captured. This revised design, matching PRD,
+research, implementation phases, and manifests must be presented as one final planning summary. A
+new explicit user approval after that summary was received; product implementation may resume.

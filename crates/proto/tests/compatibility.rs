@@ -11,7 +11,7 @@ use zterm_core::{
 use zterm_proto::{
     DecodedFrame, MAX_PAIR_HELLO_FRAME_BYTES, PAIR_TICKET_PREFIX, RELAY_ROUTE_CACHE_VERSION,
     WIRE_MAJOR, WireFieldError, WireKind, decode_pair_ticket, decode_relay_route_cache,
-    encode_pair_ticket, encode_payload, encode_relay_route_cache, v1, validate_pair_operation,
+    encode_pair_ticket, encode_payload, encode_relay_route_cache, v2, validate_pair_operation,
 };
 
 // Cross-language golden vector from `zterm-core/tests/pairing_vectors.rs`, fixed
@@ -118,9 +118,9 @@ fn ticket_text_rejects_prefix_padding_alphabet_truncation_and_oversize() {
 fn ticket_proto_validates_id_secret_url_count_and_version() {
     let make =
         |offer_id: Vec<u8>, secret: Vec<u8>, relay_urls: Vec<String>, format_version: u32| {
-            v1::PairTicketV1 {
+            v2::PairTicketV1 {
                 format_version,
-                host_device_id: Some(v1::DeviceId {
+                host_device_id: Some(v2::DeviceId {
                     value: HOST_DEVICE.to_vec(),
                 }),
                 host_name: "test-host".to_owned(),
@@ -211,7 +211,7 @@ fn pair_connection_and_local_device_adapters_round_trip_validated_values() {
     )
     .expect("pair begin validates");
     assert_eq!(
-        PairBegin::try_from(v1::PairBegin::from(&begin)).expect("pair begin round-trips"),
+        PairBegin::try_from(v2::PairBegin::from(&begin)).expect("pair begin round-trips"),
         begin
     );
 
@@ -222,14 +222,14 @@ fn pair_connection_and_local_device_adapters_round_trip_validated_values() {
     )
     .expect("pair challenge validates");
     assert_eq!(
-        PairChallenge::try_from(v1::PairChallenge::from(&challenge))
+        PairChallenge::try_from(v2::PairChallenge::from(&challenge))
             .expect("pair challenge round-trips"),
         challenge
     );
 
     let proof = PairProof::from_bytes([4; 32]);
     assert_eq!(
-        PairProof::try_from(v1::PairProof::from(&proof)).expect("pair proof round-trips"),
+        PairProof::try_from(v2::PairProof::from(&proof)).expect("pair proof round-trips"),
         proof
     );
 
@@ -237,14 +237,14 @@ fn pair_connection_and_local_device_adapters_round_trip_validated_values() {
     let accepted =
         PairAccepted::new(generation, [5; 32], "0.1.1").expect("pair acceptance validates");
     assert_eq!(
-        PairAccepted::try_from(v1::PairAccepted::from(&accepted))
+        PairAccepted::try_from(v2::PairAccepted::from(&accepted))
             .expect("pair acceptance round-trips"),
         accepted
     );
 
     let hello = ConnectionHello::new(
-        1,
-        1,
+        WIRE_MAJOR,
+        WIRE_MAJOR,
         Capabilities::from_bits_retain(u64::MAX),
         ConnectionAttemptId::from_array([6; 16]),
         "controller",
@@ -253,12 +253,12 @@ fn pair_connection_and_local_device_adapters_round_trip_validated_values() {
     )
     .expect("hello validates");
     assert_eq!(
-        ConnectionHello::try_from(v1::ConnectionHello::from(&hello)).expect("hello round-trips"),
+        ConnectionHello::try_from(v2::ConnectionHello::from(&hello)).expect("hello round-trips"),
         hello
     );
 
     let welcome = ConnectionWelcome::new(
-        1,
+        WIRE_MAJOR,
         Capabilities::from_bits_retain(u64::MAX),
         "host",
         "0.1.1",
@@ -267,14 +267,14 @@ fn pair_connection_and_local_device_adapters_round_trip_validated_values() {
     )
     .expect("welcome validates");
     assert_eq!(
-        ConnectionWelcome::try_from(v1::ConnectionWelcome::from(&welcome))
+        ConnectionWelcome::try_from(v2::ConnectionWelcome::from(&welcome))
             .expect("welcome round-trips"),
         welcome
     );
 
     let device_id = DeviceId::from_array([7; 32]);
     let alias = DeviceAlias::new("workstation").expect("alias validates");
-    let rename = v1::LocalDeviceRenameRequest {
+    let rename = v2::LocalDeviceRenameRequest {
         device_id: Some(device_id.into()),
         alias: alias.as_str().to_owned(),
     };
@@ -282,7 +282,7 @@ fn pair_connection_and_local_device_adapters_round_trip_validated_values() {
         <(DeviceId, DeviceAlias)>::try_from(rename).expect("rename request validates"),
         (device_id, alias)
     );
-    let revoke = v1::LocalDeviceRevokeRequest {
+    let revoke = v2::LocalDeviceRevokeRequest {
         device_id: Some(device_id.into()),
     };
     assert_eq!(
@@ -308,9 +308,9 @@ fn pairing_handshake_budget_uses_checked_cumulative_accounting() {
 #[test]
 fn unknown_fields_and_capability_bits_survive_round_trip() {
     // Capability bits retain unknown bits end to end.
-    let hello = v1::ConnectionHello {
-        min_wire_major: 1,
-        max_wire_major: 1,
+    let hello = v2::ConnectionHello {
+        min_wire_major: WIRE_MAJOR,
+        max_wire_major: WIRE_MAJOR,
         capabilities: u64::MAX,
         attempt_id: vec![7; 16],
         initiator_display: "laptop".to_owned(),
@@ -318,7 +318,7 @@ fn unknown_fields_and_capability_bits_survive_round_trip() {
         initiator_platform: "macos".to_owned(),
     };
     let bytes = hello.encode_to_vec();
-    let decoded = v1::ConnectionHello::decode(bytes.as_slice()).expect("hello decodes");
+    let decoded = v2::ConnectionHello::decode(bytes.as_slice()).expect("hello decodes");
     assert_eq!(decoded, hello);
     assert_eq!(decoded.capabilities, u64::MAX);
     let capabilities = Capabilities::from_bits_retain(decoded.capabilities);
@@ -328,7 +328,7 @@ fn unknown_fields_and_capability_bits_survive_round_trip() {
     // An unknown trailing protobuf field is ignored by a compatible decoder.
     let mut with_unknown = bytes;
     with_unknown.extend_from_slice(&[0xf8, 0x07, 0x01]); // field 255, varint 1
-    let decoded = v1::ConnectionHello::decode(with_unknown.as_slice()).expect("unknown field kept");
+    let decoded = v2::ConnectionHello::decode(with_unknown.as_slice()).expect("unknown field kept");
     assert_eq!(decoded, hello);
 }
 
@@ -345,7 +345,7 @@ fn relay_route_cache_round_trips_and_rejects_unknown_versions() {
     );
 
     // An unknown cache version fails with a diagnostic and is never migrated.
-    let unknown = v1::RelayRouteCacheV1 {
+    let unknown = v2::RelayRouteCacheV1 {
         format_version: 2,
         relay_urls: vec!["https://relay.example.com".to_owned()],
     };
@@ -362,7 +362,7 @@ fn relay_route_cache_enforces_count_and_byte_ceiling() {
         encode_relay_route_cache(&[]),
         Err(zterm_proto::RouteCacheError::MissingUrl)
     ));
-    let empty = v1::RelayRouteCacheV1 {
+    let empty = v2::RelayRouteCacheV1 {
         format_version: RELAY_ROUTE_CACHE_VERSION,
         relay_urls: Vec::new(),
     };
@@ -383,7 +383,7 @@ fn relay_route_cache_enforces_count_and_byte_ceiling() {
     ));
 
     // A decoded cache advertising more than the bound is rejected.
-    let oversized = v1::RelayRouteCacheV1 {
+    let oversized = v2::RelayRouteCacheV1 {
         format_version: RELAY_ROUTE_CACHE_VERSION,
         relay_urls: (0..5)
             .map(|index| format!("https://relay{index}.example.com"))
@@ -447,8 +447,8 @@ fn wire_kind_registry_is_unique_and_centrally_mapped() {
         WireKind::SessionOperationLeaseRequest,
         WireKind::SessionOperationLeaseResponse,
         WireKind::TerminalAttachRequest,
-        WireKind::TerminalSnapshot,
-        WireKind::TerminalDelta,
+        WireKind::TerminalSemanticSnapshot,
+        WireKind::TerminalSemanticDelta,
         WireKind::TerminalInput,
         WireKind::TerminalResize,
         WireKind::TerminalDetach,
@@ -458,13 +458,9 @@ fn wire_kind_registry_is_unique_and_centrally_mapped() {
         WireKind::TerminalLeaseLost,
         WireKind::TerminalSessionEnded,
         WireKind::TerminalTransportStateEvent,
-        WireKind::TerminalHistoryRequest,
-        WireKind::TerminalHistoryPage,
         WireKind::TerminalConnectionStatusEvent,
-        WireKind::TerminalViewportRequest,
-        WireKind::TerminalViewportFrame,
         WireKind::TerminalHistoryWindowRequest,
-        WireKind::TerminalHistoryWindowFrame,
+        WireKind::TerminalSemanticHistoryWindowFrame,
     ];
 
     let mut seen = BTreeSet::new();
@@ -482,29 +478,24 @@ fn wire_kind_registry_is_unique_and_centrally_mapped() {
     assert_eq!(WireKind::LocalSessionUnaryRequest as u32, 24);
     assert_eq!(WireKind::PairBegin as u32, 100);
     assert_eq!(WireKind::ConnectionWelcome as u32, 105);
+    assert_eq!(WireKind::TerminalSemanticSnapshot as u32, 301);
+    assert_eq!(WireKind::TerminalSemanticDelta as u32, 302);
     assert_eq!(WireKind::TerminalTransportStateEvent as u32, 311);
-    assert_eq!(WireKind::TerminalHistoryRequest as u32, 312);
-    assert_eq!(WireKind::TerminalHistoryPage as u32, 313);
     assert_eq!(WireKind::TerminalConnectionStatusEvent as u32, 314);
-    assert_eq!(WireKind::TerminalViewportRequest as u32, 315);
-    assert_eq!(WireKind::TerminalViewportFrame as u32, 316);
     assert_eq!(WireKind::TerminalHistoryWindowRequest as u32, 317);
-    assert_eq!(WireKind::TerminalHistoryWindowFrame as u32, 318);
-    assert_eq!(Capabilities::HISTORY_PAGING, 1_u64 << 17);
+    assert_eq!(WireKind::TerminalSemanticHistoryWindowFrame as u32, 318);
     assert_eq!(Capabilities::AGENT_EVENTS, 1_u64 << 18);
-    assert_eq!(Capabilities::TERMINAL_VIEWPORT, 1_u64 << 19);
-    assert_eq!(Capabilities::TERMINAL_HISTORY_WINDOW, 1_u64 << 20);
 }
 
 #[test]
 fn device_summary_exposes_each_direction_explicitly() {
-    let device = v1::DeviceSummary {
-        device_id: Some(v1::DeviceId { value: vec![7; 32] }),
+    let device = v2::DeviceSummary {
+        device_id: Some(v2::DeviceId { value: vec![7; 32] }),
         outbound_known: true,
         alias: String::new(),
         remote_name: "laptop".to_owned(),
         route_verified: true,
-        auth_status: v1::DeviceAuthStatus::None as i32,
+        auth_status: v2::DeviceAuthStatus::None as i32,
         generation: 0,
         paired_at_unix: 0,
         last_seen_at_unix: 1_700_000_000,
@@ -513,17 +504,17 @@ fn device_summary_exposes_each_direction_explicitly() {
         remote_attachment_count: 0,
     };
     let bytes = device.encode_to_vec();
-    let decoded = v1::DeviceSummary::decode(bytes.as_slice()).expect("device summary decodes");
+    let decoded = v2::DeviceSummary::decode(bytes.as_slice()).expect("device summary decodes");
     assert_eq!(decoded, device);
     // An empty alias must not be the way a consumer learns the outbound row is
     // absent: `outbound_known` is the explicit direction.
     assert!(decoded.outbound_known);
     assert!(decoded.alias.is_empty());
-    assert_eq!(decoded.auth_status, v1::DeviceAuthStatus::None as i32);
+    assert_eq!(decoded.auth_status, v2::DeviceAuthStatus::None as i32);
     let domain = DeviceSummary::try_from(decoded).expect("directional summary validates");
     assert!(domain.outbound_known());
 
-    for invalid in [v1::DeviceAuthStatus::Unspecified as i32, 99] {
+    for invalid in [v2::DeviceAuthStatus::Unspecified as i32, 99] {
         let mut malformed = device.clone();
         malformed.auth_status = invalid;
         assert!(matches!(
@@ -535,7 +526,7 @@ fn device_summary_exposes_each_direction_explicitly() {
 
 #[test]
 fn handshake_adapters_reject_zero_protocol_and_authorization_sentinels() {
-    let zero_range = v1::ConnectionHello {
+    let zero_range = v2::ConnectionHello {
         min_wire_major: 0,
         max_wire_major: 0,
         capabilities: 0,
@@ -549,7 +540,7 @@ fn handshake_adapters_reject_zero_protocol_and_authorization_sentinels() {
         Err(WireFieldError::InvalidConnection(_))
     ));
 
-    let zero_welcome = v1::ConnectionWelcome {
+    let zero_welcome = v2::ConnectionWelcome {
         wire_major: 0,
         capabilities: 0,
         responder_display: "host".to_owned(),
@@ -562,7 +553,7 @@ fn handshake_adapters_reject_zero_protocol_and_authorization_sentinels() {
         Err(WireFieldError::InvalidConnection(_))
     ));
 
-    let zero_generation = v1::PairAccepted {
+    let zero_generation = v2::PairAccepted {
         authorization_generation: 0,
         host_confirmation_proof: vec![2; 32],
         host_diagnostic_version: "0.1.1".to_owned(),
@@ -582,7 +573,7 @@ fn generated_pair_messages_and_decoded_frames_redact_sensitive_payloads() {
     const KEY_SENTINEL: &[u8; 32] = b"PAIR_KEY_SENTINEL_0123456789ABCD";
     const TICKET_SENTINEL: &str = "zterm-pair-v1:PAIR_TICKET_SENTINEL_470b";
 
-    let wire = v1::WireFrame {
+    let wire = v2::WireFrame {
         wire_major: WIRE_MAJOR,
         kind: WireKind::PairProof as u32,
         payload: FRAME_SENTINEL.to_vec(),
@@ -595,7 +586,7 @@ fn generated_pair_messages_and_decoded_frames_redact_sensitive_payloads() {
         deadline_ms: 8,
         payload: FRAME_SENTINEL.to_vec(),
     };
-    let ticket = v1::PairTicketV1 {
+    let ticket = v2::PairTicketV1 {
         format_version: PAIR_TICKET_FORMAT_VERSION,
         host_device_id: None,
         host_name: "host".to_owned(),
@@ -604,29 +595,29 @@ fn generated_pair_messages_and_decoded_frames_redact_sensitive_payloads() {
         secret: KEY_SENTINEL.to_vec(),
         expires_at_unix: EXPIRES_AT_UNIX,
     };
-    let begin = v1::PairBegin {
+    let begin = v2::PairBegin {
         offer_id: OFFER_SENTINEL.to_vec(),
         controller_name: "controller".to_owned(),
         controller_nonce: NONCE_SENTINEL.to_vec(),
         pair_protocol_version: PAIR_PROTOCOL_VERSION,
     };
-    let challenge = v1::PairChallenge {
+    let challenge = v2::PairChallenge {
         host_nonce: NONCE_SENTINEL.to_vec(),
         selected_version: PAIR_PROTOCOL_VERSION,
         ticket_expiry_unix: EXPIRES_AT_UNIX,
     };
-    let proof = v1::PairProof {
+    let proof = v2::PairProof {
         controller_proof: PROOF_SENTINEL.to_vec(),
     };
-    let accepted = v1::PairAccepted {
+    let accepted = v2::PairAccepted {
         authorization_generation: 1,
         host_confirmation_proof: PROOF_SENTINEL.to_vec(),
         host_diagnostic_version: "test-build".to_owned(),
     };
-    let local_create = v1::LocalPairCreateResponse {
+    let local_create = v2::LocalPairCreateResponse {
         ticket: TICKET_SENTINEL.to_owned(),
     };
-    let local_accept = v1::LocalPairAcceptRequest {
+    let local_accept = v2::LocalPairAcceptRequest {
         ephemeral_operation_id: OFFER_SENTINEL.to_vec(),
         fingerprint: KEY_SENTINEL.to_vec(),
         ticket: TICKET_SENTINEL.to_owned(),
@@ -664,66 +655,110 @@ fn generated_session_terminal_and_route_debug_is_redacted_without_wire_changes()
     const CWD_SENTINEL: &str = "/private/tmp/CWD_SENTINEL_8b62/project";
     const RELAY_SENTINEL: &str = "https://RELAY_ROUTE_SENTINEL_60e4.example.test/path";
     const HOME_RELAY_SENTINEL: &str = "https://HOME_RELAY_SENTINEL_19a5.example.test";
-    const SCREEN_SENTINEL: &[u8] = b"PROTO_SCREEN_SENTINEL_e357";
-    const HISTORY_SENTINEL: &[u8] = b"PROTO_HISTORY_SENTINEL_4d18";
-    const DELTA_SENTINEL: &[u8] = b"PROTO_DELTA_SENTINEL_729a";
+    const SCREEN_SENTINEL: &str = "PROTO_SCREEN_SENTINEL_e357";
+    const HISTORY_SENTINEL: &str = "PROTO_HISTORY_SENTINEL_4d18";
+    const DELTA_SENTINEL: &str = "PROTO_DELTA_SENTINEL_729a";
     const INPUT_SENTINEL: &[u8] = b"PROTO_INPUT_SENTINEL_b84f";
     const RESUME_SENTINEL: &[u8; 16] = b"RESUME_PROTO_4d2";
 
-    let summary = v1::SessionSummary {
-        session_id: Some(v1::SessionId {
+    let summary = v2::SessionSummary {
+        session_id: Some(v2::SessionId {
             value: vec![0x31; 16],
         }),
         name: "build".to_owned(),
         revision: 37,
         has_controller: true,
         working_directory: CWD_SENTINEL.to_owned(),
-        viewport: Some(v1::TerminalViewport {
+        viewport: Some(v2::TerminalViewport {
             rows: 43,
             columns: 151,
         }),
     };
-    let create = v1::SessionCreateRequest {
+    let create = v2::SessionCreateRequest {
         operation_id: None,
         target: None,
         name: "build".to_owned(),
         working_directory: CWD_SENTINEL.to_owned(),
         viewport: summary.viewport,
     };
-    let snapshot = v1::TerminalSnapshot {
+    let screen_cell = v2::TerminalCell {
+        contents: SCREEN_SENTINEL.to_owned(),
+        wide: false,
+        wide_continuation: false,
+        style: Some(v2::TerminalStyle::default()),
+    };
+    let snapshot = v2::TerminalSemanticSnapshot {
         session_id: summary.session_id.clone(),
-        attachment_id: Some(v1::AttachmentId {
+        attachment_id: Some(v2::AttachmentId {
             value: vec![0x32; 16],
         }),
         revision: 41,
-        rows: 43,
-        columns: 151,
-        screen_ansi: SCREEN_SENTINEL.to_vec(),
-        recent_history_ansi: HISTORY_SENTINEL.to_vec(),
-        active_screen: v1::TerminalActiveScreen::Main as i32,
-        modes: Some(v1::TerminalModes::default()),
-        scroll_metrics: None,
+        surface: Some(v2::TerminalSurface {
+            row_count: 43,
+            column_count: 151,
+            active_screen: v2::TerminalActiveScreen::Main as i32,
+            rows: vec![v2::TerminalSurfaceRow {
+                cells: vec![screen_cell.clone()],
+                wrapped: false,
+            }],
+            cursor: Some(v2::TerminalCursor::default()),
+            modes: Some(v2::TerminalModes::default()),
+            scroll_metrics: None,
+        }),
     };
-    let delta = v1::TerminalDelta {
+    let delta = v2::TerminalSemanticDelta {
+        attachment_id: snapshot.attachment_id.clone(),
         from_revision: 41,
         to_revision: 47,
-        ansi: DELTA_SENTINEL.to_vec(),
-        rows: 43,
-        columns: 151,
-        active_screen: v1::TerminalActiveScreen::Main as i32,
-        modes: Some(v1::TerminalModes::default()),
-        attachment_id: snapshot.attachment_id.clone(),
+        row_count: 43,
+        column_count: 151,
+        active_screen: v2::TerminalActiveScreen::Main as i32,
+        row_patches: vec![v2::TerminalSemanticRowPatch {
+            row: 0,
+            replacement: Some(v2::TerminalSurfaceRow {
+                cells: vec![v2::TerminalCell {
+                    contents: DELTA_SENTINEL.to_owned(),
+                    ..screen_cell.clone()
+                }],
+                wrapped: false,
+            }),
+        }],
+        cursor: Some(v2::TerminalCursor::default()),
+        modes: Some(v2::TerminalModes::default()),
         scroll_metrics: None,
     };
-    let input = v1::TerminalInput {
+    let history = v2::TerminalSemanticHistoryWindowFrame {
+        attachment_id: snapshot.attachment_id.clone(),
+        outcome: v2::TerminalHistoryWindowOutcome::Frame as i32,
+        disposition: v2::TerminalViewportDisposition::Exact as i32,
+        anchor: Some(v2::TerminalHistoryWindowAnchor {
+            epoch: 1,
+            revision: 41,
+            max_offset_from_bottom: 10,
+            viewport_rows: 43,
+            viewport_columns: 151,
+        }),
+        target_offset_from_bottom: 3,
+        first_row_from_live_top: -3,
+        rows: vec![v2::TerminalSurfaceRow {
+            cells: vec![v2::TerminalCell {
+                contents: HISTORY_SENTINEL.to_owned(),
+                ..screen_cell.clone()
+            }],
+            wrapped: false,
+        }],
+        current_epoch: 1,
+        current_revision: 41,
+    };
+    let input = v2::TerminalInput {
         operation_id: None,
         attachment_id: snapshot.attachment_id.clone(),
         bytes: INPUT_SENTINEL.to_vec(),
     };
-    let resume_view_id = v1::ResumeViewId {
+    let resume_view_id = v2::ResumeViewId {
         value: RESUME_SENTINEL.to_vec(),
     };
-    let attach = v1::TerminalAttachRequest {
+    let attach = v2::TerminalAttachRequest {
         target: None,
         session_id: summary.session_id.clone(),
         takeover: false,
@@ -733,44 +768,42 @@ fn generated_session_terminal_and_route_debug_is_redacted_without_wire_changes()
         resume_view_id: Some(resume_view_id.clone()),
         known_revision: Some(37),
     };
-    let route_cache = v1::RelayRouteCacheV1 {
+    let route_cache = v2::RelayRouteCacheV1 {
         format_version: RELAY_ROUTE_CACHE_VERSION,
         relay_urls: vec![RELAY_SENTINEL.to_owned()],
     };
-    let status = v1::LocalStatusResponse {
+    let status = v2::LocalStatusResponse {
         home_relay: HOME_RELAY_SENTINEL.to_owned(),
         active_session_count: 1,
         active_session_names: vec!["build".to_owned()],
         direct_path_count: 2,
         relay_path_count: 3,
-        ..v1::LocalStatusResponse::default()
+        ..v2::LocalStatusResponse::default()
     };
-    let validate_setup = v1::LocalValidateSetupRequest {
+    let validate_setup = v2::LocalValidateSetupRequest {
         device_name: "host".to_owned(),
         infrastructure_profile: "self-hosted".to_owned(),
         relay_url: RELAY_SENTINEL.to_owned(),
     };
-    let list = v1::SessionListResponse {
+    let list = v2::SessionListResponse {
         sessions: vec![summary.clone()],
     };
-    let mutate = v1::SessionMutateResponse {
+    let mutate = v2::SessionMutateResponse {
         session: Some(summary.clone()),
     };
 
     let rendered = format!(
-        "{summary:?} {create:?} {resume_view_id:?} {attach:?} {snapshot:?} {delta:?} \
-         {input:?} {route_cache:?} {status:?} {validate_setup:?} {list:?} {mutate:?}"
+        "{summary:?} {create:?} {resume_view_id:?} {attach:?} {screen_cell:?} {snapshot:?} \
+         {delta:?} {history:?} {input:?} {route_cache:?} {status:?} {validate_setup:?} \
+         {list:?} {mutate:?}"
     );
     for text in [CWD_SENTINEL, RELAY_SENTINEL, HOME_RELAY_SENTINEL] {
         assert!(!rendered.contains(text));
     }
-    for bytes in [
-        SCREEN_SENTINEL,
-        HISTORY_SENTINEL,
-        DELTA_SENTINEL,
-        INPUT_SENTINEL,
-        RESUME_SENTINEL,
-    ] {
+    for text in [SCREEN_SENTINEL, HISTORY_SENTINEL, DELTA_SENTINEL] {
+        assert!(!rendered.contains(text));
+    }
+    for bytes in [INPUT_SENTINEL, RESUME_SENTINEL] {
         assert!(!rendered.contains(std::str::from_utf8(bytes).expect("ASCII sentinel")));
         assert!(!rendered.contains(&format!("{bytes:?}")));
     }
@@ -789,6 +822,7 @@ fn generated_session_terminal_and_route_debug_is_redacted_without_wire_changes()
     assert_message_round_trip(&attach);
     assert_message_round_trip(&snapshot);
     assert_message_round_trip(&delta);
+    assert_message_round_trip(&history);
     assert_message_round_trip(&input);
     assert_message_round_trip(&route_cache);
     assert_message_round_trip(&status);
@@ -845,8 +879,8 @@ fn ticket_decode_failure_paths_never_leak_the_secret_sentinel() {
     let secret = vec![SENTINEL; 32];
 
     // Invalid host identity returns before the secret is otherwise used.
-    let bad_host = v1::PairTicketV1 {
-        host_device_id: Some(v1::DeviceId { value: vec![0; 31] }),
+    let bad_host = v2::PairTicketV1 {
+        host_device_id: Some(v2::DeviceId { value: vec![0; 31] }),
         secret: secret.clone(),
         ..good_ticket()
     };
@@ -859,7 +893,7 @@ fn ticket_decode_failure_paths_never_leak_the_secret_sentinel() {
     );
 
     // Invalid offer ID returns before the secret is otherwise used.
-    let bad_offer = v1::PairTicketV1 {
+    let bad_offer = v2::PairTicketV1 {
         offer_id: vec![0; 15],
         secret,
         ..good_ticket()
@@ -870,10 +904,10 @@ fn ticket_decode_failure_paths_never_leak_the_secret_sentinel() {
     assert!(!format!("{err}").contains("5e"));
 }
 
-fn good_ticket() -> v1::PairTicketV1 {
-    v1::PairTicketV1 {
+fn good_ticket() -> v2::PairTicketV1 {
+    v2::PairTicketV1 {
         format_version: PAIR_TICKET_FORMAT_VERSION,
-        host_device_id: Some(v1::DeviceId {
+        host_device_id: Some(v2::DeviceId {
             value: HOST_DEVICE.to_vec(),
         }),
         host_name: "test-host".to_owned(),

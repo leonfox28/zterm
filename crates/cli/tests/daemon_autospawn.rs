@@ -16,8 +16,6 @@ use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::process::{Command, Stdio};
 #[cfg(unix)]
-use std::sync::mpsc;
-#[cfg(unix)]
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -44,19 +42,15 @@ use state_fixture::TestState;
 #[cfg(unix)]
 const TERMINAL_CHILD_PREFIX: &str = "--zterm-test-terminal=";
 #[cfg(unix)]
-const TERMINAL_ENTER_BYTES: &[u8] = b"\x1b[?1049h\x1b[?25l";
-#[cfg(unix)]
-const TERMINAL_RESTORE_BYTES: &[u8] = b"\x1b[?2004l\x1b[?1l\x1b>\x1b[0m\x1b[?25h\x1b[?1049l";
+const TERMINAL_RESTORE_BYTES: &[u8] = b"\x1b[?2026l\x1b[?9l\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1007l\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[?1l\x1b>\x1b[0m\x1b[?25h\x1b[?1049l";
 #[cfg(unix)]
 const TERMINAL_CONNECT_MARKER: &[u8] = b"\xe7\x95\x8c";
 #[cfg(unix)]
 const TERMINAL_BARE_MARKER: &[u8] = b"\xe9\x9b\xaa";
 #[cfg(unix)]
-const TERMINAL_SHELL_READY_MARKER: &[u8] = b"ZTERM_LOCAL_UI_SHELL_READY";
+const TERMINAL_SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
 #[cfg(unix)]
-const TERMINAL_SCROLL_TARGET: &[u8] = b"ZTERM_SCROLL_TARGET";
-#[cfg(unix)]
-const TERMINAL_SCROLL_BOTTOM: &[u8] = b"ZTERM_SCROLL_BOTTOM";
+const TERMINAL_SYNC_END: &[u8] = b"\x1b[?2026l";
 #[cfg(unix)]
 const TERMINAL_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -365,7 +359,6 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
     wait_for_detach(&runtime, "local", &ui_main_id.to_string()).await;
 
     let scroll_output = run_local_terminal_child(&runtime, &state.paths, "scroll").await;
-    assert!(contains_bytes(&scroll_output, TERMINAL_SCROLL_TARGET));
     assert!(contains_bytes(&scroll_output, TERMINAL_RESTORE_BYTES));
     wait_for_detach(&runtime, "local", &ui_main_id.to_string()).await;
 
@@ -661,56 +654,33 @@ async fn run_local_terminal_child(
         .expect("spawn local terminal child");
     drop(slave);
 
-    let output_marker = match mode {
+    let input_probe = match mode {
         "connect" => TERMINAL_CONNECT_MARKER,
-        "scroll" => TERMINAL_SCROLL_BOTTOM,
+        "scroll" => b"ZTERM_SCROLL_PROBE".as_slice(),
         "bare-signal" => TERMINAL_BARE_MARKER,
         _ => panic!("unsupported terminal PTY fixture mode"),
     };
 
-    let (entered_sender, entered_receiver) = mpsc::channel();
-    let (ready_sender, ready_receiver) = mpsc::channel();
-    let (output_sender, output_receiver) = mpsc::channel();
-    let scroll_target_count = Arc::new(AtomicUsize::new(0));
-    let reader_scroll_target_count = Arc::clone(&scroll_target_count);
+    let presentation_count = Arc::new(AtomicUsize::new(0));
+    let reader_presentation_count = Arc::clone(&presentation_count);
     let reader = std::thread::spawn(move || {
         let mut master = master;
         let mut bytes = Vec::new();
-        let mut entered = false;
-        let mut ready = false;
-        let mut output_seen = false;
         let mut buffer = [0_u8; 4096];
         loop {
             match master.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(read) => {
                     bytes.extend_from_slice(&buffer[..read]);
-                    reader_scroll_target_count.store(
-                        bytes
-                            .windows(TERMINAL_SCROLL_TARGET.len())
-                            .filter(|window| *window == TERMINAL_SCROLL_TARGET)
-                            .count(),
-                        Ordering::Release,
-                    );
-                    if !entered && contains_bytes(&bytes, TERMINAL_ENTER_BYTES) {
-                        entered = true;
-                        let _ = entered_sender.send(());
-                    }
-                    if !ready && contains_bytes(&bytes, TERMINAL_SHELL_READY_MARKER) {
-                        ready = true;
-                        let _ = ready_sender.send(());
-                    }
-                    let second_output_end = bytes
-                        .windows(output_marker.len())
-                        .enumerate()
-                        .filter_map(|(index, window)| {
-                            (window == output_marker).then_some(index + output_marker.len())
-                        })
-                        .nth(1);
-                    if !output_seen && second_output_end.is_some() {
-                        output_seen = true;
-                        let _ = output_sender.send(());
-                    }
+                    let begin_count = bytes
+                        .windows(TERMINAL_SYNC_BEGIN.len())
+                        .filter(|window| *window == TERMINAL_SYNC_BEGIN)
+                        .count();
+                    let end_count = bytes
+                        .windows(TERMINAL_SYNC_END.len())
+                        .filter(|window| *window == TERMINAL_SYNC_END)
+                        .count();
+                    reader_presentation_count.store(begin_count.min(end_count), Ordering::Release);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(error) if error.raw_os_error() == Some(nix::errno::Errno::EIO as i32) => break,
@@ -720,114 +690,79 @@ async fn run_local_terminal_child(
         bytes
     });
 
-    if entered_receiver
-        .recv_timeout(TERMINAL_TEST_TIMEOUT)
-        .is_err()
+    wait_for_terminal_raw_mode(&probe, &mut child, mode);
+    let presentation_deadline = std::time::Instant::now() + TERMINAL_TEST_TIMEOUT;
+    while presentation_count.load(Ordering::Acquire) == 0
+        && std::time::Instant::now() < presentation_deadline
     {
-        terminate_failed_child(
-            &mut child,
-            &format!("local terminal {mode} did not enter raw mode"),
-        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    if ready_receiver.recv_timeout(TERMINAL_TEST_TIMEOUT).is_err() {
+    if presentation_count.load(Ordering::Acquire) == 0 {
         terminate_failed_child(
             &mut child,
-            &format!("local terminal {mode} fixture did not become ready"),
+            &format!("local terminal {mode} did not commit its initial semantic presentation"),
         );
     }
     let active_revision = wait_for_active_viewport(runtime, 24, 79).await;
-    // Session state can become Active just before the renderer consumes the
-    // matching event. Use an idempotent fixture-only probe until the real PTY
-    // echoes it; product input is still sent only through `run_terminal`.
-    let probe_deadline = std::time::Instant::now() + TERMINAL_TEST_TIMEOUT;
-    let output_seen = if mode == "scroll" {
-        while scroll_target_count.load(Ordering::Acquire) < 2
-            && std::time::Instant::now() < probe_deadline
-        {
-            master_writer
-                .write_all(TERMINAL_SCROLL_TARGET)
-                .and_then(|()| master_writer.write_all(b"\r"))
-                .expect("write retained scroll target probe");
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
-        if scroll_target_count.load(Ordering::Acquire) < 2 {
-            false
-        } else {
-            // The fixture PTY echoes each command once and its shell prints it
-            // twice. Seven fillers plus the bottom-marker command therefore
-            // leave exactly 24 rows after the last target occurrence: three
-            // one-line host wheel reports must bring that target back into view.
-            for index in 0..7 {
-                write!(master_writer, "ZTERM_SCROLL_FILL_{index:02}\r")
-                    .expect("write retained scroll filler");
-            }
-            master_writer
-                .write_all(TERMINAL_SCROLL_BOTTOM)
-                .and_then(|()| master_writer.write_all(b"\r"))
-                .expect("write live scroll bottom marker");
-            output_receiver.recv_timeout(TERMINAL_TEST_TIMEOUT).is_ok()
+    // Validate the real input -> PTY -> model -> semantic presentation path
+    // through protocol-visible progress. Raw presenter bytes are intentionally
+    // not treated as a reconstruction of the final screen.
+    let input_revision = current_controller_revision(runtime).await;
+    let input_presentation = presentation_count.load(Ordering::Acquire);
+    if mode == "scroll" {
+        for index in 0..12 {
+            write!(master_writer, "ZTERM_SCROLL_FILL_{index:02}\r")
+                .expect("write deterministic history filler");
         }
     } else {
-        loop {
-            master_writer
-                .write_all(output_marker)
-                .and_then(|()| master_writer.write_all(b"\r"))
-                .expect("write deterministic interactive probe");
-            if output_receiver
-                .recv_timeout(std::time::Duration::from_millis(50))
-                .is_ok()
-            {
-                break true;
-            }
-            if std::time::Instant::now() >= probe_deadline {
-                break false;
-            }
-        }
-    };
-    if !output_seen {
-        let observed_revision = runtime
-            .session_list("local")
-            .await
-            .ok()
-            .and_then(|sessions| sessions.into_iter().find(|session| session.has_controller))
-            .map(|session| session.revision);
-        let child_state = match child.try_wait().expect("poll failed terminal child") {
-            Some(status) => format!("exited_{:?}", status.code()),
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                "running_until_fixture_cleanup".to_owned()
-            }
-        };
-        drop(probe);
-        drop(master_writer);
-        let bytes = reader.join().unwrap_or_default();
-        let marker_count = bytes
-            .windows(output_marker.len())
-            .filter(|window| *window == output_marker)
-            .count();
-        panic!(
-            "local terminal {mode} did not render input/output; child_state={child_state}, child_error_kind={}, captured_bytes={}, marker_count={marker_count}, active_revision={}, observed_revision={observed_revision:?}",
-            terminal_child_error_kind(&bytes),
-            bytes.len(),
-            active_revision.get(),
-        );
-    }
-    if mode == "scroll" {
-        let baseline = scroll_target_count.load(Ordering::Acquire);
-        assert!(baseline > 0, "the retained target must first render live");
         master_writer
-            .write_all(b"\x1b[<64;10;10M\x1b[<64;10;10M\x1b[<64;10;10M")
-            .expect("write three one-line host wheel-up reports");
+            .write_all(input_probe)
+            .and_then(|()| master_writer.write_all(b"\r"))
+            .expect("write deterministic interactive probe");
+    }
+    let progressed_revision = wait_for_terminal_progress(
+        runtime,
+        &presentation_count,
+        input_revision,
+        input_presentation,
+        mode,
+    )
+    .await;
+    assert!(
+        progressed_revision.get() > active_revision.get(),
+        "fixture input must advance the authoritative terminal model"
+    );
+    let quiescent_revision = wait_for_terminal_quiescence(runtime, &presentation_count, mode).await;
+    if mode == "scroll" {
+        let presentation_baseline = presentation_count.load(Ordering::Acquire);
+        let history_revision = quiescent_revision;
         let scroll_deadline = std::time::Instant::now() + TERMINAL_TEST_TIMEOUT;
-        while scroll_target_count.load(Ordering::Acquire) <= baseline
-            && std::time::Instant::now() < scroll_deadline
-        {
-            std::thread::sleep(std::time::Duration::from_millis(10));
+        for _ in 0..32 {
+            master_writer
+                .write_all(b"\x1b[<64;10;10M")
+                .expect("write one-line host wheel-up report");
+            let gesture_deadline = (std::time::Instant::now()
+                + std::time::Duration::from_millis(50))
+            .min(scroll_deadline);
+            while presentation_count.load(Ordering::Acquire) <= presentation_baseline
+                && std::time::Instant::now() < gesture_deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            if presentation_count.load(Ordering::Acquire) > presentation_baseline
+                || std::time::Instant::now() >= scroll_deadline
+            {
+                break;
+            }
         }
         assert!(
-            scroll_target_count.load(Ordering::Acquire) > baseline,
-            "semantic wheel scrolling must repaint an older row from the real PTY history"
+            presentation_count.load(Ordering::Acquire) > presentation_baseline,
+            "semantic wheel scrolling must commit a new atomic history presentation"
+        );
+        assert_eq!(
+            current_controller_revision(runtime).await,
+            history_revision,
+            "host-owned history scrolling must not forward the wheel to or mutate the child PTY"
         );
     }
     if mode == "bare-signal" {
@@ -869,11 +804,10 @@ async fn run_local_terminal_child(
         status.success(),
         "local terminal {mode} child failed: {status}"
     );
-    let cleanup = find_bytes(&bytes, TERMINAL_RESTORE_BYTES).expect("terminal cleanup bytes");
-    let output = find_bytes(&bytes, output_marker).expect("terminal output marker");
+    let complete_presentations = assert_complete_atomic_presentations(&bytes);
     assert!(
-        output < cleanup,
-        "rendered output must precede terminal cleanup"
+        complete_presentations > 0,
+        "terminal never presented a frame"
     );
     bytes
 }
@@ -896,11 +830,12 @@ fn set_terminal_child_size(output: &File, rows: u16, columns: u16) {
 async fn wait_for_active_viewport(runtime: &LocalRuntime, rows: u16, columns: u16) -> Revision {
     let deadline = std::time::Instant::now() + TERMINAL_TEST_TIMEOUT;
     loop {
-        let active = runtime
+        let sessions = runtime
             .session_list("local")
             .await
-            .expect("observe terminal active barrier")
-            .into_iter()
+            .expect("observe terminal active barrier");
+        let active = sessions
+            .iter()
             .find(|session| {
                 session.has_controller
                     && session.viewport.rows == rows
@@ -912,9 +847,84 @@ async fn wait_for_active_viewport(runtime: &LocalRuntime, rows: u16, columns: u1
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "terminal UI did not publish its active {rows}x{columns} viewport"
+            "terminal UI did not publish its active {rows}x{columns} viewport; observed={:?}",
+            sessions
+                .iter()
+                .map(|session| (
+                    session.has_controller,
+                    session.viewport.rows,
+                    session.viewport.columns,
+                    session.revision.get()
+                ))
+                .collect::<Vec<_>>()
         );
         tokio::task::yield_now().await;
+    }
+}
+
+#[cfg(unix)]
+async fn current_controller_revision(runtime: &LocalRuntime) -> Revision {
+    runtime
+        .session_list("local")
+        .await
+        .expect("observe terminal controller revision")
+        .into_iter()
+        .find(|session| session.has_controller)
+        .expect("one controller remains attached")
+        .revision
+}
+
+#[cfg(unix)]
+async fn wait_for_terminal_progress(
+    runtime: &LocalRuntime,
+    presentation_count: &AtomicUsize,
+    revision_baseline: Revision,
+    presentation_baseline: usize,
+    mode: &str,
+) -> Revision {
+    let deadline = std::time::Instant::now() + TERMINAL_TEST_TIMEOUT;
+    loop {
+        let revision = current_controller_revision(runtime).await;
+        if revision.get() > revision_baseline.get()
+            && presentation_count.load(Ordering::Acquire) > presentation_baseline
+        {
+            return revision;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "local terminal {mode} input did not advance both the model and atomic presentation"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_terminal_quiescence(
+    runtime: &LocalRuntime,
+    presentation_count: &AtomicUsize,
+    mode: &str,
+) -> Revision {
+    const STABLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+    let deadline = std::time::Instant::now() + TERMINAL_TEST_TIMEOUT;
+    let mut revision = current_controller_revision(runtime).await;
+    let mut presentations = presentation_count.load(Ordering::Acquire);
+    let mut stable_since = std::time::Instant::now();
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let observed_revision = current_controller_revision(runtime).await;
+        let observed_presentations = presentation_count.load(Ordering::Acquire);
+        if observed_revision != revision || observed_presentations != presentations {
+            revision = observed_revision;
+            presentations = observed_presentations;
+            stable_since = std::time::Instant::now();
+        } else if stable_since.elapsed() >= STABLE_INTERVAL {
+            return revision;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "local terminal {mode} did not reach a stable model/presentation boundary"
+        );
     }
 }
 
@@ -966,6 +976,29 @@ fn terminate_failed_child(child: &mut std::process::Child, detail: &str) -> ! {
 }
 
 #[cfg(unix)]
+fn wait_for_terminal_raw_mode(probe: &File, child: &mut std::process::Child, mode: &str) {
+    use nix::sys::termios::{LocalFlags, tcgetattr};
+
+    let deadline = std::time::Instant::now() + TERMINAL_TEST_TIMEOUT;
+    loop {
+        let attributes = tcgetattr(probe).expect("observe terminal child termios");
+        if !attributes
+            .local_flags
+            .intersects(LocalFlags::ECHO | LocalFlags::ICANON)
+        {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            terminate_failed_child(
+                child,
+                &format!("local terminal {mode} did not enter raw mode"),
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[cfg(unix)]
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     find_bytes(haystack, needle).is_some()
 }
@@ -978,36 +1011,37 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 #[cfg(unix)]
-fn terminal_child_error_kind(bytes: &[u8]) -> &'static str {
-    [
-        (
-            b"error_kind: DeadlineExceeded".as_slice(),
-            "deadline_exceeded",
-        ),
-        (b"error_kind: Cancelled".as_slice(), "cancelled"),
-        (b"error_kind: LeaseLost".as_slice(), "lease_lost"),
-        (b"error_kind: MalformedFrame".as_slice(), "malformed_frame"),
-        (
-            b"error_kind: NotSynchronized".as_slice(),
-            "not_synchronized",
-        ),
-        (
-            b"error_kind: ResourceExhausted".as_slice(),
-            "resource_exhausted",
-        ),
-        (
-            b"error_kind: SessionOccupied".as_slice(),
-            "session_occupied",
-        ),
-        (b"error_kind: DaemonStopped".as_slice(), "daemon_stopped"),
-        (b"error_kind:".as_slice(), "other_daemon"),
-        (b"TerminalDriverFailure".as_slice(), "terminal_driver"),
-        (b"Io {".as_slice(), "io"),
-        (b"Usage {".as_slice(), "usage"),
-    ]
-    .into_iter()
-    .find_map(|(pattern, kind)| contains_bytes(bytes, pattern).then_some(kind))
-    .unwrap_or("none")
+fn assert_complete_atomic_presentations(bytes: &[u8]) -> usize {
+    let cleanup = find_bytes(bytes, TERMINAL_RESTORE_BYTES).expect("terminal cleanup bytes");
+    let presentation_bytes = &bytes[..cleanup];
+    let begins = presentation_bytes
+        .windows(TERMINAL_SYNC_BEGIN.len())
+        .enumerate()
+        .filter_map(|(index, window)| (window == TERMINAL_SYNC_BEGIN).then_some(index))
+        .collect::<Vec<_>>();
+    let ends = presentation_bytes
+        .windows(TERMINAL_SYNC_END.len())
+        .enumerate()
+        .filter_map(|(index, window)| (window == TERMINAL_SYNC_END).then_some(index))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        begins.len(),
+        ends.len(),
+        "every synchronized presentation must close its DEC2026 transaction"
+    );
+    for (ordinal, (&begin, &end)) in begins.iter().zip(&ends).enumerate() {
+        assert!(
+            begin + TERMINAL_SYNC_BEGIN.len() < end,
+            "presentation transaction {ordinal} must contain one non-empty frame"
+        );
+        if let Some(next) = begins.get(ordinal + 1) {
+            assert!(
+                end + TERMINAL_SYNC_END.len() <= *next,
+                "presentation transactions must not overlap"
+            );
+        }
+    }
+    begins.len()
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]

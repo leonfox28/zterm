@@ -5,7 +5,8 @@ use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::vte::ansi::{Color, NamedColor};
 use zterm_core::terminal::{
     ActiveScreen, TerminalCell, TerminalColor, TerminalCursor, TerminalModes,
-    TerminalMouseEncoding, TerminalMouseMode, TerminalSize, TerminalState, TerminalStyle,
+    TerminalMouseEncoding, TerminalMouseMode, TerminalScrollMetrics, TerminalSize, TerminalStyle,
+    TerminalSurface, TerminalSurfaceRow,
 };
 
 use crate::MAX_CELL_TEXT_BYTES;
@@ -47,10 +48,6 @@ impl InlineCellText {
     pub(crate) fn as_str(&self) -> &str {
         std::str::from_utf8(&self.bytes[..usize::from(self.len)]).unwrap_or_default()
     }
-
-    fn is_empty(&self) -> bool {
-        self.len == 0
-    }
 }
 
 #[derive(Clone, Default, Eq, PartialEq)]
@@ -62,14 +59,7 @@ pub(crate) struct ProjectedCell {
 }
 
 impl ProjectedCell {
-    pub(crate) fn is_visually_empty_default(&self) -> bool {
-        self.text.is_empty()
-            && !self.wide
-            && !self.wide_continuation
-            && self.style == TerminalStyle::default()
-    }
-
-    fn to_public(&self) -> TerminalCell {
+    pub(crate) fn to_public(&self) -> TerminalCell {
         TerminalCell {
             contents: self.text.as_str().to_owned(),
             wide: self.wide,
@@ -85,6 +75,15 @@ pub(crate) struct ProjectedRow {
     pub(crate) wrapped: bool,
 }
 
+impl ProjectedRow {
+    pub(crate) fn to_surface_row(&self) -> TerminalSurfaceRow {
+        TerminalSurfaceRow {
+            cells: self.cells.iter().map(ProjectedCell::to_public).collect(),
+            wrapped: self.wrapped,
+        }
+    }
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct ProjectedScreen {
     pub(crate) version: u16,
@@ -96,23 +95,22 @@ pub(crate) struct ProjectedScreen {
 }
 
 impl ProjectedScreen {
-    pub(crate) fn to_state(&self) -> TerminalState {
-        let cells = self
-            .rows
-            .iter()
-            .flat_map(|row| row.cells.iter().map(ProjectedCell::to_public))
-            .collect();
-        TerminalState {
-            size: self.size,
-            active_screen: self.active_screen,
-            cursor: self.cursor,
-            modes: self.modes,
-            cells,
-        }
-    }
-
     pub(crate) fn retained_cell_capacity(&self) -> usize {
         self.rows.iter().map(|row| row.cells.len()).sum()
+    }
+
+    pub(crate) fn to_surface(
+        &self,
+        scroll_metrics: Option<TerminalScrollMetrics>,
+    ) -> TerminalSurface {
+        TerminalSurface {
+            size: self.size,
+            active_screen: self.active_screen,
+            rows: self.rows.iter().map(ProjectedRow::to_surface_row).collect(),
+            cursor: self.cursor,
+            modes: self.modes,
+            scroll_metrics,
+        }
     }
 }
 

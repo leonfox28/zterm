@@ -11,9 +11,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use zterm_core::Revision;
 use zterm_core::terminal::{
-    TerminalDeltaResult, TerminalHistoryCursor, TerminalHistoryDirection, TerminalHistoryResult,
-    TerminalHistoryWindowQuery, TerminalHistoryWindowResult, TerminalScrollAction,
-    TerminalScrollMetrics, TerminalSize, TerminalSnapshot, TerminalViewportResult,
+    TerminalHistoryWindowQuery, TerminalSize, TerminalSurfaceDeltaResult,
+    TerminalSurfaceHistoryWindowResult, TerminalSurfaceSnapshot,
 };
 use zterm_platform::pty::{
     PtyChild, PtyChildInterrupt, PtyChildState, PtyError, PtyExitStatus, PtyIo, PtySession, PtySize,
@@ -470,7 +469,7 @@ impl TerminalDriver {
     }
 
     /// Returns a full latest snapshot without creating an attachment.
-    pub fn latest_snapshot(&self) -> Result<TerminalSnapshot, TerminalDriverError> {
+    pub fn latest_snapshot(&self) -> Result<TerminalSurfaceSnapshot, TerminalDriverError> {
         self.shared.check_failure()?;
         Ok(lock(&self.shared.model, "terminal model")?.snapshot())
     }
@@ -556,15 +555,37 @@ impl TerminalAttachment {
     ///
     /// No intermediate revision queue is retained. The attachment's checkpoint
     /// is replaced by a checkpoint at the exact state returned here.
-    pub fn sync_latest(&mut self) -> Result<TerminalDeltaResult, TerminalDriverError> {
+    pub fn sync_latest(&mut self) -> Result<TerminalSurfaceDeltaResult, TerminalDriverError> {
         self.shared.check_failure()?;
         let model = lock(&self.shared.model, "terminal model")?;
         let result = self.checkpoint.as_ref().map_or_else(
-            || TerminalDeltaResult::Resync(model.snapshot()),
+            || TerminalSurfaceDeltaResult::Resync(model.snapshot()),
             |checkpoint| model.delta_or_resync(checkpoint),
         );
         self.checkpoint = Some(model.checkpoint());
         Ok(result)
+    }
+
+    /// Returns one latest merged update only when the model advanced beyond
+    /// this attachment's checkpoint.
+    pub fn sync_changed(
+        &mut self,
+    ) -> Result<Option<TerminalSurfaceDeltaResult>, TerminalDriverError> {
+        self.shared.check_failure()?;
+        let model = lock(&self.shared.model, "terminal model")?;
+        if self
+            .checkpoint
+            .as_ref()
+            .is_some_and(|checkpoint| checkpoint.revision() == model.revision())
+        {
+            return Ok(None);
+        }
+        let result = self.checkpoint.as_ref().map_or_else(
+            || TerminalSurfaceDeltaResult::Resync(model.snapshot()),
+            |checkpoint| model.delta_or_resync(checkpoint),
+        );
+        self.checkpoint = Some(model.checkpoint());
+        Ok(Some(result))
     }
 
     /// Discards this attachment's stale watermark so the next sync is full.
@@ -573,40 +594,16 @@ impl TerminalAttachment {
     }
 
     /// Returns a full snapshot without changing this attachment's checkpoint.
-    pub fn latest_snapshot(&self) -> Result<TerminalSnapshot, TerminalDriverError> {
+    pub fn latest_snapshot(&self) -> Result<TerminalSurfaceSnapshot, TerminalDriverError> {
         self.shared.check_failure()?;
         Ok(lock(&self.shared.model, "terminal model")?.snapshot())
-    }
-
-    /// Returns one bounded main-screen history page without advancing this
-    /// attachment's latest-state checkpoint.
-    pub fn history_page(
-        &self,
-        direction: TerminalHistoryDirection,
-        cursor: Option<TerminalHistoryCursor>,
-        maximum_rows: usize,
-    ) -> Result<TerminalHistoryResult, TerminalDriverError> {
-        self.shared.check_failure()?;
-        lock(&self.shared.model, "terminal model")?
-            .history_page(direction, cursor, maximum_rows)
-            .map_err(Into::into)
-    }
-
-    /// Projects one complete semantic viewport without advancing the live checkpoint.
-    pub fn scroll_viewport(
-        &self,
-        previous: Option<TerminalScrollMetrics>,
-        action: TerminalScrollAction,
-    ) -> Result<TerminalViewportResult, TerminalDriverError> {
-        self.shared.check_failure()?;
-        Ok(lock(&self.shared.model, "terminal model")?.scroll_viewport(previous, action))
     }
 
     /// Projects one stateless contiguous history window under one model lock.
     pub fn history_window(
         &self,
         query: TerminalHistoryWindowQuery,
-    ) -> Result<TerminalHistoryWindowResult, TerminalDriverError> {
+    ) -> Result<TerminalSurfaceHistoryWindowResult, TerminalDriverError> {
         self.shared.check_failure()?;
         Ok(lock(&self.shared.model, "terminal model")?.history_window(query))
     }
@@ -972,6 +969,48 @@ mod tests {
         assert!(!aborted.push(vec![3]));
     }
 
+    #[test]
+    fn attachment_sync_changed_distinguishes_noop_delta_and_resync() {
+        let model = TerminalModel::new(TerminalSize::new(3, 8), 8).expect("semantic model");
+        let shared = Arc::new(SharedTerminal::new(model));
+        shared.attachments.store(1, Ordering::Release);
+        let mut attachment = TerminalAttachment {
+            shared: Arc::clone(&shared),
+            checkpoint: None,
+        };
+
+        assert!(matches!(
+            attachment.sync_changed().expect("initial sync"),
+            Some(TerminalSurfaceDeltaResult::Resync(_))
+        ));
+        assert_eq!(
+            attachment
+                .sync_changed()
+                .expect("equal revision is a no-op"),
+            None
+        );
+
+        shared.ingest(b"x").expect("advance compatible model");
+        assert!(matches!(
+            attachment.sync_changed().expect("compatible update"),
+            Some(TerminalSurfaceDeltaResult::Delta(_))
+        ));
+        assert_eq!(
+            attachment
+                .sync_changed()
+                .expect("updated revision is a no-op"),
+            None
+        );
+
+        shared
+            .ingest(b"\x1b[?1049h")
+            .expect("change semantic screen identity");
+        assert!(matches!(
+            attachment.sync_changed().expect("divergent update"),
+            Some(TerminalSurfaceDeltaResult::Resync(_))
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn drop_returns_before_blocked_io_while_reaper_releases_child_and_threads() {
@@ -996,11 +1035,13 @@ mod tests {
         let ready_deadline = Instant::now() + Duration::from_secs(2);
         loop {
             let snapshot = driver.latest_snapshot().expect("fixture snapshot");
-            if snapshot
-                .screen_ansi
-                .windows(b"DROP-READY".len())
-                .any(|window| window == b"DROP-READY")
-            {
+            if snapshot.surface.rows.iter().any(|row| {
+                row.cells
+                    .iter()
+                    .map(|cell| cell.contents.as_str())
+                    .collect::<String>()
+                    .contains("DROP-READY")
+            }) {
                 break;
             }
             assert!(

@@ -32,7 +32,7 @@ use zterm_daemon::store::StateStore;
 #[cfg(unix)]
 use zterm_platform::local_unix::{DaemonLock, bind_daemon_socket, remove_own_socket};
 #[cfg(unix)]
-use zterm_proto::{FrameDecoder, WIRE_MAJOR, WireKind, encode_message, v1};
+use zterm_proto::{FrameDecoder, WIRE_MAJOR, WireKind, encode_message, v2};
 
 #[cfg(unix)]
 use state_fixture::TestState;
@@ -86,7 +86,7 @@ async fn same_uid_service_errors_are_connection_local_and_stop_ack_is_flushed() 
         WireKind::LocalValidateSetupRequest,
         10,
         0,
-        &v1::LocalValidateSetupRequest {
+        &v2::LocalValidateSetupRequest {
             device_name: requested.device_name.clone(),
             infrastructure_profile: "official-n0".to_owned(),
             relay_url: "https://relay.example.com".to_owned(),
@@ -110,19 +110,19 @@ async fn same_uid_service_errors_are_connection_local_and_stop_ack_is_flushed() 
         WireKind::LocalStatusRequest,
         11,
         0,
-        &v1::LocalStatusRequest {},
+        &v2::LocalStatusRequest {},
     )
     .expect("request frame");
     let major = wrong_major
         .windows(2)
-        .position(|window| window == [0x08, 0x01])
+        .position(|window| window == [0x08, WIRE_MAJOR as u8])
         .expect("wire-major field")
         + 1;
-    wrong_major[major] = 2;
+    wrong_major[major] = 1;
     assert_error_code(&state, wrong_major, "wire_major_mismatch").await;
     client.readiness().await.expect("server survives major");
 
-    let unknown_kind = raw_wire(v1::WireFrame {
+    let unknown_kind = raw_wire(v2::WireFrame {
         wire_major: WIRE_MAJOR,
         kind: 65_535,
         payload: Vec::new(),
@@ -136,7 +136,7 @@ async fn same_uid_service_errors_are_connection_local_and_stop_ack_is_flushed() 
         WireKind::LocalStatusRequest,
         12,
         0,
-        &v1::LocalStatusRequest {},
+        &v2::LocalStatusRequest {},
     )
     .expect("status request");
     extra_request.extend_from_slice(&[5, 1]);
@@ -153,7 +153,7 @@ async fn same_uid_service_errors_are_connection_local_and_stop_ack_is_flushed() 
         WireKind::LocalStatusRequest,
         12,
         0,
-        &v1::LocalStatusRequest {},
+        &v2::LocalStatusRequest {},
     )
     .expect("split status request");
     split_trailing
@@ -180,7 +180,7 @@ async fn same_uid_service_errors_are_connection_local_and_stop_ack_is_flushed() 
         WireKind::LocalStatusRequest,
         14,
         40,
-        &v1::LocalStatusRequest {},
+        &v2::LocalStatusRequest {},
     )
     .expect("stalled status request");
     stalled_unary
@@ -194,7 +194,7 @@ async fn same_uid_service_errors_are_connection_local_and_stop_ack_is_flushed() 
         .await
         .expect("server survives unary half-close deadline");
 
-    let future = encode_message(WireKind::PairBegin, 13, 0, &v1::PairBegin::default())
+    let future = encode_message(WireKind::PairBegin, 13, 0, &v2::PairBegin::default())
         .expect("future request");
     assert_error_code(&state, future, "service_not_implemented").await;
     client
@@ -395,8 +395,8 @@ async fn ambiguous_mutation_retry_reuses_byte_identical_request_and_operation_id
             WireKind::SessionOperationLeaseResponse,
             lease_frame.request_id,
             0,
-            &v1::SessionOperationLeaseResponse {
-                lease: Some(v1::OperationLease {
+            &v2::SessionOperationLeaseResponse {
+                lease: Some(v2::OperationLease {
                     daemon_incarnation: vec![7; 16],
                     ordinal: 1,
                 }),
@@ -416,7 +416,7 @@ async fn ambiguous_mutation_retry_reuses_byte_identical_request_and_operation_id
         let first_bytes = read_raw_request(&mut abandoned).await;
         let first_frame = decode_raw_request(&first_bytes);
         assert_eq!(first_frame.kind, WireKind::SessionCreateRequest);
-        let first: v1::SessionCreateRequest = first_frame
+        let first: v2::SessionCreateRequest = first_frame
             .decode_message(WireKind::SessionCreateRequest)
             .expect("decode first mutation");
         let operation_key = first
@@ -435,7 +435,7 @@ async fn ambiguous_mutation_retry_reuses_byte_identical_request_and_operation_id
             "ambiguous retry must be byte-identical"
         );
         let retry_frame = decode_raw_request(&retry_bytes);
-        let retry: v1::SessionCreateRequest = retry_frame
+        let retry: v2::SessionCreateRequest = retry_frame
             .decode_message(WireKind::SessionCreateRequest)
             .expect("decode retry mutation");
         executions += usize::from(
@@ -451,9 +451,9 @@ async fn ambiguous_mutation_retry_reuses_byte_identical_request_and_operation_id
             WireKind::SessionMutateResponse,
             retry_frame.request_id,
             0,
-            &v1::SessionMutateResponse {
-                session: Some(v1::SessionSummary {
-                    session_id: Some(v1::SessionId { value: vec![8; 16] }),
+            &v2::SessionMutateResponse {
+                session: Some(v2::SessionSummary {
+                    session_id: Some(v2::SessionId { value: vec![8; 16] }),
                     name: retry.name,
                     revision: 0,
                     has_controller: false,
@@ -499,8 +499,8 @@ async fn typed_outcome_unknown_poison_rotates_only_on_the_next_user_operation() 
                 WireKind::SessionOperationLeaseResponse,
                 lease_frame.request_id,
                 0,
-                &v1::SessionOperationLeaseResponse {
-                    lease: Some(v1::OperationLease {
+                &v2::SessionOperationLeaseResponse {
+                    lease: Some(v2::OperationLease {
                         daemon_incarnation: vec![9; 16],
                         ordinal,
                     }),
@@ -515,7 +515,7 @@ async fn typed_outcome_unknown_poison_rotates_only_on_the_next_user_operation() 
 
             let (mut mutation_stream, _) = listener.accept().await.expect("accept mutation");
             let mutation_frame = decode_raw_request(&read_raw_request(&mut mutation_stream).await);
-            let mutation: v1::SessionCreateRequest = mutation_frame
+            let mutation: v2::SessionCreateRequest = mutation_frame
                 .decode_message(WireKind::SessionCreateRequest)
                 .expect("decode mutation");
             assert_eq!(
@@ -531,7 +531,7 @@ async fn typed_outcome_unknown_poison_rotates_only_on_the_next_user_operation() 
                     WireKind::ServiceErrorResponse,
                     mutation_frame.request_id,
                     0,
-                    &v1::ServiceError {
+                    &v2::ServiceError {
                         code: DomainErrorKind::OperationOutcomeUnknown.code().to_owned(),
                         message: "retired fixture lease".to_owned(),
                     },
@@ -542,9 +542,9 @@ async fn typed_outcome_unknown_poison_rotates_only_on_the_next_user_operation() 
                     WireKind::SessionMutateResponse,
                     mutation_frame.request_id,
                     0,
-                    &v1::SessionMutateResponse {
-                        session: Some(v1::SessionSummary {
-                            session_id: Some(v1::SessionId { value: vec![6; 16] }),
+                    &v2::SessionMutateResponse {
+                        session: Some(v2::SessionSummary {
+                            session_id: Some(v2::SessionId { value: vec![6; 16] }),
                             name: mutation.name,
                             revision: 0,
                             has_controller: false,
@@ -631,14 +631,14 @@ fn decode_raw_request(bytes: &[u8]) -> zterm_proto::DecodedFrame {
 
 #[cfg(unix)]
 fn assert_service_error(frame: &zterm_proto::DecodedFrame, expected: &str) {
-    let error: v1::ServiceError = frame
+    let error: v2::ServiceError = frame
         .decode_message(WireKind::ServiceErrorResponse)
         .expect("service error response");
     assert_eq!(error.code, expected);
 }
 
 #[cfg(unix)]
-fn raw_wire(wire: v1::WireFrame) -> Vec<u8> {
+fn raw_wire(wire: v2::WireFrame) -> Vec<u8> {
     let body = wire.encode_to_vec();
     assert!(body.len() < 0x80);
     let mut bytes = vec![u8::try_from(body.len()).expect("small wire fixture")];
