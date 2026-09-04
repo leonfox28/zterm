@@ -1,10 +1,15 @@
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use zterm_core::terminal::{
-    MAX_SIDE_EVENTS_PER_UPDATE, MAX_TITLE_BYTES, RejectedEffect, TerminalSideEvent, TerminalSize,
-    UnsupportedSequenceKind,
+    MAX_SIDE_EVENTS_PER_UPDATE, MAX_TITLE_BYTES, RejectedEffect, TerminalClipboardWrite,
+    TerminalHostEffect, TerminalSideEvent, TerminalSize, UnsupportedSequenceKind,
 };
 
 use crate::engine::AlacrittyEngine;
-use crate::{MAX_CONTROL_SEQUENCE_BYTES, MAX_CONTROL_STRING_BYTES, MAX_REPLY_BYTES_PER_UPDATE};
+use crate::{
+    MAX_CONTROL_SEQUENCE_BYTES, MAX_CONTROL_STRING_BYTES, MAX_OSC52_BASE64_BYTES,
+    MAX_REPLY_BYTES_PER_UPDATE,
+};
 
 const PRIMARY_DEVICE_ATTRIBUTES_REPLY: &[u8] = b"\x1b[?1;2c";
 const DEVICE_STATUS_OK_REPLY: &[u8] = b"\x1b[0n";
@@ -54,6 +59,7 @@ struct ControlString {
     bytes: Vec<u8>,
     overflowed: bool,
     saw_escape: bool,
+    clipboard: bool,
 }
 
 impl ControlString {
@@ -63,12 +69,21 @@ impl ControlString {
             bytes: Vec::new(),
             overflowed: false,
             saw_escape: false,
+            clipboard: false,
         }
     }
 
     fn push(&mut self, byte: u8) {
-        if self.bytes.len() < MAX_CONTROL_STRING_BYTES {
+        let maximum = if self.clipboard {
+            MAX_OSC52_BASE64_BYTES.saturating_add(b"52;c;".len())
+        } else {
+            MAX_CONTROL_STRING_BYTES
+        };
+        if self.bytes.len() < maximum {
             self.bytes.push(byte);
+            if matches!(self.kind, StringKind::Osc) && self.bytes == b"52;" {
+                self.clipboard = true;
+            }
         } else {
             self.overflowed = true;
         }
@@ -86,6 +101,7 @@ pub(crate) struct UpdateCollector {
     replies: Vec<u8>,
     events: Vec<TerminalSideEvent>,
     dropped_events: u64,
+    host_effect: Option<TerminalHostEffect>,
 }
 
 impl UpdateCollector {
@@ -94,6 +110,7 @@ impl UpdateCollector {
             replies: Vec::new(),
             events: Vec::new(),
             dropped_events: 0,
+            host_effect: None,
         }
     }
 
@@ -113,7 +130,13 @@ impl UpdateCollector {
         Ok(())
     }
 
-    pub(crate) fn finish(mut self) -> (Vec<u8>, Vec<TerminalSideEvent>) {
+    fn set_host_effect(&mut self, effect: TerminalHostEffect) {
+        self.host_effect = Some(effect);
+    }
+
+    pub(crate) fn finish(
+        mut self,
+    ) -> (Vec<u8>, Vec<TerminalSideEvent>, Option<TerminalHostEffect>) {
         if self.dropped_events > 0 {
             if self.events.len() == MAX_SIDE_EVENTS_PER_UPDATE {
                 self.events.pop();
@@ -123,7 +146,7 @@ impl UpdateCollector {
                 count: self.dropped_events,
             });
         }
-        (self.replies, self.events)
+        (self.replies, self.events, self.host_effect)
     }
 }
 
@@ -422,6 +445,9 @@ impl TerminalIngressPolicy {
             }
             return Ok(());
         }
+        if final_byte == b'u' {
+            return dispatch_keyboard_mode(sequence, marker, parameters, engine, output);
+        }
         if matches!(final_byte, b'h' | b'l') && marker == Some(b'?') {
             let Some(parameters) = parameters else {
                 output.push_event(TerminalSideEvent::UnsupportedSequence(
@@ -459,8 +485,7 @@ impl TerminalIngressPolicy {
             return Ok(());
         }
         let sgr_extra = final_byte == b'm' && sgr_contains_underline_color(body);
-        let unsupported =
-            matches!(final_byte, b'u' | b'b' | b'c') || body.contains(&b'$') || sgr_extra;
+        let unsupported = matches!(final_byte, b'b' | b'c') || body.contains(&b'$') || sgr_extra;
         if unsupported {
             output.push_event(TerminalSideEvent::UnsupportedSequence(
                 UnsupportedSequenceKind::Csi,
@@ -473,12 +498,18 @@ impl TerminalIngressPolicy {
 
     fn dispatch_string(&self, string: ControlString, output: &mut UpdateCollector) {
         if string.overflowed {
-            let kind = if matches!(string.kind, StringKind::Osc) {
-                UnsupportedSequenceKind::Osc
+            if string.clipboard {
+                output.push_event(TerminalSideEvent::EffectRejected(
+                    RejectedEffect::ClipboardWrite,
+                ));
             } else {
-                UnsupportedSequenceKind::Control
-            };
-            output.push_event(TerminalSideEvent::UnsupportedSequence(kind));
+                let kind = if matches!(string.kind, StringKind::Osc) {
+                    UnsupportedSequenceKind::Osc
+                } else {
+                    UnsupportedSequenceKind::Control
+                };
+                output.push_event(TerminalSideEvent::UnsupportedSequence(kind));
+            }
             return;
         }
         if !matches!(string.kind, StringKind::Osc) {
@@ -503,21 +534,66 @@ impl TerminalIngressPolicy {
                 });
             }
             b"52" => {
-                let data = payload
-                    .splitn(2, |byte| *byte == b';')
-                    .nth(1)
-                    .unwrap_or_default();
-                let effect = if data == b"?" {
-                    RejectedEffect::ClipboardRead
-                } else {
-                    RejectedEffect::ClipboardWrite
-                };
-                output.push_event(TerminalSideEvent::EffectRejected(effect));
+                dispatch_clipboard(payload, output);
             }
             _ => output.push_event(TerminalSideEvent::UnsupportedSequence(
                 UnsupportedSequenceKind::Osc,
             )),
         }
+    }
+}
+
+fn dispatch_keyboard_mode(
+    sequence: Sequence,
+    marker: Option<u8>,
+    parameters: Option<Vec<u16>>,
+    engine: &mut AlacrittyEngine,
+    output: &mut UpdateCollector,
+) -> Result<(), IngressError> {
+    let admitted = match (marker, parameters.as_deref()) {
+        (Some(b'?'), Some([])) => {
+            let reply = format!("\x1b[?{}u", engine.keyboard_mode_bits());
+            return output.push_reply(reply.as_bytes());
+        }
+        (Some(b'='), Some([] | [0..=0x1f]))
+        | (Some(b'='), Some([0..=0x1f, 0..=3]))
+        | (Some(b'>'), Some([] | [0..=0x1f]))
+        | (Some(b'<'), Some([]))
+        | (Some(b'<'), Some([_])) => true,
+        _ => false,
+    };
+    if !admitted {
+        output.push_event(TerminalSideEvent::UnsupportedSequence(
+            UnsupportedSequenceKind::Csi,
+        ));
+        return Ok(());
+    }
+
+    engine.feed_raw(&sequence.bytes);
+    Ok(())
+}
+
+fn dispatch_clipboard(payload: &[u8], output: &mut UpdateCollector) {
+    let mut fields = payload.splitn(2, |byte| *byte == b';');
+    let selector = fields.next().unwrap_or_default();
+    let data = fields.next().unwrap_or_default();
+    if data == b"?" {
+        output.push_event(TerminalSideEvent::EffectRejected(
+            RejectedEffect::ClipboardRead,
+        ));
+        return;
+    }
+    let value = (selector == b"c" && !data.is_empty())
+        .then(|| BASE64_STANDARD.decode(data).ok())
+        .flatten()
+        .and_then(|decoded| String::from_utf8(decoded).ok())
+        .and_then(|text| TerminalClipboardWrite::new(text).ok());
+    if let Some(value) = value {
+        output.set_host_effect(TerminalHostEffect::ClipboardWrite(value));
+    } else {
+        output.push_event(TerminalSideEvent::EffectRejected(
+            RejectedEffect::ClipboardWrite,
+        ));
     }
 }
 

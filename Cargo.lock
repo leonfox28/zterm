@@ -5042,6 +5042,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 name = "zterm-cli"
 version = "0.1.13"
 dependencies = [
+ "base64",
  "clap",
  "futures-util",
  "nix 0.28.0",
@@ -5142,6 +5143,7 @@ name = "zterm-terminal"
 version = "0.1.13"
 dependencies = [
  "alacritty_terminal",
+ "base64",
  "unicode-width",
  "zterm-core",
 ]

@@ -26,8 +26,8 @@ use tokio::task::JoinSet;
 use zeroize::{Zeroize, Zeroizing};
 #[cfg(unix)]
 use zterm_core::terminal::{
-    TerminalHistoryWindowQuery, TerminalSurfaceDelta, TerminalSurfaceHistoryWindowResult,
-    TerminalSurfaceSnapshot,
+    TerminalClipboardWrite, TerminalHistoryWindowQuery, TerminalSurfaceDelta,
+    TerminalSurfaceHistoryWindowResult, TerminalSurfaceSnapshot,
 };
 #[cfg(unix)]
 use zterm_core::{
@@ -520,6 +520,8 @@ pub enum LocalAttachmentEvent {
     Delta(TerminalSurfaceDelta),
     /// One correlated exact semantic history-window outcome.
     HistoryWindow(TerminalSurfaceHistoryWindowResult),
+    /// One validated latest-only child clipboard write.
+    ClipboardWrite(TerminalClipboardWrite),
     /// The following snapshot must replace the client state atomically.
     SyncRequired(v2::TerminalSyncRequired),
     /// A prepared takeover committed successfully.
@@ -557,6 +559,10 @@ impl fmt::Debug for LocalAttachmentEvent {
             Self::HistoryWindow(result) => formatter
                 .debug_tuple("SemanticHistoryWindow")
                 .field(result)
+                .finish(),
+            Self::ClipboardWrite(write) => formatter
+                .debug_tuple("ClipboardWrite")
+                .field(write)
                 .finish(),
             Self::SyncRequired(required) => formatter
                 .debug_struct("SyncRequired")
@@ -1196,6 +1202,25 @@ impl LocalAttachmentClient {
                 }
                 self.pending_history_window = None;
                 Ok(LocalAttachmentEvent::HistoryWindow(result))
+            }
+            WireKind::TerminalClipboardWrite => {
+                if frame.request_id != 0 {
+                    return Err(malformed(
+                        "terminal clipboard effect must use request_id zero",
+                    ));
+                }
+                let message: v2::TerminalClipboardWrite = frame
+                    .decode_message(WireKind::TerminalClipboardWrite)
+                    .map_err(protocol_error)?;
+                let (attachment_id, write) =
+                    zterm_proto::terminal_clipboard_write_from_message(message)
+                        .map_err(protocol_error)?;
+                if attachment_id != self.attachment_id {
+                    return Err(malformed(
+                        "terminal clipboard effect attachment_id mismatch",
+                    ));
+                }
+                Ok(LocalAttachmentEvent::ClipboardWrite(write))
             }
             WireKind::TerminalSyncRequired => {
                 let required: v2::TerminalSyncRequired = frame
@@ -3127,6 +3152,82 @@ mod tests {
                 .read_event(Duration::from_secs(1))
                 .await
                 .expect_err("unknown transport state is rejected")
+                .kind(),
+            DomainErrorKind::MalformedFrame
+        );
+    }
+
+    #[tokio::test]
+    async fn local_attachment_clipboard_event_requires_zero_request_and_exact_identity() {
+        let session_id = SessionId::from_array([0xa2; SessionId::LENGTH]);
+        let attachment_id = AttachmentId::from_array([0xa3; AttachmentId::LENGTH]);
+        let (mut client, mut daemon_stream) = LocalAttachmentClient::terminal_driver_test_pair(
+            ResolvedSessionTarget::local(),
+            session_id,
+            attachment_id,
+        );
+        let write = TerminalClipboardWrite::new("typed clipboard".to_owned())
+            .expect("valid clipboard fixture");
+        let event = zterm_proto::terminal_clipboard_write_message(attachment_id, write);
+        daemon_stream
+            .write_all(
+                &encode_message(WireKind::TerminalClipboardWrite, 0, 0, &event)
+                    .expect("bounded clipboard event"),
+            )
+            .await
+            .expect("write clipboard event");
+        let LocalAttachmentEvent::ClipboardWrite(write) = client
+            .read_event(Duration::from_secs(1))
+            .await
+            .expect("validated clipboard event")
+        else {
+            panic!("expected typed clipboard event");
+        };
+        assert_eq!(write.as_str(), "typed clipboard");
+
+        let (mut client, mut daemon_stream) = LocalAttachmentClient::terminal_driver_test_pair(
+            ResolvedSessionTarget::local(),
+            session_id,
+            attachment_id,
+        );
+        daemon_stream
+            .write_all(
+                &encode_message(WireKind::TerminalClipboardWrite, 7, 0, &event)
+                    .expect("nonzero request fixture"),
+            )
+            .await
+            .expect("write nonzero request fixture");
+        assert_eq!(
+            client
+                .read_event(Duration::from_secs(1))
+                .await
+                .expect_err("nonzero clipboard request id")
+                .kind(),
+            DomainErrorKind::MalformedFrame
+        );
+
+        let (mut client, mut daemon_stream) = LocalAttachmentClient::terminal_driver_test_pair(
+            ResolvedSessionTarget::local(),
+            session_id,
+            attachment_id,
+        );
+        let wrong = zterm_proto::terminal_clipboard_write_message(
+            AttachmentId::from_array([0xa4; AttachmentId::LENGTH]),
+            TerminalClipboardWrite::new("wrong owner".to_owned())
+                .expect("valid wrong-owner fixture"),
+        );
+        daemon_stream
+            .write_all(
+                &encode_message(WireKind::TerminalClipboardWrite, 0, 0, &wrong)
+                    .expect("wrong identity fixture"),
+            )
+            .await
+            .expect("write wrong identity fixture");
+        assert_eq!(
+            client
+                .read_event(Duration::from_secs(1))
+                .await
+                .expect_err("wrong clipboard attachment")
                 .kind(),
             DomainErrorKind::MalformedFrame
         );

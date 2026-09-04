@@ -1,13 +1,16 @@
 //! Adversarial bounds for PTY-controlled terminal input.
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use zterm_core::terminal::{
-    MAX_SIDE_EVENTS_PER_UPDATE, RejectedEffect, TerminalColor, TerminalSideEvent, TerminalSize,
+    MAX_SIDE_EVENTS_PER_UPDATE, MAX_TERMINAL_CLIPBOARD_BYTES, RejectedEffect, TerminalColor,
+    TerminalHostEffect, TerminalKeyboardFlags, TerminalSideEvent, TerminalSize,
     UnsupportedSequenceKind,
 };
 use zterm_terminal::{
     MAX_CELL_TEXT_BYTES, MAX_COMBINING_BYTES_PER_SESSION, MAX_COMBINING_CELLS_PER_SESSION,
-    MAX_CONTROL_SEQUENCE_BYTES, MAX_CONTROL_STRING_BYTES, MAX_REPLY_BYTES_PER_UPDATE,
-    TerminalError, TerminalModel,
+    MAX_CONTROL_SEQUENCE_BYTES, MAX_CONTROL_STRING_BYTES, MAX_OSC52_BASE64_BYTES,
+    MAX_REPLY_BYTES_PER_UPDATE, TerminalError, TerminalModel,
 };
 
 fn visible_text(model: &TerminalModel) -> String {
@@ -385,4 +388,202 @@ fn side_event_flood_is_summarized_at_the_hard_limit() {
         update.events.last(),
         Some(&TerminalSideEvent::EventsDropped { count: 69 })
     );
+}
+
+#[test]
+fn osc52_write_is_strict_chunk_invariant_redacted_and_latest_only() {
+    const FIRST: &str = "CLIPBOARD_FIRST_18af\n界";
+    const SECOND: &str = "CLIPBOARD_SECOND_29bc\tvalue";
+    let first = BASE64_STANDARD.encode(FIRST);
+    let second = BASE64_STANDARD.encode(SECOND);
+    let mut input =
+        format!("before\x1b]52;c;{first}\x1b\\\x1b]52;c;not-canonical\x07").into_bytes();
+    input.push(0x9d);
+    input.extend_from_slice(format!("52;c;{second}").as_bytes());
+    input.push(0x9c);
+    input.extend_from_slice(b"after");
+
+    let mut whole = TerminalModel::new(TerminalSize::new(2, 32), 0).expect("whole model");
+    let whole_update = whole.ingest(&input).expect("whole OSC 52 ingest");
+    let mut chunked = TerminalModel::new(TerminalSize::new(2, 32), 0).expect("chunked model");
+    let mut chunk_effect = None;
+    let mut chunk_events = Vec::new();
+    for chunk in input.chunks(7) {
+        let update = chunked.ingest(chunk).expect("chunked OSC 52 ingest");
+        if update.host_effect.is_some() {
+            chunk_effect = update.host_effect;
+        }
+        chunk_events.extend(update.events);
+    }
+
+    assert_same_presented_surface(&whole, &chunked);
+    assert_eq!(whole_update.host_effect, chunk_effect);
+    assert_eq!(whole_update.events, chunk_events);
+    let TerminalHostEffect::ClipboardWrite(value) = whole_update
+        .host_effect
+        .as_ref()
+        .expect("latest valid write");
+    assert_eq!(value.as_str(), SECOND);
+    assert_eq!(
+        whole_update.events,
+        vec![TerminalSideEvent::EffectRejected(
+            RejectedEffect::ClipboardWrite
+        )]
+    );
+    let debug = format!("{whole_update:?}");
+    assert!(!debug.contains(FIRST));
+    assert!(!debug.contains(SECOND));
+    assert!(!debug.contains(&first));
+    assert!(!debug.contains(&second));
+    assert!(visible_text(&whole).contains("beforeafter"));
+}
+
+#[test]
+fn osc52_exact_cap_and_both_overflow_paths_are_atomic() {
+    let exact_text = "x".repeat(MAX_TERMINAL_CLIPBOARD_BYTES);
+    let exact_encoded = BASE64_STANDARD.encode(&exact_text);
+    assert_eq!(exact_encoded.len(), MAX_OSC52_BASE64_BYTES);
+    let mut exact = TerminalModel::new(TerminalSize::new(2, 16), 0).expect("exact model");
+    let exact_update = exact
+        .ingest(format!("\x1b]52;c;{exact_encoded}\x07").as_bytes())
+        .expect("exact cap accepted");
+    let TerminalHostEffect::ClipboardWrite(value) =
+        exact_update.host_effect.expect("exact cap write");
+    assert_eq!(value.as_str().len(), MAX_TERMINAL_CLIPBOARD_BYTES);
+
+    let decoded_over = BASE64_STANDARD.encode("y".repeat(MAX_TERMINAL_CLIPBOARD_BYTES + 1));
+    assert_eq!(decoded_over.len(), MAX_OSC52_BASE64_BYTES);
+    let decoded_over_update = exact
+        .ingest(format!("\x1b]52;c;{decoded_over}\x07visible").as_bytes())
+        .expect("decoded overflow contained");
+    assert!(decoded_over_update.host_effect.is_none());
+    assert_eq!(
+        decoded_over_update.events,
+        vec![TerminalSideEvent::EffectRejected(
+            RejectedEffect::ClipboardWrite
+        )]
+    );
+    assert!(visible_text(&exact).contains("visible"));
+
+    let encoded_over = "A".repeat(MAX_OSC52_BASE64_BYTES + 1);
+    let encoded_over_update = exact
+        .ingest(format!("\x1b]52;c;{encoded_over}\x1b\\tail").as_bytes())
+        .expect("encoded overflow contained through terminator");
+    assert!(encoded_over_update.host_effect.is_none());
+    assert_eq!(
+        encoded_over_update.events,
+        vec![TerminalSideEvent::EffectRejected(
+            RejectedEffect::ClipboardWrite
+        )]
+    );
+    assert!(visible_text(&exact).contains("tail"));
+}
+
+#[test]
+fn osc52_rejects_reads_selectors_empty_noncanonical_utf8_nul_and_cancelled_input() {
+    let invalid_utf8 = BASE64_STANDARD.encode([0xff]);
+    let nul = BASE64_STANDARD.encode(b"a\0b");
+    let cases = [
+        "\x1b]52;c;?\x07".to_owned(),
+        "\x1b]52;;YQ==\x07".to_owned(),
+        "\x1b]52;p;YQ==\x07".to_owned(),
+        "\x1b]52;c,p;YQ==\x07".to_owned(),
+        "\x1b]52;c;\x07".to_owned(),
+        "\x1b]52;c;YQ\x07".to_owned(),
+        "\x1b]52;c;Zh==\x07".to_owned(),
+        format!("\x1b]52;c;{invalid_utf8}\x07"),
+        format!("\x1b]52;c;{nul}\x07"),
+    ];
+    for input in cases {
+        let mut model = TerminalModel::new(TerminalSize::new(2, 8), 0).expect("case model");
+        let update = model.ingest(input.as_bytes()).expect("rejected OSC 52");
+        assert!(update.host_effect.is_none());
+        assert_eq!(update.events.len(), 1);
+        assert!(matches!(
+            update.events[0],
+            TerminalSideEvent::EffectRejected(_)
+        ));
+        assert!(visible_text(&model).is_empty());
+    }
+
+    let mut cancelled = TerminalModel::new(TerminalSize::new(2, 8), 0).expect("cancel model");
+    let update = cancelled
+        .ingest(b"\x1b]52;c;YQ==\x18ok")
+        .expect("cancelled OSC 52");
+    assert!(update.host_effect.is_none());
+    assert!(update.events.is_empty());
+    assert!(visible_text(&cancelled).contains("ok"));
+}
+
+#[test]
+fn kitty_keyboard_stack_is_strict_projected_and_queryable() {
+    let mut model = TerminalModel::new(TerminalSize::new(2, 16), 0).expect("keyboard model");
+    let set = model.ingest(b"\x1b[=3u").expect("set flags");
+    assert!(set.events.is_empty());
+    assert_eq!(
+        model.snapshot().surface.modes.keyboard_flags,
+        TerminalKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES
+            .union(TerminalKeyboardFlags::REPORT_EVENT_TYPES)
+    );
+    let checkpoint = model.checkpoint();
+
+    model.ingest(b"\x1b[>4u").expect("push flags");
+    assert_eq!(model.snapshot().surface.modes.keyboard_flags.bits(), 4);
+    let query = model.ingest(b"\x1b[?u").expect("query flags");
+    assert_eq!(query.replies, b"\x1b[?4u");
+    model.ingest(b"\x1b[<u").expect("pop flags");
+    assert!(model.snapshot().surface.modes.keyboard_flags.is_empty());
+    model.ingest(b"\x1b[=8;2u").expect("union flags");
+    assert_eq!(model.snapshot().surface.modes.keyboard_flags.bits(), 8);
+    model.ingest(b"\x1b[=1;3u").expect("difference flags");
+    assert_eq!(model.snapshot().surface.modes.keyboard_flags.bits(), 8);
+    let delta = model.delta_or_resync(&checkpoint);
+    let zterm_core::terminal::TerminalSurfaceDeltaResult::Delta(delta) = delta else {
+        panic!("keyboard-only change remains a semantic delta");
+    };
+    assert_eq!(delta.modes.keyboard_flags.bits(), 8);
+
+    model.ingest(b"\x1b[=u").expect("default set flags");
+    assert!(model.snapshot().surface.modes.keyboard_flags.is_empty());
+    model.ingest(b"\x1b[>u").expect("default push flags");
+    assert!(model.snapshot().surface.modes.keyboard_flags.is_empty());
+    model.ingest(b"\x1b[=4;0u").expect("default set behavior");
+    assert_eq!(model.snapshot().surface.modes.keyboard_flags.bits(), 4);
+    model.ingest(b"\x1b[<0u").expect("default pop count");
+    assert!(model.snapshot().surface.modes.keyboard_flags.is_empty());
+
+    model.ingest(b"\x1b[>1u").expect("push before large pop");
+    let large_pop = model.ingest(b"\x1b[<4097u").expect("large pop count");
+    assert!(large_pop.events.is_empty());
+    assert!(model.snapshot().surface.modes.keyboard_flags.is_empty());
+
+    for malformed in [b"\x1b[=32u".as_slice(), b"\x1b[=1;4u", b"\x1b[>1;2u"] {
+        let before = model.snapshot().surface.modes.keyboard_flags;
+        let update = model.ingest(malformed).expect("malformed flags contained");
+        assert_eq!(
+            update.events,
+            vec![TerminalSideEvent::UnsupportedSequence(
+                UnsupportedSequenceKind::Csi
+            )]
+        );
+        assert_eq!(model.snapshot().surface.modes.keyboard_flags, before);
+    }
+
+    model.ingest(b"\x1bc").expect("terminal reset");
+    assert!(model.snapshot().surface.modes.keyboard_flags.is_empty());
+
+    model.ingest(b"\x1b[>1u").expect("push main flags");
+    model
+        .ingest(b"\x1b[?1049h")
+        .expect("enter alternate screen");
+    assert!(model.snapshot().surface.modes.keyboard_flags.is_empty());
+    model.ingest(b"\x1b[>2u").expect("push alternate flags");
+    model.ingest(b"\x1b[?1049l").expect("return to main screen");
+    assert_eq!(model.snapshot().surface.modes.keyboard_flags.bits(), 1);
+    model
+        .ingest(b"\x1b[?1049h")
+        .expect("restore alternate screen");
+    assert_eq!(model.snapshot().surface.modes.keyboard_flags.bits(), 2);
+    model.ingest(b"\x1bc").expect("reset both screen stacks");
+    assert!(model.snapshot().surface.modes.keyboard_flags.is_empty());
 }

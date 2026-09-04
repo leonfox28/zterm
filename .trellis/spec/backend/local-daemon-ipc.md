@@ -232,6 +232,15 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   faster than once per second; operations combine them with the attach-time
   frozen validated alias. Device IDs, addresses, relay URLs, tickets, and
   terminal bytes never enter this event, Debug, status text, or logs.
+- `TerminalClipboardWrite` kind 322 is a transient semantic host effect, not a
+  terminal revision or replayable control response. Terminal ingress validates
+  child OSC 52 once, Session targets only the controller that exists at effect
+  publication time, and remote/local bridges rewrite and revalidate only typed
+  attachment identity plus bounded text. Operations owns a separate
+  latest-only clipboard slot with a payload-free wakeup, so a slow UI cannot
+  fill or block the capacity-eight lifecycle queue. Target changes, stream loss,
+  detach, and Session end clear pending content; observers and later
+  controllers receive no replay. The wire carries no raw OSC.
 - A local or remote initial attachment has one deadline covering every
   pre-snapshot transport-state frame through the complete correlated snapshot
   or typed service error. For `create_main`, encode/connect failures before the
@@ -319,6 +328,48 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   belongs to Zterm, and alternate without either child mode receives no
   invented scroll input. This mode-driven rule is what makes nested Herdr,
   PiAgent, tmux, and other TUIs coexist without process-name detection.
+- One exhaustive pointer router also owns text selection. Active gutter drag,
+  existing selection capture, gutter hit, history navigation, child mouse,
+  alternate-scroll, live history, and eligible unmodified left selection are
+  mutually exclusive outcomes; a cancelled selection consumes its remaining
+  release instead of synthesizing an orphan child event. Selection coordinates
+  and exact presented-source identity live only in the CLI attachment. Core
+  normalizes ranges and extracts bounded semantic text for both desktop and
+  future mobile clients; the compositor applies inverse-style XOR only to its
+  cloned frame before chrome and the final cursor. The presenter applies an
+  overlay or selection-driven keyboard elevation only when those coordinates
+  match the exact source of the next frame; input decoding follows the
+  host-input projection from the last successfully flushed transaction, never
+  an uncommitted desired mode.
+- The terminal guard owns one stack-scoped Kitty keyboard entry. It pushes a
+  disabled value on entry, mirrors nonzero child flags, temporarily requests
+  flags 7 (disambiguation, event types, and alternate keys) only while a
+  finalized local selection overlays a zero-flag child, and pops on every exit.
+  The sole host-input codec preserves raw bytes when outer and child modes
+  agree; during that temporary elevation it consumes one Ctrl/Super+C press and
+  its matching repeat/release lease or performs the complete legacy downgrade
+  for other valid keys. Any other outer/child mismatch remains byte-preserving;
+  it is not treated as recoverable through legacy reinterpretation. No timer,
+  terminal brand, process name, or screen-text heuristic participates.
+- Physical input encoding is a presenter-owned host effect, not a
+  visual-history property. Its projection contains exactly application cursor,
+  application keypad, bracketed paste, focus reporting, and derived outer Kitty
+  keyboard flags. Child mouse mode/encoding and alternate-scroll remain
+  Zterm-routed semantics and are never mirrored to the outer terminal. When a
+  live delta arrives, the CLI first validates a candidate surface and previews
+  compact post-delta viewport/cache-anchor metadata plus a reconciled selection
+  candidate. That post-delta selection identity, not the pre-delta viewport,
+  determines any flags-7 elevation. The preview does not clone cached rows.
+  For a pinned history view, the sole `DesktopPresenter` emits only controls
+  for changed projected fields in one buffered `write_all + flush`; it emits no
+  rows, chrome, cursor, mouse reset/capture, or visual transaction. An unchanged
+  projection does no I/O. Only after successful output (or a proven no-I/O
+  projection) may the caller commit the surface, live metrics, cache-anchor
+  observation, selection, and presenter selection/projection together. A
+  write/flush failure commits none of those candidates and invalidates the
+  presenter baseline so the next presentation is a complete recovery frame.
+  Live full-frame delta presentation uses the same staged selection/viewport
+  ordering rather than mutating them before the outer write.
 - Snapshot, applied delta, resync replacement, history, status, and scrollbar
   changes first converge as one semantic `ComposedFrame`. The sole
   `DesktopPresenter` then emits one buffered outer transaction: DEC 2026 begin,
@@ -331,6 +382,12 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   to perform a full clear plus complete repaint. Raw-mode cleanup begins by
   ending DEC 2026, then disables capture/restores the user's terminal on normal
   exit, signal, error, and panic.
+- The same sole presenter is the desktop clipboard sink. Both a finalized local
+  selection copy action and a validated remote kind-322 effect become exactly
+  one canonical `OSC 52;c;<standard padded Base64>BEL` write and one flush.
+  Clipboard output is capped at 512 KiB decoded UTF-8, diagnostics are
+  content-free, and success or failure does not mutate the visual presenter
+  baseline or enter Session replay state.
 - Transport synchronization and connection-path validity are independent.
   Same-stream `SyncRequired`/`Synchronizing` during return-to-live preserves the
   last observed direct/relay path and RTT. It emits no standalone transition
@@ -506,6 +563,14 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
 | history-window frame is uncorrelated, predates/contradicts its request, exceeds 240 rows, contains invalid semantic rows, or does not contain the exact requested range | malformed frame scoped to the view; retain the prior complete cache/presentation and never partially install rows |
 | live wheel occurs during fresh synchronization | swallow Zterm gutter/history navigation and do not forward it to the child; an already-pinned view may continue only across background replacement sync |
 | child declares mouse reporting / alternate+alternate-scroll | forward exactly one mouse report / one cursor-key sequence; do not move Zterm history |
+| one pointer event could match selection, gutter, history, or child routing | evaluate the single exhaustive router and execute exactly one owner; cancelled capture consumes its own trailing release |
+| selection source identity changes through resize/reflow/screen/reconnect/gap/navigation | clear the attachment-local selection before reuse; never apply coordinates to unproven rows |
+| child OSC 52 is a read, malformed/noncanonical, wrong selector, empty, NUL, invalid UTF-8, or over 512 KiB | consume atomically through its terminator, emit no reply/render/effect, and keep diagnostics content-free |
+| a valid clipboard effect has no current controller or its target changes before take | drop/clear it; never broadcast, queue per write, replay to a later controller, or block PTY drain |
+| remote kind 322 is nonzero-request, wrong-ID, or outside Active/previously-active same-epoch synchronization | reject the view-local frame; do not retain it in reconnect state |
+| finalized-selection copy arrives as press/repeat/release | emit one clipboard write for the press and consume the matching repeat/release lease; never infer phases with a timer |
+| local selection elevates a zero-mode child to Kitty flags 7 | downgrade every other valid key to its legacy child representation and preserve unknown raw input; pop the owned stack entry on cleanup |
+| presenter clipboard write or flush fails | return a content-free error and preserve the committed visual baseline; do not end the Session or expose clipboard text |
 | composed render path omits DEC 2026 closure/host capture or flushes before chrome/capture | renderer contract failure; snapshot/delta/history/chrome tests must compare exact byte order, one write, and one flush |
 | Main transfers its gutter to Alternate, or a resize reduces usable width to at most four | let the authoritative child snapshot repaint, or the physical resize clip, the former gutter; emit no post-child clear into the reclaimed column |
 | Main retains a gutter but its column changes, including multiple layouts before one presentation | compare with the last successfully presented column, clear that old column first, and draw the final current gutter last in the same transaction |
@@ -670,7 +735,11 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   correlated control completion, other terminal error projection, and
   state-event ordering over pure fake streams. The local attachment client
   separately proves routing and validated transport-state consumption over a
-  real same-UID Unix duplex connection.
+  real same-UID Unix duplex connection. Clipboard regressions additionally
+  prove Active-only and previously-active same-epoch admission, exact local-ID
+  rewrite, request ID zero, wrong-phase/ID rejection, no reconnect retention,
+  and a real child PTY OSC 52 reaching the same-UID controller as one typed
+  `TerminalClipboardWrite`.
 - `terminal_ui` pure tests cover remote rows-minus-one/one-row geometry,
   oversized physical-to-bounded child projection for initial attach and resize,
   stable main gutter/alternate reclaim, all scrollbar positions and drag
@@ -708,12 +777,31 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   legal viewport and reads the original typed event after the resize command
   completes. The tmux 3.7c and Herdr 0.8.2 black-box modes must pass through the
   same generic path.
+- Selection and keyboard unit tests cover forward/reverse/pure-click ranges,
+  live and history presented-source identity, stable monotonic append versus
+  invalidation, wide/combining/blank/wrapped extraction and the 512 KiB atomic
+  cap, every pointer owner and cancelled capture, highlight ordering, Kitty
+  CSI-u fragmentation/validation, macOS Super+C, Linux Ctrl+Shift+C, one
+  press/repeat/release copy lease, raw-equality forwarding, complete legacy
+  downgrade, outer stack restoration, and exact canonical OSC 52 output.
+  A pinned-history regression changes each of application cursor/keypad,
+  bracketed paste, focus reporting, and Kitty keyboard mode through hidden
+  deltas and requires exactly one buffered changed-controls write/flush, no
+  row/chrome/cursor/mouse-capture bytes, an updated committed input baseline,
+  preserved flags-7 selection elevation when the child returns to legacy, and
+  no semantic commit after an injected host-write failure. Routed-only mouse/
+  alternate-scroll changes and an otherwise unchanged projection do no host
+  I/O. Presenter failure tests require content-free errors and the documented
+  baseline recovery behavior.
 - The CLI multiprocess PTY gate uses a task-private deterministic shell. The
   connect child proves ready -> eventual interactive echo -> default detach
   through the unmodified `run_terminal`; its scroll mode uses a real outer PTY,
   revision/echo barrier, and SGR wheel report to prove a target exactly one row
-  above a 24-row live viewport is repainted, then detached/restored. The
-  bare child separately proves
+  above a 24-row live viewport is repainted, then detached/restored. Its copy
+  mode uses the same outer PTY to make a local selection, send one enhanced
+  copy press/repeat/release actuation, and observe exactly one canonical OSC 52
+  between the owned keyboard-stack push and pop, without a child revision or a
+  new presentation transaction. The bare child separately proves
   SIGWINCH revision/viewport, SIGTERM cancellation, termios restoration,
   bounded reap, and panic cleanup. Stress it sequentially and concurrently,
   then assert no fixture daemon is orphaned. No diagnostic may contain
@@ -875,6 +963,15 @@ assert_eq!(error.kind(), DomainErrorKind::DeadlineExceeded);
   daemon-owned runtime's `enter()` guard.
 - Routing wheel input from process names, TERM, screen text, or special cases
   for tmux/Herdr/PiAgent instead of authoritative terminal modes.
+- Passing raw child OSC 52 across Session/wire, broadcasting or replaying a
+  clipboard effect, retaining clipboard payload in `watch`/lifecycle queues,
+  allowing clipboard reads, or logging/formatting its content.
+- A second mouse/pointer router, selection state in Session/model/wire, or
+  desktop gesture/ANSI/clipboard dependencies in the renderer-neutral core
+  range and extraction helpers.
+- Leaving global Kitty keyboard enhancement enabled, modifying a caller's
+  stack entry instead of owning one scoped entry, recognizing copy by terminal
+  brand/raw-byte special case, or guessing press/repeat/release with a timer.
 - Storing semantic scroll position in the shared model/resume checkpoint,
   recreating a stateful server viewport, or treating an in-epoch replacement
   snapshot as a new transport reconnect.

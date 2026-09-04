@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 use zterm_core::Revision;
+#[cfg(unix)]
+use zterm_core::terminal::TerminalHostEffect;
 use zterm_core::terminal::{
     TerminalHistoryWindowQuery, TerminalSize, TerminalSurfaceDeltaResult,
     TerminalSurfaceHistoryWindowResult, TerminalSurfaceSnapshot,
@@ -110,10 +112,112 @@ pub struct TerminalDriver {
     interrupt: PtyChildInterrupt,
     ownership: TerminalDriverOwnership,
     shared: Arc<SharedTerminal>,
+    #[cfg(unix)]
+    effects: TerminalEffectBroker,
     queue: Arc<ByteQueue>,
     reader_thread: Option<JoinHandle<()>>,
     model_thread: Option<JoinHandle<()>>,
     finalized: bool,
+}
+
+/// Latest-only terminal host-effect broker whose target is linearized with
+/// controller transitions by the Session actor.
+#[cfg(unix)]
+#[derive(Clone)]
+pub(crate) struct TerminalEffectBroker {
+    inner: Arc<TerminalEffectBrokerInner>,
+}
+
+#[cfg(unix)]
+struct TerminalEffectBrokerInner {
+    state: Mutex<TerminalEffectBrokerState>,
+    wake: watch::Sender<()>,
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct TerminalEffectBrokerState {
+    target: Option<zterm_core::AttachmentId>,
+    pending: Option<TargetedHostEffect>,
+}
+
+#[cfg(unix)]
+struct TargetedHostEffect {
+    attachment_id: zterm_core::AttachmentId,
+    effect: TerminalHostEffect,
+}
+
+#[cfg(unix)]
+impl TerminalEffectBroker {
+    fn new() -> Self {
+        let (wake, _) = watch::channel(());
+        Self {
+            inner: Arc::new(TerminalEffectBrokerInner {
+                state: Mutex::new(TerminalEffectBrokerState::default()),
+                wake,
+            }),
+        }
+    }
+
+    /// Changes the event-time target and atomically discards content for any
+    /// prior controller.
+    pub(crate) fn set_target(
+        &self,
+        target: Option<zterm_core::AttachmentId>,
+    ) -> Result<(), TerminalDriverError> {
+        let mut state = lock(&self.inner.state, "terminal effect broker")?;
+        if state.target != target {
+            state.target = target;
+            state.pending = None;
+        }
+        Ok(())
+    }
+
+    fn publish(&self, effect: TerminalHostEffect) -> Result<(), TerminalDriverError> {
+        {
+            let mut state = lock(&self.inner.state, "terminal effect broker")?;
+            let Some(attachment_id) = state.target else {
+                return Ok(());
+            };
+            state.pending = Some(TargetedHostEffect {
+                attachment_id,
+                effect,
+            });
+        }
+        self.inner.wake.send_replace(());
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_for_test(
+        &self,
+        effect: TerminalHostEffect,
+    ) -> Result<(), TerminalDriverError> {
+        self.publish(effect)
+    }
+
+    /// Subscribes to payload-free latest-slot wakeups.
+    #[must_use]
+    pub(crate) fn subscribe(&self) -> watch::Receiver<()> {
+        self.inner.wake.subscribe()
+    }
+
+    /// Takes only an effect bound to the requesting attachment.
+    pub(crate) fn take_for(
+        &self,
+        attachment_id: zterm_core::AttachmentId,
+    ) -> Result<Option<TerminalHostEffect>, TerminalDriverError> {
+        let mut state = lock(&self.inner.state, "terminal effect broker")?;
+        if state
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.attachment_id == attachment_id)
+        {
+            Ok(state.pending.take().map(|pending| pending.effect))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 /// Owner-only child interruption capability for one terminal driver.
@@ -216,11 +320,15 @@ impl TerminalDriver {
         let interrupt = parts.interrupt;
         let ownership = TerminalDriverOwnership::new();
         let shared = Arc::new(SharedTerminal::new(model));
+        #[cfg(unix)]
+        let effects = TerminalEffectBroker::new();
         let queue = Arc::new(ByteQueue::new(config.byte_channel_capacity));
 
         let model_queue = Arc::clone(&queue);
         let model_shared = Arc::clone(&shared);
         let model_io = Arc::clone(&io);
+        #[cfg(unix)]
+        let model_effects = effects.clone();
         #[cfg(test)]
         let inject_model_failure = failure == Some(StartFailureInjection::ModelThread);
         #[cfg(not(test))]
@@ -248,6 +356,17 @@ impl TerminalDriver {
                                 io.write_input(&update.replies).map_err(Into::into)
                             });
                             if let Err(error) = result {
+                                model_queue.complete();
+                                model_shared.fail(error);
+                                model_queue.abort();
+                                return;
+                            }
+                        }
+                        #[cfg(unix)]
+                        {
+                            if let Some(effect) = update.host_effect
+                                && let Err(error) = model_effects.publish(effect)
+                            {
                                 model_queue.complete();
                                 model_shared.fail(error);
                                 model_queue.abort();
@@ -321,6 +440,8 @@ impl TerminalDriver {
             interrupt,
             ownership,
             shared,
+            #[cfg(unix)]
+            effects,
             queue,
             reader_thread: Some(reader_thread),
             model_thread: Some(model_thread),
@@ -334,6 +455,8 @@ impl TerminalDriver {
         self.shared.attachments.fetch_add(1, Ordering::AcqRel);
         TerminalAttachment {
             shared: Arc::clone(&self.shared),
+            #[cfg(unix)]
+            effects: self.effects.clone(),
             checkpoint: None,
         }
     }
@@ -359,6 +482,22 @@ impl TerminalDriver {
     #[must_use]
     pub fn revision_watch(&self) -> watch::Receiver<Revision> {
         self.shared.revision_sender.subscribe()
+    }
+
+    /// Reconciles the sole controller eligible for future transient effects.
+    pub(crate) fn set_effect_target(
+        &self,
+        target: Option<zterm_core::AttachmentId>,
+    ) -> Result<(), TerminalDriverError> {
+        #[cfg(unix)]
+        {
+            self.effects.set_target(target)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = target;
+            Ok(())
+        }
     }
 
     /// Returns a recorded model/reader failure without mutating the child.
@@ -526,6 +665,8 @@ impl Drop for TerminalDriver {
 /// Latest-only terminal view owned by one UI or transport attachment.
 pub struct TerminalAttachment {
     shared: Arc<SharedTerminal>,
+    #[cfg(unix)]
+    effects: TerminalEffectBroker,
     checkpoint: Option<TerminalCheckpoint>,
 }
 
@@ -540,6 +681,13 @@ impl TerminalAttachment {
     #[must_use]
     pub fn revision_watch(&self) -> watch::Receiver<Revision> {
         self.shared.revision_sender.subscribe()
+    }
+
+    /// Returns a cloneable broker handle without exposing the terminal model.
+    #[cfg(unix)]
+    #[must_use]
+    pub(crate) fn effect_broker(&self) -> TerminalEffectBroker {
+        self.effects.clone()
     }
 
     /// Waits until the authoritative model advances beyond `revision`.
@@ -929,6 +1077,101 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn host_effect_broker_is_event_time_targeted_latest_only_and_non_replaying() {
+        fn clipboard(text: &str) -> TerminalHostEffect {
+            TerminalHostEffect::ClipboardWrite(
+                zterm_core::terminal::TerminalClipboardWrite::new(text.to_owned())
+                    .expect("clipboard fixture"),
+            )
+        }
+
+        let first = zterm_core::AttachmentId::from_array([0x11; 16]);
+        let second = zterm_core::AttachmentId::from_array([0x22; 16]);
+        let broker = TerminalEffectBroker::new();
+        let wake = broker.subscribe();
+
+        broker
+            .publish(clipboard("unowned"))
+            .expect("publish unowned effect");
+        assert!(!wake.has_changed().expect("open wake channel"));
+        broker
+            .set_target(Some(first))
+            .expect("install first target");
+        assert!(
+            broker
+                .take_for(first)
+                .expect("take from first target")
+                .is_none()
+        );
+
+        broker
+            .publish(clipboard("old"))
+            .expect("publish old effect");
+        broker
+            .publish(clipboard("latest"))
+            .expect("publish latest effect");
+        assert!(
+            broker
+                .take_for(second)
+                .expect("take from non-target")
+                .is_none()
+        );
+        let TerminalHostEffect::ClipboardWrite(write) = broker
+            .take_for(first)
+            .expect("take from first target")
+            .expect("latest first effect");
+        assert_eq!(write.as_str(), "latest");
+        assert!(
+            broker
+                .take_for(first)
+                .expect("take after pending effect consumed")
+                .is_none()
+        );
+
+        broker
+            .publish(clipboard("stale takeover content"))
+            .expect("publish pre-takeover effect");
+        broker
+            .set_target(Some(second))
+            .expect("install second target");
+        assert!(
+            broker
+                .take_for(first)
+                .expect("take from retired target")
+                .is_none()
+        );
+        assert!(
+            broker
+                .take_for(second)
+                .expect("take stale effect from new target")
+                .is_none()
+        );
+        broker
+            .publish(clipboard("second controller"))
+            .expect("publish second target effect");
+        let TerminalHostEffect::ClipboardWrite(write) = broker
+            .take_for(second)
+            .expect("take from second target")
+            .expect("second controller effect");
+        assert_eq!(write.as_str(), "second controller");
+
+        broker
+            .publish(clipboard("disconnect content"))
+            .expect("publish pre-disconnect effect");
+        broker.set_target(None).expect("clear effect target");
+        broker
+            .set_target(Some(second))
+            .expect("restore second target");
+        assert!(
+            broker
+                .take_for(second)
+                .expect("take after disconnect")
+                .is_none()
+        );
+    }
+
     #[test]
     fn bounded_queue_never_exceeds_its_capacity() {
         let queue = Arc::new(ByteQueue::new(2));
@@ -976,6 +1219,8 @@ mod tests {
         shared.attachments.store(1, Ordering::Release);
         let mut attachment = TerminalAttachment {
             shared: Arc::clone(&shared),
+            #[cfg(unix)]
+            effects: TerminalEffectBroker::new(),
             checkpoint: None,
         };
 

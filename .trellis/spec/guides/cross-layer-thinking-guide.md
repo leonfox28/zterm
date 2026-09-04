@@ -355,6 +355,15 @@ attachment-local presentation, and transport/controller synchronization.
       layouts against the last successfully presented layout.
 - [ ] Route each wheel report from authoritative screen/modes and hit geometry,
       not process names or screen contents; assert exactly one owner.
+- [ ] Route every pointer report through one exhaustive owner decision. Keep
+      gutter capture, attachment-local selection capture, child mouse,
+      alternate-scroll, and history mutually exclusive; a cancelled capture
+      must consume its trailing release rather than orphan it into another
+      owner.
+- [ ] Keep semantic range normalization/extraction in renderer-neutral core,
+      but bind selection coordinates to the exact successfully presented
+      attachment-local source identity. Prove when monotonic append preserves
+      that identity and clear selection on every unprovable transition.
 - [ ] Store desired scroll position and cached semantic windows in the CLI
       attachment view. Send stateless typed history-window queries to the model;
       never store one client's target in Session/model state or mutate a shared
@@ -367,6 +376,16 @@ attachment-local presentation, and transport/controller synchronization.
 - [ ] Distinguish received, desired, and actually presented state. A coalesced
       response that immediately schedules a newer target is not allowed to
       replace presentation metrics until its complete frame is painted.
+- [ ] When a visible frame is intentionally frozen or suppressed, enumerate
+      non-visual host state separately. Input-protocol modes must still follow
+      authoritative live state through the sole presenter. Stage the complete
+      post-update semantic surface and every local identity that can affect the
+      host projection (viewport/cache anchor and selection included), derive
+      the effect from that candidate, and commit them together only after the
+      mode-only write succeeds. Do not derive from pre-update local state and
+      repair it with a second sync. Prefer compact metadata previews over
+      cloning cached rows, and never pretend hidden rows, chrome, or cursor were
+      painted.
 - [ ] When presentation is paced, update desired state and issue independent
       requests immediately, but advance the presented baseline only after the
       outer write succeeds. One dirty bit/deadline should reference current
@@ -374,6 +393,17 @@ attachment-local presentation, and transport/controller synchronization.
 - [ ] Treat chrome geometry as presented state too. Frame construction and
       failed write/flush attempts must not advance its baseline; retries must
       clear an unknown presenter baseline and perform a complete repaint.
+- [ ] Classify terminal-originated host requests before choosing a data path.
+      A transient clipboard effect is not revisioned state, a side event, or an
+      idempotent operation: normalize it once at ingress, target the controller
+      at publication time, retain at most the latest pending value, never replay
+      or broadcast it, and let only the platform presenter/backend encode the
+      final host action.
+- [ ] When outer input enhancement is needed, own one stack-scoped Kitty entry
+      and derive it from child-declared flags plus local UI state. Preserve raw
+      bytes when modes agree; otherwise use explicit event type and alternate
+      key identity for exact copy leasing and legacy downgrade. Never infer
+      press/repeat/release with timeouts or terminal/application names.
 - [ ] Test cadence cancellation at every authority change. Resume, cache miss,
       snapshot/resync, resize, reconnect, detach, and cleanup must not let a
       stale timer promote an unseen desired offset into painted chrome.

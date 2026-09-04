@@ -47,6 +47,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ".zterm.v2.ResumeViewId",
         ".zterm.v2.TerminalAttachRequest",
         ".zterm.v2.TerminalInput",
+        ".zterm.v2.TerminalClipboardWrite",
         ".zterm.v2.TerminalCell",
         ".zterm.v2.TerminalSurfaceRow",
         ".zterm.v2.TerminalSurface",

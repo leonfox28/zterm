@@ -4,10 +4,12 @@ use std::fmt;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+#[cfg(unix)]
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use zterm_core::terminal::{
-    TerminalHistoryWindowQuery, TerminalSize, TerminalSurfaceDelta,
+    TerminalClipboardWrite, TerminalHistoryWindowQuery, TerminalSize, TerminalSurfaceDelta,
     TerminalSurfaceHistoryWindowResult, TerminalSurfaceSnapshot,
 };
 use zterm_core::{
@@ -335,6 +337,8 @@ pub enum TerminalViewEvent {
     Delta(TerminalViewDelta),
     /// One correlated stateless bounded history-window outcome.
     HistoryWindow(TerminalViewHistoryWindow),
+    /// One validated latest-only child clipboard write.
+    ClipboardWrite(TerminalClipboardWrite),
     /// The following snapshot replaces the current live rendering baseline.
     SyncRequired {
         /// Latest host revision declared by the synchronization marker.
@@ -365,6 +369,10 @@ impl fmt::Debug for TerminalViewEvent {
             Self::HistoryWindow(window) => formatter
                 .debug_tuple("HistoryWindow")
                 .field(window)
+                .finish(),
+            Self::ClipboardWrite(write) => formatter
+                .debug_tuple("ClipboardWrite")
+                .field(write)
                 .finish(),
             Self::SyncRequired { latest_revision } => formatter
                 .debug_struct("SyncRequired")
@@ -500,6 +508,10 @@ impl TerminalViewIo {
 pub struct TerminalViewEventReader {
     #[cfg(unix)]
     receiver: tokio::sync::mpsc::Receiver<Result<TerminalViewEvent, DaemonError>>,
+    #[cfg(unix)]
+    clipboard: Arc<TerminalClipboardSlot>,
+    #[cfg(unix)]
+    clipboard_wakeup: tokio::sync::watch::Receiver<()>,
 }
 
 impl fmt::Debug for TerminalViewEventReader {
@@ -515,12 +527,73 @@ impl TerminalViewEventReader {
     pub async fn read_event(&mut self) -> Result<Option<TerminalViewEvent>, DaemonError> {
         #[cfg(unix)]
         {
-            self.receiver.recv().await.transpose()
+            loop {
+                tokio::select! {
+                    biased;
+                    event = self.receiver.recv() => {
+                        if event.is_none() {
+                            self.clipboard.clear();
+                        }
+                        return event.transpose();
+                    }
+                    changed = self.clipboard_wakeup.changed() => {
+                        if changed.is_err() {
+                            continue;
+                        }
+                        self.clipboard_wakeup.borrow_and_update();
+                        if let Some(write) = self.clipboard.take() {
+                            return Ok(Some(TerminalViewEvent::ClipboardWrite(write)));
+                        }
+                    }
+                }
+            }
         }
         #[cfg(not(unix))]
         {
             Err(unsupported_command_platform())
         }
+    }
+}
+
+#[cfg(unix)]
+struct TerminalClipboardSlot {
+    pending: Mutex<Option<TerminalClipboardWrite>>,
+    wake: tokio::sync::watch::Sender<()>,
+}
+
+#[cfg(unix)]
+impl TerminalClipboardSlot {
+    fn new() -> (Arc<Self>, tokio::sync::watch::Receiver<()>) {
+        let (wake, receiver) = tokio::sync::watch::channel(());
+        (
+            Arc::new(Self {
+                pending: Mutex::new(None),
+                wake,
+            }),
+            receiver,
+        )
+    }
+
+    fn replace(&self, write: TerminalClipboardWrite) {
+        *self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(write);
+        self.wake.send_replace(());
+    }
+
+    fn take(&self) -> Option<TerminalClipboardWrite> {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    fn clear(&self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
     }
 }
 
@@ -689,6 +762,13 @@ enum TerminalDriverCommand {
 }
 
 #[cfg(unix)]
+struct TerminalDriverInitial {
+    state: TerminalViewTransportState,
+    remote_alias: Option<String>,
+    takeover: bool,
+}
+
+#[cfg(unix)]
 fn spawn_terminal_driver(
     client: LocalAttachmentClient,
     initial_state: TerminalViewTransportState,
@@ -697,19 +777,25 @@ fn spawn_terminal_driver(
 ) -> TerminalViewIo {
     let (command_sender, command_receiver) = tokio::sync::mpsc::channel(TERMINAL_DRIVER_CAPACITY);
     let (event_sender, event_receiver) = tokio::sync::mpsc::channel(TERMINAL_DRIVER_CAPACITY);
+    let (clipboard, clipboard_wakeup) = TerminalClipboardSlot::new();
     let (terminal_outcome_sender, terminal_outcome_receiver) = tokio::sync::watch::channel(false);
     tokio::spawn(run_terminal_driver(
         client,
         command_receiver,
         event_sender,
+        Arc::clone(&clipboard),
         terminal_outcome_sender,
-        initial_state,
-        remote_alias,
-        takeover,
+        TerminalDriverInitial {
+            state: initial_state,
+            remote_alias,
+            takeover,
+        },
     ));
     TerminalViewIo {
         reader: TerminalViewEventReader {
             receiver: event_receiver,
+            clipboard,
+            clipboard_wakeup,
         },
         writer: TerminalViewCommandWriter {
             sender: command_sender,
@@ -723,13 +809,17 @@ async fn run_terminal_driver(
     mut client: LocalAttachmentClient,
     mut commands: tokio::sync::mpsc::Receiver<TerminalDriverCommand>,
     events: tokio::sync::mpsc::Sender<Result<TerminalViewEvent, DaemonError>>,
+    clipboard: Arc<TerminalClipboardSlot>,
     terminal_outcome_queued: tokio::sync::watch::Sender<bool>,
-    initial_state: TerminalViewTransportState,
-    remote_alias: Option<String>,
-    takeover: bool,
+    initial: TerminalDriverInitial,
 ) {
     use std::collections::VecDeque;
 
+    let TerminalDriverInitial {
+        state: initial_state,
+        remote_alias,
+        takeover,
+    } = initial;
     let remote = remote_alias.is_some();
     let mut pending = VecDeque::from([Ok(TerminalViewEvent::TransportState(initial_state))]);
     if let Some(device) = remote_alias.as_ref() {
@@ -758,11 +848,14 @@ async fn run_terminal_driver(
                         &mut local_takeover_pending,
                         &mut last_state,
                         &mut stop_after_pending,
+                        &clipboard,
                     ).await {
+                        clipboard.clear();
                         return;
                     }
                 }
                 () = events.closed() => {
+                    clipboard.clear();
                     let _ = client.detach().await;
                     return;
                 }
@@ -773,6 +866,7 @@ async fn run_terminal_driver(
                         remote_alias.as_deref(),
                         &mut local_takeover_pending,
                         &mut last_state,
+                        &clipboard,
                     ) {
                         stop_after_pending = true;
                     }
@@ -792,18 +886,22 @@ async fn run_terminal_driver(
                     &mut local_takeover_pending,
                     &mut last_state,
                     &mut stop_after_pending,
+                    &clipboard,
                 ).await {
+                    clipboard.clear();
                     return;
                 }
             }
             permit = events.reserve() => {
                 let Ok(permit) = permit else {
+                    clipboard.clear();
                     let _ = client.detach().await;
                     return;
                 };
                 let event = pending.pop_front().expect("pending event was checked above");
                 permit.send(event);
                 if pending.is_empty() && stop_after_pending {
+                    clipboard.clear();
                     terminal_outcome_queued.send_replace(true);
                     return;
                 }
@@ -823,6 +921,7 @@ async fn apply_terminal_driver_command(
     local_takeover_pending: &mut bool,
     last_state: &mut TerminalViewTransportState,
     stop_after_pending: &mut bool,
+    clipboard: &TerminalClipboardSlot,
 ) -> bool {
     match handle_terminal_driver_command(command, client).await {
         TerminalDriverCommandResult::Continue => false,
@@ -844,6 +943,7 @@ async fn apply_terminal_driver_command(
                 local_takeover_pending,
                 last_state,
                 response,
+                clipboard,
             )
             .await;
             *stop_after_pending = true;
@@ -861,6 +961,7 @@ async fn correlate_terminal_command_closure(
     local_takeover_pending: &mut bool,
     last_state: &mut TerminalViewTransportState,
     response: tokio::sync::oneshot::Sender<Result<(), DaemonError>>,
+    clipboard: &TerminalClipboardSlot,
 ) {
     let deadline = tokio::time::Instant::now() + TERMINAL_CLOSURE_CORRELATION_WINDOW;
     loop {
@@ -878,6 +979,7 @@ async fn correlate_terminal_command_closure(
             remote_alias,
             local_takeover_pending,
             last_state,
+            clipboard,
         ) {
             break;
         }
@@ -902,8 +1004,13 @@ fn queue_local_attachment_event(
     remote_alias: Option<&str>,
     local_takeover_pending: &mut bool,
     last_state: &mut TerminalViewTransportState,
+    clipboard: &TerminalClipboardSlot,
 ) -> bool {
     match event {
+        Ok(LocalAttachmentEvent::ClipboardWrite(write)) => {
+            clipboard.replace(write);
+            false
+        }
         Ok(LocalAttachmentEvent::Takeover(_)) if *local_takeover_pending => {
             *local_takeover_pending = false;
             *last_state = TerminalViewTransportState::Active;
@@ -914,6 +1021,16 @@ fn queue_local_attachment_event(
         Ok(LocalAttachmentEvent::TransportState(state)) => {
             match terminal_transport_state_from_wire(state.state) {
                 Ok(TerminalViewTransportState::Preparing) => false,
+                Ok(TerminalViewTransportState::Reconnecting) => {
+                    clipboard.clear();
+                    if *last_state == TerminalViewTransportState::Reconnecting {
+                        false
+                    } else {
+                        *last_state = TerminalViewTransportState::Reconnecting;
+                        pending.push_back(Ok(TerminalViewEvent::TransportState(*last_state)));
+                        false
+                    }
+                }
                 Ok(state) if state == *last_state => false,
                 Ok(state) => {
                     *last_state = state;
@@ -921,6 +1038,7 @@ fn queue_local_attachment_event(
                     false
                 }
                 Err(error) => {
+                    clipboard.clear();
                     pending.push_back(Err(error));
                     true
                 }
@@ -931,6 +1049,9 @@ fn queue_local_attachment_event(
                 event,
                 LocalAttachmentEvent::LeaseLost(_) | LocalAttachmentEvent::SessionEnded(_)
             );
+            if terminal {
+                clipboard.clear();
+            }
             if local_event_requires_synchronizing(&event)
                 && *last_state != TerminalViewTransportState::Synchronizing
             {
@@ -948,6 +1069,7 @@ fn queue_local_attachment_event(
             terminal
         }
         Err(error) => {
+            clipboard.clear();
             pending.push_back(Err(error));
             true
         }
@@ -1109,7 +1231,9 @@ fn terminal_event_from_local(
                 signal: ended.signal,
             })))
         }
-        LocalAttachmentEvent::TransportState(_) | LocalAttachmentEvent::Takeover(_) => Ok(None),
+        LocalAttachmentEvent::TransportState(_)
+        | LocalAttachmentEvent::Takeover(_)
+        | LocalAttachmentEvent::ClipboardWrite(_) => Ok(None),
     }
 }
 
@@ -3075,6 +3199,7 @@ mod tests {
         let mut pending = VecDeque::new();
         let mut takeover_pending = false;
         let mut last_state = TerminalViewTransportState::Active;
+        let (clipboard, _clipboard_wakeup) = TerminalClipboardSlot::new();
         let (response, received) = tokio::sync::oneshot::channel();
         correlate_terminal_command_closure(
             &mut client,
@@ -3083,6 +3208,7 @@ mod tests {
             &mut takeover_pending,
             &mut last_state,
             response,
+            &clipboard,
         )
         .await;
         assert_eq!(received.await.expect("command response owner"), Ok(()));
@@ -3110,6 +3236,7 @@ mod tests {
             &mut takeover_pending,
             &mut last_state,
             response,
+            &clipboard,
         )
         .await;
         assert_eq!(received.await.expect("EOF command response owner"), Ok(()));
@@ -3120,6 +3247,92 @@ mod tests {
         assert!(!error.detail().contains("Broken pipe"));
         assert!(!error.detail().contains("os error"));
         assert!(eof_pending.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clipboard_events_bypass_the_bounded_semantic_queue_and_keep_only_latest() {
+        let (clipboard, mut wakeup) = TerminalClipboardSlot::new();
+        let mut pending = VecDeque::from_iter((0..TERMINAL_DRIVER_CAPACITY).map(|_| {
+            Ok(TerminalViewEvent::TransportState(
+                TerminalViewTransportState::Active,
+            ))
+        }));
+        let mut takeover_pending = false;
+        let mut last_state = TerminalViewTransportState::Active;
+        let first =
+            TerminalClipboardWrite::new("first".to_owned()).expect("valid first clipboard value");
+        let latest =
+            TerminalClipboardWrite::new("latest".to_owned()).expect("valid latest clipboard value");
+
+        assert!(!queue_local_attachment_event(
+            Ok(LocalAttachmentEvent::ClipboardWrite(first)),
+            &mut pending,
+            None,
+            &mut takeover_pending,
+            &mut last_state,
+            &clipboard,
+        ));
+        assert!(!queue_local_attachment_event(
+            Ok(LocalAttachmentEvent::ClipboardWrite(latest)),
+            &mut pending,
+            None,
+            &mut takeover_pending,
+            &mut last_state,
+            &clipboard,
+        ));
+        assert_eq!(pending.len(), TERMINAL_DRIVER_CAPACITY);
+        assert!(wakeup.has_changed().expect("open clipboard wakeup"));
+        wakeup.borrow_and_update();
+        assert_eq!(
+            clipboard
+                .take()
+                .expect("latest clipboard value remains")
+                .as_str(),
+            "latest"
+        );
+        assert!(clipboard.take().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clipboard_slot_is_cleared_by_reconnect_and_malformed_transport_state() {
+        let attachment_id = AttachmentId::from_array([0xd2; AttachmentId::LENGTH]);
+
+        for (state, terminal) in [
+            (v2::TerminalTransportState::Reconnecting as i32, false),
+            (i32::MAX, true),
+        ] {
+            let (clipboard, _clipboard_wakeup) = TerminalClipboardSlot::new();
+            clipboard.replace(
+                TerminalClipboardWrite::new("stale epoch clipboard".to_owned())
+                    .expect("valid clipboard fixture"),
+            );
+            let mut pending = VecDeque::new();
+            let mut takeover_pending = false;
+            let mut last_state = TerminalViewTransportState::Active;
+
+            assert_eq!(
+                queue_local_attachment_event(
+                    Ok(LocalAttachmentEvent::TransportState(
+                        v2::TerminalTransportStateEvent {
+                            attachment_id: Some(attachment_id.into()),
+                            state,
+                        },
+                    )),
+                    &mut pending,
+                    None,
+                    &mut takeover_pending,
+                    &mut last_state,
+                    &clipboard,
+                ),
+                terminal,
+            );
+            assert!(
+                clipboard.take().is_none(),
+                "an epoch boundary or terminal protocol error must discard pending clipboard content"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -3280,6 +3493,7 @@ mod tests {
         let mut takeover_pending = false;
         let mut last_state = TerminalViewTransportState::Active;
         let mut stop_after_pending = false;
+        let (clipboard, _clipboard_wakeup) = TerminalClipboardSlot::new();
         let (response, received) = tokio::sync::oneshot::channel();
         assert!(
             !apply_terminal_driver_command(
@@ -3294,6 +3508,7 @@ mod tests {
                 &mut takeover_pending,
                 &mut last_state,
                 &mut stop_after_pending,
+                &clipboard,
             )
             .await,
             "a correlated closure drains its typed outcome before the driver stops"

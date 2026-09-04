@@ -31,7 +31,13 @@ SessionAttachment::write_input(bytes) -> Result<(), DaemonError>
 SessionAttachment::resize(size) -> Result<Revision, DaemonError>
 SessionAttachment::history_window(query: TerminalHistoryWindowQuery)
     -> Result<TerminalSurfaceHistoryWindowResult, DaemonError>
+SessionAttachment::effect_watch() -> watch::Receiver<()>
+SessionAttachment::take_host_effect() -> Result<Option<TerminalHostEffect>, DaemonError>
 ```
+
+The two transient host-effect delivery methods and their attachment fields are
+`cfg(unix)`. Windows keeps the shared Session/model boundary constructible but
+stores and subscribes to no unsupported host effect.
 
 Adapters may call the deadline-bearing `*_until(..., Instant)` variants, but
 they must not duplicate registry, replay, session-reservation, or controller logic.
@@ -108,6 +114,20 @@ they must not duplicate registry, replay, session-reservation, or controller log
   takeover exists per session, so 1.0 retains at most the active controller
   checkpoint and one replacement checkpoint. Attachments never receive PTY
   close authority.
+- The Session actor is also the sole authority for transient host-effect
+  eligibility. One centralized reconciliation derives a target only for the
+  current generation after first activation, or for that exact previously
+  active controller during an in-epoch replacement snapshot. A fresh or
+  prepared takeover is ineligible. First activation is attachment-lifetime
+  state: resume or takeover never inherits eligibility merely because the
+  terminal or an older attachment was previously active. Takeover, detach,
+  principal removal, resume, lease loss, and Session end reconcile the broker
+  under its single target lock; changing target clears pending content. The
+  effect subscription exists before an eligible target is installed, and target
+  installation precedes publishing the externally observable `Active`
+  lifecycle value. Effects are event-time targeted, best-effort, latest-only,
+  and absent from snapshot, delta, history, checkpoint, resume, replay,
+  persistence, and final drain.
 - A fresh attach or pending takeover must acknowledge its first full semantic
   snapshot at the exact revision before input or contiguous history-window
   operations.
@@ -231,6 +251,8 @@ they must not duplicate registry, replay, session-reservation, or controller log
 | steady-state checkpoint equals current model revision | `next_update == None`; publish no `SyncRequired`/snapshot loop |
 | takeover response arrives before current snapshot acknowledgement | retain pending activation; activate only after that acknowledgement |
 | stale/replaced attachment | `lease_lost`, no PTY write |
+| host effect occurs before first activation or with no controller | drop; never replay after acknowledgement/reconnect |
+| host effect races takeover/detach | the broker-lock order selects exactly the old or new eligible controller; never both |
 | missing session selector | `session_not_found` |
 | retained operation retry | exact prior success or typed error |
 | invalid incarnation/ordinal, retired lease, or evicted sequence | `operation_outcome_unknown`, no side effect |
@@ -288,6 +310,11 @@ they must not duplicate registry, replay, session-reservation, or controller log
   readiness reset, and same-operation continuation without allowing a later
   controller to be replaced. Driver/session tests cover equal-revision no-op so
   snapshot acknowledgement cannot start an infinite resync loop.
+- Host-effect tests cover first-sync exclusion, already-active replacement
+  sync, takeover target replacement, detach/principal removal, no-controller
+  drop, latest-wins, observer exclusion, and no replay. Lifecycle assertions
+  must observe the broker target commit before `Active`/lease replacement is
+  externally visible.
 - `principal_detach`, `local_device_ipc`, and the `session_wire` revoke matrix
   cover matching-only detach across Sessions, stale-effect rejection,
   idempotence, preservation of local/other-remote attachments, durable restart

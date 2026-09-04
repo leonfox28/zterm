@@ -461,6 +461,7 @@ fn wire_kind_registry_is_unique_and_centrally_mapped() {
         WireKind::TerminalConnectionStatusEvent,
         WireKind::TerminalHistoryWindowRequest,
         WireKind::TerminalSemanticHistoryWindowFrame,
+        WireKind::TerminalClipboardWrite,
     ];
 
     let mut seen = BTreeSet::new();
@@ -484,6 +485,7 @@ fn wire_kind_registry_is_unique_and_centrally_mapped() {
     assert_eq!(WireKind::TerminalConnectionStatusEvent as u32, 314);
     assert_eq!(WireKind::TerminalHistoryWindowRequest as u32, 317);
     assert_eq!(WireKind::TerminalSemanticHistoryWindowFrame as u32, 318);
+    assert_eq!(WireKind::TerminalClipboardWrite as u32, 322);
     assert_eq!(Capabilities::AGENT_EVENTS, 1_u64 << 18);
 }
 
@@ -658,6 +660,7 @@ fn generated_session_terminal_and_route_debug_is_redacted_without_wire_changes()
     const SCREEN_SENTINEL: &str = "PROTO_SCREEN_SENTINEL_e357";
     const HISTORY_SENTINEL: &str = "PROTO_HISTORY_SENTINEL_4d18";
     const DELTA_SENTINEL: &str = "PROTO_DELTA_SENTINEL_729a";
+    const CLIPBOARD_SENTINEL: &str = "PROTO_CLIPBOARD_SENTINEL_f6a9";
     const INPUT_SENTINEL: &[u8] = b"PROTO_INPUT_SENTINEL_b84f";
     const RESUME_SENTINEL: &[u8; 16] = b"RESUME_PROTO_4d2";
 
@@ -755,6 +758,10 @@ fn generated_session_terminal_and_route_debug_is_redacted_without_wire_changes()
         attachment_id: snapshot.attachment_id.clone(),
         bytes: INPUT_SENTINEL.to_vec(),
     };
+    let clipboard = v2::TerminalClipboardWrite {
+        attachment_id: snapshot.attachment_id.clone(),
+        text: CLIPBOARD_SENTINEL.to_owned(),
+    };
     let resume_view_id = v2::ResumeViewId {
         value: RESUME_SENTINEL.to_vec(),
     };
@@ -794,7 +801,7 @@ fn generated_session_terminal_and_route_debug_is_redacted_without_wire_changes()
 
     let rendered = format!(
         "{summary:?} {create:?} {resume_view_id:?} {attach:?} {screen_cell:?} {snapshot:?} \
-         {delta:?} {history:?} {input:?} {route_cache:?} {status:?} {validate_setup:?} \
+         {delta:?} {history:?} {input:?} {clipboard:?} {route_cache:?} {status:?} {validate_setup:?} \
          {list:?} {mutate:?}"
     );
     for text in [CWD_SENTINEL, RELAY_SENTINEL, HOME_RELAY_SENTINEL] {
@@ -803,6 +810,7 @@ fn generated_session_terminal_and_route_debug_is_redacted_without_wire_changes()
     for text in [SCREEN_SENTINEL, HISTORY_SENTINEL, DELTA_SENTINEL] {
         assert!(!rendered.contains(text));
     }
+    assert!(!rendered.contains(CLIPBOARD_SENTINEL));
     for bytes in [INPUT_SENTINEL, RESUME_SENTINEL] {
         assert!(!rendered.contains(std::str::from_utf8(bytes).expect("ASCII sentinel")));
         assert!(!rendered.contains(&format!("{bytes:?}")));
@@ -824,6 +832,7 @@ fn generated_session_terminal_and_route_debug_is_redacted_without_wire_changes()
     assert_message_round_trip(&delta);
     assert_message_round_trip(&history);
     assert_message_round_trip(&input);
+    assert_message_round_trip(&clipboard);
     assert_message_round_trip(&route_cache);
     assert_message_round_trip(&status);
     assert_message_round_trip(&validate_setup);

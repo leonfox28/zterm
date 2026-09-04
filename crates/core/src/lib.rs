@@ -6,6 +6,7 @@ pub mod domain;
 pub mod pairing;
 pub mod release;
 pub mod terminal;
+pub mod terminal_selection;
 pub mod transport;
 pub mod viewport_cache;
 

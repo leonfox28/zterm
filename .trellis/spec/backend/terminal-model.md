@@ -54,8 +54,9 @@ Debug implementation exposes an `alacritty_terminal` or `vte` type.
 - `Term<BoundedEventSink>` and the re-exported `vte::ansi::Processor` are the
   sole terminal state engine. The Zterm ingress policy frames controls and
   applies product policy but never stores a grid or history.
-- Engine configuration uses the requested bounded scrollback, disables OSC 52
-  and Kitty keyboard mode, and normalizes initial alternate-scroll to off.
+- Engine configuration uses the requested bounded scrollback, keeps Alacritty
+  OSC 52 callbacks disabled as defense in depth, enables Alacritty's Kitty
+  keyboard state machine, and normalizes initial alternate-scroll to off.
 - Zterm never calls Alacritty tty, event-loop, renderer, process-spawn, or
   selection APIs. `portable-pty` remains the sole PTY/process owner.
 - All Zterm-owned crates inherit `unsafe_code = "forbid"`. No wrapper, FFI,
@@ -85,6 +86,8 @@ these hard caps:
 | --- | ---: |
 | ESC/CSI bytes | 256 |
 | OSC/DCS/APC/PM/SOS bytes | 1,024 |
+| recognized OSC 52 canonical Base64 bytes | 699,052 |
+| decoded OSC 52 UTF-8 bytes | 524,288 |
 | canonical reply bytes per update | 64 KiB |
 | side events per update | 32 |
 | title/icon source bytes | 256 |
@@ -101,9 +104,21 @@ these hard caps:
 - BEL maps to audible bell, `ESC g` to visual bell,
   `CSI 8;rows;columns t` to a validated resize request, OSC 0/2 to title, and
   OSC 1 to icon-name. Title/icon values retain no more than 256 source bytes.
-- OSC 52 maps to a payload-free clipboard rejection. OSC 8, other OSC,
-  DCS/APC/PM/SOS, synchronized-update 2026, Kitty keyboard controls, REP, and
-  underline-color controls are consumed or rejected before the engine.
+- Once exact `OSC 52;` framing is recognized, a dedicated streaming state
+  accepts only non-empty `c` writes with canonical padded RFC 4648 Base64,
+  valid UTF-8, no NUL, and at most 512 KiB decoded text. It emits at most the
+  latest validated `TerminalHostEffect::ClipboardWrite` per ingest. Reads,
+  other selectors, malformed/empty/overflow values, and cancelled input emit
+  no reply or render residue; rejection diagnostics never retain content.
+- Kitty set/push/pop/query CSI-u controls are admitted only with valid five-bit
+  flags, a single parser-representable stack-pop count, and standard behavior
+  values. Set/push/pop update the sole engine state and query produces one
+  bounded reply. Ingress
+  does not independently track or cap the engine's keyboard-stack depth;
+  admitted controls use the pinned Alacritty engine's stack semantics directly.
+  Unrelated CSI-u remains rejected. OSC 8, other OSC, DCS/APC/PM/SOS,
+  synchronized-update 2026, REP, and underline-color controls remain consumed
+  or rejected before the engine.
 - Underline-color filtering follows top-level SGR parameter boundaries: numeric
   aliases such as leading-zero `058` are contained, while `58`/`59` used as an
   indexed or RGB foreground/background color component remain ordinary color.
@@ -143,9 +158,9 @@ released when the Session model is dropped.
 
 - Projection reads the active grid at display offset zero and maps only the
   current Zterm subset: indexed/RGB/default colors, bold/dim/italic/underline/
-  inverse, wide head/spacer, cursor, and supported input modes. Hyperlinks,
-  strike, hidden, underline color/style detail, palette state, Kitty keyboard,
-  and graphics are not advertised.
+  inverse, wide head/spacer, cursor, supported input modes, and the validated
+  five Kitty keyboard flags. Hyperlinks, strike, hidden, underline color/style
+  detail, palette state, and graphics are not advertised.
 - Projection produces only exact semantic rows/cells, cursor, modes, active
   screen, and optional main-screen scroll metrics. Model, driver, Session,
   protobuf, local IPC, and remote bridge construct no presentation ANSI.
@@ -170,6 +185,12 @@ released when the Session model is dropped.
 - Scroll motion, desired offset, request coalescing, and presentation cadence
   are client/cache concerns. The model stores no attachment display offset and
   exposes no stateful viewport action API.
+- Renderer-neutral selection normalization/extraction lives in `zterm-core`,
+  not in the engine. It expands wide-glyph boundaries, skips continuations,
+  preserves combining text, maps selected blanks to spaces, applies wrapped
+  versus hard line joins, and constructs one validated clipboard value under
+  the same 512 KiB cap. Mouse gestures, highlight rendering, and clipboard
+  backends remain client concerns.
 
 ## 8. History Contract
 
@@ -209,7 +230,7 @@ released when the Session model is dropped.
 | history-window anchor/query is invalid, from the future, or has an unrepresentable exact range | `HistoryGap`; no row is returned and the model is unchanged |
 | history-window identity/size changed or retained extent decreased | one complete request-shaped `Rebased` frame, never mixed old/new rows |
 | history-window requested while alternate is active | `HistoryChanged`; no alternate history is invented |
-| event/title/control/combining cap reached | bounded summary/classification; no payload leak |
+| event/title/control/OSC52/combining cap reached | bounded summary/classification; no payload leak or partial clipboard effect |
 | equal/future/incompatible checkpoint passed to `delta_or_resync` | one full semantic `Resync`; `sync_changed` owns equal-revision suppression |
 | semantic surface or row patch has invalid size/shape/text/wide pair/cursor/metrics/revision | reject transactionally before forwarding or installing it |
 | CI forces colored Cargo output | dependency-tree policy overrides color to `never` before byte comparison |
@@ -221,7 +242,8 @@ released when the Session model is dropped.
   resync, allocation/revision overflow, and active-screen normalization.
 - `security_policy` covers control-string and secret containment, title/event/
   reply bounds, per-cell combining flood, both-screen/session combining cell
-  and byte limits, synchronized updates, OSC 8/52, and malformed input.
+  and byte limits, synchronized updates, strict OSC 8/52 handling, Kitty
+  set/push/pop/query projection, and malformed input.
 - Lifecycle tests prove dropping the model releases the engine while an opaque
   checkpoint remains usable and engine/history-free.
 - Daemon driver/session and real-PTY tests remain required for drain, reply

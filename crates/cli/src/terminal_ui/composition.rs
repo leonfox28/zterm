@@ -150,16 +150,61 @@ impl ComposedFrame {
         status: &StatusRenderer,
         transport_state: TerminalViewTransportState,
     ) -> Result<Self, CliError> {
+        Self::compose_inner(
+            surface,
+            previous,
+            viewport,
+            None,
+            status,
+            transport_state,
+        )
+    }
+
+    pub(super) fn compose_live_candidate(
+        surface: &TerminalSurface,
+        previous: Option<&Self>,
+        viewport: &ViewportController,
+        live: LiveViewportProjection,
+        status: &StatusRenderer,
+        transport_state: TerminalViewTransportState,
+    ) -> Result<Self, CliError> {
+        Self::compose_inner(
+            surface,
+            previous,
+            viewport,
+            Some(live),
+            status,
+            transport_state,
+        )
+    }
+
+    fn compose_inner(
+        surface: &TerminalSurface,
+        previous: Option<&Self>,
+        viewport: &ViewportController,
+        live: Option<LiveViewportProjection>,
+        status: &StatusRenderer,
+        transport_state: TerminalViewTransportState,
+    ) -> Result<Self, CliError> {
         let physical_size = status.physical_size;
+        let content_size = live.map_or(viewport.content_size, |live| live.content_size);
+        let gutter_column = live.map_or(viewport.gutter_column, |live| live.gutter_column);
+        let scroll_metrics = live
+            .map(|live| live.scroll_metrics)
+            .unwrap_or_else(|| viewport.scroll_metrics());
+        let is_live = live.is_some() || viewport.is_live();
         let mut rows = BTreeMap::new();
-        let height = usize::from(viewport.content_size.rows);
-        let width = usize::from(viewport.content_size.columns);
-        let semantic_history = viewport.visible_semantic_history_rows();
+        let height = usize::from(content_size.rows);
+        let width = usize::from(content_size.columns);
+        let semantic_history = live
+            .is_none()
+            .then(|| viewport.visible_semantic_history_rows())
+            .flatten();
         let history_source = semantic_history.as_ref().map(|(rows, _, _)| rows);
         let history_notice = semantic_history.as_ref().and_then(|(_, _, notice)| *notice);
 
         for row_index in 0..height {
-            let mut row = if viewport.is_live() {
+            let mut row = if is_live {
                 surface
                     .rows
                     .get(row_index)
@@ -188,10 +233,9 @@ impl ComposedFrame {
             {
                 row = text_cells(notice, width, TerminalStyle::default());
             }
-            if let Some(column) = viewport.gutter_column {
-                let geometry = viewport
-                    .scroll_metrics()
-                    .and_then(|metrics| ScrollbarGeometry::new(viewport.content_size.rows, metrics));
+            if let Some(column) = gutter_column {
+                let geometry = scroll_metrics
+                    .and_then(|metrics| ScrollbarGeometry::new(content_size.rows, metrics));
                 let glyph = match geometry {
                     Some(geometry)
                         if u16::try_from(row_index).is_ok_and(|row| {
@@ -238,10 +282,10 @@ impl ComposedFrame {
         }
 
         let cursor = if transport_state == TerminalViewTransportState::Active
-            && viewport.is_live()
+            && is_live
             && surface.cursor.visible
-            && surface.cursor.row < viewport.content_size.rows
-            && surface.cursor.column < viewport.content_size.columns
+            && surface.cursor.row < content_size.rows
+            && surface.cursor.column < content_size.columns
         {
             ComposedCursor {
                 row: surface.cursor.row,
@@ -260,8 +304,8 @@ impl ComposedFrame {
         Ok(Self {
             physical_size,
             layout: LayoutIdentity {
-                content_size: viewport.content_size,
-                gutter_column: viewport.gutter_column,
+                content_size,
+                gutter_column,
                 status_row: status
                     .enabled()
                     .then_some(physical_size.rows.saturating_sub(1)),
@@ -270,6 +314,27 @@ impl ComposedFrame {
             cursor,
             modes: surface.modes,
         })
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct LiveViewportProjection {
+    content_size: TerminalSize,
+    gutter_column: Option<u16>,
+    scroll_metrics: Option<TerminalScrollMetrics>,
+}
+
+impl LiveViewportProjection {
+    pub(super) const fn new(
+        content_size: TerminalSize,
+        gutter_column: Option<u16>,
+        scroll_metrics: Option<TerminalScrollMetrics>,
+    ) -> Self {
+        Self {
+            content_size,
+            gutter_column,
+            scroll_metrics,
+        }
     }
 }
 

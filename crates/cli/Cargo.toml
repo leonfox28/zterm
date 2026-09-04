@@ -10,6 +10,7 @@ name = "zterm"
 path = "src/main.rs"
 
 [dependencies]
+base64.workspace = true
 clap.workspace = true
 futures-util.workspace = true
 serde.workspace = true

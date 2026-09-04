@@ -7,12 +7,12 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use prost::Message;
 use zeroize::{Zeroize, Zeroizing};
 use zterm_core::terminal::{
-    ActiveScreen, TerminalCell, TerminalColor, TerminalCursor, TerminalHistoryWindowAnchor,
-    TerminalHistoryWindowQuery, TerminalModes, TerminalMouseEncoding, TerminalMouseMode,
-    TerminalScrollMetrics, TerminalSize, TerminalStyle, TerminalSurface, TerminalSurfaceDelta,
-    TerminalSurfaceError, TerminalSurfaceHistoryWindowFrame, TerminalSurfaceHistoryWindowResult,
-    TerminalSurfaceRow, TerminalSurfaceRowPatch, TerminalSurfaceSnapshot,
-    TerminalViewportDisposition,
+    ActiveScreen, TerminalCell, TerminalClipboardWrite, TerminalColor, TerminalCursor,
+    TerminalHistoryWindowAnchor, TerminalHistoryWindowQuery, TerminalKeyboardFlags, TerminalModes,
+    TerminalMouseEncoding, TerminalMouseMode, TerminalScrollMetrics, TerminalSize, TerminalStyle,
+    TerminalSurface, TerminalSurfaceDelta, TerminalSurfaceError, TerminalSurfaceHistoryWindowFrame,
+    TerminalSurfaceHistoryWindowResult, TerminalSurfaceRow, TerminalSurfaceRowPatch,
+    TerminalSurfaceSnapshot, TerminalViewportDisposition,
 };
 use zterm_core::{
     AttachmentId, AuthGeneration, AuthorizationStatus, Capabilities, ConnectionAttemptId,
@@ -53,6 +53,17 @@ impl fmt::Debug for v2::TerminalCell {
             .field("wide", &self.wide)
             .field("wide_continuation", &self.wide_continuation)
             .field("style", &self.style)
+            .finish()
+    }
+}
+
+impl fmt::Debug for v2::TerminalClipboardWrite {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalClipboardWrite")
+            .field("attachment_id_present", &self.attachment_id.is_some())
+            .field("text", &"[REDACTED]")
+            .field("text_len", &self.text.len())
             .finish()
     }
 }
@@ -474,6 +485,8 @@ pub enum WireKind {
     TerminalHistoryWindowRequest = 317,
     /// Correlated semantic-cell history-window outcome.
     TerminalSemanticHistoryWindowFrame = 318,
+    /// Decoded latest-only child clipboard write for the current controller.
+    TerminalClipboardWrite = 322,
 }
 
 impl WireKind {
@@ -572,6 +585,7 @@ impl TryFrom<u32> for WireKind {
             314 => Self::TerminalConnectionStatusEvent,
             317 => Self::TerminalHistoryWindowRequest,
             318 => Self::TerminalSemanticHistoryWindowFrame,
+            322 => Self::TerminalClipboardWrite,
             unknown => return Err(ProtocolError::UnknownKind(unknown)),
         };
         Ok(kind)
@@ -1088,6 +1102,7 @@ impl From<TerminalModes> for v2::TerminalModes {
                 TerminalMouseEncoding::Sgr => 2,
             },
             alternate_scroll: value.alternate_scroll,
+            keyboard_flags: u32::from(value.keyboard_flags.bits()),
         }
     }
 }
@@ -1114,6 +1129,12 @@ impl TryFrom<v2::TerminalModes> for TerminalModes {
                 ));
             }
         };
+        let keyboard_flags = u8::try_from(value.keyboard_flags)
+            .ok()
+            .and_then(TerminalKeyboardFlags::from_bits)
+            .ok_or(ProtocolError::InvalidTerminalSemanticField(
+                "keyboard_flags",
+            ))?;
         Ok(Self {
             application_keypad: value.application_keypad,
             application_cursor: value.application_cursor,
@@ -1122,8 +1143,34 @@ impl TryFrom<v2::TerminalModes> for TerminalModes {
             alternate_scroll: value.alternate_scroll,
             mouse_mode,
             mouse_encoding,
+            keyboard_flags,
         })
     }
+}
+
+/// Projects a validated decoded clipboard write into its redacted wire DTO.
+#[must_use]
+pub fn terminal_clipboard_write_message(
+    attachment_id: AttachmentId,
+    write: TerminalClipboardWrite,
+) -> v2::TerminalClipboardWrite {
+    v2::TerminalClipboardWrite {
+        attachment_id: Some(attachment_id.into()),
+        text: write.into_string(),
+    }
+}
+
+/// Validates a decoded clipboard write at the protocol boundary.
+pub fn terminal_clipboard_write_from_message(
+    value: v2::TerminalClipboardWrite,
+) -> Result<(AttachmentId, TerminalClipboardWrite), ProtocolError> {
+    let attachment_id = value
+        .attachment_id
+        .ok_or(ProtocolError::InvalidTerminalSemanticField("attachment_id"))?
+        .try_into()?;
+    let write = TerminalClipboardWrite::new(value.text)
+        .map_err(|_| ProtocolError::InvalidTerminalSemanticField("clipboard_text"))?;
+    Ok((attachment_id, write))
 }
 
 impl From<TerminalColor> for v2::TerminalColor {
@@ -2257,6 +2304,7 @@ pub fn validate_pair_operation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zterm_core::terminal::MAX_TERMINAL_CLIPBOARD_BYTES;
 
     fn assert_message_round_trip<M>(kind: WireKind, message: M)
     where
@@ -2685,6 +2733,10 @@ mod tests {
                 WireKind::TerminalSemanticHistoryWindowFrame,
                 v2::MessageKind::TerminalSemanticHistoryWindowFrame as u32,
             ),
+            (
+                WireKind::TerminalClipboardWrite,
+                v2::MessageKind::TerminalClipboardWrite as u32,
+            ),
         ];
 
         for (kind, proto_number) in kinds {
@@ -2944,6 +2996,96 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_write_round_trips_as_decoded_redacted_content() {
+        const SENTINEL: &str = "CLIPBOARD_3f7a";
+        let attachment_id = AttachmentId::from_array([7; 16]);
+        let write = TerminalClipboardWrite::new(SENTINEL.to_owned()).expect("valid write");
+        let message = terminal_clipboard_write_message(attachment_id, write.clone());
+
+        let debug = format!("{message:?}");
+        assert!(!debug.contains(SENTINEL));
+        assert!(debug.contains("[REDACTED]"));
+        let (decoded_attachment, decoded) =
+            terminal_clipboard_write_from_message(message.clone()).expect("valid message");
+        assert_eq!(decoded_attachment, attachment_id);
+        assert_eq!(decoded, write);
+        assert_message_round_trip(WireKind::TerminalClipboardWrite, message);
+
+        let invalid = v2::TerminalClipboardWrite {
+            attachment_id: Some(attachment_id.into()),
+            text: "bad\0clipboard".to_owned(),
+        };
+        assert!(matches!(
+            terminal_clipboard_write_from_message(invalid),
+            Err(ProtocolError::InvalidTerminalSemanticField(
+                "clipboard_text"
+            ))
+        ));
+
+        for invalid in [
+            v2::TerminalClipboardWrite {
+                attachment_id: None,
+                text: "missing owner".to_owned(),
+            },
+            v2::TerminalClipboardWrite {
+                attachment_id: Some(attachment_id.into()),
+                text: String::new(),
+            },
+            v2::TerminalClipboardWrite {
+                attachment_id: Some(attachment_id.into()),
+                text: "x".repeat(MAX_TERMINAL_CLIPBOARD_BYTES + 1),
+            },
+        ] {
+            assert!(terminal_clipboard_write_from_message(invalid).is_err());
+        }
+
+        let maximum = terminal_clipboard_write_message(
+            attachment_id,
+            TerminalClipboardWrite::new("x".repeat(MAX_TERMINAL_CLIPBOARD_BYTES))
+                .expect("exact maximum clipboard value"),
+        );
+        let encoded = encode_message(WireKind::TerminalClipboardWrite, 0, 0, &maximum)
+            .expect("exact maximum clipboard frame fits the control cap");
+        let decoded = FrameDecoder::new()
+            .feed(&encoded)
+            .expect("exact maximum clipboard frame decodes")
+            .pop()
+            .expect("one exact maximum clipboard frame");
+        assert_eq!(decoded.kind, WireKind::TerminalClipboardWrite);
+        assert!(decoded.payload.len() <= MAX_CONTROL_PAYLOAD_BYTES);
+        let maximum: v2::TerminalClipboardWrite = decoded
+            .decode_message(WireKind::TerminalClipboardWrite)
+            .expect("exact maximum clipboard message decodes");
+        assert_eq!(maximum.text.len(), MAX_TERMINAL_CLIPBOARD_BYTES);
+    }
+
+    #[test]
+    fn terminal_keyboard_flags_round_trip_and_reject_unknown_bits() {
+        let flags = TerminalKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES
+            .union(TerminalKeyboardFlags::REPORT_EVENT_TYPES)
+            .union(TerminalKeyboardFlags::REPORT_ASSOCIATED_TEXT);
+        let modes = TerminalModes {
+            keyboard_flags: flags,
+            ..TerminalModes::default()
+        };
+        assert_eq!(
+            TerminalModes::try_from(v2::TerminalModes::from(modes)).expect("valid flags"),
+            modes
+        );
+
+        let malformed = v2::TerminalModes {
+            keyboard_flags: 32,
+            ..v2::TerminalModes::default()
+        };
+        assert!(matches!(
+            TerminalModes::try_from(malformed),
+            Err(ProtocolError::InvalidTerminalSemanticField(
+                "keyboard_flags"
+            ))
+        ));
+    }
+
+    #[test]
     fn maximum_semantic_frames_fit_the_existing_eight_mib_bound() {
         let attachment_id = AttachmentId::from_array([9; 16]);
         let session_id = SessionId::from_array([8; 16]);
@@ -3013,6 +3155,7 @@ mod tests {
         assert!(!WireKind::TerminalSemanticDelta.is_control());
         assert!(!WireKind::TerminalSemanticHistoryWindowFrame.is_control());
         assert!(WireKind::TerminalConnectionStatusEvent.is_control());
+        assert!(WireKind::TerminalClipboardWrite.is_control());
 
         let content = vec![0_u8; MAX_CONTROL_PAYLOAD_BYTES + 1];
         let encoded = encode_payload(

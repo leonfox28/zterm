@@ -1365,6 +1365,7 @@ where
 {
     let mut revisions = attachment.revision_watch()?;
     let mut lifecycle = attachment.lifecycle_watch()?;
+    let mut effects = attachment.effect_watch();
     let mut revisions_open = true;
     let initial_lifecycle = lifecycle.borrow().clone();
     if write_lifecycle_event(
@@ -1411,6 +1412,18 @@ where
                     return Ok(AttachmentTaskEnd::Terminal);
                 }
             }
+            changed = effects.changed() => {
+                changed.map_err(|_| attachment_cancelled())?;
+                effects.borrow_and_update();
+                if let Some(effect) = attachment.take_host_effect()? {
+                    write_host_effect(
+                        &mut writer,
+                        attachment.attachment_id(),
+                        effect,
+                        Instant::now() + operation_timeout,
+                    ).await?;
+                }
+            }
             changed = revisions.changed(), if revisions_open => {
                 if changed.is_err() {
                     // Driver finalization closes its revision watch before the actor publishes
@@ -1447,6 +1460,30 @@ where
             }
         }
     }
+}
+
+#[cfg(unix)]
+async fn write_host_effect<Writer>(
+    writer: &mut Writer,
+    attachment_id: AttachmentId,
+    effect: zterm_core::terminal::TerminalHostEffect,
+    deadline: Instant,
+) -> Result<(), DaemonError>
+where
+    Writer: AsyncWrite + Unpin,
+{
+    let zterm_core::terminal::TerminalHostEffect::ClipboardWrite(write) = effect;
+    let message = zterm_proto::terminal_clipboard_write_message(attachment_id, write);
+    let bytes =
+        encode_message(WireKind::TerminalClipboardWrite, 0, 0, &message).map_err(protocol_error)?;
+    write_attachment_bytes_until(
+        writer,
+        &bytes,
+        deadline,
+        "clipboard effect exceeded its absolute deadline",
+        "write clipboard effect",
+    )
+    .await
 }
 
 #[cfg(unix)]
@@ -2692,6 +2729,40 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(zero_error.kind(), DomainErrorKind::Unauthorized);
+    }
+
+    #[tokio::test]
+    async fn host_clipboard_effect_uses_zero_request_id_and_typed_kind() {
+        let attachment_id = AttachmentId::from_array([0x5a; AttachmentId::LENGTH]);
+        let write = zterm_core::terminal::TerminalClipboardWrite::new("wire clipboard".to_owned())
+            .expect("valid wire clipboard fixture");
+        let effect = zterm_core::terminal::TerminalHostEffect::ClipboardWrite(write);
+        let (mut reader, mut writer) = tokio::io::duplex(1024 * 1024);
+        write_host_effect(
+            &mut writer,
+            attachment_id,
+            effect,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .expect("write typed host effect");
+
+        let mut bytes = vec![0; 1024];
+        let count = tokio::time::timeout(Duration::from_secs(1), reader.read(&mut bytes))
+            .await
+            .expect("effect read deadline")
+            .expect("effect bytes");
+        let frame = decode_one(&bytes[..count]);
+        assert_eq!(frame.kind, WireKind::TerminalClipboardWrite);
+        assert_eq!(frame.request_id, 0);
+        assert_eq!(frame.deadline_ms, 0);
+        let message: v2::TerminalClipboardWrite = frame
+            .decode_message(WireKind::TerminalClipboardWrite)
+            .expect("decode host clipboard effect");
+        let (actual_id, write) = zterm_proto::terminal_clipboard_write_from_message(message)
+            .expect("validate host clipboard effect");
+        assert_eq!(actual_id, attachment_id);
+        assert_eq!(write.as_str(), "wire clipboard");
     }
 
     #[test]

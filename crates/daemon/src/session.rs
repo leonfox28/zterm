@@ -19,6 +19,8 @@ use tokio::sync::watch;
 #[cfg(all(unix, test))]
 use zterm_core::terminal::TerminalHistoryWindowAnchor;
 #[cfg(unix)]
+use zterm_core::terminal::TerminalHostEffect;
+#[cfg(unix)]
 use zterm_core::terminal::{TerminalHistoryWindowQuery, TerminalSurfaceHistoryWindowResult};
 use zterm_core::terminal::{
     TerminalSize, TerminalSurfaceDelta, TerminalSurfaceDeltaResult, TerminalSurfaceSnapshot,
@@ -33,6 +35,8 @@ use zterm_platform::pty::{PtyChildState, PtyError, PtyHost, PtyPathKind, PtySess
 use zterm_terminal::{TerminalError, TerminalModel};
 
 use crate::error::DaemonError;
+#[cfg(unix)]
+use crate::terminal_driver::TerminalEffectBroker;
 use crate::terminal_driver::{
     TerminalAttachment, TerminalDriver, TerminalDriverConfig, TerminalDriverError,
     TerminalDriverInterrupt, TerminalDriverOwnership, spawn_background_reaper,
@@ -179,6 +183,10 @@ pub struct SessionAttachment {
     revisions: watch::Receiver<Revision>,
     lifecycle: watch::Receiver<AttachmentLifecycle>,
     #[cfg(unix)]
+    effect_broker: TerminalEffectBroker,
+    #[cfg(unix)]
+    effect_wakeup: watch::Receiver<()>,
+    #[cfg(unix)]
     final_update: FinalAttachmentUpdateSlot,
 }
 
@@ -203,6 +211,20 @@ impl SessionAttachment {
     /// Subscribes to lifecycle changes such as takeover or session end.
     pub fn lifecycle_watch(&self) -> Result<watch::Receiver<AttachmentLifecycle>, DaemonError> {
         Ok(self.lifecycle.clone())
+    }
+
+    /// Subscribes to payload-free transient host-effect wakeups.
+    #[cfg(unix)]
+    pub(crate) fn effect_watch(&self) -> watch::Receiver<()> {
+        self.effect_wakeup.clone()
+    }
+
+    /// Takes only a transient effect bound to this exact attachment.
+    #[cfg(unix)]
+    pub(crate) fn take_host_effect(&self) -> Result<Option<TerminalHostEffect>, DaemonError> {
+        self.effect_broker
+            .take_for(self.attachment_id)
+            .map_err(map_driver_error)
     }
 
     /// Confirms a full snapshot, or returns a newer replacement snapshot.
@@ -3013,7 +3035,7 @@ fn run_session_actor(
     commands: &Receiver<SessionCommand>,
 ) -> Result<(), DaemonError> {
     loop {
-        reap_detached(actor, runtime);
+        reap_detached(actor, runtime)?;
         if let Some(reason) = actor.ready_end_reason() {
             return finish_runtime(actor, runtime, reason);
         }
@@ -3069,6 +3091,9 @@ fn finish_runtime(
     runtime.resume = None;
     runtime.controller = None;
     runtime.controller_operation = None;
+    if let Some(driver) = runtime.driver.as_ref() {
+        driver.set_effect_target(None).map_err(map_driver_error)?;
+    }
     let finalization = runtime
         .driver
         .take()
@@ -3191,7 +3216,7 @@ fn dispatch_command(
             processed,
             reply,
         } => respond(actor, meta, reply, || {
-            let outcome = detach_remote_principal(actor, runtime, device_id);
+            let outcome = detach_remote_principal(actor, runtime, device_id)?;
             #[cfg(test)]
             if let Some(processed) = processed {
                 let _ = processed.send(());
@@ -3252,11 +3277,10 @@ fn prepare_attach(
     takeover: bool,
     resume: Option<RemoteResumeRequest>,
 ) -> Result<PreparedAttachment, DaemonError> {
-    reap_detached(actor, runtime);
+    reap_detached(actor, runtime)?;
     #[cfg(unix)]
     let resume_view_id = resume.map(|request| request.view_id);
     let resumed_terminal = take_resume_terminal(actor, runtime, principal, resume);
-    let resumed_controller = resumed_terminal.is_some();
     if runtime.controller.is_some() && !takeover {
         return Err(DaemonError::new(
             DomainErrorKind::SessionOccupied,
@@ -3282,6 +3306,10 @@ fn prepare_attach(
     let attachment_id = next_attachment_id(&runtime.attachments)?;
     let driver = runtime.driver.as_ref().ok_or_else(session_not_found)?;
     let mut terminal = resumed_terminal.unwrap_or_else(|| driver.attach());
+    #[cfg(unix)]
+    let effect_broker = terminal.effect_broker();
+    #[cfg(unix)]
+    let effect_wakeup = effect_broker.subscribe();
     let revisions = terminal.revision_watch();
     let initial_state = if resume.is_some() && terminal.checkpoint_revision().is_some() {
         match terminal.sync_latest().map_err(map_driver_error)? {
@@ -3332,7 +3360,7 @@ fn prepare_attach(
             #[cfg(unix)]
             resume_view_id,
             terminal,
-            ever_active: resumed_controller,
+            ever_active: false,
             prepared_snapshot_applied: false,
             sync: AttachmentSync::Awaiting {
                 revision: initial_revision,
@@ -3343,6 +3371,7 @@ fn prepare_attach(
             final_update: Arc::clone(&final_update),
         },
     );
+    reconcile_effect_target(runtime)?;
     actor.update_cached(runtime, false);
     Ok(PreparedAttachment {
         attachment: Arc::new(SessionAttachment {
@@ -3351,6 +3380,10 @@ fn prepare_attach(
             detached,
             revisions,
             lifecycle: lifecycle_receiver,
+            #[cfg(unix)]
+            effect_broker,
+            #[cfg(unix)]
+            effect_wakeup,
             #[cfg(unix)]
             final_update,
         }),
@@ -3429,6 +3462,7 @@ fn detach_for_remote_resume(
             false
         }
     };
+    reconcile_effect_target(runtime)?;
     actor.update_cached(runtime, false);
     Ok(saved)
 }
@@ -3461,24 +3495,28 @@ fn snapshot_applied(
             .send_replace(AttachmentLifecycle::AwaitingSnapshot {
                 revision: snapshot.revision,
             });
+        reconcile_effect_target(runtime)?;
         return Ok(Some(snapshot));
     }
-    attachment.sync = match target {
+    let lifecycle = match target {
         SyncTarget::Active { generation } => {
             attachment.ever_active = true;
-            attachment
-                .lifecycle
-                .send_replace(AttachmentLifecycle::Active { generation });
-            AttachmentSync::Active { generation }
+            attachment.sync = AttachmentSync::Active { generation };
+            AttachmentLifecycle::Active { generation }
         }
         SyncTarget::PreparedTakeover => {
             attachment.prepared_snapshot_applied = true;
-            attachment
-                .lifecycle
-                .send_replace(AttachmentLifecycle::PreparedTakeover);
-            AttachmentSync::PreparedTakeover
+            attachment.sync = AttachmentSync::PreparedTakeover;
+            AttachmentLifecycle::PreparedTakeover
         }
     };
+    reconcile_effect_target(runtime)?;
+    runtime
+        .attachments
+        .get(&attachment_id)
+        .ok_or_else(lease_lost)?
+        .lifecycle
+        .send_replace(lifecycle);
     Ok(None)
 }
 
@@ -3512,6 +3550,7 @@ fn next_update(
                 .send_replace(AttachmentLifecycle::AwaitingSnapshot {
                     revision: snapshot.revision,
                 });
+            reconcile_effect_target(runtime)?;
             Ok(Some(AttachmentUpdate::Snapshot(snapshot)))
         }
     }
@@ -3574,6 +3613,7 @@ fn sync_latest(
         .send_replace(AttachmentLifecycle::AwaitingSnapshot {
             revision: snapshot.revision,
         });
+    reconcile_effect_target(runtime)?;
     Ok(snapshot)
 }
 
@@ -3682,15 +3722,15 @@ fn takeover(
         .checked_add(1)
         .ok_or_else(|| resource_error("controller generation exhausted"))?;
     let generation = runtime.next_generation;
-    if let Some(old) = runtime.controller
+    let old_lifecycle = if let Some(old) = runtime.controller
         && old.attachment_id != attachment_id
         && let Some(mut attachment) = runtime.attachments.remove(&old.attachment_id)
     {
         attachment.terminal.discard_checkpoint();
-        attachment
-            .lifecycle
-            .send_replace(AttachmentLifecycle::LeaseLost { generation });
-    }
+        Some(attachment.lifecycle)
+    } else {
+        None
+    };
     runtime.controller = Some(ControllerLease {
         attachment_id,
         generation,
@@ -3700,13 +3740,11 @@ fn takeover(
         .attachments
         .get_mut(&attachment_id)
         .ok_or_else(lease_lost)?;
-    match attachment.sync {
+    let active_lifecycle = match attachment.sync {
         AttachmentSync::PreparedTakeover => {
             attachment.sync = AttachmentSync::Active { generation };
             attachment.ever_active = true;
-            attachment
-                .lifecycle
-                .send_replace(AttachmentLifecycle::Active { generation });
+            Some(attachment.lifecycle.clone())
         }
         AttachmentSync::Awaiting {
             revision,
@@ -3716,14 +3754,22 @@ fn takeover(
                 revision,
                 target: SyncTarget::Active { generation },
             };
+            None
         }
         _ => unreachable!("takeover readiness was validated above"),
+    };
+    reconcile_effect_target(runtime)?;
+    if let Some(lifecycle) = old_lifecycle {
+        lifecycle.send_replace(AttachmentLifecycle::LeaseLost { generation });
+    }
+    if let Some(lifecycle) = active_lifecycle {
+        lifecycle.send_replace(AttachmentLifecycle::Active { generation });
     }
     actor.update_cached(runtime, false);
     Ok(())
 }
 
-fn reap_detached(actor: &SessionActor, runtime: &mut SessionRuntime) {
+fn reap_detached(actor: &SessionActor, runtime: &mut SessionRuntime) -> Result<(), DaemonError> {
     let detached = runtime
         .attachments
         .iter()
@@ -3735,7 +3781,7 @@ fn reap_detached(actor: &SessionActor, runtime: &mut SessionRuntime) {
         })
         .collect::<Vec<_>>();
     if detached.is_empty() {
-        return;
+        return Ok(());
     }
     for attachment_id in detached {
         runtime.attachments.remove(&attachment_id);
@@ -3747,14 +3793,16 @@ fn reap_detached(actor: &SessionActor, runtime: &mut SessionRuntime) {
             runtime.controller_operation = None;
         }
     }
+    reconcile_effect_target(runtime)?;
     actor.update_cached(runtime, false);
+    Ok(())
 }
 
 fn detach_remote_principal(
     actor: &SessionActor,
     runtime: &mut SessionRuntime,
     device_id: DeviceId,
-) -> PrincipalDetachOutcome {
+) -> Result<PrincipalDetachOutcome, DaemonError> {
     let resume_removed = runtime.resume.as_ref().is_some_and(|resume| {
         matches!(
             resume.principal,
@@ -3798,9 +3846,36 @@ fn detach_remote_principal(
         }
     }
     if outcome.attachments_removed > 0 || resume_removed {
+        reconcile_effect_target(runtime)?;
         actor.update_cached(runtime, false);
     }
-    outcome
+    Ok(outcome)
+}
+
+fn reconcile_effect_target(runtime: &SessionRuntime) -> Result<(), DaemonError> {
+    let target = runtime.controller.and_then(|controller| {
+        runtime
+            .attachments
+            .get(&controller.attachment_id)
+            .filter(|attachment| {
+                attachment.ever_active
+                    && matches!(
+                        attachment.sync,
+                        AttachmentSync::Active { generation }
+                            | AttachmentSync::Awaiting {
+                                target: SyncTarget::Active { generation },
+                                ..
+                            } if generation == controller.generation
+                    )
+            })
+            .map(|_| controller.attachment_id)
+    });
+    runtime
+        .driver
+        .as_ref()
+        .ok_or_else(session_not_found)?
+        .set_effect_target(target)
+        .map_err(map_driver_error)
 }
 
 #[cfg(unix)]
@@ -4683,6 +4758,244 @@ mod tests {
         assert!(after_explicit_detach.initial_delta.is_none());
         after_explicit_detach.attachment.detach();
         service.shutdown().expect("resume fixture shuts down");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resumed_attachment_effect_eligibility_waits_for_its_current_active_barrier() {
+        let temporary = tempfile::tempdir().expect("temporary resume-effect fixture");
+        let service = unix_fixture_service(
+            DeviceId::from_array([0xa1; 32]),
+            temporary.path().to_path_buf(),
+            "exec /bin/cat",
+        );
+        let local = service.local_principal(AttachmentId::from_array([0xa1; 16]));
+        let lease = service
+            .issue_operation_lease(local)
+            .expect("fixture operation lease");
+        let summary = service
+            .create(
+                local,
+                OperationId { lease, sequence: 1 },
+                SessionName::new("resume-effect-fence").expect("fixture session name"),
+                None,
+                None,
+            )
+            .expect("fixture session creates");
+        let remote = AttachmentPrincipal::RemoteEndpoint {
+            device_id: DeviceId::from_array([0xa2; 32]),
+            auth_generation: 11,
+        };
+        let view_id = ResumeViewId::from_array([0xa3; 16]);
+        let request = |known_revision| RemoteAttachmentRequest {
+            selector: Some(SessionSelector::Id(summary.session_id)),
+            create_main: false,
+            takeover: false,
+            initial_viewport: None,
+            resume: RemoteResumeRequest {
+                view_id,
+                known_revision,
+            },
+        };
+
+        let first = service
+            .prepare_remote_attach_until(
+                remote,
+                request(None),
+                Instant::now() + Duration::from_secs(2),
+            )
+            .expect("initial remote attachment");
+        assert!(
+            first
+                .attachment
+                .snapshot_applied(first.snapshot.revision)
+                .expect("activate initial controller")
+                .is_none()
+        );
+        let retained_revision = first.snapshot.revision;
+        assert!(
+            first
+                .attachment
+                .detach_for_remote_resume_until(Instant::now() + Duration::from_secs(2))
+                .expect("save active controller checkpoint")
+        );
+
+        let resumed = service
+            .prepare_remote_attach_until(
+                remote,
+                request(Some(retained_revision)),
+                Instant::now() + Duration::from_secs(2),
+            )
+            .expect("matching checkpoint resumes into a new attachment lifetime");
+        let before_active = TerminalHostEffect::ClipboardWrite(
+            zterm_core::terminal::TerminalClipboardWrite::new("resume before active".to_owned())
+                .expect("valid clipboard fixture"),
+        );
+        resumed
+            .attachment
+            .effect_broker
+            .publish_for_test(before_active)
+            .expect("publish through the real Session broker");
+        assert!(
+            resumed
+                .attachment
+                .take_host_effect()
+                .expect("inspect resumed attachment effect")
+                .is_none(),
+            "a retained checkpoint must not transfer effect eligibility into a new attachment lifetime"
+        );
+
+        assert!(
+            resumed
+                .attachment
+                .snapshot_applied(resumed.snapshot.revision)
+                .expect("activate resumed attachment")
+                .is_none()
+        );
+        let after_active = TerminalHostEffect::ClipboardWrite(
+            zterm_core::terminal::TerminalClipboardWrite::new("resume after active".to_owned())
+                .expect("valid clipboard fixture"),
+        );
+        resumed
+            .attachment
+            .effect_broker
+            .publish_for_test(after_active)
+            .expect("publish after current Active barrier");
+        let TerminalHostEffect::ClipboardWrite(write) = resumed
+            .attachment
+            .take_host_effect()
+            .expect("take resumed attachment effect")
+            .expect("active resumed attachment is eligible");
+        assert_eq!(write.as_str(), "resume after active");
+
+        resumed.attachment.detach();
+        service
+            .shutdown()
+            .expect("resume-effect fixture shuts down");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn takeover_awaiting_replacement_effect_eligibility_waits_for_active_barrier() {
+        let temporary = tempfile::tempdir().expect("temporary takeover-effect fixture");
+        let service = unix_fixture_service(
+            DeviceId::from_array([0xb1; 32]),
+            temporary.path().to_path_buf(),
+            "exec /bin/cat",
+        );
+        let original = service.local_principal(AttachmentId::from_array([0xb1; 16]));
+        let original_lease = service
+            .issue_operation_lease(original)
+            .expect("original operation lease");
+        let summary = service
+            .create(
+                original,
+                OperationId {
+                    lease: original_lease,
+                    sequence: 1,
+                },
+                SessionName::new("takeover-effect-fence").expect("fixture session name"),
+                None,
+                None,
+            )
+            .expect("fixture session creates");
+        let active = service
+            .prepare_attach(
+                original,
+                Some(SessionSelector::Id(summary.session_id)),
+                false,
+                false,
+                None,
+            )
+            .expect("original controller prepares");
+        assert!(
+            active
+                .attachment
+                .snapshot_applied(active.snapshot.revision)
+                .expect("activate original controller")
+                .is_none()
+        );
+
+        let replacement_principal = service.local_principal(AttachmentId::from_array([0xb2; 16]));
+        let replacement_lease = service
+            .issue_operation_lease(replacement_principal)
+            .expect("replacement operation lease");
+        let replacement = service
+            .prepare_attach(
+                replacement_principal,
+                Some(SessionSelector::Id(summary.session_id)),
+                false,
+                true,
+                None,
+            )
+            .expect("takeover attachment prepares");
+        assert!(
+            replacement
+                .attachment
+                .snapshot_applied(replacement.snapshot.revision)
+                .expect("acknowledge prepared takeover snapshot")
+                .is_none()
+        );
+        let current_snapshot = replacement
+            .attachment
+            .sync_latest(replacement.snapshot.revision)
+            .expect("begin a replacement snapshot before takeover response");
+        service
+            .takeover(
+                replacement_principal,
+                OperationId {
+                    lease: replacement_lease,
+                    sequence: 1,
+                },
+                &replacement.attachment,
+            )
+            .expect("commit takeover while current replacement is awaiting acknowledgement");
+
+        let before_active = TerminalHostEffect::ClipboardWrite(
+            zterm_core::terminal::TerminalClipboardWrite::new("takeover before active".to_owned())
+                .expect("valid clipboard fixture"),
+        );
+        replacement
+            .attachment
+            .effect_broker
+            .publish_for_test(before_active)
+            .expect("publish through the real Session broker");
+        assert!(
+            replacement
+                .attachment
+                .take_host_effect()
+                .expect("inspect takeover attachment effect")
+                .is_none(),
+            "takeover commit must not bypass the current attachment lifetime's Active barrier"
+        );
+
+        assert!(
+            replacement
+                .attachment
+                .snapshot_applied(current_snapshot.revision)
+                .expect("activate replacement controller")
+                .is_none()
+        );
+        let after_active = TerminalHostEffect::ClipboardWrite(
+            zterm_core::terminal::TerminalClipboardWrite::new("takeover after active".to_owned())
+                .expect("valid clipboard fixture"),
+        );
+        replacement
+            .attachment
+            .effect_broker
+            .publish_for_test(after_active)
+            .expect("publish after replacement Active barrier");
+        let TerminalHostEffect::ClipboardWrite(write) = replacement
+            .attachment
+            .take_host_effect()
+            .expect("take replacement attachment effect")
+            .expect("active takeover attachment is eligible");
+        assert_eq!(write.as_str(), "takeover after active");
+
+        replacement.attachment.detach();
+        service
+            .shutdown()
+            .expect("takeover-effect fixture shuts down");
     }
 
     #[cfg(unix)]

@@ -4,15 +4,15 @@ use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::vte::ansi::{Color, NamedColor};
 use zterm_core::terminal::{
-    ActiveScreen, TerminalCell, TerminalColor, TerminalCursor, TerminalModes,
-    TerminalMouseEncoding, TerminalMouseMode, TerminalScrollMetrics, TerminalSize, TerminalStyle,
-    TerminalSurface, TerminalSurfaceRow,
+    ActiveScreen, TerminalCell, TerminalColor, TerminalCursor, TerminalKeyboardFlags,
+    TerminalModes, TerminalMouseEncoding, TerminalMouseMode, TerminalScrollMetrics, TerminalSize,
+    TerminalStyle, TerminalSurface, TerminalSurfaceRow,
 };
 
 use crate::MAX_CELL_TEXT_BYTES;
 use crate::engine::AlacrittyEngine;
 
-pub(crate) const CHECKPOINT_FORMAT_VERSION: u16 = 1;
+pub(crate) const CHECKPOINT_FORMAT_VERSION: u16 = 2;
 
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct InlineCellText {
@@ -267,5 +267,7 @@ fn terminal_modes(engine: &AlacrittyEngine) -> TerminalModes {
         alternate_scroll: mode.contains(TermMode::ALTERNATE_SCROLL),
         mouse_mode,
         mouse_encoding,
+        keyboard_flags: TerminalKeyboardFlags::from_bits(engine.keyboard_mode_bits())
+            .unwrap_or_default(),
     }
 }

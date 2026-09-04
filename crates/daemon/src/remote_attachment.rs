@@ -1679,6 +1679,30 @@ where
         };
     }
     match frame.kind {
+        WireKind::TerminalClipboardWrite => {
+            if frame.request_id != 0 {
+                return Err(malformed(
+                    "remote clipboard effect must use request_id zero",
+                ));
+            }
+            if !visual_read_ready(phase) {
+                return Err(malformed(
+                    "remote clipboard effect arrived outside an active controller epoch",
+                ));
+            }
+            let message: v2::TerminalClipboardWrite = decode(&frame)?;
+            let (attachment_id, write) =
+                zterm_proto::terminal_clipboard_write_from_message(message)
+                    .map_err(protocol_error)?;
+            if attachment_id != remote_attachment_id {
+                return Err(malformed("remote clipboard effect attachment_id mismatch"));
+            }
+            let message = zterm_proto::terminal_clipboard_write_message(state.local_view_id, write);
+            let bytes = encode_message(WireKind::TerminalClipboardWrite, 0, 0, &message)
+                .map_err(protocol_error)?;
+            write_local(local_writer, &bytes, Instant::now() + operation_timeout).await?;
+            Ok(None)
+        }
         WireKind::TerminalSyncRequired => {
             let mut required: v2::TerminalSyncRequired = decode(&frame)?;
             require_remote_attachment(required.attachment_id.clone(), remote_attachment_id)?;
@@ -2531,8 +2555,8 @@ mod tests {
     use tokio::net::UnixStream;
     use tokio::sync::{mpsc, oneshot};
     use zterm_core::terminal::{
-        ActiveScreen, TerminalCell, TerminalCursor, TerminalModes, TerminalSurface,
-        TerminalSurfaceDelta, TerminalSurfaceRow, TerminalSurfaceSnapshot,
+        ActiveScreen, TerminalCell, TerminalClipboardWrite, TerminalCursor, TerminalModes,
+        TerminalSurface, TerminalSurfaceDelta, TerminalSurfaceRow, TerminalSurfaceSnapshot,
     };
     use zterm_core::{
         AuthGeneration, AuthorizationStatus, DeviceDisplayName, OperationId, OperationLease,
@@ -2566,6 +2590,107 @@ mod tests {
                 ERROR_SENTINEL,
             ))
         );
+    }
+
+    #[tokio::test]
+    async fn remote_clipboard_effect_is_active_only_and_rewrites_only_attachment_identity() {
+        let target = device(0x31);
+        let local_id = attachment(0x32);
+        let remote_id = attachment(0x33);
+        let session_id = session(0x34);
+        let write = TerminalClipboardWrite::new("remote clipboard".to_owned())
+            .expect("valid remote clipboard fixture");
+        let remote_message = zterm_proto::terminal_clipboard_write_message(remote_id, write);
+        let frame = decoded_message(WireKind::TerminalClipboardWrite, 0, &remote_message);
+        let mut state = bridge_state(target, local_id, session_id, Revision::new(1));
+        let mut phase = EpochPhase::Active;
+        let mut desired = DesiredViewPhase::Active;
+        let (local_read, mut local_write) = duplex(1024 * 1024);
+        let mut local_read = FramedReader::fresh(local_read);
+        let mut remote_sink = tokio::io::sink();
+
+        assert!(
+            process_epoch_remote_frame(
+                frame,
+                remote_id,
+                &mut state,
+                &mut local_write,
+                &mut remote_sink,
+                EpochControl {
+                    phase: &mut phase,
+                    desired_phase: &mut desired,
+                    operation_timeout: Duration::from_secs(1),
+                },
+            )
+            .await
+            .expect("active clipboard effect")
+            .is_none()
+        );
+        let forwarded = next_frame(&mut local_read).await;
+        assert_eq!(forwarded.kind, WireKind::TerminalClipboardWrite);
+        assert_eq!(forwarded.request_id, 0);
+        assert_eq!(forwarded.deadline_ms, 0);
+        let message: v2::TerminalClipboardWrite = forwarded
+            .decode_message(WireKind::TerminalClipboardWrite)
+            .expect("decode forwarded clipboard effect");
+        let (attachment_id, write) = zterm_proto::terminal_clipboard_write_from_message(message)
+            .expect("validate forwarded clipboard effect");
+        assert_eq!(attachment_id, local_id);
+        assert_eq!(write.as_str(), "remote clipboard");
+
+        let mut phase = EpochPhase::Synchronizing {
+            expected: Revision::new(2),
+            acknowledged: false,
+            needs_takeover: false,
+            takeover_ready: false,
+            controller_was_active: true,
+        };
+        let frame = decoded_message(WireKind::TerminalClipboardWrite, 0, &remote_message);
+        assert!(
+            process_epoch_remote_frame(
+                frame,
+                remote_id,
+                &mut state,
+                &mut local_write,
+                &mut remote_sink,
+                EpochControl {
+                    phase: &mut phase,
+                    desired_phase: &mut desired,
+                    operation_timeout: Duration::from_secs(1),
+                },
+            )
+            .await
+            .expect("already-active controller resync clipboard effect")
+            .is_none()
+        );
+        assert_eq!(
+            next_frame(&mut local_read).await.kind,
+            WireKind::TerminalClipboardWrite
+        );
+
+        let mut phase = EpochPhase::Synchronizing {
+            expected: Revision::new(2),
+            acknowledged: false,
+            needs_takeover: true,
+            takeover_ready: false,
+            controller_was_active: false,
+        };
+        let frame = decoded_message(WireKind::TerminalClipboardWrite, 0, &remote_message);
+        let error = process_epoch_remote_frame(
+            frame,
+            remote_id,
+            &mut state,
+            &mut local_write,
+            &mut remote_sink,
+            EpochControl {
+                phase: &mut phase,
+                desired_phase: &mut desired,
+                operation_timeout: Duration::from_secs(1),
+            },
+        )
+        .await
+        .expect_err("non-controller epoch rejects clipboard effect");
+        assert_eq!(error.kind(), DomainErrorKind::MalformedFrame);
     }
 
     #[derive(Clone)]

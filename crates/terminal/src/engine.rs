@@ -175,7 +175,7 @@ impl AlacrittyEngine {
         let sink = BoundedEventSink::default();
         let config = Config {
             scrolling_history: scrollback_rows,
-            kitty_keyboard: false,
+            kitty_keyboard: true,
             osc52: Osc52::Disabled,
             ..Config::default()
         };
@@ -245,6 +245,15 @@ impl AlacrittyEngine {
 
     pub(crate) const fn legacy_x10_mouse(&self) -> bool {
         self.legacy_x10_mouse
+    }
+
+    pub(crate) fn keyboard_mode_bits(&self) -> u8 {
+        let mode = self.term.mode();
+        u8::from(mode.contains(TermMode::DISAMBIGUATE_ESC_CODES))
+            | (u8::from(mode.contains(TermMode::REPORT_EVENT_TYPES)) << 1)
+            | (u8::from(mode.contains(TermMode::REPORT_ALTERNATE_KEYS)) << 2)
+            | (u8::from(mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC)) << 3)
+            | (u8::from(mode.contains(TermMode::REPORT_ASSOCIATED_TEXT)) << 4)
     }
 
     pub(crate) fn cursor_report(&self, private: bool) -> Vec<u8> {

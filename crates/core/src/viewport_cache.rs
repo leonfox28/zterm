@@ -1,9 +1,22 @@
 //! Renderer-neutral bounded viewport-window cache and request coalescer.
 
 use crate::terminal::{
-    MAX_HISTORY_WINDOW_ROWS, TerminalHistoryWindowAnchor, TerminalHistoryWindowQuery,
+    MAX_HISTORY_WINDOW_ROWS, TerminalHistoryWindowAnchor, TerminalHistoryWindowQuery, TerminalSize,
     TerminalViewportDisposition,
 };
+
+/// Immutable identity of one complete cached viewport slice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ViewportSliceIdentity {
+    /// Retained-history epoch of the immutable cached window.
+    pub epoch: crate::Revision,
+    /// Model revision at which the cached rows were projected.
+    pub revision: crate::Revision,
+    /// First visible row in the cached window's live-top coordinates.
+    pub first_row_from_live_top: i64,
+    /// Exact viewport geometry represented by the slice.
+    pub viewport: TerminalSize,
+}
 
 /// One immutable contiguous row window in live-top coordinates.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -97,6 +110,42 @@ pub struct ViewportCacheInstall {
     pub request: Option<TerminalHistoryWindowQuery>,
 }
 
+/// Compact two-phase plan for observing a live history-coordinate anchor.
+///
+/// The plan contains only cache metadata. In particular, it never clones the
+/// cached row window, so a platform presenter may validate and flush related
+/// host effects before committing the corresponding semantic observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ViewportAnchorObservation {
+    latest_anchor: Option<TerminalHistoryWindowAnchor>,
+    desired_offset_from_bottom: u64,
+    presented_offset_from_bottom: Option<u64>,
+    cache_action: AnchorCacheAction,
+    compatible: bool,
+    presented_slice_identity: Option<ViewportSliceIdentity>,
+}
+
+impl ViewportAnchorObservation {
+    /// Returns whether the observation preserves the cached coordinate space.
+    #[must_use]
+    pub const fn is_compatible(self) -> bool {
+        self.compatible
+    }
+
+    /// Returns the presented slice identity after this plan is committed.
+    #[must_use]
+    pub const fn presented_slice_identity(self) -> Option<ViewportSliceIdentity> {
+        self.presented_slice_identity
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AnchorCacheAction {
+    Preserve,
+    InvalidateRows,
+    InvalidateAll,
+}
+
 /// A bounded, contiguous, renderer-independent viewport cache.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ViewportCache<Row> {
@@ -162,6 +211,19 @@ impl<Row> ViewportCache<Row> {
         window.visible_rows(target)
     }
 
+    /// Returns the immutable identity of the latest desired full-height slice.
+    #[must_use]
+    pub fn visible_slice_identity(&self) -> Option<ViewportSliceIdentity> {
+        let window = self.window.as_ref()?;
+        let target = target_in_window_coordinates(
+            self.latest_anchor?,
+            window.anchor,
+            self.desired_offset_from_bottom,
+        )?;
+        window.visible_rows(target)?;
+        slice_identity(window, target)
+    }
+
     /// Returns the last complete slice committed for presentation.
     #[must_use]
     pub fn presented_rows(&self) -> Option<&[Row]> {
@@ -174,44 +236,89 @@ impl<Row> ViewportCache<Row> {
         window.visible_rows(target)
     }
 
+    /// Returns the immutable identity of the last locally presentable slice.
+    #[must_use]
+    pub fn presented_slice_identity(&self) -> Option<ViewportSliceIdentity> {
+        let window = self.window.as_ref()?;
+        let target = target_in_window_coordinates(
+            self.latest_anchor?,
+            window.anchor,
+            self.presented_offset_from_bottom?,
+        )?;
+        window.visible_rows(target)?;
+        slice_identity(window, target)
+    }
+
     /// Observes a live anchor, translating a pinned cache across monotonic append.
     ///
     /// Returns `false` when incompatible identity invalidated cached rows.
     pub fn observe_anchor(&mut self, anchor: TerminalHistoryWindowAnchor) -> bool {
+        let observation = self.preview_anchor_observation(anchor);
+        self.commit_anchor_observation(observation)
+    }
+
+    /// Previews a live-anchor observation without mutating or cloning cached rows.
+    #[must_use]
+    pub fn preview_anchor_observation(
+        &self,
+        anchor: TerminalHistoryWindowAnchor,
+    ) -> ViewportAnchorObservation {
         if !anchor.is_valid() {
-            self.invalidate();
-            return false;
+            return ViewportAnchorObservation {
+                latest_anchor: None,
+                desired_offset_from_bottom: 0,
+                presented_offset_from_bottom: None,
+                cache_action: AnchorCacheAction::InvalidateAll,
+                compatible: false,
+                presented_slice_identity: None,
+            };
         }
         let Some(previous) = self.latest_anchor else {
-            self.latest_anchor = Some(anchor);
-            return true;
+            return self.anchor_observation(
+                Some(anchor),
+                self.desired_offset_from_bottom,
+                self.presented_offset_from_bottom,
+                AnchorCacheAction::Preserve,
+                true,
+            );
         };
         if anchor.revision < previous.revision {
             // Live observations can race an already accepted response. Never
             // let an older observation regress the authoritative coordinate
             // space or invalidate a newer complete cache entry.
-            return true;
+            return self.anchor_observation(
+                self.latest_anchor,
+                self.desired_offset_from_bottom,
+                self.presented_offset_from_bottom,
+                AnchorCacheAction::Preserve,
+                true,
+            );
         }
         if previous.epoch != anchor.epoch
             || previous.viewport != anchor.viewport
             || anchor.max_offset_from_bottom < previous.max_offset_from_bottom
         {
-            self.invalidate_rows();
-            self.desired_offset_from_bottom = self
-                .desired_offset_from_bottom
-                .min(anchor.max_offset_from_bottom);
-            self.latest_anchor = Some(anchor);
-            return false;
+            return self.anchor_observation(
+                Some(anchor),
+                self.desired_offset_from_bottom
+                    .min(anchor.max_offset_from_bottom),
+                None,
+                AnchorCacheAction::InvalidateRows,
+                false,
+            );
         }
         let growth = anchor
             .max_offset_from_bottom
             .saturating_sub(previous.max_offset_from_bottom);
+        let mut desired_offset_from_bottom = self.desired_offset_from_bottom;
+        let mut presented_offset_from_bottom = self.presented_offset_from_bottom;
+        let mut cache_action = AnchorCacheAction::Preserve;
         if growth > 0 && self.desired_offset_from_bottom > 0 {
-            self.desired_offset_from_bottom = self
+            desired_offset_from_bottom = self
                 .desired_offset_from_bottom
                 .saturating_add(growth)
                 .min(anchor.max_offset_from_bottom);
-            self.presented_offset_from_bottom = self.presented_offset_from_bottom.map(|offset| {
+            presented_offset_from_bottom = self.presented_offset_from_bottom.map(|offset| {
                 offset
                     .saturating_add(growth)
                     .min(anchor.max_offset_from_bottom)
@@ -221,11 +328,65 @@ impl<Row> ViewportCache<Row> {
             // latest metrics separate from the immutable response snapshot and
             // force the next live gesture to refill instead of presenting stale
             // live rows as the new revision.
-            self.window = None;
-            self.presented_offset_from_bottom = None;
+            cache_action = AnchorCacheAction::InvalidateRows;
+            presented_offset_from_bottom = None;
         }
-        self.latest_anchor = Some(anchor);
-        true
+        self.anchor_observation(
+            Some(anchor),
+            desired_offset_from_bottom,
+            presented_offset_from_bottom,
+            cache_action,
+            true,
+        )
+    }
+
+    /// Commits a previously previewed live-anchor observation.
+    ///
+    /// Callers must not mutate this cache between preview and commit.
+    pub fn commit_anchor_observation(&mut self, observation: ViewportAnchorObservation) -> bool {
+        match observation.cache_action {
+            AnchorCacheAction::Preserve => {}
+            AnchorCacheAction::InvalidateRows => self.window = None,
+            AnchorCacheAction::InvalidateAll => {
+                self.window = None;
+                self.pending_query = None;
+            }
+        }
+        self.latest_anchor = observation.latest_anchor;
+        self.desired_offset_from_bottom = observation.desired_offset_from_bottom;
+        self.presented_offset_from_bottom = observation.presented_offset_from_bottom;
+        observation.compatible
+    }
+
+    fn anchor_observation(
+        &self,
+        latest_anchor: Option<TerminalHistoryWindowAnchor>,
+        desired_offset_from_bottom: u64,
+        presented_offset_from_bottom: Option<u64>,
+        cache_action: AnchorCacheAction,
+        compatible: bool,
+    ) -> ViewportAnchorObservation {
+        let presented_slice_identity = if cache_action == AnchorCacheAction::Preserve {
+            self.window.as_ref().and_then(|window| {
+                let target = target_in_window_coordinates(
+                    latest_anchor?,
+                    window.anchor,
+                    presented_offset_from_bottom?,
+                )?;
+                window.visible_rows(target)?;
+                slice_identity(window, target)
+            })
+        } else {
+            None
+        };
+        ViewportAnchorObservation {
+            latest_anchor,
+            desired_offset_from_bottom,
+            presented_offset_from_bottom,
+            cache_action,
+            compatible,
+            presented_slice_identity,
+        }
     }
 
     /// Changes the desired absolute offset and returns local-render/fetch work.
@@ -240,9 +401,6 @@ impl<Row> ViewportCache<Row> {
         self.desired_offset_from_bottom =
             target_offset_from_bottom.min(anchor.max_offset_from_bottom);
         let render_local = self.visible_rows().is_some();
-        if render_local {
-            self.presented_offset_from_bottom = Some(self.desired_offset_from_bottom);
-        }
         let request = if self.pending_query.is_none()
             && (!render_local || self.needs_prefetch(self.desired_offset_from_bottom))
         {
@@ -330,7 +488,6 @@ impl<Row> ViewportCache<Row> {
             .is_some();
         if covers_latest {
             self.window = Some(window);
-            self.presented_offset_from_bottom = Some(desired);
         }
         let request = (!covers_latest).then(|| {
             let query = make_query(latest_anchor, desired);
@@ -349,6 +506,14 @@ impl<Row> ViewportCache<Row> {
     /// request has actually been written.
     pub fn defer_pending_request(&mut self) {
         self.pending_query = None;
+    }
+
+    /// Commits the current complete desired slice only after its renderer has
+    /// successfully presented it.
+    pub fn commit_visible_presentation(&mut self) -> Option<ViewportSliceIdentity> {
+        self.visible_rows()?;
+        self.presented_offset_from_bottom = Some(self.desired_offset_from_bottom);
+        self.presented_slice_identity()
     }
 
     /// Clears cached rows and interaction state.
@@ -412,6 +577,20 @@ impl<Row> ViewportCache<Row> {
             && visible_start.saturating_sub(window.first_row_from_live_top) < threshold)
             || (end < live_end && end.saturating_sub(visible_end) < threshold)
     }
+}
+
+fn slice_identity<Row>(
+    window: &CachedViewportWindow<Row>,
+    target_offset_from_bottom: u64,
+) -> Option<ViewportSliceIdentity> {
+    Some(ViewportSliceIdentity {
+        epoch: window.anchor.epoch,
+        revision: window.anchor.revision,
+        first_row_from_live_top: i64::try_from(target_offset_from_bottom)
+            .ok()?
+            .checked_neg()?,
+        viewport: window.anchor.viewport,
+    })
 }
 
 fn target_in_window_coordinates(
@@ -533,9 +712,57 @@ mod tests {
                 rows: (-8_i32..1).collect(),
             })
             .expect("valid response");
+        let presented = cache
+            .commit_visible_presentation()
+            .expect("complete slice is presented");
         assert!(cache.observe_anchor(anchor(2, 10)));
         assert_eq!(cache.desired_offset_from_bottom(), 5);
         assert_eq!(cache.visible_rows(), Some(&[-3, -2, -1, 0][..]));
+        assert_eq!(cache.presented_slice_identity(), Some(presented));
+        assert_eq!(
+            cache.visible_slice_identity(),
+            Some(ViewportSliceIdentity {
+                epoch: Revision::new(1),
+                revision: Revision::new(1),
+                first_row_from_live_top: -3,
+                viewport: crate::terminal::TerminalSize::new(4, 10),
+            })
+        );
+    }
+
+    #[test]
+    fn anchor_observation_stages_metadata_until_explicit_commit() {
+        let mut cache = ViewportCache::new();
+        cache.observe_anchor(anchor(1, 8));
+        let _ = cache.set_target(3);
+        cache
+            .install_window(CachedViewportWindow {
+                disposition: TerminalViewportDisposition::Exact,
+                anchor: anchor(1, 8),
+                target_offset_from_bottom: 3,
+                first_row_from_live_top: -8,
+                rows: (-8_i32..1).collect(),
+            })
+            .expect("valid response");
+        let presented = cache
+            .commit_visible_presentation()
+            .expect("complete slice is presented");
+        let pending_before = cache.request_pending();
+        let mut changed = anchor(2, 6);
+        changed.epoch = Revision::new(2);
+
+        let observation = cache.preview_anchor_observation(changed);
+        assert!(!observation.is_compatible());
+        assert_eq!(observation.presented_slice_identity(), None);
+        assert_eq!(cache.anchor(), Some(anchor(1, 8)));
+        assert_eq!(cache.presented_slice_identity(), Some(presented));
+        assert!(cache.presented_rows().is_some());
+
+        assert!(!cache.commit_anchor_observation(observation));
+        assert_eq!(cache.anchor(), Some(changed));
+        assert_eq!(cache.desired_offset_from_bottom(), 3);
+        assert!(cache.presented_rows().is_none());
+        assert_eq!(cache.request_pending(), pending_before);
     }
 
     #[test]
