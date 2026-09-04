@@ -91,6 +91,12 @@ blocking PtyReader
   every target change clears stale pending content. Thus a slow or disconnected
   controller cannot backpressure PTY drain, create an effect queue, broadcast
   to observers, or replay content to a later controller.
+- Host-effect delivery storage is a Unix attachment capability. The shared
+  Windows build still performs terminal-model ingestion, but retains no broker,
+  target, pending payload, or wake subscription; controller-target reconciliation
+  is an explicit no-op there. Gate the complete private capability boundary
+  instead of suppressing dead-code diagnostics or adding a Windows clipboard
+  backend.
 - Zero attachments do not stop the reader, model owner, or root child.
 - Dropping an attachment or transport guard changes only subscription count.
 - `wait()` polls root-child state while releasing the child mutex between

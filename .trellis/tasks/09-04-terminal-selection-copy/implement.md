@@ -180,6 +180,14 @@
   require exact controls for all five categories, unchanged/routed-only no-I/O, epoch/extent selection
   invalidation in the sole transaction, live and hidden failure atomicity, no visual repaint, accurate
   committed state, and full-frame recovery.
+- [x] Correct the Windows shared-boundary CI follow-up as a local change-propagation defect, not a new
+  clipboard architecture. The delivery consumer is Unix-only, but its broker fields and private
+  payload slot had remained in the Windows build. Gate the complete delivery capability—broker,
+  targeted slot, attachment storage/subscription, and construction bindings—with `cfg(unix)` while
+  retaining shared terminal-model ingestion. The Windows driver target-reconciliation hook is an
+  explicit no-op and retains no effect; Unix, including Android's eventual Unix target, keeps the
+  controller-targeted latest-only behavior unchanged. The existing cross-platform spec already owns
+  this complete-private-boundary rule, so no duplicate platform contract was added.
 
 ## Focused validation commands
 

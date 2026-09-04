@@ -35,6 +35,10 @@ SessionAttachment::effect_watch() -> watch::Receiver<()>
 SessionAttachment::take_host_effect() -> Result<Option<TerminalHostEffect>, DaemonError>
 ```
 
+The two transient host-effect delivery methods and their attachment fields are
+`cfg(unix)`. Windows keeps the shared Session/model boundary constructible but
+stores and subscribes to no unsupported host effect.
+
 Adapters may call the deadline-bearing `*_until(..., Instant)` variants, but
 they must not duplicate registry, replay, session-reservation, or controller logic.
 

@@ -19,10 +19,11 @@ use tokio::sync::watch;
 #[cfg(all(unix, test))]
 use zterm_core::terminal::TerminalHistoryWindowAnchor;
 #[cfg(unix)]
+use zterm_core::terminal::TerminalHostEffect;
+#[cfg(unix)]
 use zterm_core::terminal::{TerminalHistoryWindowQuery, TerminalSurfaceHistoryWindowResult};
 use zterm_core::terminal::{
-    TerminalHostEffect, TerminalSize, TerminalSurfaceDelta, TerminalSurfaceDeltaResult,
-    TerminalSurfaceSnapshot,
+    TerminalSize, TerminalSurfaceDelta, TerminalSurfaceDeltaResult, TerminalSurfaceSnapshot,
 };
 use zterm_core::{
     AttachmentId, AttachmentPrincipal, ControllerLease, DaemonIncarnation, DeviceId,
@@ -34,10 +35,11 @@ use zterm_platform::pty::{PtyChildState, PtyError, PtyHost, PtyPathKind, PtySess
 use zterm_terminal::{TerminalError, TerminalModel};
 
 use crate::error::DaemonError;
+#[cfg(unix)]
+use crate::terminal_driver::TerminalEffectBroker;
 use crate::terminal_driver::{
     TerminalAttachment, TerminalDriver, TerminalDriverConfig, TerminalDriverError,
-    TerminalDriverInterrupt, TerminalDriverOwnership, TerminalEffectBroker,
-    spawn_background_reaper,
+    TerminalDriverInterrupt, TerminalDriverOwnership, spawn_background_reaper,
 };
 
 const OPERATION_RESULTS_PER_EPOCH: usize = 128;
@@ -180,7 +182,9 @@ pub struct SessionAttachment {
     detached: Arc<AtomicBool>,
     revisions: watch::Receiver<Revision>,
     lifecycle: watch::Receiver<AttachmentLifecycle>,
+    #[cfg(unix)]
     effect_broker: TerminalEffectBroker,
+    #[cfg(unix)]
     effect_wakeup: watch::Receiver<()>,
     #[cfg(unix)]
     final_update: FinalAttachmentUpdateSlot,
@@ -210,11 +214,13 @@ impl SessionAttachment {
     }
 
     /// Subscribes to payload-free transient host-effect wakeups.
+    #[cfg(unix)]
     pub(crate) fn effect_watch(&self) -> watch::Receiver<()> {
         self.effect_wakeup.clone()
     }
 
     /// Takes only a transient effect bound to this exact attachment.
+    #[cfg(unix)]
     pub(crate) fn take_host_effect(&self) -> Result<Option<TerminalHostEffect>, DaemonError> {
         self.effect_broker
             .take_for(self.attachment_id)
@@ -3300,7 +3306,9 @@ fn prepare_attach(
     let attachment_id = next_attachment_id(&runtime.attachments)?;
     let driver = runtime.driver.as_ref().ok_or_else(session_not_found)?;
     let mut terminal = resumed_terminal.unwrap_or_else(|| driver.attach());
+    #[cfg(unix)]
     let effect_broker = terminal.effect_broker();
+    #[cfg(unix)]
     let effect_wakeup = effect_broker.subscribe();
     let revisions = terminal.revision_watch();
     let initial_state = if resume.is_some() && terminal.checkpoint_revision().is_some() {
@@ -3372,7 +3380,9 @@ fn prepare_attach(
             detached,
             revisions,
             lifecycle: lifecycle_receiver,
+            #[cfg(unix)]
             effect_broker,
+            #[cfg(unix)]
             effect_wakeup,
             #[cfg(unix)]
             final_update,
