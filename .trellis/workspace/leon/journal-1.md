@@ -234,3 +234,25 @@ Updated the project Trellis runtime and platform integrations to 0.6.16, validat
 ### Status
 
 [OK] **Completed**
+
+
+## Session 10: Harden release preparation
+<!-- trellis-session: v=2 fp=5dd87451af3d1605 -->
+
+**Date**: 2026-09-04
+**Task**: Harden release preparation
+**Branch**: `fix/release-prepare-reliability`
+
+### Summary
+
+Made release preparation deterministic with Cargo-owned workspace lock refresh, focused validation, exact clean-commit branch/PR resume, real Cargo fixture coverage, clearer diagnostics, and synchronized release docs/specs. Focused gates, independent Trellis review, and full just check passed.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `367a7f9` | fix: make release preparation deterministic |
+
+### Status
+
+[OK] **Completed**
