@@ -256,3 +256,26 @@ Made release preparation deterministic with Cargo-owned workspace lock refresh, 
 ### Status
 
 [OK] **Completed**
+
+
+## Session 11: Unify local and remote terminal attachments
+<!-- trellis-session: v=2 fp=da2d32926ddf81b9 -->
+
+**Date**: 2026-09-05
+**Task**: Unify local and remote terminal attachments
+**Branch**: `fix-zterm-herdr-not-synchronized-attachment-snapshot`
+
+### Summary
+
+Unified local and remote daemon attachment semantics behind a frontend-owned Session client, added an opaque viewer-daemon tunnel over shared Iroh connections, made terminal chrome universal with exact local status, fixed event-entry snapshot acknowledgement for alternate-screen resize, and verified Herdr 0.8.2 plus full workspace gates.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `4328e2e` | fix: unify local and remote terminal attachments |
+| `c343146` | docs: record unified terminal attachment contract |
+
+### Status
+
+[OK] **Completed**
