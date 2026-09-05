@@ -1,0 +1,9 @@
+{"file": ".trellis/spec/backend/terminal-model.md", "reason": "Host-only engine, bounded semantic capture, checkpoint/history contracts; no performance benchmark."}
+{"file": ".trellis/spec/backend/terminal-driver.md", "reason": "Lossless drain, opaque attachment checkpoints, single capture, ownership and finalization."}
+{"file": ".trellis/spec/backend/core-wire-domain.md", "reason": "Semantic validation, revision atomicity, framing, identity and replay boundaries."}
+{"file": ".trellis/spec/backend/local-daemon-ipc.md", "reason": "Single frontend Session client, opaque daemon tunnel, input fence and presenter transaction."}
+{"file": ".trellis/spec/backend/session-service.md", "reason": "Synchronous per-session actor, command deadlines, controller and lifecycle invariants."}
+{"file": ".trellis/spec/backend/transport-auth.md", "reason": "Endpoint/broker ownership, singleflight, stream isolation, authorization and platform limits."}
+{"file": ".trellis/spec/guides/evidence-driven-simplicity.md", "reason": "Remove proven duplication; retain distinct validation owners. User forbids all sub-agents."}
+{"file": ".trellis/spec/guides/root-cause-and-architecture-thinking-guide.md", "reason": "Distinguish local defects from architecture issues before changing scope."}
+{"file": ".trellis/tasks/09-05-zterm-architecture-review/research/architecture-audit.md", "reason": "F1-F6 evidence, priorities, root-cause classifications, retained/deferred decisions and review limits."}
