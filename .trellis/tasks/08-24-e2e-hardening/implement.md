@@ -28,6 +28,24 @@
 - [ ] Run generic tmux/Herdr, OSC/DCS/APC/graphics, malformed stream, secret/log, peer UID, symlink, and revoke gates.
 - [ ] Resolve concrete release blockers; do not add stress loops or redundant static/runtime assertions after a contract is green.
 
+### Release blocker: macOS arm64 `session_limits`
+
+- **Observation:** final `main` CI run `33934342197` rejected the release because
+  `session_count_and_viewport_limits_fail_without_mutation` compared the whole
+  `SessionSummary`. The rejected 81x240 resize left the viewport at 80x240,
+  while background PTY output independently advanced the terminal revision
+  from 1 to 2.
+- **Classification:** local test implementation defect / evidence mismatch, not
+  an architecture defect. `SessionActor` already owns both the authoritative
+  terminal revision and resize validation; the test incorrectly included an
+  asynchronously mutable, non-resize-owned field in the rollback assertion.
+- **Owning invariant and scope:** a rejected resize must preserve the accepted
+  viewport and session identity. Assert those observable fields only; retain
+  strict production validation and make no daemon or protocol change.
+- **Acceptance:** the focused `session_limits` test passes repeatedly, the full
+  local release gate passes once, an independent checker reviews the boundary,
+  and a fresh exact-`main` hosted matrix is green before tagging.
+
 ## Step 4: Independent release review
 
 - [ ] Run the complete workspace, dependency, source/version/secret, artifact, installer, network, and documentation gates once.

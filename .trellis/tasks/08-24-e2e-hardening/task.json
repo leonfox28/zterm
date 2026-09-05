@@ -12,7 +12,7 @@
   "assignee": "leon",
   "createdAt": "2026-08-24",
   "completedAt": null,
-  "branch": null,
+  "branch": "fix/session-limits-revision-race",
   "base_branch": "main",
   "worktree_path": null,
   "commit": null,
