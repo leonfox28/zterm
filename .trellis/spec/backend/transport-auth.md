@@ -47,6 +47,10 @@ RemoteSessionService::resolve(selector, deadline)
     -> Result<ResolvedSessionTarget, DaemonError>
 RemoteSessionService::forward_preencoded(target, request_id, bytes, deadline)
     -> Result<DecodedFrame, DaemonError>
+RemoteSessionService::serve_tunnel(stream, first, limits, deadline)
+    -> Result<(), DaemonError>
+serve_remote_session_tunnel(broker, target, local_stream, first, limits, deadline)
+    -> Result<(), DaemonError>
 
 trait RemoteServiceHandler {
     fn handle_service_stream(
@@ -109,6 +113,11 @@ outbound-known and inbound-authorization directions explicit.
 - Product startup uses `run_daemon`; the doc-hidden local-only test entry must
   never prepare or bind Iroh. Shutdown quiesces pairing and broker work before
   closing the endpoint, while retained Session ownership remains authoritative.
+- A remote frontend may retain only a narrow restart capability backed by its
+  `LocalRuntime` launcher and paths. If its replacement local IPC open reports
+  `DaemonStopped`, the ordinary lifecycle-locked `ensure` starts at most one
+  replacement viewer daemon across all frontends; each frontend then opens its
+  own tunnel. Local views and network-only failures do not invoke this path.
 - Incoming ALPN classification is exact. Unknown ALPNs are dropped; normal and
   pair pre-auth budgets are separate, with one shared outer connection bound.
   Completed Iroh TLS authentication is required; no 0-RTT application path is
@@ -149,31 +158,26 @@ outbound-known and inbound-authorization directions explicit.
   Framing, EOF, correlation, kind, or typed-payload failure after a write is
   ambiguous; after the second remote attempt a mutation becomes outcome unknown.
   The outer same-UID mutation envelope never adds another retry.
-- One `RemoteAttachmentBridge` holds one `ConnectionDemand` for one same-UID
-  desired view and opens a fresh bounded service stream for each reconnect
-  epoch. The stable local view ID is never sent as the host attachment ID.
-  Initial attach write/flush, snapshot-or-delta exchange, inconsistent-delta
-  `TerminalSyncRequired` plus same-attachment full-snapshot recovery, and all
-  outbound controls use absolute attempt/operation deadlines. A stalled peer
-  therefore cannot retain the demand indefinitely, while active remote reads
-  remain long-lived. The bridge freezes the first SessionId and never recreates
-  a same-named Session after daemon restart or terminal loss. After the view has
-  reached `Active`, an initial `SessionOccupied` on a replacement stream may mean
-  the old authenticated host reader has not observed EOF yet. Only for that
-  frozen SessionId, the bridge drops the rejected epoch, remains `Reconnecting`,
-  drains input and coalesces the latest history target through one fixed 250 ms
-  cancellable delay,
-  then retries with `create_main = false`. First-ever occupancy and every other
-  typed initial attach error remain terminal.
-- Every opened attachment epoch owns an address-free observer for the exact
-  candidate that opened its service stream. Its selected Iroh path sample must
-  use only that observer; a later deterministic
-  primary replacement cannot change an already-open epoch, and only a fresh
-  reconnect epoch may observe the replacement candidate. RTT is rounded to the
-  nearest millisecond and clamped to `u32`; addresses, candidate keys, DeviceIds,
-  and relay URLs never cross or appear in Debug at this observation boundary.
-  The attachment bridge samples changed values at most once per second and
-  clears the local-only projection to unknown on reconnect.
+- One remote frontend socket causes the viewer daemon to hold one
+  `ConnectionDemand` and one admitted `StreamPurpose::Service` stream. The
+  broker still owns one active authenticated connection per device pair, so
+  independent frontend tunnels share that connection without sharing an IPC
+  byte stream or QUIC service stream. Dropping one demand/stream releases only
+  that tunnel; it never closes the peer connection or a sibling tunnel.
+- The viewer daemon's tunnel is application-opaque. After same-UID, exact
+  outbound target, non-self, version, and envelope validation, it forwards
+  nonempty chunks of at most 64 KiB with direct bounded backpressure. It does
+  not decode normal Session frames, rewrite IDs, track revisions/viewports,
+  acknowledge snapshots, recover controls, or decide replay. The target
+  `SessionWireServer` remains the sole normal-ALPN decoder and applies the
+  authenticated remote principal and generation to every Session/PTY effect.
+- Every admitted tunnel epoch owns an address-free observer for the exact
+  candidate that opened its service stream. Its selected Iroh path sample uses
+  only that observer; a later primary replacement cannot change an already-open
+  epoch, and only a fresh tunnel may observe the replacement candidate. RTT is
+  rounded to milliseconds and clamped to `u32`; addresses, candidate keys,
+  DeviceIds, and relay URLs never cross this boundary. The tunnel sends an
+  explicit unknown reset, then changed samples no faster than once per second.
 - Semantic history-window reads are the only remote scrolling control in wire
   major 2. Kind 317 retains its complete anchor/target/margins beside one bounded
   pending correlation; kind 318 is structurally decoded and validated against
@@ -183,19 +187,18 @@ outbound-known and inbound-authorization directions explicit.
   capability negotiation, pager, stateful remote viewport, sentinel response,
   downgrade, or representation fallback. Connection-status events remain
   local-only and are never valid normal-ALPN service kinds.
-- A `RemoteAttachmentBridge` may structurally decode semantic cells to enforce
-  shape/content bounds, revision, correlation, and request identity, rewrite the
-  private attachment ID, and re-encode. It must not interpret application
-  content, translate representation, compose UI, construct ANSI, or present.
-- `controller_was_active` is scoped to one remote stream epoch. A host-initiated
-  `TerminalSyncRequired -> Snapshot` inside that epoch preserves it, allowing
-  only the same previously-active controller's input/history-window controls to cross
-  the replacement sync window. A new transport epoch, initial attach, or
-  takeover initializes it false. Epoch loss completes a pending history window
-  once as a correlated content-free nonzero Gap not older than its saved query.
-  The bridge then emits `Reconnecting`; the read is not replayed, and
-  mutation/lease/takeover errors retain their existing typed or outcome-unknown
-  semantics.
+- Session identity, one stable ResumeViewId, target-issued AttachmentId,
+  applied revision, desired viewport, query correlation, and mutation ambiguity
+  are frontend state. The frontend opens a fresh tunnel after retryable loss
+  and sends unchanged target Session frames; the daemon never synthesizes
+  Session transport states or a replacement attachment identity. A pending
+  history query resolves once as a Gap before reconnect, while input and
+  potentially committed mutations are never blindly replayed.
+- Viewer-daemon loss does not change that Session owner. The frontend remains
+  `Reconnecting`, singleflight-ensures the configured local daemon, then opens a
+  new tunnel using the same frozen resume state. It never treats a successfully
+  launched daemon as proof that the remote Session mutation or snapshot
+  acknowledgement committed.
 - Apply normal QUIC limits immediately after connect/accept and before
   Hello/Welcome: advertise `max_bi_streams_per_connection` and zero
   unidirectional streams. Pair connections advertise one bidirectional and zero
@@ -301,8 +304,11 @@ outbound-known and inbound-authorization directions explicit.
   task-only direct routes.
 - Its real target checks Linux before bind and is ignored elsewhere. It proves
   pair/normal ALPN isolation, one-Endpoint reuse, normal-primary reuse,
-  directional authorization, and direct-route non-persistence. It does not
-  prove pairing-service workflows, remote Session workflows, `run_daemon`, the
+  directional authorization, direct-route non-persistence, and two simultaneous
+  Service streams on one primary. Completing and dropping the first stream
+  leaves the second able to complete a valid exchange, then both stream metrics
+  return to zero without replacing the primary. It does not prove pairing-
+  service workflows, a complete remote Session handler, `run_daemon`, the
   public CLI, Relay, Internet, DNS/Pkarr, or M10 paths.
 - Do not keep a second daemon-like real-Iroh fixture merely for compile-only
   evidence. A future end-to-end pairing or remote Session acceptance target
@@ -342,16 +348,20 @@ outbound-known and inbound-authorization directions explicit.
 | remote operation-lease allocation loses a validated response after write | return the typed transport/protocol failure after one service stream; do not allocate again |
 | first/second remote mutation service stream loses a validated response | retry once with identical bytes / return `operation_outcome_unknown`; never allocate a fresh lease for that operation |
 | remote unary fully validated expected response or correlated known service error | terminal response; do not retry |
+| same-UID tunnel Open names self, unknown/revoked/inbound-only target, zero request ID, or unsupported version | correlated local error before demand/service-stream acquisition |
+| opened tunnel receives zero/oversized Data, nonzero stream correlation fields, or another invalid outer kind | send one ProtocolError close best effort; release only that tunnel |
+| one tunnel stalls, resets, is malformed, or its frontend cancels | bound every write/flush/shutdown, release its demand and stream, retain the peer connection and sibling streams |
+| a replacement tunnel cannot connect to a stopped viewer daemon | call the lifecycle-locked remote-only restart capability, then reopen independently; propagate launch failure and never restart for a local view |
 | post-`Active` frozen-session attachment receives initial `session_occupied` before old host reader EOF | drop the rejected epoch, remain reconnecting, drain/drop input and coalesce the latest history target for 250 ms, then retry the same SessionId with `create_main = false`; first-ever occupancy is terminal |
 | remote Session context is self, generation zero/stale, or targets local/wrong DeviceId | generic `unauthorized`; no Session/PTY effect |
 | malformed, trailing, oversized, stalled, or panicking remote service stream | close/fail only that stream; retain primary connection, Session, PTY, and other streams |
-| reconnect delta baseline is inconsistent | consume and validate `TerminalSyncRequired`, then require a same-attachment snapshot at its declared revision |
-| selected path changes direct/relay or disappears | emit a redacted changed local observation no faster than 1 Hz; reconnect displays unknown |
+| reconnect begins with neither a target snapshot nor a delta contiguous with the frontend's applied revision | reject that tunnel epoch; never weaken target Session acknowledgement or invent a baseline |
+| selected path changes direct/relay or disappears | emit a redacted changed local tunnel observation no faster than 1 Hz; every fresh tunnel first displays unknown |
 | history-window request loses its remote stream | resolve once with a correlated content-free nonzero Gap not older than the saved query, then reconnect; do not replay it |
 | history-window request/frame lacks saved-query correlation, product bounds, semantic validity, or exact request shape | reject; never expose or retain its rows |
-| input/history-window control arrives during replacement sync | forward only if `controller_was_active` is true for this exact stream epoch and controller; initial/new-epoch/takeover stays fenced |
-| active epoch changes to a full snapshot | emit one local `Synchronizing` event before snapshot bytes; suppress duplicates until the view becomes active again |
-| remote write/control peer stops reading | operation deadline releases the stream epoch and eventually the desired-view demand |
+| input/history-window control arrives during replacement sync | target Session admits it only for the exact previously-active controller in that stream epoch; initial/new-epoch/takeover stays fenced |
+| active epoch changes to a full snapshot | frontend emits one `Synchronizing` transition before exposing the snapshot and remains non-active through its exact acknowledgement |
+| remote or local tunnel writer stops reading | the bounded operation deadline releases the tunnel's stream and demand |
 | continuously ready accept branch with completed handler tasks | reap completed `JoinSet` entries before the next accept; retained task ownership stays bounded |
 | Unix-only private field or actor-query chain in a shared Windows module | gate every private owner/variant/arm/helper together; shared Clippy must have zero dead code |
 | non-Unix caller constructs or invokes `LocalDeviceClient` | construction succeeds without Unix state; operation returns typed `UnsupportedPlatform` |
@@ -386,6 +396,15 @@ outbound-known and inbound-authorization directions explicit.
 - **Good:** preserve a previously-active controller across only an in-epoch
   replacement snapshot, validate one query-bound semantic history window, and
   resolve it as a correlated nonzero Gap before reconnecting if the epoch dies.
+- **Good:** two remote frontends observe a stopped viewer daemon, converge on
+  one lifecycle-singleflight daemon launch, then independently resume two
+  tunnels over one broker-owned peer connection.
+- **Base:** a remote frontend reconnects through an already-running viewer
+  daemon without invoking the launcher; a local view terminates when its daemon
+  and target Session end.
+- **Bad:** let the viewer daemon become a semantic attachment client, replay a
+  frontend mutation after restart, or create one Endpoint/peer connection per
+  frontend tunnel.
 - **Bad:** cap the combined route list at four, accept unidirectional QUIC
   streams that no actor consumes, persist a direct address, roll back an
   outcome-unknown authorization, detach a PTY because one device was revoked,
@@ -415,17 +434,20 @@ outbound-known and inbound-authorization directions explicit.
   revoke fairness, transport-neutral diagnostics, stream-local malformed/stall/
   panic failure, single handler installation, bounded task reaping, and
   quiesce-before-Endpoint ordering without creating an Endpoint.
-- `remote_attachment` pure fake-stream tests cover one demand across fresh
-  stream/attachment epochs, stable local identity, state ordering, input drop,
-  latest geometry and semantic-history-target coalescing, request-shaped
-  contiguous semantic windows, snapshot preservation, same-epoch visual-sync
-  fences, nonzero correlated Gap on epoch loss, bounded stalled writes,
-  pending lease/takeover
-  completion, post-active half-open occupancy retry under paused time,
-  first-ever occupancy termination, and other terminal classifications. The
-  authenticated `session_wire` PTY regression proves
-  EOF-only checkpoint move versus explicit/protocol discard without opening an
-  Endpoint.
+- `remote_tunnel` pure fake-stream tests cover bounded opaque Data, Path
+  ordering, one-way half-close, malformed/post-half-close isolation, and one
+  healthy sibling without decoding an inner Session frame. The broker tests
+  `service_handler_admission_quiesce_and_reclamation_use_raii_permits`,
+  `service_handler_panic_releases_only_its_stream_permits`, and
+  `per_peer_stream_observation_tracks_raii_lifetimes` own permit reclamation.
+  `local_ipc` pairs direct/tunnel target traces byte-for-byte, proves stable
+  ResumeViewId/SessionId/applied revision/viewport and target-issued attachment
+  identity, successfully restarts a stopped viewer fixture into a resumed
+  tunnel, and keeps two peer-loss resume checkpoints independent.
+  `demand_bookkeeping_is_checked_singleflight_and_drops_transient_routes` owns
+  broker reconnect singleflight; `single_instance` owns daemon-launch
+  singleflight. Authenticated `session_wire` tests retain target-side strict
+  acknowledgement, resume, takeover, authorization, and PTY checkpoint rules.
 - Unix IPC: `local_pair_ipc`, `local_device_ipc`, `local_ipc`, and
   `local_session_ipc` cover strict EOF, exact retry, ordered revoke, matching-
   principal detach, response loss, and listener/session independence.
@@ -449,8 +471,9 @@ outbound-known and inbound-authorization directions explicit.
   ```
 
   Its assertions include distinct owners, pair-to-normal confirmation, one
-  normal primary with zero business streams, one Endpoint identity/socket per
-  owner, directional durable state, and no direct-route persistence. Pure
+  normal primary, two independent Service streams with sibling survival and
+  zero final stream metrics, one Endpoint identity/socket per owner,
+  directional durable state, and no direct-route persistence. Pure
   pairing and remote Session suites retain workflow, replay, response-loss,
   reconnect, no-HOL, revoke, and cleanup evidence without duplicating Endpoint
   owners. Foundation Case C separately owns official-n0 Relay runtime evidence.
@@ -497,6 +520,19 @@ for source in [fresh, cache, ticket] {
 
 Each independently validated source stays bounded, deduplication preserves the
 fallback order, and later sources remain reachable after earlier dial failures.
+
+Session ownership across the local tunnel boundary is similarly singular:
+
+```rust
+// Wrong: the viewer daemon becomes a second semantic Session client.
+let desired = daemon.decode_and_cache_session(inner_bytes)?;
+daemon.rewrite_attachment_id_and_acknowledge(desired).await?;
+
+// Correct: the daemon validates only the local envelope and transport target.
+pump_bounded_opaque_bytes(ipc_tunnel, admitted_service_stream).await?;
+// The frontend's sole Session client decodes target frames and owns resume.
+frontend.resume(frozen_session, stable_view, applied_revision, viewport).await?;
+```
 
 History correlation and sync identity follow the same epoch ownership rule:
 

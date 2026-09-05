@@ -344,9 +344,11 @@ them: physical outer-terminal capture, child-declared input modes,
 attachment-local presentation, and transport/controller synchronization.
 
 - [ ] Trace one terminal update as semantic model rows -> driver -> Session ->
-      wire -> structural bridge -> `AttachmentSurface` -> `ComposedFrame` ->
-      sole platform presenter. Only that final presenter may encode physical
-      terminal ANSI, restore host capture, perform one write, and flush once.
+      wire -> frontend Session adapter -> `AttachmentSurface` ->
+      `ComposedFrame` -> sole platform presenter. A viewer-daemon tunnel, when
+      present, transports only opaque wire bytes. Only the final presenter may
+      encode physical terminal ANSI, restore host capture, perform one write,
+      and flush once.
 - [ ] For every screen/layout transition, assign ownership of status rows,
       gutters, overlays, and reclaimed cells before ordering writers. Stale
       cleanup is valid only while the current layout still assigns that region
@@ -373,6 +375,10 @@ attachment-local presentation, and transport/controller synchronization.
 - [ ] Treat transport synchronization, connection-path observation, and visual
       presentation as separate authorities. Same-epoch sync must not invent a
       disconnect; true reconnect must not leak old direct/relay/RTT data.
+- [ ] When handling one event, snapshot at event entry any authority state used
+      to classify or acknowledge that event. If an effect triggered by the
+      event can mutate that same state, never base the event's acknowledgement
+      decision on the post-effect value.
 - [ ] Distinguish received, desired, and actually presented state. A coalesced
       response that immediately schedules a newer target is not allowed to
       replace presentation metrics until its complete frame is painted.
@@ -418,7 +424,7 @@ attachment-local presentation, and transport/controller synchronization.
 - [ ] Complete pending read-only controls once with a correlated typed outcome
       before publishing reconnect; do not convert expected epoch loss into a
       fatal uncorrelated UI error.
-- [ ] Test the composition at model, driver, Session, wire, bridge,
+- [ ] Test the composition at model, driver, Session, wire, route adapter,
       `AttachmentSurface`, compositor, presenter, and real outer-PTY boundaries.
       Tests below the presenter assert typed revisions, correlations, semantic
       rows, and state transitions—not raw ANSI substrings or arbitrary flush

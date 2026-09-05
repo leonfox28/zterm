@@ -163,7 +163,8 @@ released when the Session model is dropped.
   detail, palette state, and graphics are not advertised.
 - Projection produces only exact semantic rows/cells, cursor, modes, active
   screen, and optional main-screen scroll metrics. Model, driver, Session,
-  protobuf, local IPC, and remote bridge construct no presentation ANSI.
+  protobuf, and the frontend Session adapter construct no presentation ANSI;
+  the viewer-daemon remote tunnel does not decode those semantic values at all.
 - A full snapshot contains the complete latest active screen only. Retained
   main history is fetched separately through the bounded stateless semantic
   history-window contract; it is never replayed as snapshot bytes.
