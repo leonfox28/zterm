@@ -128,7 +128,13 @@ case "$command_name" in
                 fi
                 ;;
             *'/actions/runs/123/artifacts?'*)
-                if [ "${FAKE_CANDIDATE_MISSING:-0}" != 1 ]; then printf '%s\n' 789; fi
+                if [ "${FAKE_CANDIDATE_MISSING:-0}" = 1 ]; then
+                    printf '%s\n' '[{"artifacts":[]}]'
+                else
+                    head=$(git rev-parse HEAD)
+                    printf '[{"artifacts":[{"id":789,"name":"release-candidate-%s-1","expired":false,"digest":"sha256:%064d","workflow_run":{"head_sha":"%s","head_branch":"main"}}]}]\n' \
+                        "$head" 0 "$head"
+                fi
                 ;;
             *'/actions/runs/123 '*) printf '%s\n' 123 ;;
             *) exit 1 ;;

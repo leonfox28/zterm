@@ -183,6 +183,9 @@ workspace version.
   artifact ID; the downloader fails on a digest mismatch. It cannot select PR
   artifacts or another commit. Failed-job retries may reuse an earlier
   successful assembly within that exact run.
+  Fetch paginated artifact pages successfully before querying them with external
+  `jq`: GitHub CLI rejects `--slurp` combined with its `--jq` option. Lookup
+  fixtures must preserve this CLI contract and exercise multiple response pages.
 - Main native jobs build/self-check only the shipped binary and upload its raw
   bytes plus identity. Their ephemeral per-target uploads may be replaced during
   a CI retry. Ubuntu assembles deterministic archives and the exact unsigned
