@@ -30,7 +30,8 @@ runs:
             go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
           fi
           echo "$HOME/go/bin" >> "$GITHUB_PATH"
-          test "$("$HOME/go/bin/actionlint" -version | sed -n '1p')" = '1.7.12'
+          # go install reports the module version, including its v prefix.
+          test "$("$HOME/go/bin/actionlint" -version | sed -n '1p')" = 'v1.7.12'
         elif [ "$TOOL_PROFILE" = dependencies ]; then
           command -v cargo-deny >/dev/null 2>&1 \
             || cargo +1.98.0 install cargo-deny --version 0.20.2 --locked

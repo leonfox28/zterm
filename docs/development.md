@@ -153,6 +153,8 @@ Windows CI are paused until a future task explicitly restores them.
 
 Command caches are keyed by OS/architecture, profile and pinned tool versions,
 independently of the product lockfile. Only main writes these small caches.
+Version checks follow the installation owner: Go-installed actionlint reports
+`v1.7.12`, while Homebrew's build reports `1.7.12`.
 Cargo downloads use lockfile keys with an OS/architecture/toolchain fallback.
 The same download namespace is usable by main candidates and tag publication;
 no compiled PR output becomes a publication input.
