@@ -15,8 +15,9 @@ if [ "${1:-}" = contract ]; then
 fi
 
 output_dir=${1:-}
-[ "$#" -eq 1 ] && [ -n "$output_dir" ] \
-    || fail "usage: build-native.sh <output-directory>"
+if [ "$#" -ne 1 ] || [ -z "$output_dir" ]; then
+    fail "usage: build-native.sh <output-directory>"
+fi
 
 target=${RELEASE_TARGET:-}
 [ -n "$target" ] || fail "RELEASE_TARGET is required"

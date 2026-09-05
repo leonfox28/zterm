@@ -508,9 +508,10 @@ publish_release() {
     commit=$(git rev-parse HEAD)
     if remote_ref_state tags "refs/tags/$tag"; then
         git fetch --quiet --no-tags origin "refs/tags/$tag"
-        [ "$(git cat-file -t FETCH_HEAD)" = tag ] \
-            && [ "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$commit" ] \
-            || fail "existing remote tag does not identify this exact annotated source"
+        if [ "$(git cat-file -t FETCH_HEAD)" != tag ] \
+            || [ "$(git rev-parse 'FETCH_HEAD^{commit}')" != "$commit" ]; then
+            fail "existing remote tag does not identify this exact annotated source"
+        fi
         tag_pushed=true
         watch_release
         return
@@ -528,9 +529,10 @@ publish_release() {
     printf '%s\n' "Exact release candidate artifact: $candidate_id"
 
     if git show-ref --verify --quiet "refs/tags/$tag"; then
-        [ "$(git cat-file -t "refs/tags/$tag")" = tag ] \
-            && [ "$(git rev-list -n 1 "$tag")" = "$commit" ] \
-            || fail "existing local tag does not identify this exact annotated source"
+        if [ "$(git cat-file -t "refs/tags/$tag")" != tag ] \
+            || [ "$(git rev-list -n 1 "$tag")" != "$commit" ]; then
+            fail "existing local tag does not identify this exact annotated source"
+        fi
     else
         git tag -a "$tag" -m "zterm $tag"
     fi
@@ -548,8 +550,9 @@ read_finish_pr() {
     IFS="$tab" read -r pr_state pr_head pr_base pr_cross_repo pr_merge pr_branch <<EOF
 $pr_record
 EOF
-    [ "$pr_base" = main ] && [ "$pr_cross_repo" = false ] \
-        || fail "release requires one same-repository PR targeting main"
+    if [ "$pr_base" != main ] || [ "$pr_cross_repo" != false ]; then
+        fail "release requires one same-repository PR targeting main"
+    fi
 }
 
 finish_release() {
