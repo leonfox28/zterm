@@ -25,11 +25,16 @@ the same bytes or command semantics.
   checkout and before `rustfmt` or compilation in every OS matrix entry.
 - CI admission runs on pull requests, `main` pushes, and manual dispatch rather
   than duplicating a PR branch through both push and pull-request events. The
-  five-entry Rust matrix still expands the source-policy step on every host;
+  three-entry Rust matrix still expands the source-policy step on every host;
   pure version/format/docs owners may be centralized because they do not prove
   checkout bytes on another OS.
 - A workflow step that requires POSIX shell behavior must name `shell: bash` on
   Windows instead of depending on the runner's default shell.
+
+The current publication policy pauses Intel macOS, Windows CI/distribution and
+relay image publication. Restore them only when a future task explicitly requests
+it. Historical Windows incidents below remain guidance for any later reactivation;
+they do not require silently restoring that runner.
 
 ## Verification Checklist
 
@@ -43,7 +48,7 @@ Before changing source attributes or cross-platform workflows:
       source-policy and portable policy owners.
 - [ ] Run `just check` before push or delivery. It is the authoritative local
       gate, while hosted runners retain evidence for their own checkout bytes.
-- [ ] Let the Linux, macOS, and Windows matrix execute the same policy probe.
+- [ ] Let every enabled Linux/macOS matrix entry execute the same policy probe.
 - [ ] When a policy compares command output byte-for-byte, set color and other
       presentation controls at that command's owning boundary; do not inherit
       runner-wide formatting such as `CARGO_TERM_COLOR=always`.

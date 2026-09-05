@@ -14,18 +14,14 @@ if [ "${1:-}" = contract ]; then
     exit 0
 fi
 
-mode=${1:-}
-output_dir=${2:-}
-case "$mode" in
-    readiness) [ -z "$output_dir" ] || fail "readiness mode does not accept an output directory" ;;
-    formal) [ -n "$output_dir" ] || fail "formal mode requires an output directory" ;;
-    *) fail "usage: build-native.sh <readiness|formal> [output-directory]" ;;
-esac
+output_dir=${1:-}
+[ "$#" -eq 1 ] && [ -n "$output_dir" ] \
+    || fail "usage: build-native.sh <output-directory>"
 
 target=${RELEASE_TARGET:-}
 [ -n "$target" ] || fail "RELEASE_TARGET is required"
 case "$target" in
-    aarch64-apple-darwin|x86_64-apple-darwin)
+    aarch64-apple-darwin)
         platform=macos
         export MACOSX_DEPLOYMENT_TARGET=$minimum_macos
         ;;
@@ -38,14 +34,12 @@ esac
 host=$(rustc +1.98.0 -vV | sed -n 's/^host: //p')
 [ "$host" = "$target" ] || fail "Rust host $host does not equal release target $target"
 
-if [ "$mode" = formal ]; then
-    source_commit=${ZTERM_SOURCE_COMMIT:-}
-    source_epoch=${SOURCE_DATE_EPOCH:-}
-    [ -n "$source_commit" ] || fail "formal mode requires ZTERM_SOURCE_COMMIT"
-    [ -n "$source_epoch" ] || fail "formal mode requires SOURCE_DATE_EPOCH"
-    [ "$(git rev-parse HEAD)" = "$source_commit" ] \
-        || fail "checkout does not match ZTERM_SOURCE_COMMIT"
-fi
+source_commit=${ZTERM_SOURCE_COMMIT:-}
+source_epoch=${SOURCE_DATE_EPOCH:-}
+[ -n "$source_commit" ] || fail "candidate build requires ZTERM_SOURCE_COMMIT"
+[ -n "$source_epoch" ] || fail "candidate build requires SOURCE_DATE_EPOCH"
+[ "$(git rev-parse HEAD)" = "$source_commit" ] \
+    || fail "checkout does not match ZTERM_SOURCE_COMMIT"
 
 cargo +1.98.0 build --locked --release --package zterm-cli
 binary=target/release/zterm
@@ -53,11 +47,7 @@ binary=target/release/zterm
 
 case "$platform" in
     macos)
-        case "$target" in
-            aarch64-apple-darwin) architecture=arm64 ;;
-            x86_64-apple-darwin) architecture=x86_64 ;;
-        esac
-        file "$binary" | grep -F "$architecture" >/dev/null \
+        file "$binary" | grep -F arm64 >/dev/null \
             || fail "Mach-O architecture does not match $target"
         observed_macos=$(otool -l "$binary" \
             | awk '$1 == "minos" {print $2}' | sort -u)
@@ -83,16 +73,14 @@ case "$platform" in
         ;;
 esac
 
-if [ "$mode" = formal ]; then
-    mkdir -p "$output_dir"
-    candidate="$output_dir/zterm-$target"
-    identity="$output_dir/zterm-$target.identity.json"
-    if [ -e "$candidate" ] || [ -e "$identity" ]; then
-        fail "formal candidate output already exists for $target"
-    fi
-    "$binary" --internal-release-self-check >"$identity"
-    cp "$binary" "$candidate"
-    chmod 700 "$candidate"
+mkdir -p "$output_dir"
+candidate="$output_dir/zterm-$target"
+identity="$output_dir/zterm-$target.identity.json"
+if [ -e "$candidate" ] || [ -e "$identity" ]; then
+    fail "candidate output already exists for $target"
 fi
+"$binary" --internal-release-self-check >"$identity"
+cp "$binary" "$candidate"
+chmod 700 "$candidate"
 
-echo "native $mode build verified for $target"
+echo "native release candidate verified for $target"

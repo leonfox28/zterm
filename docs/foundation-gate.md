@@ -418,9 +418,11 @@ or monitor was introduced.
 
 ## Step 7 platform and aggregate result
 
-The ordinary Rust CI matrix now uses the five current standard hosted labels:
+The historical Foundation Rust CI matrix used five standard hosted labels:
 `macos-latest` (arm64), `macos-15-intel`, `ubuntu-24.04`,
-`ubuntu-24.04-arm`, and `windows-latest`. Every matrix entry runs the source
+`ubuntu-24.04-arm`, and `windows-latest`. Current distribution policy pauses
+Intel macOS and Windows; see [Development environment](development.md).
+At that gate, every matrix entry ran the source
 checkout policy immediately after checkout and before formatting or compiling,
 then executes the same format, Clippy, workspace-test, documentation, and
 side-effect-free CLI sequence. The harness-free PTY/drain tests execute their

@@ -15,10 +15,18 @@ use zeroize::Zeroizing;
 use zterm_core::release::{
     MAX_RELEASE_ARTIFACT_BYTES, MAX_RELEASE_MANIFEST_BYTES, MINIMUM_GLIBC, MINIMUM_MACOS,
     RELEASE_BOOTSTRAP_SCHEMA, RELEASE_KEY_ID, RELEASE_MANIFEST_SCHEMA, RELEASE_ORIGIN,
-    ReleaseArtifact, ReleaseClassification, ReleaseManifest, ReleaseSelfCheck,
-    SUPPORTED_RELEASE_TARGETS, artifact_filename, immutable_asset_url, official_release_public_key,
-    sha256_hex, sha256_reader, validate_unsigned_manifest, verify_official_release_manifest,
+    ReleaseArtifact, ReleaseClassification, ReleaseManifest, ReleaseSelfCheck, artifact_filename,
+    immutable_asset_url, official_release_public_key, sha256_hex, sha256_reader,
+    validate_unsigned_manifest, verify_official_release_manifest,
 };
+
+// Maintainer publication policy only; installed updaters must not depend on this list.
+// Expanding it requires an explicit future task.
+const PUBLISHED_RELEASE_TARGETS: [&str; 3] = [
+    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-gnu",
+];
 use zterm_core::{STATE_SCHEMA_VERSION, WIRE_MAJOR};
 
 const MANIFEST_NAME: &str = "zterm-release.json";
@@ -125,7 +133,7 @@ fn inspect_archive(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Assembles all unsigned assets from four independently built native archives.
+/// Assembles all unsigned assets from the current publication targets' native archives.
 pub fn prepare(
     input: &Path,
     output: &Path,
@@ -148,8 +156,8 @@ pub fn prepare(
     );
     let classification = ReleaseClassification::from_version(&version);
 
-    let mut artifacts = Vec::with_capacity(SUPPORTED_RELEASE_TARGETS.len());
-    for target in SUPPORTED_RELEASE_TARGETS {
+    let mut artifacts = Vec::with_capacity(PUBLISHED_RELEASE_TARGETS.len());
+    for target in PUBLISHED_RELEASE_TARGETS {
         let filename = artifact_filename(target).context("unsupported release target")?;
         let archive_path = input.join(&filename);
         regular_file_metadata(&archive_path, "release archive")?;
@@ -200,7 +208,7 @@ pub fn prepare(
         public_key_id: RELEASE_KEY_ID.to_owned(),
         artifacts,
     };
-    validate_unsigned_manifest(&manifest).context("assembled release manifest is invalid")?;
+    validate_publication_manifest(&manifest)?;
     let raw_manifest =
         serde_json::to_vec(&manifest).context("unable to encode release manifest")?;
     ensure!(
@@ -229,7 +237,7 @@ fn render_installer(
     test_mode: bool,
 ) -> Result<String> {
     let mut cases = String::new();
-    for target in SUPPORTED_RELEASE_TARGETS {
+    for target in PUBLISHED_RELEASE_TARGETS {
         let artifact = manifest
             .artifact_for_target(target)
             .context("release manifest target is missing")?;
@@ -356,11 +364,10 @@ pub fn verify(directory: &Path, signed: bool) -> Result<()> {
         verify_official_release_manifest(&raw_manifest, &signature)
             .context("signed release manifest verification failed")?
     } else {
-        let manifest: ReleaseManifest = serde_json::from_slice(&raw_manifest)
-            .context("unsigned release manifest JSON is invalid")?;
-        validate_unsigned_manifest(&manifest).context("unsigned release manifest is invalid")?;
-        manifest
+        serde_json::from_slice(&raw_manifest)
+            .context("unsigned release manifest JSON is invalid")?
     };
+    validate_publication_manifest(&manifest)?;
 
     ensure!(
         manifest.version == env!("CARGO_PKG_VERSION"),
@@ -391,6 +398,19 @@ pub fn verify(directory: &Path, signed: bool) -> Result<()> {
             "release checksums are incomplete or invalid"
         );
     }
+    Ok(())
+}
+
+fn validate_publication_manifest(manifest: &ReleaseManifest) -> Result<()> {
+    validate_unsigned_manifest(manifest).context("release artifact metadata is invalid")?;
+    ensure!(
+        manifest.artifacts.len() == PUBLISHED_RELEASE_TARGETS.len()
+            && manifest
+                .artifacts
+                .iter()
+                .all(|artifact| { PUBLISHED_RELEASE_TARGETS.contains(&artifact.target.as_str()) }),
+        "release manifest must contain exactly the planned publication targets"
+    );
     Ok(())
 }
 
@@ -436,7 +456,7 @@ fn ensure_inventory(directory: &Path, signed: bool) -> Result<()> {
 
 fn expected_inventory(signed: bool) -> Result<BTreeSet<String>> {
     let mut names = BTreeSet::new();
-    for target in SUPPORTED_RELEASE_TARGETS {
+    for target in PUBLISHED_RELEASE_TARGETS {
         names.insert(artifact_filename(target).context("unsupported release target")?);
     }
     names.insert(MANIFEST_NAME.to_owned());
@@ -757,7 +777,7 @@ mod tests {
 
         assert!(installer.contains(&format!("release_tag='v{}'", env!("CARGO_PKG_VERSION"))));
         assert!(installer.contains("test_mode='0'"));
-        for target in SUPPORTED_RELEASE_TARGETS {
+        for target in PUBLISHED_RELEASE_TARGETS {
             assert!(installer.contains(target));
             assert!(installer.contains(&artifact_filename(target).expect("filename")));
         }
@@ -789,11 +809,32 @@ mod tests {
         assert!(syntax.wait().expect("shell syntax status").success());
     }
 
+    #[test]
+    fn publisher_requires_exactly_its_planned_targets() {
+        let manifest = fixture_manifest();
+        validate_publication_manifest(&manifest).expect("complete planned release");
+
+        let mut missing = manifest.clone();
+        missing.artifacts.pop();
+        assert!(validate_unsigned_manifest(&missing).is_ok());
+        assert!(validate_publication_manifest(&missing).is_err());
+
+        let mut extra = manifest;
+        let mut intel = extra.artifacts[0].clone();
+        intel.target = "x86_64-apple-darwin".to_owned();
+        intel.build.target.clone_from(&intel.target);
+        intel.filename = artifact_filename(&intel.target).expect("archive name");
+        intel.url = immutable_asset_url(&extra.tag, &intel.filename);
+        extra.artifacts.push(intel);
+        assert!(validate_unsigned_manifest(&extra).is_ok());
+        assert!(validate_publication_manifest(&extra).is_err());
+    }
+
     fn fixture_manifest() -> ReleaseManifest {
         let source_commit = "0123456789abcdef0123456789abcdef01234567";
         let version = env!("CARGO_PKG_VERSION");
         let tag = format!("v{version}");
-        let artifacts = SUPPORTED_RELEASE_TARGETS
+        let artifacts = PUBLISHED_RELEASE_TARGETS
             .iter()
             .map(|target| {
                 let filename = artifact_filename(target).expect("filename");

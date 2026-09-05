@@ -27,13 +27,6 @@ pub const MINIMUM_GLIBC: &str = "2.28";
 pub const MINIMUM_MACOS: &str = "13.0";
 /// Official immutable Release asset origin.
 pub const RELEASE_ORIGIN: &str = "https://github.com/leonfox28/zterm/releases";
-/// Four target triples shipped by the first official installer.
-pub const SUPPORTED_RELEASE_TARGETS: [&str; 4] = [
-    "aarch64-apple-darwin",
-    "x86_64-apple-darwin",
-    "aarch64-unknown-linux-gnu",
-    "x86_64-unknown-linux-gnu",
-];
 
 const OFFICIAL_PUBLIC_KEY_HEX: &str = include_str!("../../../release/public-key.hex");
 
@@ -89,8 +82,8 @@ pub struct ReleaseBuildIdentity {
 }
 
 /// One compressed native binary authenticated by a release manifest.
+/// Additional platform-specific fields do not change schema-v1's common fields.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct ReleaseArtifact {
     /// Fixed GitHub Release asset filename.
     pub filename: String,
@@ -136,7 +129,7 @@ pub struct ReleaseManifest {
     pub bootstrap_schema: u32,
     /// Reviewed release verification-key identifier.
     pub public_key_id: String,
-    /// Exact four-target artifact inventory.
+    /// Authenticated target inventory for this release, independent of current publication policy.
     pub artifacts: Vec<ReleaseArtifact>,
 }
 
@@ -177,13 +170,12 @@ impl ReleaseSelfCheck {
         }
     }
 
-    /// Cross-checks this self-check against an authenticated manifest target.
-    pub fn require_manifest(&self, manifest: &ReleaseManifest) -> Result<(), ReleaseError> {
-        if self.schema != RELEASE_MANIFEST_SCHEMA || self.product != "zterm" {
-            return Err(ReleaseError::BuildIdentityMismatch);
-        }
-        let artifact = manifest.artifact_for_target(&self.build.target)?;
-        if artifact.build != self.build {
+    /// Cross-checks this self-check against the updater's authenticated selected artifact.
+    pub fn require_artifact(&self, artifact: &ReleaseArtifact) -> Result<(), ReleaseError> {
+        if self.schema != RELEASE_MANIFEST_SCHEMA
+            || self.product != "zterm"
+            || artifact.build != self.build
+        {
             return Err(ReleaseError::BuildIdentityMismatch);
         }
         Ok(())
@@ -191,12 +183,19 @@ impl ReleaseSelfCheck {
 }
 
 impl ReleaseManifest {
-    /// Returns one exact target entry after the complete manifest is validated.
+    /// Selects and validates the unique requested target; other targets are not inspected.
+    /// The caller must first authenticate the manifest's exact bytes.
     pub fn artifact_for_target(&self, target: &str) -> Result<&ReleaseArtifact, ReleaseError> {
-        self.artifacts
+        let mut matches = self
+            .artifacts
             .iter()
-            .find(|artifact| artifact.target == target)
-            .ok_or(ReleaseError::UnsupportedTarget)
+            .filter(|artifact| artifact.target == target);
+        let artifact = matches.next().ok_or(ReleaseError::UnsupportedTarget)?;
+        if matches.next().is_some() {
+            return Err(ReleaseError::ArtifactInventory);
+        }
+        validate_artifact(self, artifact)?;
+        Ok(artifact)
     }
 
     /// Parses the manifest's validated SemVer.
@@ -274,7 +273,7 @@ pub enum ReleaseError {
     ArtifactDigest,
     /// Platform support floor did not match the release contract.
     PlatformFloor,
-    /// Requested build target is not one of the four official targets.
+    /// Requested build target is not in this authenticated release's inventory.
     UnsupportedTarget,
     /// Candidate binary identity did not match authenticated metadata.
     BuildIdentityMismatch,
@@ -312,7 +311,8 @@ impl fmt::Display for ReleaseError {
 
 impl std::error::Error for ReleaseError {}
 
-/// Verifies the detached signature over exact bytes, then parses and validates schema v1.
+/// Authenticates exact bytes and validates schema-v1 release metadata.
+/// Select and validate the required platform with `artifact_for_target` before use.
 pub fn verify_release_manifest(
     raw_manifest: &[u8],
     signature: &[u8],
@@ -365,9 +365,21 @@ pub fn require_official_distribution_build(
     validate_distribution_build(build)
 }
 
-/// Validates an unsigned manifest before release tooling signs its exact bytes.
+/// Validates every artifact for release authoring, independently of a publication matrix.
+/// Runtime consumers authenticate the manifest and validate only their selected artifact.
 pub fn validate_unsigned_manifest(manifest: &ReleaseManifest) -> Result<(), ReleaseError> {
-    validate_manifest(manifest)
+    validate_manifest(manifest)?;
+    if manifest.artifacts.is_empty() {
+        return Err(ReleaseError::ArtifactInventory);
+    }
+    let mut targets = BTreeSet::new();
+    for artifact in &manifest.artifacts {
+        if !targets.insert(artifact.target.as_str()) {
+            return Err(ReleaseError::ArtifactInventory);
+        }
+        validate_artifact(manifest, artifact)?;
+    }
+    Ok(())
 }
 
 /// Computes canonical lowercase SHA-256 for in-memory bytes.
@@ -399,9 +411,9 @@ pub fn sha256_reader(mut reader: impl Read, maximum: u64) -> Result<(u64, String
     Ok((length, encode_hex(context.finish().as_ref())))
 }
 
-/// Returns the fixed archive filename for one supported target.
+/// Returns the fixed archive filename for one path-safe target identifier.
 pub fn artifact_filename(target: &str) -> Result<String, ReleaseError> {
-    if !SUPPORTED_RELEASE_TARGETS.contains(&target) {
+    if !is_target_identifier(target) {
         return Err(ReleaseError::UnsupportedTarget);
     }
     Ok(format!("zterm-{target}.tar.gz"))
@@ -437,44 +449,35 @@ fn validate_manifest(manifest: &ReleaseManifest) -> Result<(), ReleaseError> {
     if manifest.public_key_id != RELEASE_KEY_ID {
         return Err(ReleaseError::KeyIdentifier);
     }
-    if manifest.artifacts.len() != SUPPORTED_RELEASE_TARGETS.len() {
-        return Err(ReleaseError::ArtifactInventory);
-    }
+    Ok(())
+}
 
-    let mut targets = BTreeSet::new();
-    for artifact in &manifest.artifacts {
-        if !targets.insert(artifact.target.as_str()) {
-            return Err(ReleaseError::ArtifactInventory);
-        }
-        let filename = artifact_filename(&artifact.target)?;
-        if artifact.filename != filename
-            || artifact.url != immutable_asset_url(&manifest.tag, &filename)
-        {
-            return Err(ReleaseError::ArtifactLocation);
-        }
-        if artifact.length == 0 || artifact.length > MAX_RELEASE_ARTIFACT_BYTES {
-            return Err(ReleaseError::ArtifactSize);
-        }
-        if !is_lower_hex(&artifact.sha256, 64) {
-            return Err(ReleaseError::ArtifactDigest);
-        }
-        validate_platform_floor(artifact)?;
-        if artifact.build.version != manifest.version
-            || artifact.build.target != artifact.target
-            || artifact.build.source_commit != manifest.source_commit
-            || artifact.build.wire_major != manifest.wire_major
-            || artifact.build.state_schema != manifest.state_schema
-            || artifact.build.release_key_id != manifest.public_key_id
-            || artifact.build.classification != manifest.classification
-        {
-            return Err(ReleaseError::BuildIdentityMismatch);
-        }
-    }
-    if SUPPORTED_RELEASE_TARGETS
-        .iter()
-        .any(|target| !targets.contains(target))
+fn validate_artifact(
+    manifest: &ReleaseManifest,
+    artifact: &ReleaseArtifact,
+) -> Result<(), ReleaseError> {
+    let filename = artifact_filename(&artifact.target)?;
+    if artifact.filename != filename
+        || artifact.url != immutable_asset_url(&manifest.tag, &filename)
     {
-        return Err(ReleaseError::ArtifactInventory);
+        return Err(ReleaseError::ArtifactLocation);
+    }
+    if artifact.length == 0 || artifact.length > MAX_RELEASE_ARTIFACT_BYTES {
+        return Err(ReleaseError::ArtifactSize);
+    }
+    if !is_lower_hex(&artifact.sha256, 64) {
+        return Err(ReleaseError::ArtifactDigest);
+    }
+    validate_platform_floor(artifact)?;
+    if artifact.build.version != manifest.version
+        || artifact.build.target != artifact.target
+        || artifact.build.source_commit != manifest.source_commit
+        || artifact.build.wire_major != manifest.wire_major
+        || artifact.build.state_schema != manifest.state_schema
+        || artifact.build.release_key_id != manifest.public_key_id
+        || artifact.build.classification != manifest.classification
+    {
+        return Err(ReleaseError::BuildIdentityMismatch);
     }
     Ok(())
 }
@@ -563,7 +566,7 @@ fn validate_distribution_build(build: &crate::BuildIdentity) -> Result<(), Relea
     let version = Version::parse(build.version).map_err(|_| ReleaseError::InvalidVersion)?;
     if build.version != version.to_string()
         || build.phase != crate::PHASE_NAME
-        || !SUPPORTED_RELEASE_TARGETS.contains(&build.target)
+        || !is_target_identifier(build.target)
         || !is_lower_hex(build.source_commit, 40)
         || build.source_commit.bytes().all(|byte| byte == b'0')
         || build.wire_major != crate::WIRE_MAJOR
@@ -575,6 +578,13 @@ fn validate_distribution_build(build: &crate::BuildIdentity) -> Result<(), Relea
         return Err(ReleaseError::BuildIdentityMismatch);
     }
     Ok(())
+}
+
+fn is_target_identifier(target: &str) -> bool {
+    !target.is_empty()
+        && target
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -600,12 +610,18 @@ mod tests {
     use super::*;
 
     const TEST_SEED: [u8; 32] = [7; 32];
+    const HISTORICAL_TARGETS: [&str; 4] = [
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-unknown-linux-gnu",
+    ];
 
     fn fixture() -> ReleaseManifest {
         let version = "0.1.2".to_owned();
         let tag = "v0.1.2".to_owned();
         let source_commit = "0123456789abcdef0123456789abcdef01234567".to_owned();
-        let artifacts = SUPPORTED_RELEASE_TARGETS
+        let artifacts = HISTORICAL_TARGETS
             .iter()
             .map(|target| {
                 let filename = artifact_filename(target).expect("supported target");
@@ -646,7 +662,7 @@ mod tests {
         }
     }
 
-    fn signed(manifest: &ReleaseManifest) -> (Vec<u8>, Vec<u8>, [u8; 32]) {
+    fn signed(manifest: &impl Serialize) -> (Vec<u8>, Vec<u8>, [u8; 32]) {
         let pair = Ed25519KeyPair::from_seed_unchecked(&TEST_SEED).expect("test signing key");
         let raw = serde_json::to_vec(manifest).expect("fixture JSON");
         let signature = pair.sign(&raw).as_ref().to_vec();
@@ -668,13 +684,132 @@ mod tests {
 
         assert_eq!(verified, manifest);
         assert_eq!(
-            verified.artifact_for_target(SUPPORTED_RELEASE_TARGETS[0]),
+            verified.artifact_for_target(HISTORICAL_TARGETS[0]),
             Ok(&verified.artifacts[0])
         );
         assert_eq!(
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn only_the_requested_target_must_be_present() {
+        let historical = fixture();
+        let (raw, signature, public_key) = signed(&historical);
+        assert_eq!(
+            verify_release_manifest(&raw, &signature, &public_key),
+            Ok(historical.clone())
+        );
+
+        let mut current = historical;
+        current
+            .artifacts
+            .retain(|artifact| artifact.target == "aarch64-apple-darwin");
+        let (raw, signature, public_key) = signed(&current);
+        let verified = verify_release_manifest(&raw, &signature, &public_key)
+            .expect("single-target signed manifest");
+        assert_eq!(verified.artifacts.len(), 1);
+        assert_eq!(
+            verified.artifact_for_target("x86_64-apple-darwin"),
+            Err(ReleaseError::UnsupportedTarget)
+        );
+        assert!(verified.artifact_for_target("aarch64-apple-darwin").is_ok());
+
+        current.artifacts.clear();
+        let (raw, signature, public_key) = signed(&current);
+        let verified = verify_release_manifest(&raw, &signature, &public_key)
+            .expect("authenticated release metadata");
+        assert_eq!(
+            verified.artifact_for_target("aarch64-apple-darwin"),
+            Err(ReleaseError::UnsupportedTarget)
+        );
+        assert_eq!(
+            validate_unsigned_manifest(&current),
+            Err(ReleaseError::ArtifactInventory)
+        );
+    }
+
+    #[test]
+    fn unrelated_future_platforms_do_not_affect_the_selected_artifact() {
+        let mut manifest = fixture();
+        for index in 0..4 {
+            let mut future = manifest.artifacts[0].clone();
+            future.target = format!("future-{index}");
+            future.filename = "future.zip".to_owned();
+            future.url = "https://example.invalid/future.zip".to_owned();
+            future.length = 0;
+            future.sha256 = "future-digest-format".to_owned();
+            future.minimum_macos = None;
+            manifest.artifacts.push(future);
+        }
+        let mut document = serde_json::to_value(&manifest).expect("manifest JSON");
+        document["artifacts"][4]["minimum_future_os"] = serde_json::json!("1.0");
+        let (raw, signature, public_key) = signed(&document);
+        let verified = verify_release_manifest(&raw, &signature, &public_key)
+            .expect("platform-independent signed manifest");
+
+        assert_eq!(verified.artifacts.len(), 8);
+        assert_eq!(
+            verified.artifact_for_target("aarch64-apple-darwin"),
+            Ok(&manifest.artifacts[0])
+        );
+        assert!(validate_unsigned_manifest(&verified).is_err());
+    }
+
+    #[test]
+    fn selected_artifact_still_requires_its_location_digest_floor_and_identity() {
+        let manifest = fixture();
+        let mut mismatched_build = manifest.artifacts[0].build.clone();
+        mismatched_build.source_commit = "ff".repeat(20);
+        for (field, value, expected) in [
+            (
+                "url",
+                serde_json::json!("https://example.invalid/zterm.tar.gz"),
+                ReleaseError::ArtifactLocation,
+            ),
+            (
+                "sha256",
+                serde_json::json!("invalid-digest"),
+                ReleaseError::ArtifactDigest,
+            ),
+            (
+                "minimum_macos",
+                serde_json::json!("99.0"),
+                ReleaseError::PlatformFloor,
+            ),
+            (
+                "build",
+                serde_json::to_value(&mismatched_build).expect("build JSON"),
+                ReleaseError::BuildIdentityMismatch,
+            ),
+        ] {
+            let mut document = serde_json::to_value(&manifest).expect("manifest JSON");
+            document["artifacts"][0][field] = value;
+            let (raw, signature, public_key) = signed(&document);
+            let verified = verify_release_manifest(&raw, &signature, &public_key)
+                .expect("authenticated release metadata");
+            assert_eq!(
+                verified.artifact_for_target("aarch64-apple-darwin"),
+                Err(expected),
+                "selected artifact field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_self_check_must_match_the_updaters_selected_platform() {
+        let manifest = fixture();
+        let candidate = ReleaseSelfCheck {
+            schema: RELEASE_MANIFEST_SCHEMA,
+            product: "zterm".to_owned(),
+            build: manifest.artifacts[1].build.clone(),
+        };
+        assert_eq!(
+            candidate.require_artifact(&manifest.artifacts[0]),
+            Err(ReleaseError::BuildIdentityMismatch)
+        );
+        assert_eq!(candidate.require_artifact(&manifest.artifacts[1]), Ok(()));
     }
 
     #[test]
@@ -698,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_prerelease_verifies_and_invalid_version_or_target_is_rejected() {
+    fn explicit_prerelease_verifies_and_invalid_version_is_rejected() {
         let mut prerelease = fixture();
         prerelease.version = "0.2.0-rc.1".to_owned();
         prerelease.tag = "v0.2.0-rc.1".to_owned();
@@ -721,14 +856,6 @@ mod tests {
             verify_release_manifest(&raw, &signature, &public_key),
             Err(ReleaseError::InvalidVersion)
         );
-
-        let mut invalid_target = fixture();
-        invalid_target.artifacts[0].target = "x86_64-unknown-freebsd".to_owned();
-        let (raw, signature, public_key) = signed(&invalid_target);
-        assert_eq!(
-            verify_release_manifest(&raw, &signature, &public_key),
-            Err(ReleaseError::UnsupportedTarget)
-        );
     }
 
     #[test]
@@ -745,7 +872,9 @@ mod tests {
         manifest.artifacts[1].target = manifest.artifacts[0].target.clone();
         let (raw, signature, public_key) = signed(&manifest);
         assert_eq!(
-            verify_release_manifest(&raw, &signature, &public_key),
+            verify_release_manifest(&raw, &signature, &public_key)
+                .expect("authenticated metadata")
+                .artifact_for_target("aarch64-apple-darwin"),
             Err(ReleaseError::ArtifactInventory)
         );
 
@@ -753,7 +882,9 @@ mod tests {
         manifest.artifacts[0].length = MAX_RELEASE_ARTIFACT_BYTES + 1;
         let (raw, signature, public_key) = signed(&manifest);
         assert_eq!(
-            verify_release_manifest(&raw, &signature, &public_key),
+            verify_release_manifest(&raw, &signature, &public_key)
+                .expect("authenticated metadata")
+                .artifact_for_target("aarch64-apple-darwin"),
             Err(ReleaseError::ArtifactSize)
         );
 

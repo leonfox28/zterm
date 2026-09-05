@@ -139,16 +139,29 @@ CI uses the same repository profiles:
 | Hosted owner | Reproduction entry |
 | --- | --- |
 | Policy and portable checks | `just ci-policy` |
-| Four Unix hosts | `just ci-unix <docs> <smoke>` on the matching host |
-| Windows shared boundary | `just ci-windows` on Windows |
+| Three Unix hosts | `just ci-unix <docs> <smoke>` on the matching host |
 | Dependency policy | `just ci-dependencies` |
 | Docker/QEMU relay bundle | `just ci-relay` on Docker-capable Linux |
-| Four main release-readiness targets | `tools/release/build-native.sh readiness` on the exact native/pinned builder |
+| Three main native candidates | `tools/release/build-native.sh <output-directory>` with explicit source identity on the native/pinned builder |
 
 Workspace version and format each run once, docs run on Linux x64, and the
 no-argument CLI smoke runs once per shipped OS family. Source checkout policy
-still runs before compilation in every OS matrix entry, and the first pass
-keeps all existing Unix runtime and Windows shared-boundary tests.
+runs before compilation in every supported OS matrix entry. macOS Intel and
+Windows CI are paused until a future task explicitly restores them.
+
+## Cache ownership
+
+Command caches are keyed by OS/architecture, profile and pinned tool versions,
+independently of the product lockfile. Only main writes these small caches.
+Cargo downloads use lockfile keys with an OS/architecture/toolchain fallback.
+The same download namespace is usable by main candidates and tag publication;
+no compiled PR output becomes a publication input.
+
+PRs only restore compiled dependency caches. Main strips workspace/test outputs
+before saving `target/debug/{deps,build,.fingerprint}` and skips entries larger
+than 1 GiB. Incremental compilation is disabled in CI. The whole `target` tree,
+large test fixtures and release outputs are not cached. Measure restore/save
+and test durations together before changing this policy.
 
 ## Branch and pull-request flow
 
@@ -164,16 +177,17 @@ gh pr create
 CI runs for the pull request, not a duplicate branch-push workflow. Updating
 the branch cancels the older PR-head run. Merge only after the stable `CI gate`
 is green; the resulting `main` push runs the full integration graph plus all
-four exact-SHA release-readiness builds.
+three exact-SHA candidate builds and one unsigned assembly. Tag publication
+reuses that candidate instead of compiling the product again.
 
 The deterministic two-file release-version commit is the narrow exception to
 the local `just check` step: `just release-prepare VERSION` runs focused
-version/lock validation, then its required PR CI owns the complete gate. See
+version/lock validation, in the current feature PR or a standalone release PR;
+its PR CI owns the complete gate. See
 [Release operations](releasing.md) for that path.
 
-After this workflow change is merged, a repository administrator must apply
-the following one-time `main` protection checklist. The repository code does
-not mutate these settings:
+Repository administrators own the following `main` protection settings.
+The release operator checks them and does not mutate them:
 
 1. require changes through a pull request, with zero mandatory outside
    approvals for the solo-maintainer repository;

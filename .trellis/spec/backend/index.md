@@ -8,6 +8,10 @@
 
 This directory contains guidelines for backend development. Fill in each file with your project's specific conventions.
 
+Current CI/distribution scope is macOS arm64 and Linux arm64/x64. Intel macOS,
+Windows CI/distribution, and relay image publication remain paused until an
+explicit future task requests them; see [Distribution](./distribution-lifecycle.md).
+
 ---
 
 ## Guidelines Index

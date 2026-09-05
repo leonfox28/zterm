@@ -54,8 +54,40 @@ case "$command_name" in
     pr)
         pr_command=${1:-}
         case "$pr_command" in
+            view)
+                merge=-
+                if [ -f "$FAKE_STATE_DIR/merge" ]; then merge=$(cat "$FAKE_STATE_DIR/merge"); fi
+                awk -F '\t' -v merge="$merge" \
+                    '{printf "%s\t%s\t%s\t%s\t%s\t%s\n", $2, $5, $4, $6, merge, $3}' \
+                    "$FAKE_STATE_DIR/pr-record"
+                ;;
+            checks) exit 0 ;;
+            merge)
+                expected=
+                previous=
+                for argument in "$@"; do
+                    if [ "$previous" = --match-head-commit ]; then expected=$argument; fi
+                    previous=$argument
+                done
+                head=$(awk -F '\t' '{print $5}' "$FAKE_STATE_DIR/pr-record")
+                [ "$head" = "$expected" ] || exit 1
+                parent=$(git rev-parse refs/remotes/origin/main)
+                merge=$(printf '%s\n' 'Merge fixture PR' \
+                    | git commit-tree "$head^{tree}" -p "$parent" -p "$head")
+                git push --quiet origin "$merge:refs/heads/main"
+                sed 's/OPEN/MERGED/' "$FAKE_STATE_DIR/pr-record" >"$FAKE_STATE_DIR/updated-pr"
+                mv "$FAKE_STATE_DIR/updated-pr" "$FAKE_STATE_DIR/pr-record"
+                printf '%s\n' "$merge" >"$FAKE_STATE_DIR/merge"
+                ;;
             list)
                 if [ -f "$FAKE_STATE_DIR/pr-record" ]; then
+                    if [ "${FAKE_PR_FOLLOWS_REMOTE:-0}" = 1 ]; then
+                        branch=$(awk -F '\t' '{print $3}' "$FAKE_STATE_DIR/pr-record")
+                        head=$(git ls-remote --heads origin "refs/heads/$branch" | awk '{print $1}')
+                        awk -v head="$head" 'BEGIN { FS = OFS = "\t" } { $5 = head; print }' \
+                            "$FAKE_STATE_DIR/pr-record" >"$FAKE_STATE_DIR/updated-pr"
+                        mv "$FAKE_STATE_DIR/updated-pr" "$FAKE_STATE_DIR/pr-record"
+                    fi
                     cat "$FAKE_STATE_DIR/pr-record"
                 fi
                 ;;
@@ -95,13 +127,23 @@ case "$command_name" in
                     printf '%s\n' '123 https://example.invalid/actions/runs/123'
                 fi
                 ;;
+            *'/actions/runs/123/artifacts?'*)
+                if [ "${FAKE_CANDIDATE_MISSING:-0}" != 1 ]; then printf '%s\n' 789; fi
+                ;;
+            *'/actions/runs/123 '*) printf '%s\n' 123 ;;
             *) exit 1 ;;
         esac
         ;;
     run)
         case "${1:-}" in
-            list) printf '%s\n' '456 https://example.invalid/actions/runs/456' ;;
-            watch) exit 0 ;;
+            list)
+                case " $* " in
+                    *'--event pull_request '*) printf '%s\n' '122 https://example.invalid/actions/runs/122' ;;
+                    *'--workflow ci.yml '*) printf '%s\n' '123 https://example.invalid/actions/runs/123' ;;
+                    *) printf '%s\n' '456 https://example.invalid/actions/runs/456' ;;
+                esac
+                ;;
+            watch) [ "${FAKE_WATCH_FAILURE:-}" != "${2:-}" ] ;;
             *) exit 1 ;;
         esac
         ;;
@@ -164,6 +206,8 @@ new_case() {
 }
 
 run_operator() {
+    set -- "$@" sh "$operator" "$operator_command" "$operator_version"
+    if [ "$operator_command" = finish ]; then set -- "$@" 1; fi
     env PATH="$fake_bin:$PATH" \
         REAL_CARGO="$real_cargo" \
         FAKE_TRACE="$case_trace" \
@@ -174,7 +218,7 @@ run_operator() {
         ZTERM_RELEASE_WORKTREE="$case_worktree" \
         ZTERM_RELEASE_POLL_ATTEMPTS=1 \
         ZTERM_RELEASE_POLL_SECONDS=0 \
-        "$@" sh "$operator" "$operator_command" "$operator_version"
+        "$@"
 }
 
 assert_no_remote_tag() {
@@ -461,4 +505,92 @@ fi
 [ "$(grep -Fc 'gh run watch 456 ' "$case_trace")" -eq 1 ] \
     || fail "publish did not watch exactly one formal release run"
 
-echo "two-phase release operator fixture passed without external state"
+published_tag=$(git --git-dir="$case_remote" rev-parse refs/tags/v0.1.9)
+run_operator >"$case_root/resume-stdout" 2>"$case_root/resume-stderr" \
+    || fail "publication could not resume its exact existing tag"
+[ "$(git --git-dir="$case_remote" rev-parse refs/tags/v0.1.9)" = "$published_tag" ] \
+    || fail "publication resume replaced its annotated tag"
+
+new_case missing-candidate
+operator_command=publish
+operator_version=0.1.9
+if run_operator FAKE_CANDIDATE_MISSING=1 >"$case_root/stdout" 2>"$case_root/stderr"; then
+    fail "publication accepted green CI without its exact candidate"
+fi
+assert_no_remote_tag missing-candidate
+
+new_case feature-pr-release
+git -C "$case_worktree" switch --quiet -c fix/one-release-pr
+printf '%s\n' 'reviewed product fix' >"$case_worktree/fix.txt"
+git -C "$case_worktree" add fix.txt
+git -C "$case_worktree" commit --quiet -m 'fix: reviewed product behavior'
+operator_command=prepare
+operator_version=0.1.10
+run_operator >"$case_root/prepare-stdout" 2>"$case_root/prepare-stderr" \
+    || fail "version could not be prepared in the existing feature branch"
+[ "$(git -C "$case_worktree" branch --show-current)" = fix/one-release-pr ] \
+    || fail "preparation created a second release branch"
+if git --git-dir="$case_remote" show-ref --verify --quiet refs/heads/release/v0.1.10; then
+    fail "feature preparation pushed a competing version branch"
+fi
+grep -Fq 'gh pr create --repo fixture/zterm --base main --head fix/one-release-pr --fill' \
+    "$case_trace" || fail "feature PR did not retain its product change description"
+assert_no_remote_tag feature-pr-release
+
+operator_command=finish
+reviewed_pr_record=$(cat "$case_state/pr-record")
+awk -v head="$(git -C "$case_worktree" rev-parse HEAD^)" \
+    'BEGIN { FS = OFS = "\t" } { $5 = head; print }' \
+    "$case_state/pr-record" >"$case_state/updated-pr"
+mv "$case_state/updated-pr" "$case_state/pr-record"
+if run_operator >"$case_root/mismatch-stdout" 2>"$case_root/mismatch-stderr"; then
+    fail "finish accepted a PR head different from the reviewed checkout"
+fi
+if grep -Fq 'gh pr merge ' "$case_trace"; then
+    fail "finish tried to merge an unreviewed PR head"
+fi
+printf '%s\n' "$reviewed_pr_record" >"$case_state/pr-record"
+if run_operator FAKE_WATCH_FAILURE=123 >"$case_root/failed-stdout" 2>"$case_root/failed-stderr"; then
+    fail "finish ignored failed main CI"
+fi
+assert_no_remote_tag failed-main-after-merge
+[ "$(grep -Fc 'gh pr merge ' "$case_trace")" -eq 1 ] \
+    || fail "finish did not merge the reviewed head once"
+if ! run_operator >"$case_root/finish-stdout" 2>"$case_root/finish-stderr"; then
+    cat "$case_root/finish-stderr" >&2
+    fail "finish could not resume from the merged PR"
+fi
+[ "$(git --git-dir="$case_remote" rev-list -n 1 v0.1.10)" = "$(cat "$case_state/merge")" ] \
+    || fail "finish tagged a source other than the PR merge commit"
+[ "$(git -C "$case_worktree" branch --show-current)" = fix/one-release-pr ] \
+    || fail "finish switched the caller's branch"
+[ "$(git -C "$case_worktree" worktree list --porcelain | grep -c '^worktree ')" -eq 1 ] \
+    || fail "finish leaked its private checkout"
+run_operator >"$case_root/finished-stdout" 2>"$case_root/finished-stderr" \
+    || fail "completed release could not be rejoined"
+[ "$(grep -Fc 'gh pr merge ' "$case_trace")" -eq 1 ] \
+    || fail "finish resume merged a second time"
+
+new_case already-open-feature-pr
+git -C "$case_worktree" switch --quiet -c fix/open-pr
+printf '%s\n' 'reviewed product fix' >"$case_worktree/fix.txt"
+git -C "$case_worktree" add fix.txt
+git -C "$case_worktree" commit --quiet -m 'fix: reviewed product behavior'
+git -C "$case_worktree" push --quiet --set-upstream origin fix/open-pr
+feature_head=$(git -C "$case_worktree" rev-parse HEAD)
+printf 'https://example.invalid/pull/1\tOPEN\tfix/open-pr\tmain\t%s\tfalse\n' \
+    "$feature_head" >"$case_state/pr-record"
+operator_command=prepare
+operator_version=0.1.10
+run_operator FAKE_PR_FOLLOWS_REMOTE=1 >"$case_root/stdout" 2>"$case_root/stderr" \
+    || fail "could not append version preparation to an already open feature PR"
+[ "$(git --git-dir="$case_remote" rev-parse refs/heads/fix/open-pr)" = "$(git -C "$case_worktree" rev-parse HEAD)" ] \
+    || fail "existing feature PR did not receive the version commit"
+[ "$(git -C "$case_worktree" rev-parse HEAD^)" = "$feature_head" ] \
+    || fail "version preparation rewrote the existing feature history"
+if grep -Fq 'gh pr create ' "$case_trace"; then
+    fail "version preparation created a second PR"
+fi
+assert_no_remote_tag already-open-feature-pr
+
+echo "release operator prepare, finish, and recovery fixtures passed without external state"

@@ -137,6 +137,8 @@ pub enum DistributionError {
     Candidate,
     /// Candidate is not newer than the running CLI.
     NotNewer,
+    /// This release has no supported artifact for the current platform.
+    UnsupportedTarget,
     /// A local private staging operation failed.
     Staging,
 }
@@ -153,6 +155,9 @@ impl fmt::Display for DistributionError {
             Self::Archive => "release archive inventory is invalid",
             Self::Candidate => "release candidate self-check failed",
             Self::NotNewer => "release candidate is not newer than this zterm binary",
+            Self::UnsupportedTarget => {
+                "this release has no supported update package for this platform"
+            }
             Self::Staging => "unable to stage the verified release candidate",
         })
     }
@@ -173,6 +178,7 @@ impl From<DistributionError> for DaemonError {
             | DistributionError::Candidate => DomainErrorKind::ReleaseArtifactInvalid,
             DistributionError::Fetch => DomainErrorKind::ReleaseUnavailable,
             DistributionError::NotNewer => DomainErrorKind::UpdateRejected,
+            DistributionError::UnsupportedTarget => DomainErrorKind::UnsupportedPlatform,
             DistributionError::Staging => DomainErrorKind::PathUnsafe,
         };
         Self::new(kind, error.to_string())
@@ -306,10 +312,13 @@ pub(crate) fn verify_activated_candidate(
     candidate: &Path,
     manifest: &ReleaseManifest,
 ) -> Result<(), DaemonError> {
+    let artifact = manifest
+        .artifact_for_target(BuildIdentity::current().target)
+        .map_err(map_release_error)?;
     run_candidate_self_check(candidate)
         .and_then(|self_check| {
             self_check
-                .require_manifest(manifest)
+                .require_artifact(artifact)
                 .map_err(map_release_error)
         })
         .map_err(Into::into)
@@ -429,7 +438,7 @@ fn prepare_with(
     write_private(&signature_path, &signature)?;
     let self_check = run_candidate_self_check(&candidate)?;
     self_check
-        .require_manifest(&manifest)
+        .require_artifact(&artifact)
         .map_err(map_release_error)?;
     run_candidate_verification(&candidate, &manifest_path, &signature_path)?;
 
@@ -597,6 +606,7 @@ fn map_release_error(error: ReleaseError) -> DistributionError {
         | ReleaseError::ArtifactDigest
         | ReleaseError::ArtifactLocation => DistributionError::Artifact,
         ReleaseError::NotNewer => DistributionError::NotNewer,
+        ReleaseError::UnsupportedTarget => DistributionError::UnsupportedTarget,
         ReleaseError::DigestRead => DistributionError::Artifact,
         ReleaseError::ManifestSize
         | ReleaseError::ManifestSyntax
@@ -607,7 +617,6 @@ fn map_release_error(error: ReleaseError) -> DistributionError {
         | ReleaseError::KeyIdentifier
         | ReleaseError::ArtifactInventory
         | ReleaseError::PlatformFloor
-        | ReleaseError::UnsupportedTarget
         | ReleaseError::BuildIdentityMismatch => DistributionError::Manifest,
     }
 }
@@ -619,8 +628,7 @@ mod tests {
     use ring::signature::{Ed25519KeyPair, KeyPair};
     use zterm_core::release::{
         MINIMUM_GLIBC, MINIMUM_MACOS, RELEASE_BOOTSTRAP_SCHEMA, RELEASE_KEY_ID,
-        RELEASE_MANIFEST_SCHEMA, ReleaseBuildIdentity, SUPPORTED_RELEASE_TARGETS,
-        artifact_filename, immutable_asset_url,
+        RELEASE_MANIFEST_SCHEMA, ReleaseBuildIdentity, artifact_filename, immutable_asset_url,
     };
 
     use super::*;
@@ -686,7 +694,6 @@ mod tests {
     ) {
         let temporary = tempfile::tempdir().expect("fixture root");
         let target = BuildIdentity::current().target;
-        assert!(SUPPORTED_RELEASE_TARGETS.contains(&target));
         let version = "9.1.0";
         let tag = "v9.1.0";
         let source_commit = "0123456789abcdef0123456789abcdef01234567";
@@ -697,37 +704,21 @@ mod tests {
             build: selected_build.clone(),
         };
         let archive = archive_for(&self_check, &temporary.path().join("candidate-ran"));
-        let mut artifacts = Vec::new();
-        for item_target in SUPPORTED_RELEASE_TARGETS {
-            let filename = artifact_filename(item_target).expect("supported target");
-            let selected = item_target == target;
-            artifacts.push(ReleaseArtifact {
-                filename: filename.clone(),
-                target: item_target.to_owned(),
-                url: immutable_asset_url(tag, &filename),
-                length: if selected {
-                    u64::try_from(archive.len()).expect("archive length")
-                } else {
-                    1
-                },
-                sha256: if selected {
-                    sha256_hex(&archive)
-                } else {
-                    "11".repeat(32)
-                },
-                minimum_macos: item_target
-                    .ends_with("apple-darwin")
-                    .then(|| MINIMUM_MACOS.to_owned()),
-                minimum_glibc: item_target
-                    .ends_with("unknown-linux-gnu")
-                    .then(|| MINIMUM_GLIBC.to_owned()),
-                build: if selected {
-                    selected_build.clone()
-                } else {
-                    build_identity(version, item_target, source_commit)
-                },
-            });
-        }
+        let filename = artifact_filename(target).expect("host target");
+        let artifacts = vec![ReleaseArtifact {
+            filename: filename.clone(),
+            target: target.to_owned(),
+            url: immutable_asset_url(tag, &filename),
+            length: u64::try_from(archive.len()).expect("archive length"),
+            sha256: sha256_hex(&archive),
+            minimum_macos: target
+                .ends_with("apple-darwin")
+                .then(|| MINIMUM_MACOS.to_owned()),
+            minimum_glibc: target
+                .ends_with("unknown-linux-gnu")
+                .then(|| MINIMUM_GLIBC.to_owned()),
+            build: selected_build,
+        }];
         let manifest = ReleaseManifest {
             schema: RELEASE_MANIFEST_SCHEMA,
             product: "zterm".to_owned(),
@@ -791,6 +782,40 @@ mod tests {
         assert_eq!(prepared.version(), "9.1.0");
         assert_eq!(prepared.target(), BuildIdentity::current().target);
         assert!(temporary.path().join("candidate-ran").exists());
+    }
+
+    #[test]
+    fn unrelated_targets_do_not_block_update_but_missing_host_target_does() {
+        for include_host in [true, false] {
+            let (mut fetcher, selection, public_key, current, temporary) = fixture();
+            let manifest_url = selection.asset_url(MANIFEST_ASSET);
+            let mut manifest: ReleaseManifest =
+                serde_json::from_slice(&fetcher.0[&manifest_url]).expect("fixture manifest");
+            let mut unrelated = manifest.artifacts[0].clone();
+            unrelated.target = "unknown-future-platform".to_owned();
+            unrelated.url = "https://example.invalid/unavailable".to_owned();
+            unrelated.length = 0;
+            if !include_host {
+                manifest.artifacts.clear();
+            }
+            manifest.artifacts.push(unrelated);
+            let raw = serde_json::to_vec(&manifest).expect("manifest JSON");
+            let pair = Ed25519KeyPair::from_seed_unchecked(&[8; 32]).expect("fixture key");
+            let signature = pair.sign(&raw).as_ref().to_vec();
+            fetcher.0.insert(manifest_url, raw);
+            fetcher
+                .0
+                .insert(selection.asset_url(SIGNATURE_ASSET), signature);
+
+            let result = prepare_with(&fetcher, &selection, &public_key, current);
+            if include_host {
+                assert_eq!(result.expect("host-only update").version(), "9.1.0");
+                assert!(temporary.path().join("candidate-ran").exists());
+            } else {
+                assert!(matches!(result, Err(DistributionError::UnsupportedTarget)));
+                assert!(!temporary.path().join("candidate-ran").exists());
+            }
+        }
     }
 
     #[test]
