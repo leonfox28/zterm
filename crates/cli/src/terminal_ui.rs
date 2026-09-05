@@ -1413,10 +1413,6 @@ mod unix {
         last_submitted: TerminalSize,
     }
 
-    fn delta_acknowledges_existing_sync(state: TerminalViewTransportState) -> bool {
-        state == TerminalViewTransportState::Synchronizing
-    }
-
     impl ResizeCoalescer {
         const fn new(initial_size: TerminalSize) -> Self {
             Self {
@@ -2119,7 +2115,7 @@ mod unix {
             metrics: Option<TerminalScrollMetrics>,
             live_layout: Option<ChromeLayout>,
         ) -> ViewportDeltaPlan {
-            debug_assert_eq!(self.is_live(), live_layout.is_some());
+            debug_assert!(!self.is_history() || live_layout.is_none());
             let content_size = live_layout.map_or(self.content_size, |layout| layout.child);
             let gutter_column =
                 live_layout.map_or(self.gutter_column, |layout| layout.gutter_column);
@@ -2990,25 +2986,74 @@ mod unix {
         surface: &mut AttachmentSurface,
         presenter: &mut DesktopPresenter,
         snapshot: &TerminalSurfaceSnapshot,
-        viewport: &ViewportController,
+        viewport: &mut ViewportController,
+        status: &StatusRenderer,
+        transport_state: TerminalViewTransportState,
+    ) -> Result<(), CliError> {
+        let stdout = io::stdout();
+        let mut output = stdout.lock();
+        install_snapshot_with_writer(
+            &mut output,
+            surface,
+            presenter,
+            snapshot,
+            viewport,
+            status,
+            transport_state,
+        )
+    }
+
+    fn install_snapshot_with_writer(
+        writer: &mut impl Write,
+        surface: &mut AttachmentSurface,
+        presenter: &mut DesktopPresenter,
+        snapshot: &TerminalSurfaceSnapshot,
+        viewport: &mut ViewportController,
         status: &StatusRenderer,
         transport_state: TerminalViewTransportState,
     ) -> Result<(), CliError> {
         let candidate = AttachmentSurface::from_snapshot(snapshot)?;
-        let stdout = io::stdout();
-        let mut output = stdout.lock();
-        present_surface_with_writer(
-            &mut output,
-            &candidate,
-            presenter,
-            viewport,
-            status,
-            transport_state,
-        )?;
+        let layout = ChromeLayout::new(
+            status.physical_size,
+            viewport.effective_screen(candidate.active_screen()),
+        );
+        // ResumePending fences input, but its replacement frame must already
+        // contain live cells. Background sync of pinned history keeps its view.
+        let desired = if viewport.is_history() {
+            ComposedFrame::compose(
+                &candidate.surface,
+                presenter.baseline.as_ref(),
+                viewport,
+                status,
+                transport_state,
+            )?
+        } else {
+            ComposedFrame::compose_live_candidate(
+                &candidate.surface,
+                presenter.baseline.as_ref(),
+                viewport,
+                LiveViewportProjection::new(
+                    layout.child,
+                    layout.gutter_column,
+                    snapshot.surface.scroll_metrics,
+                ),
+                status,
+                transport_state,
+            )?
+        };
+        let source = viewport.is_live().then_some(SelectionSourceIdentity::Live {
+            revision: candidate.revision(),
+            screen: candidate.active_screen(),
+            viewport: layout.child,
+        });
+        presenter.present(writer, desired, source)?;
+        viewport.set_layout(layout);
+        viewport.observe_snapshot(snapshot.surface.scroll_metrics);
         *surface = candidate;
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn apply_delta_stdout(
         surface: &mut AttachmentSurface,
         presenter: &mut DesktopPresenter,
@@ -3017,6 +3062,7 @@ mod unix {
         selection: &mut SelectionController,
         status: &StatusRenderer,
         transport_state: TerminalViewTransportState,
+        resume_barrier: bool,
     ) -> Result<DeltaRender, CliError> {
         let stdout = io::stdout();
         let mut output = stdout.lock();
@@ -3029,6 +3075,7 @@ mod unix {
             selection,
             status,
             transport_state,
+            resume_barrier,
         )
     }
 
@@ -3042,11 +3089,12 @@ mod unix {
         selection: &mut SelectionController,
         status: &StatusRenderer,
         transport_state: TerminalViewTransportState,
+        resume_barrier: bool,
     ) -> Result<DeltaRender, CliError> {
         let Some(candidate) = surface.candidate_after_delta(delta)? else {
             return Ok(DeltaRender::Gap);
         };
-        let render_live = viewport.is_live();
+        let render_live = viewport.is_live() || (resume_barrier && viewport.is_resume_pending());
         let live_layout =
             render_live.then(|| ChromeLayout::new(status.physical_size, candidate.active_screen()));
         let viewport_plan = viewport.preview_delta(&candidate, delta.scroll_metrics, live_layout);
@@ -3084,6 +3132,9 @@ mod unix {
         }
 
         viewport.commit_delta(viewport_plan);
+        if resume_barrier {
+            viewport.observe_snapshot(candidate.surface.scroll_metrics);
+        }
         *selection = candidate_selection;
         *surface = candidate;
         Ok(DeltaRender::Applied)
@@ -3155,11 +3206,10 @@ mod unix {
         viewport: &ViewportController,
         status: &StatusRenderer,
         transport_state: TerminalViewTransportState,
-        resumed_from_snapshot: bool,
     ) -> Result<bool, CliError> {
         let resume_sync_is_visually_unchanged = viewport.is_resume_pending()
             && transport_state == TerminalViewTransportState::Synchronizing;
-        if resumed_from_snapshot || resume_sync_is_visually_unchanged {
+        if resume_sync_is_visually_unchanged {
             return Ok(false);
         }
         present_surface_with_writer(
@@ -3169,8 +3219,7 @@ mod unix {
             viewport,
             status,
             transport_state,
-        )?;
-        Ok(true)
+        )
     }
 
     fn present_transport_transition_stdout(
@@ -3179,7 +3228,6 @@ mod unix {
         viewport: &ViewportController,
         status: &StatusRenderer,
         transport_state: TerminalViewTransportState,
-        resumed_from_snapshot: bool,
     ) -> Result<bool, CliError> {
         let stdout = io::stdout();
         let mut output = stdout.lock();
@@ -3190,7 +3238,6 @@ mod unix {
             viewport,
             status,
             transport_state,
-            resumed_from_snapshot,
         )
     }
 
@@ -3705,6 +3752,315 @@ mod unix {
             ));
         }
 
+        #[test]
+        fn resume_snapshot_presents_all_live_rows_before_activation_or_more_input() {
+            for route in [TerminalViewRoute::Local, TerminalViewRoute::Remote] {
+                for new_output in [false, true] {
+                    let physical = TerminalSize::new(5, 24);
+                    let layout = ChromeLayout::new(physical, ActiveScreen::Main);
+                    let mut snapshot =
+                        test_snapshot(layout.child, ActiveScreen::Main, Revision::new(2));
+                    for (index, row) in snapshot.surface.rows.iter_mut().enumerate() {
+                        *row = test_row(
+                            layout.child.columns,
+                            &format!("live-{index}"),
+                            TerminalStyle::default(),
+                        );
+                    }
+                    let mut surface = AttachmentSurface::from_snapshot(&snapshot)
+                        .expect("resume presentation fixture succeeds");
+                    let mut viewport =
+                        ViewportController::with_layout(layout, snapshot.surface.scroll_metrics);
+                    let status = StatusRenderer::new(
+                        TerminalViewTarget::for_display("peer", route),
+                        physical,
+                    );
+                    let mut presenter = DesktopPresenter::default();
+                    let mut output = ViewportFrameWriter::default();
+                    install_test_history_window(&mut viewport);
+                    let _ = viewport.navigate(true, 1);
+                    present_surface_with_writer(
+                        &mut output,
+                        &surface,
+                        &mut presenter,
+                        &viewport,
+                        &status,
+                        TerminalViewTransportState::Active,
+                    )
+                    .expect("resume presentation fixture succeeds");
+                    viewport.observe_presentation();
+                    let history = presenter
+                        .baseline
+                        .clone()
+                        .expect("resume presentation fixture succeeds");
+                    assert!(matches!(
+                        viewport.navigate(false, 2),
+                        ViewportEffect::Resume
+                    ));
+                    viewport
+                        .retain_resume_input(b"\x1b[200~retained paste\x1b[201~")
+                        .expect("resume presentation fixture succeeds");
+                    viewport.observe_sync_required();
+                    assert!(
+                        !present_transport_transition_with_writer(
+                            &mut output,
+                            &surface,
+                            &mut presenter,
+                            &viewport,
+                            &status,
+                            TerminalViewTransportState::Synchronizing
+                        )
+                        .expect("resume presentation fixture succeeds")
+                    );
+                    assert_eq!(presenter.baseline.as_ref(), Some(&history));
+                    if new_output {
+                        snapshot.revision = Revision::new(3);
+                        snapshot
+                            .surface
+                            .scroll_metrics
+                            .as_mut()
+                            .expect("resume presentation fixture succeeds")
+                            .revision = snapshot.revision;
+                        for row in 2..4 {
+                            snapshot.surface.rows[row] = test_row(
+                                layout.child.columns,
+                                &format!("new-tail-{row}"),
+                                TerminalStyle::default(),
+                            );
+                        }
+                    }
+                    install_snapshot_with_writer(
+                        &mut output,
+                        &mut surface,
+                        &mut presenter,
+                        &snapshot,
+                        &mut viewport,
+                        &status,
+                        TerminalViewTransportState::Synchronizing,
+                    )
+                    .expect("resume presentation fixture succeeds");
+                    viewport.observe_presentation();
+                    assert!(
+                        viewport.is_resume_pending(),
+                        "painting live must not release input"
+                    );
+                    for row in 0..layout.child.rows {
+                        assert_eq!(
+                            presenter
+                                .baseline
+                                .as_ref()
+                                .expect("resume presentation fixture succeeds")
+                                .rows[&row][..usize::from(layout.child.columns)],
+                            snapshot.surface.rows[usize::from(row)].cells,
+                            "route={route:?} new_output={new_output} row={row}"
+                        );
+                    }
+                    assert_eq!(
+                        viewport
+                            .scroll_metrics()
+                            .expect("resume presentation fixture succeeds")
+                            .offset_from_bottom,
+                        0
+                    );
+                    assert!(
+                        !presenter
+                            .baseline
+                            .as_ref()
+                            .expect("resume presentation fixture succeeds")
+                            .cursor
+                            .visible
+                    );
+                    assert_eq!(
+                        viewport.finish_resume(),
+                        Some(b"\x1b[200~retained paste\x1b[201~".to_vec())
+                    );
+                    assert_eq!(
+                        viewport.finish_resume(),
+                        None,
+                        "retained input is released once"
+                    );
+                    assert!(
+                        present_transport_transition_with_writer(
+                            &mut output,
+                            &surface,
+                            &mut presenter,
+                            &viewport,
+                            &status,
+                            TerminalViewTransportState::Active
+                        )
+                        .expect("resume presentation fixture succeeds"),
+                        "Active must restore the live cursor"
+                    );
+                    assert!(
+                        presenter
+                            .baseline
+                            .as_ref()
+                            .expect("resume presentation fixture succeeds")
+                            .cursor
+                            .visible
+                    );
+                    let expected = ComposedFrame::compose(
+                        &surface.surface,
+                        presenter.baseline.as_ref(),
+                        &viewport,
+                        &status,
+                        TerminalViewTransportState::Active,
+                    )
+                    .expect("resume presentation fixture succeeds");
+                    assert_eq!(presenter.baseline.as_ref(), Some(&expected));
+                    let writes = output.writes;
+                    assert!(
+                        !present_transport_transition_with_writer(
+                            &mut output,
+                            &surface,
+                            &mut presenter,
+                            &viewport,
+                            &status,
+                            TerminalViewTransportState::Active
+                        )
+                        .expect("resume presentation fixture succeeds")
+                    );
+                    assert_eq!(output.writes, writes, "identical desired frames do no I/O");
+                }
+            }
+        }
+
+        #[test]
+        fn snapshot_flush_failure_keeps_resume_surface_layout_and_input_uncommitted() {
+            struct FlushFailure;
+            impl Write for FlushFailure {
+                fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                    Ok(bytes.len())
+                }
+                fn flush(&mut self) -> io::Result<()> {
+                    Err(io::Error::other("snapshot flush failure"))
+                }
+            }
+            let physical = TerminalSize::new(5, 24);
+            let layout = ChromeLayout::new(physical, ActiveScreen::Main);
+            let snapshot = test_snapshot(layout.child, ActiveScreen::Main, Revision::new(2));
+            let mut surface = AttachmentSurface::from_snapshot(&snapshot)
+                .expect("resume presentation fixture succeeds");
+            let mut viewport =
+                ViewportController::with_layout(layout, snapshot.surface.scroll_metrics);
+            let status = StatusRenderer::new(
+                TerminalViewTarget::for_display("local", TerminalViewRoute::Local),
+                physical,
+            );
+            let mut presenter = DesktopPresenter::default();
+            let mut output = ViewportFrameWriter::default();
+            install_test_history_window(&mut viewport);
+            present_surface_with_writer(
+                &mut output,
+                &surface,
+                &mut presenter,
+                &viewport,
+                &status,
+                TerminalViewTransportState::Active,
+            )
+            .expect("resume presentation fixture succeeds");
+            viewport.observe_presentation();
+            viewport
+                .begin_resume(b"retained".to_vec())
+                .expect("resume presentation fixture succeeds");
+            let metrics = viewport.scroll_metrics();
+            let anchor = viewport.window_cache.anchor();
+            let replacement = test_snapshot(
+                ChromeLayout::new(physical, ActiveScreen::Alternate).child,
+                ActiveScreen::Alternate,
+                Revision::new(3),
+            );
+            assert!(
+                install_snapshot_with_writer(
+                    &mut FlushFailure,
+                    &mut surface,
+                    &mut presenter,
+                    &replacement,
+                    &mut viewport,
+                    &status,
+                    TerminalViewTransportState::Synchronizing
+                )
+                .is_err()
+            );
+            assert_eq!(surface.revision(), snapshot.revision);
+            assert_eq!(viewport.content_size(), layout.child);
+            assert_eq!(viewport.gutter_column, layout.gutter_column);
+            assert_eq!(viewport.scroll_metrics(), metrics);
+            assert_eq!(viewport.window_cache.anchor(), anchor);
+            assert_eq!(viewport.finish_resume(), None);
+            assert!(presenter.baseline.is_none());
+            install_snapshot_with_writer(
+                &mut output,
+                &mut surface,
+                &mut presenter,
+                &replacement,
+                &mut viewport,
+                &status,
+                TerminalViewTransportState::Synchronizing,
+            )
+            .expect("resume presentation fixture succeeds");
+            assert_eq!(viewport.finish_resume(), Some(b"retained".to_vec()));
+            assert_eq!(viewport.gutter_column, None);
+        }
+
+        #[test]
+        fn background_snapshot_preserves_pinned_history_cells() {
+            let physical = TerminalSize::new(5, 24);
+            let layout = ChromeLayout::new(physical, ActiveScreen::Main);
+            let snapshot = test_snapshot(layout.child, ActiveScreen::Main, Revision::new(2));
+            let mut surface = AttachmentSurface::from_snapshot(&snapshot)
+                .expect("resume presentation fixture succeeds");
+            let mut viewport =
+                ViewportController::with_layout(layout, snapshot.surface.scroll_metrics);
+            let status = StatusRenderer::new(
+                TerminalViewTarget::for_display("local", TerminalViewRoute::Local),
+                physical,
+            );
+            let mut presenter = DesktopPresenter::default();
+            let mut output = ViewportFrameWriter::default();
+            install_test_history_window(&mut viewport);
+            present_surface_with_writer(
+                &mut output,
+                &surface,
+                &mut presenter,
+                &viewport,
+                &status,
+                TerminalViewTransportState::Active,
+            )
+            .expect("resume presentation fixture succeeds");
+            viewport.observe_presentation();
+            let history = presenter
+                .baseline
+                .as_ref()
+                .expect("resume presentation fixture succeeds")
+                .rows
+                .clone();
+            viewport.observe_sync_required();
+            let replacement = test_snapshot(layout.child, ActiveScreen::Main, Revision::new(3));
+            install_snapshot_with_writer(
+                &mut output,
+                &mut surface,
+                &mut presenter,
+                &replacement,
+                &mut viewport,
+                &status,
+                TerminalViewTransportState::Synchronizing,
+            )
+            .expect("resume presentation fixture succeeds");
+            assert!(viewport.is_history());
+            for row in 0..layout.child.rows {
+                assert_eq!(
+                    presenter
+                        .baseline
+                        .as_ref()
+                        .expect("resume presentation fixture succeeds")
+                        .rows[&row],
+                    history[&row]
+                );
+            }
+            assert_eq!(surface.revision(), replacement.revision);
+        }
+
         fn finalize_test_selection(
             surface: &AttachmentSurface,
             viewport: &mut ViewportController,
@@ -3765,34 +4121,6 @@ mod unix {
             assert_eq!(
                 coalescer.enter_transport_state(TerminalViewTransportState::Active),
                 (TerminalViewTransportState::Active, None)
-            );
-        }
-
-        #[test]
-        fn delta_acknowledgement_uses_event_entry_state_before_mode_resize() {
-            assert!(delta_acknowledges_existing_sync(
-                TerminalViewTransportState::Synchronizing
-            ));
-            assert!(!delta_acknowledges_existing_sync(
-                TerminalViewTransportState::Active
-            ));
-            assert!(!delta_acknowledges_existing_sync(
-                TerminalViewTransportState::Preparing
-            ));
-            assert!(!delta_acknowledges_existing_sync(
-                TerminalViewTransportState::Reconnecting
-            ));
-
-            let main = TerminalSize::new(23, 79);
-            let alternate = TerminalSize::new(23, 80);
-            let mut coalescer = ResizeCoalescer::new(main);
-            let entry_state = TerminalViewTransportState::Active;
-            assert_eq!(coalescer.observe(alternate, entry_state), Some(alternate));
-            let post_resize_state = TerminalViewTransportState::Synchronizing;
-            assert_eq!(post_resize_state, TerminalViewTransportState::Synchronizing);
-            assert!(
-                !delta_acknowledges_existing_sync(entry_state),
-                "the delta that starts a resize epoch must not acknowledge that new epoch"
             );
         }
 
@@ -4471,6 +4799,7 @@ mod unix {
                     &mut selection,
                     &status,
                     TerminalViewTransportState::Active,
+                    false,
                 )
                 .expect("apply hidden history delta"),
                 DeltaRender::Applied
@@ -4535,6 +4864,7 @@ mod unix {
                     &mut selection,
                     &status,
                     TerminalViewTransportState::Active,
+                    false,
                 )
                 .expect("restore child legacy mode behind history"),
                 DeltaRender::Applied
@@ -4592,6 +4922,7 @@ mod unix {
                     &mut selection,
                     &status,
                     TerminalViewTransportState::Active,
+                    false,
                 )
                 .expect("install routed-only child modes behind history"),
                 DeltaRender::Applied
@@ -4712,6 +5043,7 @@ mod unix {
                         &mut selection,
                         &status,
                         TerminalViewTransportState::Active,
+                        false,
                     )
                     .unwrap_or_else(|error| panic!("{case} delta failed: {error}")),
                     DeltaRender::Applied
@@ -4867,6 +5199,7 @@ mod unix {
                     &mut selection,
                     &status,
                     TerminalViewTransportState::Active,
+                    false,
                 )
                 .expect_err("failed physical mode commit rejects every candidate state");
                 assert!(error.to_string().contains(match point {
@@ -4997,6 +5330,7 @@ mod unix {
                 &mut selection,
                 &status,
                 TerminalViewTransportState::Active,
+                false,
             )
             .expect_err("failed live frame rejects every candidate state");
             assert!(

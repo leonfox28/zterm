@@ -150,6 +150,7 @@ async fn unary_mutations_and_duplex_reconnect_share_one_live_registry() -> Resul
             .await
             .map_err(|error| format!("natural-exit attachment event failed: {error}"))?
         {
+            LocalAttachmentEvent::ResumeDelta(_) => panic!("a local attachment cannot resume"),
             LocalAttachmentEvent::Delta(delta) => {
                 saw_final_output |= semantic_delta_contains(&delta, b"SOCKET-FINAL-MARKER");
             }
@@ -201,6 +202,7 @@ async fn unary_mutations_and_duplex_reconnect_share_one_live_registry() -> Resul
             .map_err(|error| format!("daemon-stop attachment event failed: {error}"))?
         {
             LocalAttachmentEvent::Snapshot(_)
+            | LocalAttachmentEvent::ResumeDelta(_)
             | LocalAttachmentEvent::Delta(_)
             | LocalAttachmentEvent::SyncRequired(_)
             | LocalAttachmentEvent::TransportState(_)
@@ -418,7 +420,8 @@ async fn takeover_response_loss_reconnects_with_input_authority_while_old_stream
                 assert_eq!(summary.session_id, session_id);
                 break;
             }
-            LocalAttachmentEvent::Delta(_)
+            LocalAttachmentEvent::ResumeDelta(_)
+            | LocalAttachmentEvent::Delta(_)
             | LocalAttachmentEvent::Snapshot(_)
             | LocalAttachmentEvent::SyncRequired(_) => {}
             event => return Err(format!("unexpected takeover continuation event: {event:?}")),
@@ -994,6 +997,7 @@ async fn wait_for_clipboard(
                 return Err(format!("terminal ended before clipboard effect: {event:?}"));
             }
             LocalAttachmentEvent::Snapshot(_)
+            | LocalAttachmentEvent::ResumeDelta(_)
             | LocalAttachmentEvent::Delta(_)
             | LocalAttachmentEvent::HistoryWindow(_)
             | LocalAttachmentEvent::SyncRequired(_)
@@ -1013,7 +1017,8 @@ async fn wait_for_lease_lost(client: &mut LocalAttachmentClient) -> Result<(), S
             .map_err(session_fixture::display)?
         {
             LocalAttachmentEvent::LeaseLost(_) => return Ok(()),
-            LocalAttachmentEvent::Delta(_)
+            LocalAttachmentEvent::ResumeDelta(_)
+            | LocalAttachmentEvent::Delta(_)
             | LocalAttachmentEvent::Snapshot(_)
             | LocalAttachmentEvent::SyncRequired(_)
             | LocalAttachmentEvent::TransportState(_)

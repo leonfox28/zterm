@@ -45,6 +45,8 @@ pub enum LocalAttachmentEvent {
     Snapshot(TerminalSurfaceSnapshot),
     /// A merged revision update from the acknowledged checkpoint.
     Delta(TerminalSurfaceDelta),
+    /// Correlated reconnect barrier; acknowledge once after successful application.
+    ResumeDelta(TerminalSurfaceDelta),
     /// One correlated exact semantic history-window outcome.
     HistoryWindow(TerminalSurfaceHistoryWindowResult),
     /// One validated latest-only child clipboard write.
@@ -76,8 +78,12 @@ impl fmt::Debug for LocalAttachmentEvent {
                 .field("revision", &snapshot.revision)
                 .field("row_count", &snapshot.surface.rows.len())
                 .finish_non_exhaustive(),
-            Self::Delta(delta) => formatter
-                .debug_struct("SemanticDelta")
+            Self::Delta(delta) | Self::ResumeDelta(delta) => formatter
+                .debug_struct(if matches!(self, Self::ResumeDelta(_)) {
+                    "SemanticResumeDelta"
+                } else {
+                    "SemanticDelta"
+                })
                 .field("from_revision", &delta.from_revision)
                 .field("to_revision", &delta.to_revision)
                 .field("row_patch_count", &delta.row_patches.len())
@@ -591,7 +597,11 @@ impl SessionClient {
                             ));
                         }
                         let size = delta.size;
-                        (attachment_id, LocalAttachmentEvent::Delta(delta), size)
+                        (
+                            attachment_id,
+                            LocalAttachmentEvent::ResumeDelta(delta),
+                            size,
+                        )
                     }
                     _ => {
                         return Err(malformed(
@@ -2239,6 +2249,21 @@ mod tests {
             .await
             .expect("write tunneled target trace");
 
+        // The target has emitted the ordinary delta, but the frontend submits
+        // resize before consuming it. Framing/batching must not promote it to a
+        // reconnect barrier on either adapter.
+        let viewport = zterm_core::terminal::TerminalSize::new(31, 97);
+        direct
+            .snapshot_applied(Revision::new(1))
+            .await
+            .expect("direct acknowledgement");
+        tunneled
+            .snapshot_applied(Revision::new(1))
+            .await
+            .expect("tunneled acknowledgement");
+        direct.resize(viewport).await.expect("direct resize");
+        tunneled.resize(viewport).await.expect("tunneled resize");
+
         for expected_kind in ["delta", "clipboard", "sync-required"] {
             let direct_event = direct
                 .read_next_event()
@@ -2248,23 +2273,17 @@ mod tests {
                 .read_next_event()
                 .await
                 .unwrap_or_else(|error| panic!("tunnel {expected_kind} event failed: {error}"));
+            if expected_kind == "delta" {
+                assert!(matches!(direct_event, LocalAttachmentEvent::Delta(_)));
+                direct.applied_revision.store(2, Ordering::Release);
+                tunneled.applied_revision.store(2, Ordering::Release);
+            }
             assert_eq!(
                 direct_event, tunnel_event,
                 "the shared Session interpreter diverged for {expected_kind}"
             );
         }
 
-        let viewport = zterm_core::terminal::TerminalSize::new(31, 97);
-        direct
-            .snapshot_applied(Revision::new(2))
-            .await
-            .expect("direct acknowledgement");
-        tunneled
-            .snapshot_applied(Revision::new(2))
-            .await
-            .expect("tunneled acknowledgement");
-        direct.resize(viewport).await.expect("direct resize");
-        tunneled.resize(viewport).await.expect("tunneled resize");
         direct
             .write_input(b"paired-input".to_vec())
             .await
@@ -2545,7 +2564,7 @@ mod tests {
                 Ok(v2::TerminalConnectionPath::Unknown)
             );
             assert_eq!(path.rtt_ms, None);
-            let LocalAttachmentEvent::Delta(delta) = client
+            let LocalAttachmentEvent::ResumeDelta(delta) = client
                 .read_next_event()
                 .await
                 .expect("replacement epoch resumes from its own checkpoint")
@@ -2828,7 +2847,7 @@ mod tests {
             Ok(v2::TerminalConnectionPath::Direct)
         );
         assert_eq!(path.rtt_ms, Some(6));
-        let LocalAttachmentEvent::Delta(delta) = client
+        let LocalAttachmentEvent::ResumeDelta(delta) = client
             .read_next_event()
             .await
             .expect("replacement epoch exposes its contiguous delta")
@@ -2983,7 +3002,7 @@ mod tests {
             Ok(v2::TerminalConnectionPath::Unknown)
         );
         assert_eq!(path.rtt_ms, None);
-        let LocalAttachmentEvent::Delta(delta) = client
+        let LocalAttachmentEvent::ResumeDelta(delta) = client
             .read_next_event()
             .await
             .expect("replacement epoch returns a contiguous delta")

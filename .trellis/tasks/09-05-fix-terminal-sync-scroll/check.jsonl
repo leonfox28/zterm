@@ -1,0 +1,9 @@
+{"file": ".trellis/spec/backend/local-daemon-ipc.md", "reason": "Shared SessionClient/view/UI, strict ACK, input and presentation contracts."}
+{"file": ".trellis/spec/backend/session-service.md", "reason": "Authoritative attachment synchronization, resize and controller lifecycle."}
+{"file": ".trellis/spec/backend/terminal-driver.md", "reason": "Producer revision/checkpoint semantics and existing black-box evidence boundary."}
+{"file": ".trellis/spec/backend/terminal-model.md", "reason": "Authoritative semantic screen/history contract; no app-specific behavior."}
+{"file": ".trellis/spec/guides/root-cause-and-architecture-thinking-guide.md", "reason": "Preserve the diagnosed distinction between an event-boundary defect and a presentation-path violation."}
+{"file": ".trellis/spec/guides/evidence-driven-simplicity.md", "reason": "One regression owner per failure mechanism; no additional interpreters or repaint machinery."}
+{"file": ".trellis/tasks/09-05-fix-terminal-sync-scroll/research/causal-evidence.md", "reason": "Baseline reproductions, causal source anchors, limitations and missing evidence."}
+{"file": ".trellis/tasks/09-05-fix-terminal-sync-scroll/design.md", "reason": "Approved scope will follow explicit barrier events and atomic live candidate presentation."}
+{"file": ".trellis/tasks/09-05-fix-terminal-sync-scroll/implement.md", "reason": "Single-agent ordering and focused plus final verification."}

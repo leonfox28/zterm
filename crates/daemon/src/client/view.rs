@@ -192,6 +192,8 @@ pub enum TerminalViewEvent {
     Snapshot(TerminalViewSnapshot),
     /// Apply one merged update only when its baseline is contiguous.
     Delta(TerminalViewDelta),
+    /// Correlated reconnect barrier; acknowledge once after successful application.
+    ResumeDelta(TerminalViewDelta),
     /// One correlated stateless bounded history-window outcome.
     HistoryWindow(TerminalViewHistoryWindow),
     /// One validated latest-only child clipboard write.
@@ -223,6 +225,7 @@ impl fmt::Debug for TerminalViewEvent {
                 .finish(),
             Self::Snapshot(snapshot) => formatter.debug_tuple("Snapshot").field(snapshot).finish(),
             Self::Delta(delta) => formatter.debug_tuple("Delta").field(delta).finish(),
+            Self::ResumeDelta(delta) => formatter.debug_tuple("ResumeDelta").field(delta).finish(),
             Self::HistoryWindow(window) => formatter
                 .debug_tuple("HistoryWindow")
                 .field(window)
@@ -1031,7 +1034,9 @@ enum TerminalDriverCommandResult {
 fn local_event_requires_synchronizing(event: &LocalAttachmentEvent) -> bool {
     matches!(
         event,
-        LocalAttachmentEvent::Snapshot(_) | LocalAttachmentEvent::SyncRequired(_)
+        LocalAttachmentEvent::Snapshot(_)
+            | LocalAttachmentEvent::ResumeDelta(_)
+            | LocalAttachmentEvent::SyncRequired(_)
     )
 }
 
@@ -1043,6 +1048,7 @@ fn terminal_event_from_local(
     match event {
         LocalAttachmentEvent::Snapshot(snapshot) => Ok(Some(TerminalViewEvent::Snapshot(snapshot))),
         LocalAttachmentEvent::Delta(delta) => Ok(Some(TerminalViewEvent::Delta(delta))),
+        LocalAttachmentEvent::ResumeDelta(delta) => Ok(Some(TerminalViewEvent::ResumeDelta(delta))),
         LocalAttachmentEvent::HistoryWindow(result) => {
             Ok(Some(TerminalViewEvent::HistoryWindow(result)))
         }
@@ -1910,6 +1916,64 @@ mod tests {
         ));
         drop(writer);
         server.await.expect("local driver server");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn queued_resume_barrier_survives_view_state_transitions() {
+        let (prepared, _peer, _, _) = terminal_test_view(false);
+        let snapshot = prepared.initial_snapshot();
+        let delta = TerminalViewDelta {
+            from_revision: snapshot.revision,
+            to_revision: Revision::new(snapshot.revision.get() + 1),
+            size: snapshot.surface.size,
+            active_screen: snapshot.surface.active_screen,
+            row_patches: Vec::new(),
+            cursor: snapshot.surface.cursor,
+            modes: snapshot.surface.modes,
+            scroll_metrics: None,
+        };
+        for route in [TerminalViewRoute::Local, TerminalViewRoute::Remote] {
+            for initial in [
+                TerminalViewTransportState::Active,
+                TerminalViewTransportState::Synchronizing,
+            ] {
+                let mut pending = VecDeque::new();
+                let mut takeover_pending = false;
+                let mut state = initial;
+                let (clipboard, _wakeup) = TerminalClipboardSlot::new();
+                for event in [
+                    LocalAttachmentEvent::Delta(delta.clone()),
+                    LocalAttachmentEvent::ResumeDelta(delta.clone()),
+                ] {
+                    assert!(!queue_local_attachment_event(
+                        Ok(event),
+                        &mut pending,
+                        route,
+                        &mut takeover_pending,
+                        &mut state,
+                        &clipboard
+                    ));
+                }
+                assert!(matches!(
+                    pending.pop_front(),
+                    Some(Ok(TerminalViewEvent::Delta(_)))
+                ));
+                if initial == TerminalViewTransportState::Active {
+                    assert!(matches!(
+                        pending.pop_front(),
+                        Some(Ok(TerminalViewEvent::TransportState(
+                            TerminalViewTransportState::Synchronizing
+                        )))
+                    ));
+                }
+                assert!(matches!(
+                    pending.pop_front(),
+                    Some(Ok(TerminalViewEvent::ResumeDelta(_)))
+                ));
+                assert!(pending.is_empty());
+            }
+        }
     }
 
     #[cfg(unix)]
