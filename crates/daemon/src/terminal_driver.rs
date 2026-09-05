@@ -706,11 +706,8 @@ impl TerminalAttachment {
     pub fn sync_latest(&mut self) -> Result<TerminalSurfaceDeltaResult, TerminalDriverError> {
         self.shared.check_failure()?;
         let model = lock(&self.shared.model, "terminal model")?;
-        let result = self.checkpoint.as_ref().map_or_else(
-            || TerminalSurfaceDeltaResult::Resync(model.snapshot()),
-            |checkpoint| model.delta_or_resync(checkpoint),
-        );
-        self.checkpoint = Some(model.checkpoint());
+        let (result, checkpoint) = model.capture(self.checkpoint.as_ref());
+        self.checkpoint = Some(checkpoint);
         Ok(result)
     }
 
@@ -728,11 +725,8 @@ impl TerminalAttachment {
         {
             return Ok(None);
         }
-        let result = self.checkpoint.as_ref().map_or_else(
-            || TerminalSurfaceDeltaResult::Resync(model.snapshot()),
-            |checkpoint| model.delta_or_resync(checkpoint),
-        );
-        self.checkpoint = Some(model.checkpoint());
+        let (result, checkpoint) = model.capture(self.checkpoint.as_ref());
+        self.checkpoint = Some(checkpoint);
         Ok(Some(result))
     }
 

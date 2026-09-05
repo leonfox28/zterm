@@ -35,6 +35,8 @@ TerminalModel::checkpoint(&self) -> TerminalCheckpoint
 TerminalModel::snapshot(&self) -> TerminalSurfaceSnapshot
 TerminalModel::delta_or_resync(&self, checkpoint: &TerminalCheckpoint)
     -> TerminalSurfaceDeltaResult
+TerminalModel::capture(&self, checkpoint: Option<&TerminalCheckpoint>)
+    -> (TerminalSurfaceDeltaResult, TerminalCheckpoint)
 TerminalModel::live_scroll_metrics(&self) -> Option<TerminalScrollMetrics>
 TerminalModel::history_window(query: TerminalHistoryWindowQuery)
     -> TerminalSurfaceHistoryWindowResult
@@ -171,6 +173,15 @@ released when the Session model is dropped.
 - A checkpoint retains format, revision, size, active-screen identity, and one
   fixed projected active viewport. It retains neither Alacritty state, inactive
   screen, nor history; capacity is exactly `rows * columns` cells.
+- `capture` projects the visible screen exactly once, derives the Delta/Resync
+  from that projection, and moves it into the returned checkpoint. The update
+  and checkpoint represent the same revision and cells. Attachment callers
+  use this paired result rather than calling `snapshot`/`delta_or_resync` and
+  then `checkpoint`, which would project the same screen twice. Independent
+  snapshot and checkpoint consumers retain their dedicated APIs.
+  Good: derive an attachment update and its next checkpoint from one capture.
+  Base: take a standalone snapshot for a read-only caller. Bad: recapture the
+  same revision immediately after producing its update.
 - Delta compares owned rows and returns sorted, unique, complete row
   replacements plus the latest cursor, modes, screen, size, and metrics.
   Future/equal revision at this low-level comparison or any
@@ -233,6 +244,7 @@ released when the Session model is dropped.
 | history-window requested while alternate is active | `HistoryChanged`; no alternate history is invented |
 | event/title/control/OSC52/combining cap reached | bounded summary/classification; no payload leak or partial clipboard effect |
 | equal/future/incompatible checkpoint passed to `delta_or_resync` | one full semantic `Resync`; `sync_changed` owns equal-revision suppression |
+| `capture(None)` or an incompatible baseline | one full replacement and a checkpoint at that exact replacement revision |
 | semantic surface or row patch has invalid size/shape/text/wide pair/cursor/metrics/revision | reject transactionally before forwarding or installing it |
 | CI forces colored Cargo output | dependency-tree policy overrides color to `never` before byte comparison |
 
@@ -247,6 +259,9 @@ released when the Session model is dropped.
   set/push/pop/query projection, and malformed input.
 - Lifecycle tests prove dropping the model releases the engine while an opaque
   checkpoint remains usable and engine/history-free.
+- `captured_checkpoint_matches_every_returned_update` replays consecutive
+  captures, including screen switches and resize, and compares the applied
+  result to a fresh snapshot and to the returned checkpoint revision.
 - Daemon driver/session and real-PTY tests remain required for drain, reply
   ordering, resize, detach/reconnect, and lifecycle ownership.
 - History-window tests cover live/middle/oldest clipping, exact request-shaped
@@ -279,11 +294,12 @@ model.scroll_display(Scroll::Delta(lines));
 Correct:
 
 ```rust
-let checkpoint = model.checkpoint();
-match model.delta_or_resync(&checkpoint) {
+let (update, next_checkpoint) = model.capture(previous_checkpoint.as_ref());
+match update {
     TerminalSurfaceDeltaResult::Delta(delta) => apply_semantic_rows(delta),
     TerminalSurfaceDeltaResult::Resync(snapshot) => replace_semantic_surface(snapshot),
 }
+previous_checkpoint = Some(next_checkpoint);
 
 let result = model.history_window(query);
 // Read-only request-shaped semantic rows; the client cache owns scroll intent.

@@ -62,15 +62,20 @@ mod unix {
         CachedViewportWindow, ViewportAnchorObservation, ViewportCache, ViewportCacheUpdate,
     };
     use zterm_core::{DomainErrorKind, SessionId};
-    use zterm_daemon::error::DaemonError;
-    use zterm_daemon::operations::{
-        LocalRuntime, PreparedTerminalView, TerminalViewConnectionPath,
-        TerminalViewConnectionStatus, TerminalViewEndReason, TerminalViewEvent,
-        TerminalViewHistoryWindow, TerminalViewRoute, TerminalViewTarget,
-        TerminalViewTransportState,
+    use zterm_daemon::client::view::{
+        PreparedTerminalView, TerminalViewConnectionPath, TerminalViewConnectionStatus,
+        TerminalViewEndReason, TerminalViewEvent, TerminalViewHistoryWindow, TerminalViewRoute,
+        TerminalViewTarget, TerminalViewTransportState,
     };
+    use zterm_daemon::error::DaemonError;
+    use zterm_daemon::operations::LocalRuntime;
 
     use super::super::{CliError, TerminalRequest, TerminalRequestKind};
+
+    mod ui_session {
+        include!("terminal_ui/session.rs");
+    }
+    use ui_session::TerminalUiSession;
 
     mod attachment_surface {
         include!("terminal_ui/surface.rs");
@@ -250,10 +255,10 @@ mod unix {
                 }
         );
         let input_epoch = InputEpoch::new();
-        let mut current_input_epoch = input_epoch.current();
+        let current_input_epoch = input_epoch.current();
         let mut stdin_pump = StdinPump::start(stdin, input_epoch.clone())?;
         let mut prefix = PrefixParser::new(escape.0);
-        let mut transport_state = TerminalViewTransportState::Synchronizing;
+        let transport_state = TerminalViewTransportState::Synchronizing;
         let mut resize_coalescer = ResizeCoalescer::new(initial_size);
         let prepared = match await_while_inactive(
             prepare(request, runtime, initial_size),
@@ -286,7 +291,7 @@ mod unix {
             }
         };
         let session_id = prepared.session_id();
-        let mut physical_size = terminal_size(stdout)?;
+        let physical_size = terminal_size(stdout)?;
         let latest_layout = ChromeLayout::new(
             physical_size,
             prepared.initial_snapshot().surface.active_screen,
@@ -297,12 +302,12 @@ mod unix {
         }
 
         let view_target = prepared.target().clone();
-        let mut surface = AttachmentSurface::from_snapshot(prepared.initial_snapshot())?;
+        let surface = AttachmentSurface::from_snapshot(prepared.initial_snapshot())?;
         let mut presenter = DesktopPresenter::default();
         let mut selection = SelectionController::default();
         let initial_scroll_metrics = prepared.initial_snapshot().surface.scroll_metrics;
         let mut viewport = ViewportController::with_layout(latest_layout, initial_scroll_metrics);
-        let mut status_renderer = StatusRenderer::new(view_target, physical_size);
+        let status_renderer = StatusRenderer::new(view_target, physical_size);
         reconcile_presenter_selection(&mut selection, &viewport, &surface, &mut presenter);
         present_surface_stdout(
             &surface,
@@ -351,7 +356,7 @@ mod unix {
                 return inactive_cancellation_result(cancellation, Some(session_id));
             }
         };
-        let (mut events, writer) = view.split();
+        let (events, writer) = view.split();
         if let Some(query) = viewport.prefetch_live()
             && writer.request_history_window(query).await.is_err()
         {
@@ -359,810 +364,35 @@ mod unix {
             // and let the first real gesture retry.
             viewport.window_cache.defer_pending_request();
         }
-        let mut sync_requested = false;
-        let mut input_codec = HostInputCodec::new();
-        let mut copy_key_lease = CopyKeyLease::default();
-        let mut deferred_active = false;
+        let sync_requested = false;
+        let input_codec = HostInputCodec::new();
+        let copy_key_lease = CopyKeyLease::default();
+        let deferred_active = false;
 
-        let loop_result = 'terminal: loop {
-            let now = Instant::now();
-            if viewport_pacer.due(now) {
-                if let Err(error) = present_cached_viewport_stdout(
-                    &surface,
-                    &mut presenter,
-                    &mut viewport,
-                    &status_renderer,
-                    transport_state,
-                    &mut viewport_pacer,
-                    CachedPresentationRequest { now, force: false },
-                ) {
-                    break Err(error);
-                }
-                continue;
-            }
-            if prefix
-                .deadline()
-                .is_some_and(|deadline| Instant::now() >= deadline)
-            {
-                if let Some(bytes) = prefix.flush_pending() {
-                    if viewport.is_live() && transport_state == TerminalViewTransportState::Active {
-                        if let Err(error) = writer.write_input(bytes).await {
-                            break Err(error.into());
-                        }
-                    } else if !viewport.is_live() {
-                        let effect = viewport.retain_or_resume(bytes)?;
-                        if apply_viewport_effect(
-                            effect,
-                            &mut viewport,
-                            &surface,
-                            &mut presenter,
-                            &writer,
-                            &status_renderer,
-                            transport_state,
-                            &mut viewport_pacer,
-                            false,
-                        )
-                        .await?
-                        {
-                            sync_requested = true;
-                        }
-                    }
-                }
-                continue;
-            }
-            let prefix_deadline = prefix.deadline();
-            let viewport_deadline = viewport_pacer.deadline();
-            tokio::select! {
-                cancellation = receive_terminal_cancellation(cancellation_receiver) => {
-                    viewport_pacer.cancel();
-                    break Err(cancellation.error(Some(session_id)));
-                }
-                signal = resize_signal.recv() => {
-                    if signal.is_none() {
-                        break Err(terminal_daemon_error(
-                            DomainErrorKind::Cancelled,
-                            "SIGWINCH handler closed",
-                        ));
-                    }
-                    let latest_physical = match terminal_size(stdout) {
-                        Ok(size) => size,
-                        Err(error) => break Err(error),
-                    };
-                    physical_size = latest_physical;
-                    let layout = ChromeLayout::new(
-                        latest_physical,
-                        viewport.effective_screen(surface.active_screen()),
-                    );
-                    let latest = layout.child;
-                    viewport_pacer.cancel();
-                    viewport.set_layout(layout);
-                    status_renderer.resize(latest_physical);
-                    selection.cancel();
-                    reconcile_presenter_selection(
-                        &mut selection,
-                        &viewport,
-                        &surface,
-                        &mut presenter,
-                    );
-                    if let Err(error) = present_surface_stdout(
-                        &surface,
-                        &mut presenter,
-                        &viewport,
-                        &status_renderer,
-                        transport_state,
-                    ) {
-                        break Err(error);
-                    }
-                    viewport.observe_presentation();
-                    viewport_pacer.mark_presented(Instant::now());
-                    if let Some(size) = resize_coalescer.observe(latest, transport_state) {
-                        if let Err(error) = writer.resize(size).await {
-                            break Err(error.into());
-                        }
-                        match apply_transport_state_transition(
-                            stdin,
-                            &input_epoch,
-                            &mut current_input_epoch,
-                            &mut stdin_pump,
-                            &mut prefix,
-                            transport_state,
-                            TerminalViewTransportState::Synchronizing,
-                            &mut viewport,
-                            &surface,
-                            &mut presenter,
-                            &mut selection,
-                            &mut status_renderer,
-                            &mut resize_coalescer,
-                            &writer,
-                            &mut viewport_pacer,
-                        ).await {
-                            Ok(state) => transport_state = state,
-                            Err(error) => break 'terminal Err(error),
-                        }
-                    }
-                }
-                // The explicit expired-deadline check above makes this local
-                // timeout independent of continuously ready terminal output.
-                () = wait_for_prefix_deadline(prefix_deadline), if prefix_deadline.is_some() => {
-                    if let Some(bytes) = prefix.flush_pending() {
-                        if viewport.is_live()
-                            && transport_state == TerminalViewTransportState::Active
-                        {
-                            if let Err(error) = writer.write_input(bytes).await {
-                                break Err(error.into());
-                            }
-                        } else if !viewport.is_live() {
-                            let effect = viewport.retain_or_resume(bytes)?;
-                            if apply_viewport_effect(
-                                effect,
-                                &mut viewport,
-                                &surface,
-                                &mut presenter,
-                                &writer,
-                                &status_renderer,
-                                transport_state,
-                                &mut viewport_pacer,
-                                false,
-                            ).await? {
-                                sync_requested = true;
-                            }
-                        }
-                    }
-                }
-                () = wait_for_viewport_deadline(viewport_deadline), if viewport_deadline.is_some() => {
-                    let now = Instant::now();
-                    if let Err(error) = present_cached_viewport_stdout(
-                        &surface,
-                        &mut presenter,
-                        &mut viewport,
-                        &status_renderer,
-                        transport_state,
-                        &mut viewport_pacer,
-                        CachedPresentationRequest { now, force: false },
-                    ) {
-                        break Err(error);
-                    }
-                }
-                event = events.read_event() => {
-                    let event = match event {
-                        Ok(Some(event)) => event,
-                        Ok(None) => {
-                            break Err(terminal_daemon_error(
-                                DomainErrorKind::Cancelled,
-                                "terminal attachment event stream closed",
-                            ));
-                        }
-                        Err(error) => break Err(error.into()),
-                    };
-                    match event {
-                        TerminalViewEvent::TransportState(state) => {
-                            if should_defer_active_for_paste(state, &viewport, &input_codec) {
-                                deferred_active = true;
-                                continue;
-                            }
-                            deferred_active = false;
-                            match apply_transport_state_transition(
-                                stdin,
-                                &input_epoch,
-                                &mut current_input_epoch,
-                                &mut stdin_pump,
-                                &mut prefix,
-                                transport_state,
-                                state,
-                                &mut viewport,
-                                &surface,
-                                &mut presenter,
-                                &mut selection,
-                                &mut status_renderer,
-                                &mut resize_coalescer,
-                                &writer,
-                                &mut viewport_pacer,
-                            ).await {
-                                Ok(applied) => transport_state = applied,
-                                Err(error) => break 'terminal Err(error),
-                            }
-                        }
-                        TerminalViewEvent::ConnectionStatus(status) => {
-                            status_renderer.observe(status)?;
-                            if let Err(error) = present_surface_stdout(
-                                &surface,
-                                &mut presenter,
-                                &viewport,
-                                &status_renderer,
-                                transport_state,
-                            ) {
-                                break Err(error);
-                            }
-                            viewport.observe_presentation();
-                            viewport_pacer.mark_presented(Instant::now());
-                        }
-                        TerminalViewEvent::Snapshot(snapshot) => {
-                            viewport_pacer.cancel();
-                            selection.cancel();
-                            reconcile_presenter_selection(
-                                &mut selection,
-                                &viewport,
-                                &surface,
-                                &mut presenter,
-                            );
-                            let preserving_resume_input = viewport.is_resume_pending();
-                            if transport_state != TerminalViewTransportState::Synchronizing
-                                && !preserving_resume_input
-                            {
-                                if let Err(error) = transition_input_state(
-                                    stdin,
-                                    &input_epoch,
-                                    &mut current_input_epoch,
-                                    &mut stdin_pump,
-                                    &mut prefix,
-                                    TerminalViewTransportState::Synchronizing,
-                                ) {
-                                    break 'terminal Err(error);
-                                }
-                                transport_state = TerminalViewTransportState::Synchronizing;
-                            }
-                            viewport.observe_snapshot(snapshot.surface.scroll_metrics);
-                            let layout = ChromeLayout::new(
-                                physical_size,
-                                viewport.effective_screen(snapshot.surface.active_screen),
-                            );
-                            viewport.set_layout(layout);
-                            let _ = resize_coalescer.observe(layout.child, transport_state);
-                            let history_refill = viewport.refetch_history_window();
-                            let rendered = install_snapshot_stdout(
-                                &mut surface,
-                                &mut presenter,
-                                &snapshot,
-                                &viewport,
-                                &status_renderer,
-                                transport_state,
-                            );
-                            if let Err(error) = rendered {
-                                break Err(error);
-                            }
-                            viewport.observe_presentation();
-                            viewport_pacer.mark_presented(Instant::now());
-                            prefix.clear_pending();
-                            sync_requested = false;
-                            writer.revision_applied(snapshot.revision);
-                            if let Err(error) = writer.snapshot_applied(snapshot.revision).await {
-                                break Err(error.into());
-                            }
-                            if let Some(query) = history_refill
-                                && let Err(error) = writer.request_history_window(query).await
-                            {
-                                break Err(error.into());
-                            }
-                        }
-                        TerminalViewEvent::Delta(delta) => {
-                            // A delta may itself change Main/Alternate layout and submit a
-                            // resize below. That resize starts a *new* snapshot epoch, so the
-                            // old delta is an activation barrier only when this view was already
-                            // synchronizing as the event entered the handler.
-                            let acknowledges_existing_sync =
-                                delta_acknowledges_existing_sync(transport_state);
-                            let rendered_live = viewport.is_live();
-                            if rendered_live {
-                                viewport_pacer.cancel();
-                            }
-                            let delta_result = apply_delta_stdout(
-                                &mut surface,
-                                &mut presenter,
-                                &delta,
-                                &mut viewport,
-                                &mut selection,
-                                &status_renderer,
-                                transport_state,
-                            );
-                            match delta_result {
-                                Ok(DeltaRender::Applied) => {
-                                    sync_requested = false;
-                                    writer.revision_applied(delta.to_revision);
-                                    if rendered_live {
-                                        viewport.observe_presentation();
-                                        viewport_pacer.mark_presented(Instant::now());
-                                        let mode_resize = resize_coalescer
-                                            .observe(viewport.content_size(), transport_state);
-                                        if let Some(size) = mode_resize {
-                                            if let Err(error) = writer.resize(size).await {
-                                                break Err(error.into());
-                                            }
-                                            match apply_transport_state_transition(
-                                                stdin,
-                                                &input_epoch,
-                                                &mut current_input_epoch,
-                                                &mut stdin_pump,
-                                                &mut prefix,
-                                                transport_state,
-                                                TerminalViewTransportState::Synchronizing,
-                                                &mut viewport,
-                                                &surface,
-                                                &mut presenter,
-                                                &mut selection,
-                                                &mut status_renderer,
-                                                &mut resize_coalescer,
-                                                &writer,
-                                                &mut viewport_pacer,
-                                            ).await {
-                                                Ok(state) => transport_state = state,
-                                                Err(error) => break 'terminal Err(error),
-                                            }
-                                        }
-                                    } else {
-                                        cancel_unpresentable_cached_viewport(
-                                            &viewport,
-                                            &mut viewport_pacer,
-                                        );
-                                    }
-                                    if acknowledges_existing_sync
-                                        && let Err(error) = writer
-                                            .snapshot_applied(delta.to_revision)
-                                            .await
-                                    {
-                                        break Err(error.into());
-                                    }
-                                }
-                                Ok(DeltaRender::Gap) => {
-                                    viewport_pacer.cancel();
-                                    selection.cancel();
-                                    reconcile_presenter_selection(
-                                        &mut selection,
-                                        &viewport,
-                                        &surface,
-                                        &mut presenter,
-                                    );
-                                    if rendered_live {
-                                        viewport.begin_resume(Vec::new())?;
-                                    }
-                                    if transport_state
-                                        != TerminalViewTransportState::Synchronizing
-                                        && !viewport.is_resume_pending()
-                                    {
-                                        if let Err(error) = transition_input_state(
-                                            stdin,
-                                            &input_epoch,
-                                            &mut current_input_epoch,
-                                            &mut stdin_pump,
-                                            &mut prefix,
-                                            TerminalViewTransportState::Synchronizing,
-                                        ) {
-                                            break 'terminal Err(error);
-                                        }
-                                        transport_state =
-                                            TerminalViewTransportState::Synchronizing;
-                                    }
-                                    if !sync_requested {
-                                        sync_requested = true;
-                                        if let Err(error) = writer
-                                            .request_sync(surface.revision())
-                                            .await
-                                        {
-                                            break 'terminal Err(error.into());
-                                        }
-                                    }
-                                }
-                                Err(error) => break Err(error),
-                            }
-                        }
-                        TerminalViewEvent::HistoryWindow(result) => {
-                            let effect = viewport.apply_view_history_window(result)?;
-                            reconcile_presenter_selection_for_next_frame(
-                                &mut selection,
-                                &viewport,
-                                &surface,
-                                &mut presenter,
-                            );
-                            if apply_viewport_effect(
-                                effect,
-                                &mut viewport,
-                                &surface,
-                                &mut presenter,
-                                &writer,
-                                &status_renderer,
-                                transport_state,
-                                &mut viewport_pacer,
-                                false,
-                            )
-                            .await?
-                            {
-                                sync_requested = true;
-                            }
-                            reconcile_presenter_selection(
-                                &mut selection,
-                                &viewport,
-                                &surface,
-                                &mut presenter,
-                            );
-                        }
-                        TerminalViewEvent::ClipboardWrite(write) => {
-                            let stdout = io::stdout();
-                            let mut output = stdout.lock();
-                            if let Err(error) = presenter.write_clipboard(&mut output, &write) {
-                                break Err(error);
-                            }
-                        }
-                        TerminalViewEvent::SyncRequired { .. } => {
-                            viewport_pacer.cancel();
-                            selection.cancel();
-                            reconcile_presenter_selection(
-                                &mut selection,
-                                &viewport,
-                                &surface,
-                                &mut presenter,
-                            );
-                            viewport.observe_sync_required();
-                            if transport_state != TerminalViewTransportState::Synchronizing {
-                                transport_state = TerminalViewTransportState::Synchronizing;
-                            }
-                            // The marker and its authoritative replacement snapshot are emitted
-                            // together. Keep the last complete host presentation untouched while
-                            // that replacement is in flight instead of repainting an identical
-                            // history frame or clearing attachment scroll state with a redundant
-                            // sync request.
-                            sync_requested = true;
-                        }
-                        TerminalViewEvent::LeaseLost { .. } => {
-                            viewport_pacer.cancel();
-                            break Err(terminal_daemon_error(
-                                DomainErrorKind::LeaseLost,
-                                "another attachment took over this terminal controller",
-                            ));
-                        }
-                        TerminalViewEvent::SessionEnded(ended) => {
-                            viewport_pacer.cancel();
-                            break terminal_end_completion(ended.reason);
-                        }
-                    }
-                }
-                input = stdin_pump.recv() => {
-                    match input {
-                        Some(StdinEvent::Bytes { epoch, bytes })
-                            if input_epoch_is_current(epoch, current_input_epoch) =>
-                        {
-                            // A paced history frame may have committed a new
-                            // source since the preceding pointer event. Retire
-                            // any old coordinates before interpreting a copy
-                            // key against the physical keyboard mode.
-                            reconcile_presenter_selection(
-                                &mut selection,
-                                &viewport,
-                                &surface,
-                                &mut presenter,
-                            );
-                            let mut host_events = match input_codec.feed(&bytes) {
-                                Ok(events) => VecDeque::from(events),
-                                Err(error) => break 'terminal Err(error),
-                            };
-                            let mut force_viewport_presentation = false;
-                            while let Some(host_event) = host_events.pop_front() {
-                                match host_event {
-                                    HostInputEvent::Bytes(bytes) => {
-                                        if let Err(error) = invalidate_selection_stdout(
-                                            &mut selection,
-                                            &mut viewport,
-                                            &surface,
-                                            &mut presenter,
-                                            &status_renderer,
-                                            transport_state,
-                                            &mut viewport_pacer,
-                                        ) {
-                                            break 'terminal Err(error);
-                                        }
-                                        for action in prefix.feed(&bytes, Instant::now()) {
-                                            match action {
-                                                PrefixAction::Input(bytes) if viewport.is_live()
-                                                    && transport_state
-                                                        == TerminalViewTransportState::Active =>
-                                                {
-                                                    if let Err(error) = writer.write_input(bytes).await {
-                                                        break 'terminal Err(error.into());
-                                                    }
-                                                }
-                                                PrefixAction::Input(bytes) if !viewport.is_live() => {
-                                                    let effect = viewport.retain_or_resume(bytes)?;
-                                                    if apply_viewport_effect(
-                                                        effect,
-                                                        &mut viewport,
-                                                        &surface,
-                                                        &mut presenter,
-                                                        &writer,
-                                                        &status_renderer,
-                                                        transport_state,
-                                                        &mut viewport_pacer,
-                                                        true,
-                                                    ).await? {
-                                                        sync_requested = true;
-                                                    }
-                                                }
-                                                PrefixAction::Input(_) => {}
-                                                PrefixAction::Detach => break,
-                                            }
-                                        }
-                                    }
-                                    HostInputEvent::LegacyCtrlC => {
-                                        if selection.is_finalized() {
-                                            if let Err(error) = write_selection_clipboard_stdout(
-                                                &selection,
-                                                &viewport,
-                                                &surface,
-                                                &mut presenter,
-                                            ) {
-                                                break 'terminal Err(error);
-                                            }
-                                        } else {
-                                            host_events
-                                                .push_front(HostInputEvent::Bytes(vec![0x03]));
-                                        }
-                                    }
-                                    HostInputEvent::EnhancedKey(key) => {
-                                        let outer_flags = presenter.presented_keyboard_flags();
-                                        match route_enhanced_input(
-                                            &key,
-                                            surface.modes(),
-                                            outer_flags,
-                                            selection.is_finalized(),
-                                            &mut copy_key_lease,
-                                        ) {
-                                            KeyboardRoute::Copy => {
-                                                if let Err(error) =
-                                                    write_selection_clipboard_stdout(
-                                                        &selection,
-                                                        &viewport,
-                                                        &surface,
-                                                        &mut presenter,
-                                                    )
-                                                {
-                                                    break 'terminal Err(error);
-                                                }
-                                            }
-                                            KeyboardRoute::Consume => {}
-                                            KeyboardRoute::Forward {
-                                                bytes,
-                                                clear_selection,
-                                                reinterpret_legacy,
-                                            } => {
-                                                if clear_selection
-                                                    && let Err(error) =
-                                                        invalidate_selection_stdout(
-                                                            &mut selection,
-                                                            &mut viewport,
-                                                            &surface,
-                                                            &mut presenter,
-                                                            &status_renderer,
-                                                            transport_state,
-                                                            &mut viewport_pacer,
-                                                        )
-                                                {
-                                                    break 'terminal Err(error);
-                                                }
-                                                let forwarded = if reinterpret_legacy {
-                                                    host_events_from_legacy_bytes(bytes)
-                                                } else if bytes.is_empty() {
-                                                    Vec::new()
-                                                } else {
-                                                    vec![HostInputEvent::Bytes(bytes)]
-                                                };
-                                                for event in forwarded.into_iter().rev() {
-                                                    host_events.push_front(event);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    HostInputEvent::Paste(bytes) => {
-                                        if let Err(error) = invalidate_selection_stdout(
-                                            &mut selection,
-                                            &mut viewport,
-                                            &surface,
-                                            &mut presenter,
-                                            &status_renderer,
-                                            transport_state,
-                                            &mut viewport_pacer,
-                                        ) {
-                                            break 'terminal Err(error);
-                                        }
-                                        if viewport.is_live()
-                                            && transport_state
-                                                == TerminalViewTransportState::Active
-                                        {
-                                            if let Err(error) = writer.write_input(bytes).await {
-                                                break 'terminal Err(error.into());
-                                            }
-                                        } else if !viewport.is_live() {
-                                            let effect = viewport.retain_or_resume(bytes)?;
-                                            if apply_viewport_effect(
-                                                effect,
-                                                &mut viewport,
-                                                &surface,
-                                                &mut presenter,
-                                                &writer,
-                                                &status_renderer,
-                                                transport_state,
-                                                &mut viewport_pacer,
-                                                true,
-                                            ).await? {
-                                                sync_requested = true;
-                                            }
-                                        }
-                                    }
-                                    HostInputEvent::PageUp | HostInputEvent::PageDown => {
-                                        if let Err(error) = invalidate_selection_stdout(
-                                            &mut selection,
-                                            &mut viewport,
-                                            &surface,
-                                            &mut presenter,
-                                            &status_renderer,
-                                            transport_state,
-                                            &mut viewport_pacer,
-                                        ) {
-                                            break 'terminal Err(error);
-                                        }
-                                        let older = matches!(host_event, HostInputEvent::PageUp);
-                                        let raw = if older { PAGE_UP } else { PAGE_DOWN };
-                                        if viewport.is_resume_pending() {
-                                            viewport.retain_resume_input(raw)?;
-                                        } else if viewport.is_history()
-                                            || live_history_navigation_allowed(transport_state)
-                                                && history_owns_gestures(
-                                                    surface.active_screen(),
-                                                    surface.modes(),
-                                                )
-                                        {
-                                            let effect = viewport.navigate(
-                                                older,
-                                                usize::from(viewport.content_size().rows)
-                                                    .saturating_sub(1)
-                                                    .max(1),
-                                            );
-                                            if apply_viewport_effect(
-                                                effect,
-                                                &mut viewport,
-                                                &surface,
-                                                &mut presenter,
-                                                &writer,
-                                                &status_renderer,
-                                                transport_state,
-                                                &mut viewport_pacer,
-                                                true,
-                                            ).await? {
-                                                sync_requested = true;
-                                            }
-                                        } else if transport_state
-                                            == TerminalViewTransportState::Active
-                                            && let Err(error) = writer.write_input(raw.to_vec()).await
-                                        {
-                                            break 'terminal Err(error.into());
-                                        }
-                                    }
-                                    HostInputEvent::Mouse(mouse) => {
-                                        let routed = match route_pointer(
-                                            &mouse,
-                                            &mut viewport,
-                                            &surface,
-                                            &mut selection,
-                                            live_history_navigation_allowed(transport_state),
-                                        ) {
-                                            Ok(routed) => routed,
-                                            Err(error) => break 'terminal Err(error),
-                                        };
-                                        reconcile_presenter_selection(
-                                            &mut selection,
-                                            &viewport,
-                                            &surface,
-                                            &mut presenter,
-                                        );
-                                        match routed {
-                                            PointerRoute::Viewport(effect) => {
-                                                force_viewport_presentation |= mouse.release;
-                                                if apply_viewport_effect(
-                                                    effect,
-                                                    &mut viewport,
-                                                    &surface,
-                                                    &mut presenter,
-                                                    &writer,
-                                                    &status_renderer,
-                                                    transport_state,
-                                                    &mut viewport_pacer,
-                                                    true,
-                                                ).await? {
-                                                    sync_requested = true;
-                                                }
-                                            }
-                                            PointerRoute::Child(bytes)
-                                                if viewport.is_resume_pending() =>
-                                            {
-                                                viewport.retain_resume_input(&bytes)?;
-                                            }
-                                            PointerRoute::Child(bytes)
-                                                if viewport.is_live()
-                                                    && transport_state
-                                                        == TerminalViewTransportState::Active =>
-                                            {
-                                                if let Err(error) = writer.write_input(bytes).await {
-                                                    break 'terminal Err(error.into());
-                                                }
-                                            }
-                                            PointerRoute::Child(_) | PointerRoute::Ignore => {}
-                                            PointerRoute::SelectionChanged => {
-                                                let now = Instant::now();
-                                                if mark_cached_viewport_dirty(
-                                                    &viewport,
-                                                    &mut viewport_pacer,
-                                                    now,
-                                                ) {
-                                                    force_viewport_presentation |= mouse.release;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                if prefix.detached() {
-                                    break;
-                                }
-                            }
-                            if prefix.detached() {
-                                viewport_pacer.cancel();
-                                break Ok(TerminalCompletion::Detached);
-                            }
-                            if deferred_active && !input_codec.paste_in_progress() {
-                                match apply_transport_state_transition(
-                                    stdin,
-                                    &input_epoch,
-                                    &mut current_input_epoch,
-                                    &mut stdin_pump,
-                                    &mut prefix,
-                                    transport_state,
-                                    TerminalViewTransportState::Active,
-                                    &mut viewport,
-                                    &surface,
-                                    &mut presenter,
-                                    &mut selection,
-                                    &mut status_renderer,
-                                    &mut resize_coalescer,
-                                    &writer,
-                                    &mut viewport_pacer,
-                                ).await {
-                                    Ok(applied) => transport_state = applied,
-                                    Err(error) => break 'terminal Err(error),
-                                }
-                                deferred_active = false;
-                            }
-                            if let Err(error) = present_cached_viewport_stdout(
-                                &surface,
-                                &mut presenter,
-                                &mut viewport,
-                                &status_renderer,
-                                transport_state,
-                                &mut viewport_pacer,
-                                CachedPresentationRequest {
-                                    now: Instant::now(),
-                                    force: force_viewport_presentation,
-                                },
-                            ) {
-                                break 'terminal Err(error);
-                            }
-                        }
-                        Some(StdinEvent::Bytes { .. }) => {}
-                        Some(StdinEvent::Eof) | None => {
-                            viewport_pacer.cancel();
-                            if let Some(bytes) = take_pending_active_input(
-                                &mut prefix,
-                                transport_state,
-                            ) && viewport.is_live()
-                                && let Err(error) = writer.write_input(bytes).await
-                            {
-                                break Err(error.into());
-                            }
-                            break Ok(TerminalCompletion::Detached);
-                        }
-                        Some(StdinEvent::Error(detail)) => {
-                            break Err(CliError::Io(format!("read terminal stdin: {detail}")));
-                        }
-                    }
-                }
-            }
-        };
-
-        finish_terminal_view(loop_result, &mut stdin_pump, &writer).await
+        TerminalUiSession {
+            session_id,
+            events,
+            writer,
+            input_epoch,
+            current_input_epoch,
+            stdin_pump,
+            prefix,
+            transport_state,
+            resize_coalescer,
+            physical_size,
+            surface,
+            presenter,
+            selection,
+            viewport,
+            status_renderer,
+            viewport_pacer,
+            sync_requested,
+            input_codec,
+            copy_key_lease,
+            deferred_active,
+        }
+        .run(stdin, stdout, resize_signal, cancellation_receiver)
+        .await
     }
 
     struct InactiveWaitContext<'a> {
@@ -1340,66 +570,6 @@ mod unix {
             && input_codec.paste_in_progress()
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn apply_transport_state_transition(
-        stdin: &impl AsFd,
-        input_epoch: &InputEpoch,
-        current_input_epoch: &mut u64,
-        stdin_pump: &mut StdinPump,
-        prefix: &mut PrefixParser,
-        previous: TerminalViewTransportState,
-        next: TerminalViewTransportState,
-        viewport: &mut ViewportController,
-        surface: &AttachmentSurface,
-        presenter: &mut DesktopPresenter,
-        selection: &mut SelectionController,
-        status_renderer: &mut StatusRenderer,
-        resize_coalescer: &mut ResizeCoalescer,
-        writer: &zterm_daemon::operations::TerminalViewCommandWriter,
-        viewport_pacer: &mut ViewportPresentationPacer,
-    ) -> Result<TerminalViewTransportState, CliError> {
-        viewport_pacer.cancel();
-        let (next, pending_resize) = resize_coalescer.enter_transport_state(next);
-        if next == TerminalViewTransportState::Reconnecting {
-            viewport.reset_presentation_for_reconnect();
-            status_renderer.reset_for_reconnect();
-        }
-        if next != previous && next != TerminalViewTransportState::Active {
-            selection.cancel();
-        }
-        let resume_input = transition_transport_input_state(
-            stdin,
-            input_epoch,
-            current_input_epoch,
-            stdin_pump,
-            prefix,
-            previous,
-            next,
-            viewport,
-        )?;
-        reconcile_presenter_selection(selection, viewport, surface, presenter);
-        if present_transport_transition_stdout(
-            surface,
-            presenter,
-            viewport,
-            status_renderer,
-            next,
-            resume_input.is_some(),
-        )? {
-            viewport.observe_presentation();
-            viewport_pacer.mark_presented(Instant::now());
-        }
-        if let Some(size) = pending_resize {
-            writer.resize(size).await?;
-        }
-        if let Some(bytes) = resume_input
-            && !bytes.is_empty()
-        {
-            writer.write_input(bytes).await?;
-        }
-        Ok(next)
-    }
-
     const fn input_epoch_is_current(observed: u64, current: u64) -> bool {
         observed == current
     }
@@ -1407,7 +577,7 @@ mod unix {
     async fn finish_terminal_view(
         loop_result: Result<TerminalCompletion, CliError>,
         stdin_pump: &mut StdinPump,
-        writer: &zterm_daemon::operations::TerminalViewCommandWriter,
+        writer: &zterm_daemon::client::view::TerminalViewCommandWriter,
     ) -> Result<TerminalCompletion, CliError> {
         let stdin_result = stdin_pump.shutdown();
         let session_already_ended = matches!(&loop_result, Ok(TerminalCompletion::SessionEnded(_)));
@@ -4030,7 +3200,7 @@ mod unix {
         viewport: &mut ViewportController,
         surface: &AttachmentSurface,
         presenter: &mut DesktopPresenter,
-        writer: &zterm_daemon::operations::TerminalViewCommandWriter,
+        writer: &zterm_daemon::client::view::TerminalViewCommandWriter,
         status: &StatusRenderer,
         transport_state: TerminalViewTransportState,
         pacer: &mut ViewportPresentationPacer,

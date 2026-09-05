@@ -9,6 +9,7 @@
 
 pub mod authorization;
 pub mod bootstrap;
+pub mod client;
 pub mod config;
 pub mod connection_broker;
 pub mod device_directory;

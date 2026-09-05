@@ -212,10 +212,31 @@ impl TerminalModel {
     /// Produces one merged semantic row update or a complete semantic replacement.
     #[must_use]
     pub fn delta_or_resync(&self, checkpoint: &TerminalCheckpoint) -> TerminalSurfaceDeltaResult {
-        let latest = project(&self.engine);
+        self.capture(Some(checkpoint)).0
+    }
+
+    /// Captures one update and its exact next baseline with one screen projection.
+    #[must_use]
+    pub fn capture(
+        &self,
+        checkpoint: Option<&TerminalCheckpoint>,
+    ) -> (TerminalSurfaceDeltaResult, TerminalCheckpoint) {
+        let next = self.checkpoint();
+        let update = self.update_from_projection(checkpoint, &next.projection);
+        (update, next)
+    }
+
+    fn update_from_projection(
+        &self,
+        checkpoint: Option<&TerminalCheckpoint>,
+        latest: &ProjectedScreen,
+    ) -> TerminalSurfaceDeltaResult {
         let snapshot = || TerminalSurfaceSnapshot {
             revision: self.revision,
             surface: latest.to_surface(self.live_scroll_metrics()),
+        };
+        let Some(checkpoint) = checkpoint else {
+            return TerminalSurfaceDeltaResult::Resync(snapshot());
         };
         if checkpoint.revision >= self.revision
             || checkpoint.projection.version != CHECKPOINT_FORMAT_VERSION
@@ -452,6 +473,41 @@ mod tests {
             model.delta_or_resync(&checkpoint),
             TerminalSurfaceDeltaResult::Resync(_)
         ));
+    }
+
+    #[test]
+    fn captured_checkpoint_matches_every_returned_update() {
+        let mut model = TerminalModel::new(TerminalSize::new(3, 8), 8).expect("model");
+        let (initial, mut checkpoint) = model.capture(None);
+        let TerminalSurfaceDeltaResult::Resync(mut applied) = initial else {
+            panic!("initial capture must replace the surface");
+        };
+        for bytes in [
+            b"first".as_slice(),
+            b"\r\nsecond",
+            b"\x1b[?1049h",
+            b"alternate",
+            b"\x1b[?1049l",
+        ] {
+            model.ingest(bytes).expect("advance model");
+            let (update, next) = model.capture(Some(&checkpoint));
+            match update {
+                TerminalSurfaceDeltaResult::Resync(snapshot) => applied = snapshot,
+                TerminalSurfaceDeltaResult::Delta(delta) => {
+                    delta
+                        .apply_to(applied.revision, &mut applied.surface)
+                        .expect("exact baseline");
+                    applied.revision = delta.to_revision;
+                }
+            }
+            assert_eq!(next.revision(), applied.revision);
+            assert_eq!(applied, model.snapshot());
+            checkpoint = next;
+        }
+        model.resize(TerminalSize::new(2, 10)).expect("resize");
+        let (update, next) = model.capture(Some(&checkpoint));
+        assert_eq!(update, TerminalSurfaceDeltaResult::Resync(model.snapshot()));
+        assert_eq!(next.revision(), model.revision());
     }
 
     #[test]
