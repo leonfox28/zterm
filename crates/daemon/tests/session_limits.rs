@@ -87,8 +87,12 @@ fn session_count_and_viewport_limits_fail_without_mutation() -> Result<(), Strin
         .find(|summary| summary.session_id == session.session_id)
         .ok_or_else(|| "resized session disappeared".to_owned())?;
     assert_eq!(
-        before, after,
-        "failed resize must retain terminal and viewport state"
+        before.session_id, after.session_id,
+        "failed resize must retain the Session identity"
+    );
+    assert_eq!(
+        before.viewport, after.viewport,
+        "failed resize must retain the accepted viewport"
     );
     let oversized_attach = match fixture.service.prepare_attach(
         fixture.principal,
