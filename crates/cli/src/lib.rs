@@ -5,17 +5,17 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use serde::Serialize;
+use unicode_width::UnicodeWidthStr;
 use zeroize::Zeroizing;
 use zterm_core::{AuthorizationStatus, MAX_TICKET_TEXT_BYTES, SessionId, validate_pair_ttl};
 use zterm_daemon::bootstrap::BootstrapResult;
 use zterm_daemon::config::validate_setup_profile;
 use zterm_daemon::error::DaemonError;
 use zterm_daemon::operations::{
-    CommandDeviceSummary, CommandSessionSummary, DoctorReport, LocalRuntime, ObservedState,
+    CommandDeviceSummary, CommandSessionSummary, LocalRuntime, ObservedState, UpdateStage,
 };
 use zterm_daemon::pairing::PairTicketText;
-use zterm_daemon::service::DaemonStatus;
+use zterm_daemon::service::{DaemonStatus, SessionImpact};
 
 mod terminal_ui;
 
@@ -134,9 +134,9 @@ enum Command {
     /// Configure this device and explicitly start its daemon.
     Setup(SetupArgs),
     /// Show setup and daemon state without starting anything.
-    Status(JsonArgs),
+    Status,
     /// Run local-only diagnostics without starting anything.
-    Doctor(JsonArgs),
+    Doctor,
     /// Create or accept one-time device pairing tickets.
     Pair {
         /// Pairing operation.
@@ -213,13 +213,6 @@ impl ProfileArg {
     }
 }
 
-#[derive(Debug, clap::Args)]
-struct JsonArgs {
-    /// Render the same typed result as JSON.
-    #[arg(long)]
-    json: bool,
-}
-
 #[derive(Debug, Subcommand)]
 enum PairCommand {
     /// Create a bounded one-time bearer ticket.
@@ -230,7 +223,7 @@ enum PairCommand {
 
 #[derive(Debug, clap::Args)]
 struct PairCreateArgs {
-    /// Ticket lifetime such as 30s, 10m, or 1h.
+    /// Ticket lifetime such as 60s, 10m, or 1h.
     #[arg(long, value_parser = parse_pair_ttl)]
     ttl: Option<u32>,
 }
@@ -242,13 +235,13 @@ struct PairAcceptArgs {
     stdin: bool,
     /// Exact outbound alias assigned after acceptance.
     #[arg(long)]
-    name: Option<String>,
+    alias: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
 enum DeviceCommand {
     /// List outbound-known and inbound-authorization directions.
-    List(JsonArgs),
+    List,
     /// Rename only the outbound known-device alias.
     Rename(DeviceRenameArgs),
     /// Revoke only the remote device's inbound authorization.
@@ -268,7 +261,7 @@ struct DeviceRevokeArgs {
     /// Exact alias or canonical full Device ID.
     device: String,
     /// Confirm without an interactive prompt.
-    #[arg(long)]
+    #[arg(short = 'y', long)]
     yes: bool,
 }
 
@@ -303,11 +296,9 @@ enum SessionCommand {
 
 #[derive(Debug, clap::Args)]
 struct SessionListArgs {
-    /// Exact outbound device alias/full ID, or local.
+    /// Exact outbound device alias/full ID, or local (the default).
+    #[arg(default_value = "local")]
     target: String,
-    /// Render the same typed result as JSON.
-    #[arg(long)]
-    json: bool,
 }
 
 #[derive(clap::Args)]
@@ -368,31 +359,31 @@ struct SessionCloseArgs {
     /// Exact Session name or canonical full Session ID.
     session: String,
     /// Confirm without an interactive prompt.
-    #[arg(long)]
+    #[arg(short = 'y', long)]
     yes: bool,
 }
 
 #[derive(Debug, Subcommand)]
 enum DaemonCommand {
     /// Show daemon state without starting it.
-    Status(JsonArgs),
+    Status,
     /// Gracefully stop the daemon; already stopped succeeds.
-    Stop(ForceArgs),
+    Stop(YesArgs),
     /// Gracefully stop and explicitly start one daemon.
-    Restart(ForceArgs),
+    Restart(YesArgs),
 }
 
 #[derive(Debug, clap::Args)]
-struct ForceArgs {
-    /// Allow the daemon stop to end active Sessions and their PTYs.
-    #[arg(long)]
-    force: bool,
+struct YesArgs {
+    /// Confirm without prompting; end active Sessions and their PTYs.
+    #[arg(short = 'y', long)]
+    yes: bool,
 }
 
 #[derive(Debug, clap::Args)]
 struct LogsArgs {
     /// Number of recent lines (bounded to 1000).
-    #[arg(long, default_value_t = 100)]
+    #[arg(short = 'n', long, default_value_t = 100)]
     lines: usize,
 }
 
@@ -402,11 +393,8 @@ struct ResetArgs {
     #[arg(long, required = true)]
     identity: bool,
     /// Confirm without an interactive prompt.
-    #[arg(long)]
+    #[arg(short = 'y', long)]
     yes: bool,
-    /// Allow active Sessions to be ended by the bounded daemon stop.
-    #[arg(long)]
-    force: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -414,19 +402,16 @@ struct UpdateArgs {
     /// Install one exact published stable or prerelease tag instead of latest stable.
     #[arg(long, value_name = "TAG")]
     version: Option<String>,
-    /// Allow verified activation to stop active Sessions and their PTYs.
-    #[arg(long)]
-    force: bool,
+    /// Confirm without prompting; end active Sessions after candidate verification.
+    #[arg(short = 'y', long)]
+    yes: bool,
 }
 
 #[derive(Debug, clap::Args)]
 struct UninstallArgs {
     /// Confirm without an interactive prompt.
-    #[arg(long)]
+    #[arg(short = 'y', long)]
     yes: bool,
-    /// Allow uninstall to end active Sessions and their PTYs.
-    #[arg(long)]
-    force: bool,
 }
 
 /// Whether missing first-setup values may be prompted from the terminal.
@@ -456,8 +441,6 @@ pub enum CliError {
     Daemon(DaemonError),
     /// Required CLI input is missing or contradictory.
     Usage(String),
-    /// JSON projection unexpectedly failed.
-    Serialization(String),
     /// Interactive prompt I/O failed.
     Io(String),
     /// A Session was created successfully, but its follow-up attach failed.
@@ -483,11 +466,6 @@ impl fmt::Debug for CliError {
                 .field("detail", &"[REDACTED]")
                 .field("detail_len", &detail.len())
                 .finish(),
-            Self::Serialization(detail) => formatter
-                .debug_struct("Serialization")
-                .field("detail", &"[REDACTED]")
-                .field("detail_len", &detail.len())
-                .finish(),
             Self::Io(detail) => formatter
                 .debug_struct("Io")
                 .field("detail", &"[REDACTED]")
@@ -508,7 +486,6 @@ impl fmt::Display for CliError {
         match self {
             Self::Daemon(error) => error.fmt(formatter),
             Self::Usage(detail) => write!(formatter, "invalid command: {detail}"),
-            Self::Serialization(detail) => write!(formatter, "unable to render JSON: {detail}"),
             Self::Io(detail) => write!(formatter, "interactive terminal failed: {detail}"),
             Self::CreatedSessionAttach { session_id, source } => write!(
                 formatter,
@@ -650,30 +627,24 @@ pub async fn execute(
         Some(Command::Setup(arguments)) => setup(runtime, arguments, interaction)
             .await
             .map(CommandOutcome::Text),
-        Some(Command::Status(arguments)) => status(runtime, arguments.json)
-            .await
-            .map(CommandOutcome::Text),
-        Some(Command::Doctor(arguments)) => doctor(runtime, arguments.json)
-            .await
-            .map(CommandOutcome::Text),
+        Some(Command::Status) => status(runtime).await.map(CommandOutcome::Text),
+        Some(Command::Doctor) => doctor(runtime).await.map(CommandOutcome::Text),
         Some(Command::Pair { command }) => pair(runtime, command, interaction).await,
         Some(Command::Device { command }) => device(runtime, command, interaction).await,
         Some(Command::Connect(arguments)) => connect(runtime, arguments).await,
         Some(Command::Session { command }) => session(runtime, command, interaction).await,
         Some(Command::Daemon { command }) => match command {
-            DaemonCommand::Status(arguments) => status(runtime, arguments.json)
+            DaemonCommand::Status => status(runtime).await.map(CommandOutcome::Text),
+            DaemonCommand::Stop(arguments) => stop(runtime, arguments.yes, interaction)
                 .await
                 .map(CommandOutcome::Text),
-            DaemonCommand::Stop(arguments) => stop(runtime, arguments.force)
-                .await
-                .map(CommandOutcome::Text),
-            DaemonCommand::Restart(arguments) => restart(runtime, arguments.force)
+            DaemonCommand::Restart(arguments) => restart(runtime, arguments.yes, interaction)
                 .await
                 .map(CommandOutcome::Text),
         },
         Some(Command::Logs(arguments)) => logs(runtime, arguments.lines).map(CommandOutcome::Text),
         Some(Command::Reset(arguments)) => reset(runtime, arguments, interaction).await,
-        Some(Command::Update(arguments)) => update(runtime, arguments).await,
+        Some(Command::Update(arguments)) => update(runtime, arguments, interaction).await,
         Some(Command::Uninstall(arguments)) => uninstall(runtime, arguments, interaction).await,
         None => bare(runtime).await,
     }
@@ -704,7 +675,14 @@ async fn pair(
 ) -> Result<CommandOutcome, CliError> {
     match command {
         PairCommand::Create(arguments) => {
-            let ticket = runtime.pair_create(arguments.ttl.unwrap_or(0)).await?;
+            let ttl = arguments.ttl.unwrap_or(
+                u32::try_from(zterm_core::DEFAULT_PAIR_TTL_SECONDS)
+                    .expect("default TTL fits wire field"),
+            );
+            let ticket = runtime.pair_create(ttl).await?;
+            eprintln!(
+                "Ticket expires in {ttl} seconds. On the connecting device, run zterm pair accept and paste this ticket."
+            );
             let output = Zeroizing::new(format!("{}\n", ticket.expose()));
             drop(ticket);
             Ok(CommandOutcome::PairTicket(output))
@@ -713,12 +691,15 @@ async fn pair(
             runtime.ensure_configured_daemon().await?;
             let ticket = read_pair_ticket(arguments.stdin, interaction)?;
             let device = runtime
-                .pair_accept(ticket, arguments.name.as_deref())
+                .pair_accept(ticket, arguments.alias.as_deref())
                 .await?;
+            let alias = device
+                .alias
+                .clone()
+                .unwrap_or_else(|| device.device_id.to_string());
             Ok(CommandOutcome::Text(format!(
-                "Paired outbound device {} as {}.\n",
-                device.device_id,
-                device.alias.as_deref().unwrap_or("(no alias)")
+                "Paired as {alias}. This device can now connect to that host.\nConnect with: zterm connect {}\n",
+                connect_target(&alias)
             )))
         }
     }
@@ -730,11 +711,11 @@ async fn device(
     interaction: InteractionMode,
 ) -> Result<CommandOutcome, CliError> {
     match command {
-        DeviceCommand::List(arguments) => runtime
+        DeviceCommand::List => runtime
             .device_list()
             .await
             .map_err(Into::into)
-            .and_then(|devices| render_devices(devices, arguments.json))
+            .map(render_devices)
             .map(CommandOutcome::Text),
         DeviceCommand::Rename(arguments) => {
             let device = runtime
@@ -804,7 +785,7 @@ async fn session(
             .session_list(&arguments.target)
             .await
             .map_err(Into::into)
-            .and_then(|sessions| render_sessions(sessions, arguments.json))
+            .map(|sessions| render_sessions(sessions, &arguments.target))
             .map(CommandOutcome::Text),
         SessionCommand::New(arguments) => {
             let escape = arguments.escape;
@@ -888,27 +869,19 @@ async fn reset(
                 .to_owned(),
         ));
     }
-    if preflight.active_session_count() > 0 && !arguments.force {
-        return Err(CliError::Usage(format!(
-            "identity reset would end {} active Session(s); retry with --force",
-            preflight.active_session_count()
-        )));
-    }
     let public_identity = preflight
         .endpoint_id
         .as_deref()
         .unwrap_or("incomplete identity state");
     confirm(
         &format!(
-            "Destroy identity {public_identity}, invalidate all local pairing state, and end {} active Session(s)? No RevokeSelf will be sent.",
-            preflight.active_session_count()
+            "{}Destroy identity {public_identity}, remove all local pairing state, and end all running sessions?",
+            session_impact_text(&preflight.active_session_names)
         ),
         arguments.yes,
         interaction,
     )?;
-    let result = runtime
-        .reset_identity(preflight.device_id, arguments.force)
-        .await?;
+    let result = runtime.reset_identity(preflight.device_id, true).await?;
     Ok(CommandOutcome::Text(if result.removed {
         "Managed identity state removed. Run `zterm setup` to create a new identity.\n".to_owned()
     } else {
@@ -917,21 +890,45 @@ async fn reset(
     }))
 }
 
-async fn update(runtime: &LocalRuntime, arguments: UpdateArgs) -> Result<CommandOutcome, CliError> {
+async fn update(
+    runtime: &LocalRuntime,
+    arguments: UpdateArgs,
+    interaction: InteractionMode,
+) -> Result<CommandOutcome, CliError> {
     let result = runtime
-        .update(arguments.version.as_deref(), arguments.force)
+        .update_with_callbacks(
+            arguments.version.as_deref(),
+            arguments.yes,
+            |impact| confirm_sessions("Updating zterm", impact, interaction),
+            |stage| {
+                eprintln!(
+                    "{}",
+                    match stage {
+                        UpdateStage::Preparing => "Downloading and verifying the release...",
+                        UpdateStage::Verified => "Release verified.",
+                        UpdateStage::Stopping => "Stopping the daemon...",
+                        UpdateStage::Activating => "Installing the verified release...",
+                        UpdateStage::Starting => "Starting the updated daemon...",
+                    }
+                )
+            },
+        )
         .await?;
-    let impact = if result.ended_session_names.is_empty() {
-        "No active Sessions were ended.".to_owned()
+    let startup = if result.daemon_started {
+        "Daemon: running"
+    } else {
+        "Run zterm setup to configure and start the daemon."
+    };
+    let ended = if result.ended_session_names.is_empty() {
+        String::new()
     } else {
         format!(
-            "Ended {} active Session(s): {}.",
-            result.ended_session_names.len(),
+            "Ended sessions: {}.\n",
             result.ended_session_names.join(", ")
         )
     };
     Ok(CommandOutcome::Text(format!(
-        "Updated zterm from {} to {}. {impact} The daemon remains stopped.\n",
+        "Updated zterm from {} to {}.\n{ended}{startup}\n",
         result.previous_version, result.installed_version
     )))
 }
@@ -942,12 +939,6 @@ async fn uninstall(
     interaction: InteractionMode,
 ) -> Result<CommandOutcome, CliError> {
     let preflight = runtime.uninstall_preflight().await?;
-    if preflight.identity.active_session_count() > 0 && !arguments.force {
-        return Err(CliError::Usage(format!(
-            "uninstall would end {} active Session(s); retry with --force",
-            preflight.identity.active_session_count()
-        )));
-    }
     let identity = preflight
         .identity
         .endpoint_id
@@ -955,17 +946,16 @@ async fn uninstall(
         .unwrap_or("no committed identity");
     confirm(
         &format!(
-            "Uninstall zterm {} for {}, destroy identity {}, remove all local pairing/authorization state, and end {} active Session(s)? No RevokeSelf will be sent and every device must be paired again after reinstall.",
+            "{}Uninstall zterm {}, destroy identity {}, remove all local pairing state, and end all running sessions? Devices must be paired again after reinstall.",
+            session_impact_text(&preflight.identity.active_session_names),
             preflight.version,
-            preflight.target,
-            identity,
-            preflight.identity.active_session_count()
+            identity
         ),
         arguments.yes,
         interaction,
     )?;
     let result = runtime
-        .uninstall(preflight.identity.device_id, arguments.force)
+        .uninstall(preflight.identity.device_id, true)
         .await?;
     Ok(CommandOutcome::Text(format!(
         "Uninstalled zterm. Managed state removed: {}. Executable removed: {}.\n",
@@ -1178,135 +1168,181 @@ fn pair_ticket_from_bytes(bytes: &[u8]) -> Result<PairTicketText, CliError> {
 }
 
 fn confirm(impact: &str, yes: bool, interaction: InteractionMode) -> Result<(), CliError> {
+    confirm_with(impact, yes, interaction, || {
+        prompt(&format!("{impact} Continue? [y/N]: "))
+    })
+}
+
+fn confirm_with(
+    impact: &str,
+    yes: bool,
+    interaction: InteractionMode,
+    read: impl FnOnce() -> Result<String, CliError>,
+) -> Result<(), CliError> {
     if yes {
         return Ok(());
     }
     if interaction == InteractionMode::NonInteractive {
         return Err(CliError::Usage(format!(
-            "{impact} Noninteractive use requires --yes"
+            "{impact} Run again with -y to continue without prompting."
         )));
     }
-    let answer = prompt(&format!("{impact} Type yes to continue: "))?;
-    if answer.trim() == "yes" {
+    let answer = read()?;
+    if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
         Ok(())
     } else {
         Err(CliError::Daemon(DaemonError::new(
             zterm_core::DomainErrorKind::Cancelled,
-            "confirmation declined",
+            "Confirmation cancelled.",
         )))
     }
 }
 
-#[derive(Serialize)]
-struct DeviceView {
-    device_id: String,
-    alias: Option<String>,
-    remote_name: Option<String>,
-    outbound_known: bool,
-    inbound_status: &'static str,
-    generation: u64,
-    paired_at_unix: u64,
-    last_seen_at_unix: u64,
-    online: bool,
-    streams: u32,
-    attachments: u32,
+fn session_impact_text(names: &[String]) -> String {
+    if names.is_empty() {
+        return String::new();
+    }
+    format!(
+        "The following sessions are running:\n  {}\n\n",
+        names.join("\n  ")
+    )
 }
 
-impl From<CommandDeviceSummary> for DeviceView {
-    fn from(summary: CommandDeviceSummary) -> Self {
-        Self {
-            device_id: summary.device_id.to_string(),
-            alias: summary.alias,
-            remote_name: summary.remote_name,
-            outbound_known: summary.outbound_known,
-            inbound_status: authorization_status(summary.inbound_status),
-            generation: summary.generation.get(),
-            paired_at_unix: summary.paired_at_unix,
-            last_seen_at_unix: summary.last_seen_at_unix,
-            online: summary.online,
-            streams: summary.active_stream_count,
-            attachments: summary.remote_attachment_count,
-        }
+fn confirm_sessions(
+    action: &str,
+    impact: &SessionImpact,
+    interaction: InteractionMode,
+) -> Result<(), DaemonError> {
+    confirm(
+        &format!(
+            "{}{action} will end all running sessions.",
+            session_impact_text(&impact.active_session_names)
+        ),
+        false,
+        interaction,
+    )
+    .map_err(|error| DaemonError::new(zterm_core::DomainErrorKind::Cancelled, error.to_string()))
+}
+
+fn shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-./".contains(&byte))
+    {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
     }
+}
+
+fn connect_target(value: &str) -> String {
+    let quoted = shell_quote(value);
+    if value.starts_with('-') {
+        format!("-- {quoted}")
+    } else {
+        quoted
+    }
+}
+
+fn padded(value: &str, width: usize) -> String {
+    format!("{value}{}", " ".repeat(width.saturating_sub(value.width())))
 }
 
 fn authorization_status(status: AuthorizationStatus) -> &'static str {
     match status {
-        AuthorizationStatus::None => "none",
-        AuthorizationStatus::Authorized => "authorized",
-        AuthorizationStatus::Revoked => "revoked",
+        AuthorizationStatus::None => "None",
+        AuthorizationStatus::Authorized => "Allowed",
+        AuthorizationStatus::Revoked => "Revoked",
     }
 }
 
-fn render_devices(devices: Vec<CommandDeviceSummary>, json: bool) -> Result<String, CliError> {
-    let views = devices
-        .into_iter()
-        .map(DeviceView::from)
-        .collect::<Vec<_>>();
-    if json {
-        return json_line(&views);
+fn render_devices(devices: Vec<CommandDeviceSummary>) -> String {
+    if devices.is_empty() {
+        return "No paired devices. Run zterm pair create to allow another device to connect, or zterm pair accept to connect to a host.\n".to_owned();
     }
-    let mut output = String::new();
-    for device in views {
+    fn name(device: &CommandDeviceSummary) -> &str {
+        device
+            .alias
+            .as_deref()
+            .or(device.remote_name.as_deref())
+            .unwrap_or("(unnamed)")
+    }
+    let width = devices
+        .iter()
+        .map(|device| name(device).width())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let mut output = format!(
+        "{}  {}  {}  Inbound control\n",
+        padded("Name", width),
+        padded("Connection", 13),
+        padded("Connect to host", 15)
+    );
+    for device in &devices {
         output.push_str(&format!(
-            "{} alias={} outbound_known={} inbound_status={} generation={} online={} streams={} attachments={}\n",
-            device.device_id,
-            device.alias.as_deref().unwrap_or("-"),
-            device.outbound_known,
-            device.inbound_status,
-            device.generation,
-            device.online,
-            device.streams,
-            device.attachments
+            "{}  {}  {}  {}\n  ID: {}\n",
+            padded(name(device), width),
+            padded(
+                if device.online {
+                    "Connected"
+                } else {
+                    "Not connected"
+                },
+                13
+            ),
+            padded(
+                if device.outbound_known {
+                    "Available"
+                } else {
+                    "Not paired"
+                },
+                15
+            ),
+            authorization_status(device.inbound_status),
+            device.device_id
         ));
     }
-    Ok(output)
+    output
 }
 
-#[derive(Serialize)]
-struct SessionView {
-    session_id: String,
-    name: String,
-    revision: u64,
-    has_controller: bool,
-    rows: u16,
-    columns: u16,
-}
-
-impl From<CommandSessionSummary> for SessionView {
-    fn from(summary: CommandSessionSummary) -> Self {
-        Self {
-            session_id: summary.session_id.to_string(),
-            name: summary.name.to_string(),
-            revision: summary.revision.get(),
-            has_controller: summary.has_controller,
-            rows: summary.viewport.rows,
-            columns: summary.viewport.columns,
-        }
+fn render_sessions(sessions: Vec<CommandSessionSummary>, target: &str) -> String {
+    if sessions.is_empty() {
+        return format!(
+            "No running sessions. Run zterm connect {} to start the main session.\n",
+            connect_target(target)
+        );
     }
-}
-
-fn render_sessions(sessions: Vec<CommandSessionSummary>, json: bool) -> Result<String, CliError> {
-    let views = sessions
-        .into_iter()
-        .map(SessionView::from)
-        .collect::<Vec<_>>();
-    if json {
-        return json_line(&views);
-    }
-    let mut output = String::new();
-    for session in views {
+    let width = sessions
+        .iter()
+        .map(|session| session.name.as_str().width())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let mut output = format!(
+        "{}  {}  Viewport\n",
+        padded("Name", width),
+        padded("Controller", 10)
+    );
+    for session in sessions {
         output.push_str(&format!(
-            "{} name={} revision={} controller={} viewport={}x{}\n",
-            session.session_id,
-            session.name,
-            session.revision,
-            session.has_controller,
-            session.columns,
-            session.rows
+            "{}  {}  {}x{}\n  ID: {}\n",
+            padded(session.name.as_str(), width),
+            padded(
+                if session.has_controller {
+                    "Attached"
+                } else {
+                    "Detached"
+                },
+                10
+            ),
+            session.viewport.columns,
+            session.viewport.rows,
+            session.session_id
         ));
     }
-    Ok(output)
+    output
 }
 
 async fn setup(
@@ -1315,6 +1351,20 @@ async fn setup(
     interaction: InteractionMode,
 ) -> Result<String, CliError> {
     let observed = runtime.observe().await?;
+    // A running self-hosted daemon deliberately does not disclose its Relay
+    // URL in status. Reusing its exact existing setup needs no URL or prompt.
+    if let ObservedState::Running(status) = &observed
+        && arguments.relay_url.is_none()
+        && arguments
+            .name
+            .as_deref()
+            .is_none_or(|name| name == status.device_name)
+        && arguments
+            .profile
+            .is_none_or(|profile| profile.as_str() == status.infrastructure_profile)
+    {
+        return Ok(render_setup_status(status));
+    }
     if arguments.name.is_none() && arguments.profile.is_none() && arguments.relay_url.is_none() {
         match &observed {
             ObservedState::Running(status) => return Ok(render_setup_status(status)),
@@ -1333,23 +1383,7 @@ async fn setup(
         "Device name: ",
         interaction,
     )?;
-    let profile = match arguments.profile {
-        Some(profile) => profile.as_str().to_owned(),
-        None if interaction == InteractionMode::Interactive => {
-            let value = prompt("Infrastructure profile [official-n0]: ")?;
-            if value.trim().is_empty() {
-                "official-n0".to_owned()
-            } else {
-                value.trim().to_owned()
-            }
-        }
-        None => {
-            return Err(CliError::Usage(
-                "first noninteractive setup requires --profile <official-n0|self-hosted>"
-                    .to_owned(),
-            ));
-        }
-    };
+    let profile = arguments.profile.unwrap_or(ProfileArg::OfficialN0).as_str();
     let relay_url = if profile == "self-hosted" && arguments.relay_url.is_none() {
         Some(required_or_prompt(
             None,
@@ -1360,7 +1394,7 @@ async fn setup(
     } else {
         arguments.relay_url
     };
-    let requested = validate_setup_profile(&name, &profile, relay_url.as_deref())?;
+    let requested = validate_setup_profile(&name, profile, relay_url.as_deref())?;
     let result = runtime.setup(&requested).await?;
     Ok(render_setup_result(&result))
 }
@@ -1435,42 +1469,54 @@ fn prompt(text: &str) -> Result<String, CliError> {
     Ok(value)
 }
 
-async fn status(runtime: &LocalRuntime, json: bool) -> Result<String, CliError> {
-    let view = StatusView::from_observed(runtime.observe().await?);
-    if json {
-        json_line(&view)
-    } else {
-        Ok(view.human())
-    }
+async fn status(runtime: &LocalRuntime) -> Result<String, CliError> {
+    Ok(StatusView::from_observed(runtime.observe().await?).human())
 }
 
-async fn doctor(runtime: &LocalRuntime, json: bool) -> Result<String, CliError> {
+async fn doctor(runtime: &LocalRuntime) -> Result<String, CliError> {
     let report = runtime.doctor().await;
-    if json {
-        let view = DoctorView::from(report);
-        json_line(&view)
-    } else {
-        let mut output = String::new();
-        for check in report.checks {
-            let marker = if check.ok { "ok" } else { "error" };
-            output.push_str(&format!("[{marker}] {}: {}\n", check.name, check.detail));
-        }
-        Ok(output)
+    let mut output = String::new();
+    for check in report.checks {
+        let marker = if check.ok { "ok" } else { "error" };
+        output.push_str(&format!("[{marker}] {}: {}\n", check.name, check.detail));
     }
+    if let Ok(observed) = runtime.observe().await {
+        output.push_str(&StatusView::from_observed(observed).diagnostics());
+    }
+    Ok(output)
 }
 
-async fn stop(runtime: &LocalRuntime, force: bool) -> Result<String, CliError> {
-    Ok(match runtime.stop(force).await? {
-        Some(impact) => format!(
-            "Daemon stopping ({} active sessions).\n",
-            impact.active_session_count
-        ),
-        None => "Daemon already stopped.\n".to_owned(),
-    })
+async fn stop(
+    runtime: &LocalRuntime,
+    yes: bool,
+    interaction: InteractionMode,
+) -> Result<String, CliError> {
+    Ok(
+        match runtime
+            .stop_with_confirmation(yes, |impact| {
+                confirm_sessions("Stopping the daemon", impact, interaction)
+            })
+            .await?
+        {
+            Some(impact) => format!(
+                "Daemon stopped ({} sessions ended).\n",
+                impact.active_session_count
+            ),
+            None => "Daemon already stopped.\n".to_owned(),
+        },
+    )
 }
 
-async fn restart(runtime: &LocalRuntime, force: bool) -> Result<String, CliError> {
-    let readiness = runtime.restart(force).await?;
+async fn restart(
+    runtime: &LocalRuntime,
+    yes: bool,
+    interaction: InteractionMode,
+) -> Result<String, CliError> {
+    let readiness = runtime
+        .restart_with_confirmation(yes, |impact| {
+            confirm_sessions("Restarting the daemon", impact, interaction)
+        })
+        .await?;
     Ok(format!(
         "Daemon ready (zterm {}, wire {}).\n",
         readiness.version, readiness.protocol.wire_major
@@ -1482,6 +1528,9 @@ fn logs(runtime: &LocalRuntime, lines: usize) -> Result<String, CliError> {
     for line in runtime.log_tail(lines)? {
         output.push_str(&line);
         output.push('\n');
+    }
+    if output.is_empty() && lines > 0 {
+        output.push_str("No daemon logs yet.\n");
     }
     Ok(output)
 }
@@ -1500,7 +1549,6 @@ fn render_setup_status(status: &DaemonStatus) -> String {
     )
 }
 
-#[derive(Serialize)]
 struct StatusView {
     state: &'static str,
     version: Option<String>,
@@ -1610,6 +1658,38 @@ impl StatusView {
         if let Some(profile) = &self.infrastructure_profile {
             output.push_str(&format!("Infrastructure: {profile}\n"));
         }
+        if let Some(version) = &self.version {
+            output.push_str(&format!("Version: {version}\n"));
+        }
+        output.push_str(&format!(
+            "Daemon: {}\n",
+            if self.state == "running" {
+                "running"
+            } else {
+                "stopped"
+            }
+        ));
+        if let Some(network) = &self.network_state {
+            output.push_str(&format!("Network: {network}\n"));
+        }
+        output.push_str(&format!("Active sessions: {}\n", self.active_session_count));
+        for name in &self.active_session_names {
+            output.push_str(&format!("  {name}\n"));
+        }
+        if self.state == "not_configured" {
+            output.push_str(SETUP_GUIDANCE);
+        }
+        output
+    }
+
+    fn diagnostics(&self) -> String {
+        let mut output = String::new();
+        if let Some(phase) = &self.phase {
+            output.push_str(&format!("Build phase: {phase}\n"));
+        }
+        if let Some(started) = self.started_at_unix {
+            output.push_str(&format!("Started at (Unix): {started}\n"));
+        }
         if let Some(network) = &self.network_state {
             output.push_str(&format!("Network: {network}\n"));
             if let Some(bound) = self.endpoint_bound {
@@ -1641,45 +1721,8 @@ impl StatusView {
                 output.push_str(&format!("Network diagnostic: {diagnostic}\n"));
             }
         }
-        output.push_str(&format!("Active sessions: {}\n", self.active_session_count));
         output
     }
-}
-
-#[derive(Serialize)]
-struct DoctorView {
-    healthy: bool,
-    checks: Vec<DoctorCheckView>,
-}
-
-#[derive(Serialize)]
-struct DoctorCheckView {
-    name: &'static str,
-    ok: bool,
-    detail: String,
-}
-
-impl From<DoctorReport> for DoctorView {
-    fn from(report: DoctorReport) -> Self {
-        Self {
-            healthy: report.healthy,
-            checks: report
-                .checks
-                .into_iter()
-                .map(|check| DoctorCheckView {
-                    name: check.name,
-                    ok: check.ok,
-                    detail: check.detail,
-                })
-                .collect(),
-        }
-    }
-}
-
-fn json_line(value: &impl Serialize) -> Result<String, CliError> {
-    serde_json::to_string_pretty(value)
-        .map(|json| format!("{json}\n"))
-        .map_err(|error| CliError::Serialization(error.to_string()))
 }
 
 #[cfg(test)]
@@ -1705,7 +1748,7 @@ mod tests {
     }
 
     #[test]
-    fn human_and_json_share_the_complete_redacted_network_view() {
+    fn status_overview_and_doctor_preserve_redacted_network_details() {
         let device_id = DeviceId::from_array([0x63; 32]);
         let view = StatusView::from_observed(ObservedState::Running(DaemonStatus {
             protocol: ProtocolStatus {
@@ -1741,26 +1784,18 @@ mod tests {
 
         let human = view.human();
         assert!(human.contains("Network: degraded"));
-        assert!(human.contains("Network bind attempts: 7"));
-        assert!(human.contains("Address publish: configured"));
-        assert!(human.contains("Address lookup: degraded"));
-        assert!(human.contains("Connections: authenticated=4, primary=2, streams=5"));
-        assert!(human.contains("Paths: direct=1, relay=1"));
-        assert!(human.contains("Network diagnostic: home_relay_unavailable"));
+        assert!(human.contains("Version: test"));
+        assert!(human.contains("  one\n  two"));
+        assert!(!human.contains("Network bind attempts"));
+        let diagnostics = view.diagnostics();
+        assert!(diagnostics.contains("Network bind attempts: 7"));
+        assert!(diagnostics.contains("Address publish: configured"));
+        assert!(diagnostics.contains("Address lookup: degraded"));
+        assert!(diagnostics.contains("Connections: authenticated=4, primary=2, streams=5"));
+        assert!(diagnostics.contains("Paths: direct=1, relay=1"));
+        assert!(diagnostics.contains("Network diagnostic: home_relay_unavailable"));
 
-        let json = serde_json::to_value(&view).expect("serialize status view");
-        assert_eq!(json["network_state"], "degraded");
-        assert_eq!(json["network_bind_attempts"], 7);
-        assert_eq!(json["address_publish_state"], "configured");
-        assert_eq!(json["address_lookup_state"], "degraded");
-        assert_eq!(json["authenticated_connection_count"], 4);
-        assert_eq!(json["primary_connection_count"], 2);
-        assert_eq!(json["active_stream_count"], 5);
-        assert_eq!(json["direct_path_count"], 1);
-        assert_eq!(json["relay_path_count"], 1);
-        assert_eq!(json["network_diagnostic"], "home_relay_unavailable");
-
-        let rendered = format!("{human}{}", serde_json::to_string(&view).expect("JSON"));
+        let rendered = format!("{human}{diagnostics}");
         for forbidden in [
             "direct_ip",
             "route_cache",
@@ -1769,6 +1804,81 @@ mod tests {
             "relay.example.test",
         ] {
             assert!(!rendered.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn confirmation_accepts_y_and_yes_and_otherwise_cancels_without_unneeded_reads() {
+        for answer in ["y", " Y ", "yes", "YeS\n"] {
+            confirm_with("End sessions?", false, InteractionMode::Interactive, || {
+                Ok(answer.to_owned())
+            })
+            .expect("accepted confirmation");
+        }
+        for answer in ["", "\n", "n", "false", "anything"] {
+            assert!(
+                confirm_with("End sessions?", false, InteractionMode::Interactive, || Ok(
+                    answer.to_owned()
+                ))
+                .is_err()
+            );
+        }
+        confirm_with(
+            "End sessions?",
+            true,
+            InteractionMode::NonInteractive,
+            || panic!("must not read"),
+        )
+        .expect("accepted confirmation");
+        assert!(
+            confirm_with(
+                "End sessions?",
+                false,
+                InteractionMode::NonInteractive,
+                || panic!("must not read")
+            )
+            .expect_err("unconfirmed noninteractive invocation")
+            .to_string()
+            .contains("-y")
+        );
+        assert_eq!(shell_quote("team's host"), "'team'\"'\"'s host'");
+        assert_eq!(connect_target("-host"), "-- -host");
+        assert_eq!(padded("开发", 6), "开发  ");
+        assert!(render_sessions(Vec::new(), "local").contains("zterm connect local"));
+        assert!(render_devices(Vec::new()).contains("zterm pair"));
+    }
+
+    #[test]
+    fn public_parser_accepts_human_conveniences_and_rejects_removed_options() {
+        for args in [
+            vec!["status", "--json"],
+            vec!["doctor", "--json"],
+            vec!["daemon", "status", "--json"],
+            vec!["device", "list", "--json"],
+            vec!["session", "list", "--json"],
+            vec!["daemon", "stop", "--force"],
+            vec!["daemon", "restart", "--force"],
+            vec!["update", "--force"],
+            vec!["uninstall", "--force"],
+            vec!["reset", "--identity", "--force"],
+            vec!["pair", "accept", "--name", "host"],
+            vec!["logs", "-f"],
+        ] {
+            assert!(Cli::try_parse_from(std::iter::once("zterm").chain(args)).is_err());
+        }
+        for args in [
+            vec!["daemon", "stop", "-y"],
+            vec!["daemon", "restart", "-y"],
+            vec!["update", "-y"],
+            vec!["uninstall", "-y"],
+            vec!["reset", "--identity", "-y"],
+            vec!["device", "revoke", "host", "-y"],
+            vec!["session", "close", "local", "main", "-y"],
+            vec!["pair", "accept", "--alias", "host"],
+            vec!["logs", "-n", "20"],
+            vec!["session", "list"],
+        ] {
+            assert!(Cli::try_parse_from(std::iter::once("zterm").chain(args)).is_ok());
         }
     }
 
@@ -1795,7 +1905,7 @@ mod tests {
     }
 
     #[test]
-    fn device_human_and_json_preserve_directions_without_route_data() {
+    fn device_table_preserves_directions_without_route_data() {
         let outbound = CommandDeviceSummary {
             device_id: DeviceId::from_array([0x71; DeviceId::LENGTH]),
             outbound_known: true,
@@ -1823,23 +1933,25 @@ mod tests {
             remote_attachment_count: 1,
         };
 
-        let human = render_devices(vec![outbound.clone(), inbound.clone()], false)
-            .expect("human device projection");
-        assert!(human.contains("outbound_known=true inbound_status=none"));
-        assert!(human.contains("outbound_known=false inbound_status=authorized"));
-        let json = render_devices(vec![outbound, inbound], true).expect("JSON device projection");
-        let value: serde_json::Value = serde_json::from_str(&json).expect("valid device JSON");
-        assert_eq!(value[0]["outbound_known"], true);
-        assert_eq!(value[0]["inbound_status"], "none");
-        assert_eq!(value[1]["outbound_known"], false);
-        assert_eq!(value[1]["inbound_status"], "authorized");
-        for forbidden in ["route", "relay", "direct", "ticket", "working_directory"] {
-            assert!(!json.contains(forbidden));
+        let human = render_devices(vec![outbound.clone(), inbound.clone()]);
+        assert!(human.contains("Name") && human.contains("Inbound control"));
+        assert!(
+            human.contains("Available")
+                && human.contains("Allowed")
+                && human.contains("Not paired")
+        );
+        assert!(human.contains("Not connected") && !human.contains("Offline"));
+        assert!(
+            human.contains(&outbound.device_id.to_string())
+                && human.contains(&inbound.device_id.to_string())
+        );
+        for forbidden in ["route", "relay", "ticket", "working_directory"] {
+            assert!(!human.contains(forbidden));
         }
     }
 
     #[test]
-    fn session_human_and_json_keep_stable_fields_without_sensitive_diagnostics() {
+    fn session_table_keeps_identity_without_sensitive_diagnostics() {
         let cwd_sentinel = "/private/tmp/CLI_CWD_SENTINEL_8eb1/project";
         let forbidden_sentinels = [
             cwd_sentinel,
@@ -1861,37 +1973,11 @@ mod tests {
         };
         let command_summary = CommandSessionSummary::from(daemon_summary);
 
-        let human = render_sessions(vec![command_summary.clone()], false)
-            .expect("human Session projection");
-        let json = render_sessions(vec![command_summary], true).expect("JSON Session projection");
-        let value: serde_json::Value = serde_json::from_str(&json).expect("valid Session JSON");
-        let object = value[0].as_object().expect("one Session JSON object");
-        let keys = object
-            .keys()
-            .map(String::as_str)
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(
-            keys,
-            std::collections::BTreeSet::from([
-                "columns",
-                "has_controller",
-                "name",
-                "revision",
-                "rows",
-                "session_id",
-            ])
-        );
-        assert_eq!(object["name"], "cli-safe-session");
-        assert_eq!(object["revision"], 67);
-        assert_eq!(object["has_controller"], true);
-        assert_eq!(object["rows"], 53);
-        assert_eq!(object["columns"], 179);
-        assert!(human.contains("name=cli-safe-session"));
-        assert!(human.contains("revision=67"));
-        assert!(human.contains("controller=true"));
-        assert!(human.contains("viewport=179x53"));
-
-        let rendered = format!("{human}{json}");
+        let rendered = render_sessions(vec![command_summary.clone()], "local");
+        assert!(rendered.contains("cli-safe-session"));
+        assert!(rendered.contains(&command_summary.session_id.to_string()));
+        assert!(rendered.contains("Attached") && rendered.contains("179x53"));
+        assert!(!rendered.contains("revision"));
         for sentinel in forbidden_sentinels {
             assert!(!rendered.contains(sentinel));
         }

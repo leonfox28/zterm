@@ -462,6 +462,19 @@ impl PairingServiceInner {
                         "pair accept operation ended unexpectedly",
                     ))
                 });
+                match &result {
+                    Ok(_) => tracing::info!(
+                        component = "pairing",
+                        operation = "accept_committed",
+                        "Outbound pairing committed"
+                    ),
+                    Err(error) => tracing::warn!(
+                        component = "pairing",
+                        operation = "accept_failed",
+                        reason = error.kind().code(),
+                        "Pair acceptance failed"
+                    ),
+                }
                 operation_cell.complete(result);
                 operation_inner.record_accept_completion(operation_id, &operation_cell);
             });
@@ -923,6 +936,12 @@ impl PairingServiceInner {
             .publish(durable)
             .map_err(|_| generic_pair_rejection())?;
 
+        tracing::info!(
+            component = "pairing",
+            operation = "inbound_authorized",
+            generation = generation.get(),
+            "Inbound authorization committed"
+        );
         let accepted = committed
             .pair_accepted()
             .map_err(PairingError::peer_error)?;
@@ -2239,6 +2258,14 @@ mod tests {
 
     #[test]
     fn create_requires_online_route_replays_and_rejects_fingerprint_mismatch() {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let mut capture = tempfile::tempfile().expect("pair log capture");
+        let writer = capture.try_clone().expect("pair log writer");
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.try_clone().expect("pair log event writer"))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
         let transport = Arc::new(FakeTransport::empty());
         let harness = harness(transport);
         let operation = EphemeralOperationId::from_array([0x61; 16]);
@@ -2273,6 +2300,14 @@ mod tests {
             )
             .expect("create replay");
         assert_eq!(created.ticket().expose(), replayed.ticket().expose());
+        capture
+            .seek(SeekFrom::Start(0))
+            .expect("read captured pair events");
+        let mut logs = String::new();
+        capture.read_to_string(&mut logs).expect("pair event text");
+        assert_eq!(logs.matches("Pairing ticket created").count(), 1);
+        assert!(!logs.contains(created.ticket().expose()));
+        assert!(!logs.contains("relay.example.test"));
 
         let mismatch = harness.service.create_until(
             LocalPairCreateInput::new(

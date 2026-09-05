@@ -150,6 +150,15 @@ pub enum ConnectionCloseReason {
 }
 
 impl ConnectionCloseReason {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::Unauthorized => "unauthorized",
+            Self::Duplicate => "duplicate",
+            Self::ShuttingDown => "shutting_down",
+            Self::EndpointReset => "endpoint_reset",
+        }
+    }
+
     const fn wire(self) -> (VarInt, &'static [u8]) {
         match self {
             Self::Unauthorized => (VarInt::from_u32(CLOSE_UNAUTHORIZED), b"not authorized"),
@@ -1526,7 +1535,7 @@ impl ConnectionBroker {
             state.close_candidates()
         };
         for candidate in candidates {
-            candidate.set_primary(false);
+            candidate.set_primary(false, reason.code());
             candidate.cancel(reason);
         }
         slot.changed.notify_waiters();
@@ -2190,9 +2199,9 @@ impl ConnectionBroker {
 
             match outcome {
                 CandidateDecision::Promoted(losers) => {
-                    candidate.set_primary(true);
+                    candidate.set_primary(true, "promoted");
                     for loser in losers {
-                        loser.set_primary(false);
+                        loser.set_primary(false, "duplicate");
                         loser.cancel(ConnectionCloseReason::Duplicate);
                     }
                     slot.changed.notify_waiters();
@@ -2424,7 +2433,7 @@ impl ConnectionBroker {
             removed
         };
         if let Some(candidate) = removed {
-            candidate.set_primary(false);
+            candidate.set_primary(false, "transport_closed");
             candidate.cancel(ConnectionCloseReason::EndpointReset);
         }
         slot.changed.notify_waiters();
@@ -2448,7 +2457,7 @@ impl ConnectionBroker {
             removed
         };
         if let Some(candidate) = removed {
-            candidate.set_primary(false);
+            candidate.set_primary(false, reason.code());
             candidate.cancel(reason);
         }
         slot.changed.notify_waiters();
@@ -2553,7 +2562,7 @@ impl Candidate {
         }))
     }
 
-    fn set_primary(&self, primary: bool) {
+    fn set_primary(&self, primary: bool, reason: &'static str) {
         let previous = self.primary.swap(primary, Ordering::AcqRel);
         if previous == primary {
             return;
@@ -2569,6 +2578,16 @@ impl Candidate {
             self.metrics.remove_path(self.remote);
         }
         self.metrics.publish();
+        tracing::info!(
+            component = "connection",
+            operation = if primary {
+                "primary_established"
+            } else {
+                "primary_closed"
+            },
+            reason,
+            "Primary connection changed"
+        );
     }
 
     fn cancel(&self, reason: ConnectionCloseReason) {

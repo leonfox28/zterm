@@ -120,11 +120,25 @@ an update request reaches the network and before uninstall observes or deletes
 state. Official binaries may still be installed in any user-selected absolute
 writable directory; the proof is about build identity, not a hard-coded path.
 
-If live Sessions would be ended, update refuses unless `--force` is explicit.
+With no live Sessions, update proceeds directly. Otherwise it lists their
+names, including detached Sessions, and asks for English `[y/N]` confirmation.
+Enter `y` or `yes` to continue in the same invocation; `-y`/`--yes` confirms
+directly. Empty input, EOF, or another answer cancels. Noninteractive use with
+live Sessions requires `-y`/`--yes`; public `--force` has been removed.
+
 After approval, zterm stops the daemon, atomically activates the candidate,
 and rechecks it. Activation/post-check failure restores the preceding binary.
-PTYs already ended for an approved update cannot be restored. A successful
-update does not restart the daemon; the next command starts it on demand.
+A successful update starts the new daemon on configured installations, even
+if it was previously stopped. The CLI shows actual update phases and reports
+success after local readiness, without waiting for Internet connectivity.
+PTYs ended for the update are not restored.
+
+Before setup, update installs the binary and prints `Run zterm setup to
+configure and start the daemon.` It never creates an identity implicitly. If
+activation committed but startup fails, the new binary stays installed and
+the command returns an explicit partial-completion error with restart guidance.
+An already installed older updater still runs its old behavior for the first
+upgrade; invoking the new binary enables these command changes.
 
 Binary rollback does not imply persistent-state rollback. A future release
 that changes the state schema must provide its own migration and recovery
@@ -145,7 +159,8 @@ For the first migration, use the existing authenticated installer/recovery path:
    install it into an empty temporary directory with `--install-dir`. This
    authenticates the candidate before touching the current executable or daemon.
 2. Stop the existing daemon with the old binary's `daemon stop`. If Sessions are
-   active, finish them first; `--force` remains a separate explicit choice.
+   active, finish them first; that old binary also has its historical `--force`
+   option. The current CLI uses `-y`/`--yes` instead.
 3. Retain the old executable at a fresh backup path, leaving its original
    destination empty. Do not run `uninstall` or remove `~/.zterm`: pairing and
    identity must remain intact.
@@ -167,13 +182,14 @@ Review impact interactively, or confirm noninteractively:
 
 ```bash
 zterm uninstall
-zterm uninstall --yes
-zterm uninstall --yes --force
+zterm uninstall -y
 ```
 
-Uninstall reuses the identity-reset boundary: it stops the daemon, refuses live
-Sessions without `--force`, removes only the validated managed state inventory,
-and unlinks the exact running executable last. This destroys the local device
+Uninstall asks once to confirm the executable/identity deletion and any running
+Sessions it will end, or accepts `-y`/`--yes` directly. Deletion still needs
+confirmation when there are no Sessions. It reuses the identity-reset boundary:
+stop the daemon, remove only the validated managed state inventory, and unlink
+the exact running executable last. This destroys the local device
 identity and authorization state; reinstalling and running setup creates a new
 identity that must be paired again. It does not send `RevokeSelf` to other
 devices, so copied old private keys remain a per-host revoke concern.

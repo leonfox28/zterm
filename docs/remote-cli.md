@@ -26,13 +26,14 @@ zterm setup [--name <name>]
 The recommended noninteractive invocation is:
 
 ```text
-zterm setup --name <name> --profile official-n0
+zterm setup --name <name>
 ```
 
-On first interactive setup, omitted values are prompted and an empty profile
-answer selects `official-n0`. First noninteractive setup requires both
-`--name` and `--profile`. Running `zterm setup` with no overrides after setup
-preserves the committed identity and configuration and ensures that one daemon
+First setup defaults to `official-n0` without a profile prompt. An interactive
+terminal asks for a missing device name; noninteractive setup requires `--name`.
+Explicit `--profile self-hosted` still requires a Relay URL, prompted when
+interactive or supplied with `--relay-url`. Running `zterm setup` with no
+overrides after setup preserves the committed identity and configuration and ensures that one daemon
 is running. The existing `self-hosted` profile remains an explicit optional
 configuration, but it is not the production default and this milestone adds no
 public or self-hosted Relay acceptance workflow.
@@ -40,28 +41,44 @@ public or self-hosted Relay acceptance workflow.
 These inspection commands do not start a daemon or create state:
 
 ```text
-zterm status [--json]
-zterm doctor [--json]
-zterm daemon status [--json]
-zterm logs [--lines <n>]
+zterm status
+zterm doctor
+zterm daemon status
+zterm logs [-n|--lines <n>]
 ```
 
-`status` and `daemon status` render the same typed observation. `doctor` checks
-the effective account, managed state, local socket/lock agreement, network
-observation, and the lack of automatic login startup. `logs` returns only a
-bounded tail: 100 lines by default, at most 1,000 lines and 1 MiB.
+`status` and `daemon status` summarize the device name, version, daemon state,
+infrastructure, network state, and running Session names/count. `doctor` shows
+the detailed local socket/lock and network observations, effective account,
+managed state, and the lack of automatic login startup. Public inspection
+output is human-readable text; `--json` is not supported.
+
+`logs` reads a bounded tail once: 100 lines by default, at most 1,000 lines and
+1 MiB. `-n` is the short spelling of `--lines`; missing logs produce an English
+explanation. There is no follow mode. Existing `daemon.log` records lifecycle,
+Session, connection, network and pairing events without terminal content or
+secrets. At daemon startup, a log of at least 4 MiB is rotated to `daemon.log.1`;
+this is a startup check, not a size cap during a long-running daemon.
 
 Daemon lifecycle commands are:
 
 ```text
-zterm daemon stop [--force]
-zterm daemon restart [--force]
+zterm daemon stop [-y|--yes]
+zterm daemon restart [-y|--yes]
 ```
 
-Stopping an already stopped daemon succeeds. If Sessions are active, stop or
-restart refuses unless `--force` is present because a daemon stop ends those
-Sessions and their PTYs. `restart` is an explicit start operation; `stop` is
-not.
+Stopping an already stopped daemon succeeds. With no running Sessions, stop
+and restart proceed directly. Otherwise they list the Session names and ask
+for English `[y/N]` confirmation because those Sessions and PTYs will end.
+Detached Sessions also need confirmation; connections without Sessions do not.
+A newly admitted Session encountered by the stop request is presented in the
+same invocation before it can be ended. `restart` explicitly starts a daemon.
+
+Confirmation accepts `y` or `yes`, ignoring case and surrounding whitespace.
+Empty input, EOF, or another answer cancels. `-y`/`--yes` skips the prompt;
+noninteractive input with live work must supply it. Public `--force` has been
+removed. The same input rules apply to close, revoke, reset, uninstall and
+update. Reset/uninstall still confirm actual deletion even with no Sessions.
 
 ## Pairing and directional trust
 
@@ -69,19 +86,23 @@ Pairing commands are:
 
 ```text
 zterm pair create [--ttl <duration-with-s|m|h-suffix>]
-zterm pair accept [--stdin] [--name <alias>]
+zterm pair accept [--stdin] [--alias <alias>]
 ```
 
-`pair create` writes the one-time bearer ticket to standard output once. Keep
-it out of command arguments, environment variables, shell history, logs, and
+`pair create` writes the one-time bearer ticket to standard output once, with
+validity and receiving instructions on standard error. The default validity is
+10 minutes; valid values range from `60s` to `1h`. Keep the ticket out of command
+arguments, environment variables, shell history, logs, and
 error reports.
 
 By default, `pair accept` reads one bounded line from an interactive TTY while
 echo is disabled. It has no ticket positional argument and no `--ticket` flag.
 A non-TTY is rejected without reading unless automation explicitly selects
 `--stdin`; that mode reads the bounded standard input to EOF, trims surrounding
-whitespace, and rejects input over 16 KiB. `--name` assigns the exact outbound
-alias after acceptance.
+whitespace, and rejects input over 16 KiB. `--alias` assigns the exact outbound
+alias after acceptance; the old `--name` spelling is rejected. Success reports
+the control direction and a `zterm connect` command using the actual stored
+alias, quoted for shell use when needed.
 
 Trust is directional. If host A creates a ticket and controller B accepts it:
 
@@ -93,22 +114,24 @@ Trust is directional. If host A creates a ticket and controller B accepts it:
 Device management preserves those two directions:
 
 ```text
-zterm device list [--json]
+zterm device list
 zterm device rename <device> <alias>
-zterm device revoke <device> [--yes]
+zterm device revoke <device> [-y|--yes]
 ```
 
-The list exposes the full device ID, alias, remote display name, outbound and
-inbound states, generation, online state, active stream count, and remote
-attachment count. It does not expose route cache entries, direct addresses,
-Relay URLs, tickets, terminal content, or working directories.
+The table leads with device names and aliases and retains full device IDs,
+both directions of control permission, authorization state, and current
+connection observations. An unconnected device is not necessarily unreachable.
+An empty list explains how to pair a device. It does not expose route cache
+entries, direct addresses, Relay URLs, tickets, terminal content, or working
+directories.
 
 `rename` changes only an outbound known-device alias and therefore rejects an
 inbound-only record. `revoke` changes only the selected device's authorization
 to control this host; its outbound-known record is retained. Revoke disconnects
 and detaches that remote principal, but it does not close the host Session or
-PTY and does not affect another principal. Interactive use must type `yes`;
-noninteractive use requires `--yes`.
+PTY and does not affect another principal. It uses the shared `[y/N]`
+confirmation or explicit `-y`/`--yes`.
 
 An unauthorized remote peer receives only the generic `unauthorized` category.
 The wire response does not reveal whether the identity is unknown, revoked, or
@@ -142,13 +165,13 @@ The public commands are:
 ```text
 zterm connect <target> [--session <name-or-id>] [--takeover]
               [--escape <ctrl-@..ctrl-_|ctrl-?|none>]
-zterm session list <target> [--json]
+zterm session list [<target>]
 zterm session new <target> <name> [--cwd <host-path>]
                    [--escape <ctrl-@..ctrl-_|ctrl-?|none>]
 zterm session attach <target> <session> [--takeover]
                       [--escape <ctrl-@..ctrl-_|ctrl-?|none>]
 zterm session rename <target> <session> <new-name>
-zterm session close <target> <session> [--yes]
+zterm session close <target> <session> [-y|--yes]
 ```
 
 `connect` defaults to `main`. If `main` does not exist, the daemon atomically
@@ -158,10 +181,14 @@ named Session and immediately attaches the exact returned `SessionId`; if the
 follow-up attach fails, the created Session remains live and its ID is reported.
 `--cwd` is interpreted and validated by the selected host, not the controller.
 
-`session close` ends the exact selected Session and its PTY. Interactive use
-must type `yes`; noninteractive use requires `--yes`. Rename preserves the
-Session ID. Human and JSON Session lists intentionally omit the working
-directory and terminal content.
+`session list` defaults to `local` when its target is omitted. Its table leads
+with names, shows Attached/Detached state, and retains full Session IDs. Empty
+results include a creation hint. Other Session commands keep their explicit
+target positions.
+
+`session close` ends the exact selected Session and its PTY using shared
+`[y/N]` confirmation or explicit `-y`/`--yes`. Rename preserves the Session ID.
+Session lists intentionally omit the working directory and terminal content.
 
 There is one controller per Session. An ordinary second attachment never
 steals it and returns occupied. `--takeover` first synchronizes a replacement,
@@ -227,7 +254,7 @@ terminates the local view through the restoration path.
 
 Session state is daemon-lifetime, not disk-persistent. Detach, CLI exit, stream
 loss, route change, and device revoke do not end the PTY. Root-shell exit,
-explicit `session close`, forced daemon stop/restart, identity reset, daemon
+explicit `session close`, confirmed daemon stop/restart, identity reset, daemon
 crash, and host reboot do. A new daemon starts with no live Session registry.
 
 ## Ambiguous operations
@@ -246,12 +273,14 @@ a new, independent command.
 ## Identity reset
 
 ```text
-zterm reset --identity [--yes] [--force]
+zterm reset --identity [-y|--yes]
 ```
 
 Identity reset is destructive but does not uninstall the binary. It reports
-the current public identity and active Session count, requires interactive
-`yes` or noninteractive `--yes`, and refuses active Sessions without `--force`.
+the current public identity and running Session names, then asks once to end
+the Sessions and delete the identity. Use `-y`/`--yes` to confirm directly.
+Existing identity data requires confirmation even with no Sessions; an already
+absent state root is a successful no-op.
 It then performs a bounded daemon stop, obtains the lifecycle lock, rechecks
 the exact identity and daemon state, and removes only the validated managed
 state root. No `RevokeSelf` is sent and setup is not run automatically.

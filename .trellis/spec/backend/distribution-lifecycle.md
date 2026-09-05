@@ -35,10 +35,12 @@ pub fn require_official_distribution_build(
 // crates/daemon/src/distribution.rs and operations.rs
 pub fn ReleaseSelection::parse(tag: Option<&str>) -> Result<ReleaseSelection, DistributionError>;
 pub async fn prepare_update(selection: ReleaseSelection) -> Result<PreparedRelease, DaemonError>;
-pub async fn LocalRuntime::update(
+pub async fn LocalRuntime::update_with_callbacks(
     &self,
     exact_tag: Option<&str>,
-    force: bool,
+    approved: bool,
+    confirm: impl FnMut(&SessionImpact) -> Result<(), DaemonError>,
+    progress: impl FnMut(UpdateStage),
 ) -> Result<UpdateResult, DaemonError>;
 pub async fn LocalRuntime::uninstall_preflight(&self) -> Result<UninstallPreflight, DaemonError>;
 pub async fn LocalRuntime::uninstall(
@@ -51,8 +53,8 @@ pub async fn LocalRuntime::uninstall(
 Public CLI signatures are:
 
 ```text
-zterm update [--version <vSEMVER>] [--force]
-zterm uninstall [--yes] [--force]
+zterm update [--version <vSEMVER>] [-y|--yes]
+zterm uninstall [-y|--yes]
 ```
 
 The installer-only entries are hidden and handled before `LocalRuntime::current`:
@@ -141,15 +143,27 @@ workspace version.
   not constrain a user-selected absolute writable install directory, but it
   rejects repository, development, ordinary-CI, and `UNCONFIGURED` binaries
   before a network request or destructive state observation.
-- Update proves the current executable locally, then fully
-  prepares/authenticates the candidate before daemon contact.
-  Incompatible CLI/daemon, active Sessions without `--force`, or failed stop
-  prevent activation. Activation retains the old executable, post-checks the
-  new path, rolls back on failure, updates metadata only when state exists, and
-  never restarts the daemon.
-- Uninstall first proves the exact running managed executable, then reuses identity
-  reset/Session force/managed-inventory deletion and removes the executable
-  last. It never sends `RevokeSelf` or performs setup.
+- Update validates the managed executable and authenticates one candidate before
+  daemon contact. Incompatible CLI/daemon or failed stop prevents activation.
+  Live work uses the shared English name/impact and y/yes/-y confirmation in
+  [Local Daemon and IPC](./local-daemon-ipc.md); idle/stopped needs no prompt.
+  Keep the prepared candidate across input without redownloading or holding
+  lifecycle.lock. The registry gates idle-stop/creation races; return new
+  impact to this invocation's confirmation flow.
+  Activation retains the old executable, post-checks/rolls back on failure and
+  writes metadata only for existing state. After commit and lock release,
+  configured installs ensure the activated executable, even if previously
+  stopped. Match readiness version/wire/schema to the signed new manifest,
+  not the old updater image; do not await the network.
+  Before setup, report setup guidance without identity creation. Post-commit
+  startup failure is a nonzero partial-completion error retaining the new
+  binary; no second rollback engine. UpdateStage exposes actual preparation,
+  verified, stop, activation and startup phases to the CLI, without a new log
+  writer. An old installed updater retains its old behavior for the first upgrade.
+- Uninstall validates the running managed executable, reuses identity reset and
+  managed-inventory deletion, then removes the executable last. One confirmation
+  or -y/--yes approves deletion and Session impact, including zero-Session
+  deletion. No public --force, RevokeSelf or implicit setup.
 - A successful `ci.yml` push run on `main` owns the three native candidate
   builds plus deterministic unsigned assembly and generated-installer checks.
   The aggregate `CI gate` requires both ordinary evidence and this candidate.
@@ -170,7 +184,7 @@ workspace version.
   mixed-version adapter, downgrade, presentation negotiation, or old terminal
   kind fallback. If rollback is required before reopening user traffic, roll
   back the whole participating release set and accept that Sessions ended by a
-  forced update are not resurrected.
+  confirmed update are not resurrected.
 - Containerized native jobs must add only the exact quoted `$GITHUB_WORKSPACE`
   as Git `safe.directory` after checkout and before Git-backed source-policy
   checks. A wildcard or broader trusted path is forbidden. Tool paths must be
@@ -224,7 +238,11 @@ workspace version.
 | Noncanonical tag, same version, or downgrade | `update_rejected` |
 | Running daemon version/wire/schema differs | `update_rejected`; do not stop it |
 | a v1 or mixed-version peer reaches a v2 ALPN/wire boundary | explicit incompatibility; do not downgrade, translate terminal representation, or partially activate the attachment |
-| Active Sessions and no `--force` | `update_rejected`; no stop/activation |
+| Live Sessions and no prior interruption approval | show names and request y/yes; cancel/EOF/noninteractive refusal leaves binary and Sessions intact |
+| Session admitted after an empty preflight | unapproved stop returns impact and confirms within this invocation before interrupting |
+| Committed update with configured state | ensure activated executable and match authenticated manifest readiness |
+| Committed update before setup | success with setup guidance; no identity creation |
+| Activation committed but startup/readiness failed | nonzero partial-completion diagnostic; new binary remains installed |
 | Stop or lifecycle ownership release fails | Preserve installed binary; return typed lifecycle error |
 | Activation/post-check/metadata fails | Restore retained executable; report ended Sessions as ended |
 | Installer destination exists, or install directory is relative/symlink/non-directory/unwritable | Refuse before download or activation; do not overwrite |
@@ -239,8 +257,8 @@ workspace version.
 ### 5. Good/Base/Bad Cases
 
 - Good: signed newer target archive verifies, zero Sessions are active, daemon
-  stops, candidate activates/post-checks, metadata commits, daemon remains
-  stopped, and the rollback file is removed.
+  stops, candidate activates/post-checks, metadata commits, lifecycle lock is
+  released, new-version daemon becomes ready, and the rollback file is removed.
 - Good: every participating node is upgraded to the same wire-major-two release
   before reconnecting, then local/direct/Relay smoke evidence is collected on
   the new semantic protocol.
@@ -283,8 +301,14 @@ workspace version.
   install-directory shape, no-clobber install, retained-backup rollback, and
   exact removal.
 - Operations tests assert development/ordinary-CI refusal before update network
-  or uninstall state access, mode-`0600` metadata, active-Session force, stop
+  or uninstall state access, mode-`0600` metadata, conditional approval, stop
   failure, and incompatible daemon rejection at their authoritative owners.
+  Injected startup-policy tests verify configured running/stopped startup,
+  manifest-relative readiness, no-setup guidance and post-commit startup failure;
+  existing detached-launch fixtures own actual executable launch and readiness.
+  This is composed local evidence, not a signed end-to-end update execution.
+  Cancellation must preserve the prepared transaction before activation; the
+  production managed-build gate cannot be bypassed to simplify source tests.
   The signed hosted candidate owns positive pre-setup/configured uninstall and
   reinstall identity-rotation evidence.
 - `sh tests/release/static.sh` asserts exact-tag triggering, an annotated tag
@@ -343,11 +367,11 @@ http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
 ```rust
 // Fixed-origin, bounded preparation authenticates bytes and candidate first.
 let prepared = prepare_update(ReleaseSelection::parse(exact_tag)?).await?;
-let impact = client.update_preflight().await?;
-require_force_if_needed(&impact, force)?;
-client.stop(force).await?;
+stop_with_confirmation(approved, confirm).await?;
 let activation = activate_verified_candidate(&prepared)?;
 postcheck_or_rollback(activation, &prepared)?;
+// After commit and lifecycle-lock release, ensure the installed daemon and
+// compare readiness against prepared.manifest(), not the old CLI version.
 ```
 
 ```sh

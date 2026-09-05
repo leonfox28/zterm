@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 13
+- **Total Sessions**: 14
 - **Last Active**: 2026-09-05
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~339 | Active |
+| `journal-1.md` | ~374 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 14 | 2026-09-05 | Simplify CLI workflows and daemon diagnostics | `b4941e0` | `zterm-cli-commands-execution` |
 | 13 | 2026-09-05 | Fix shared terminal synchronization and return-to-live presentation | `1573745` | `fix/terminal-sync-scroll` |
 | 12 | 2026-09-05 | Simplify terminal architecture and bound client control | `0c21738` | `fix-zterm-herdr-not-synchronized-attachment-snapshot` |
 | 11 | 2026-09-05 | Unify local and remote terminal attachments | `4328e2e`, `c343146` | `fix-zterm-herdr-not-synchronized-attachment-snapshot` |

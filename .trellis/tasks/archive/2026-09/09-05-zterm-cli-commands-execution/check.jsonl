@@ -1,0 +1,9 @@
+{"file":".trellis/tasks/09-05-zterm-cli-commands-execution/research/local-lifecycle-contracts.md","reason":"Focused source-referenced no-autospawn, truthful-stop and injected CLI/PTY contracts; original source exceeds injection size, so consult cited sections for final compliance."}
+{"file":".trellis/spec/backend/distribution-lifecycle.md","reason":"Check verification-before-interruption, retained activation rollback, installed-version startup and honest failure reporting."}
+{"file":".trellis/spec/backend/session-service.md","reason":"Review atomic idle-shutdown admission versus live/in-progress Session ownership and preserved cleanup bounds."}
+{"file":".trellis/spec/backend/effective-user-state.md","reason":"Check no implicit identity setup, path authority and test isolation."}
+{"file":".trellis/spec/guides/evidence-driven-simplicity.md","reason":"Require one meaningful validation owner per behavior and stop after approved acceptance criteria pass."}
+{"file":".trellis/tasks/09-05-zterm-cli-commands-execution/research/lifecycle-ux.md","reason":"Evidence for changed contracts; reject stale --force/JSON output expectations without changing internal installer serialization."}
+{"file":".trellis/tasks/09-05-zterm-cli-commands-execution/research/additional-cli-ux.md","reason":"Check selected CLI conveniences and truthful human output; preserve one-shot logs -n and exclude follow."}
+{"file":".trellis/tasks/09-05-zterm-cli-commands-execution/research/logging-gap-analysis.md","reason":"Check useful committed events, safe fields, state-change deduplication, unchanged writer/rotation and no continuous reader."}
+{"file":".trellis/spec/backend/logging-guidelines.md","reason":"Implemented logging owner/field/level contracts, one-shot bounded tail and unchanged startup rotation; verify no follow subsystem or content leakage."}

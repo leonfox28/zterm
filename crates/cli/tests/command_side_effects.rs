@@ -87,58 +87,18 @@ async fn help_version_status_doctor_logs_and_stop_never_spawn() {
     let human = run(&runtime, ["zterm", "status"]).await;
     assert!(human.contains("State: not_configured"));
     assert!(human.contains("Active sessions: 0"));
-    let json = run(&runtime, ["zterm", "status", "--json"]).await;
-    let json: serde_json::Value = serde_json::from_str(&json).expect("status JSON");
-    assert_eq!(json["state"], "not_configured");
-    assert_eq!(json["active_session_count"], 0);
-    assert_eq!(json["network_state"], serde_json::Value::Null);
-    assert_eq!(json["address_publish_state"], serde_json::Value::Null);
-    assert_eq!(json["address_lookup_state"], serde_json::Value::Null);
-    assert_eq!(json["authenticated_connection_count"], 0);
-    assert_eq!(json["direct_path_count"], 0);
-    assert_eq!(json["relay_path_count"], 0);
-    assert_eq!(json["network_diagnostic"], serde_json::Value::Null);
-
-    let doctor = run(&runtime, ["zterm", "doctor", "--json"]).await;
-    let doctor: serde_json::Value = serde_json::from_str(&doctor).expect("doctor JSON");
-    assert_eq!(doctor["healthy"], false);
-    assert_eq!(doctor["checks"][1]["name"], "autostart");
-    let checks = doctor["checks"].as_array().expect("doctor checks");
-    let network = checks
-        .iter()
-        .find(|check| check["name"] == "network")
-        .expect("network check");
-    assert_eq!(network["ok"], true);
-    assert!(
-        network["detail"]
-            .as_str()
-            .expect("network detail")
-            .contains("not attempted")
-    );
-    let state_paths = checks
-        .iter()
-        .find(|check| check["name"] == "state_paths")
-        .expect("state path check");
-    assert_eq!(state_paths["ok"], false);
-    assert!(
-        state_paths["detail"]
-            .as_str()
-            .expect("state path detail")
-            .contains(state.paths.state_root().to_string_lossy().as_ref())
-    );
-    assert_eq!(
-        checks
-            .iter()
-            .find(|check| check["name"] == "local_ipc")
-            .expect("local IPC check")["ok"],
-        true
-    );
+    let doctor = run(&runtime, ["zterm", "doctor"]).await;
+    assert!(doctor.contains("[ok] autostart:"));
+    assert!(doctor.contains("[ok] network:") && doctor.contains("not attempted"));
+    assert!(doctor.contains("[error] state_paths:"));
+    assert!(doctor.contains(state.paths.state_root().to_string_lossy().as_ref()));
+    assert!(doctor.contains("[ok] local_ipc:"));
     let daemon_status = run(&runtime, ["zterm", "daemon", "status"]).await;
     assert!(daemon_status.contains("not_configured"));
     let stop = run(&runtime, ["zterm", "daemon", "stop"]).await;
     assert_eq!(stop, "Daemon already stopped.\n");
     let logs = run(&runtime, ["zterm", "logs", "--lines", "10"]).await;
-    assert!(logs.is_empty());
+    assert_eq!(logs, "No daemon logs yet.\n");
 
     let bare = run(&runtime, ["zterm"]).await;
     assert_eq!(bare, "zterm is not configured. Run `zterm setup` first.\n");

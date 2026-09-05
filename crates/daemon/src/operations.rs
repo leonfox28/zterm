@@ -226,7 +226,7 @@ pub struct IdentityResetPreflight {
     pub endpoint_id: Option<String>,
     /// Whether the daemon answered the preflight status request.
     pub daemon_running: bool,
-    /// Active Sessions which would be ended by a forced reset.
+    /// Active Sessions which would be ended by a approved reset.
     pub active_session_names: Vec<String>,
 }
 
@@ -254,8 +254,25 @@ pub struct UpdateResult {
     pub previous_version: String,
     /// Authenticated version now installed.
     pub installed_version: String,
-    /// Sessions ended only after candidate verification and explicit force.
+    /// Sessions ended only after candidate verification and explicit approval.
     pub ended_session_names: Vec<String>,
+    /// Whether the installed daemon reached local readiness (false before setup).
+    pub daemon_started: bool,
+}
+
+/// Actual update transaction boundaries, rendered by the invoking frontend.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpdateStage {
+    /// Candidate download and authentication are beginning.
+    Preparing,
+    /// All candidate authentication checks completed.
+    Verified,
+    /// Stopping the current daemon after any required approval.
+    Stopping,
+    /// Replacing the installed executable.
+    Activating,
+    /// Starting the installed daemon and checking local readiness.
+    Starting,
 }
 
 /// Side-effect-free uninstall impact bound to the current executable and identity.
@@ -299,18 +316,59 @@ fn require_update_daemon_compatible(
     Ok(())
 }
 
-#[cfg(unix)]
-fn require_update_session_force(impact: &SessionImpact, force: bool) -> Result<(), DaemonError> {
-    if (impact.interruption_required || impact.active_session_count > 0) && !force {
-        return Err(DaemonError::new(
-            DomainErrorKind::UpdateRejected,
-            format!(
-                "{} active session(s) would be interrupted; retry with --force",
-                impact.active_session_count
-            ),
-        ));
+fn require_interruption_approval(
+    impact: &SessionImpact,
+    approved: &mut bool,
+    confirm: &mut impl FnMut(&SessionImpact) -> Result<(), DaemonError>,
+) -> Result<(), DaemonError> {
+    if !*approved && (impact.interruption_required || impact.active_session_count > 0) {
+        confirm(impact)?;
+        *approved = true;
     }
     Ok(())
+}
+
+fn confirmation_required(_: &SessionImpact) -> Result<(), DaemonError> {
+    Err(DaemonError::new(
+        DomainErrorKind::Cancelled,
+        "Running sessions require confirmation. Run again with -y to continue without prompting.",
+    ))
+}
+
+/// The post-commit policy consumes authenticated release identity, never the
+/// version of the old updater still executing in this process.
+#[cfg(unix)]
+async fn finish_update_startup<
+    F: std::future::Future<Output = Result<DaemonReadiness, DaemonError>>,
+>(
+    observed: Result<ObservedState, DaemonError>,
+    installed: &zterm_core::release::ReleaseManifest,
+    progress: &mut impl FnMut(UpdateStage),
+    ensure: impl FnOnce() -> F,
+) -> Result<bool, DaemonError> {
+    let result = async {
+        match observed? {
+            ObservedState::NotConfigured => Ok(false),
+            ObservedState::Running(_) | ObservedState::ConfiguredStopped(_) => {
+                progress(UpdateStage::Starting);
+                let ready = ensure().await?;
+                if ready.version != installed.version
+                    || ready.protocol.wire_major != installed.wire_major
+                    || ready.protocol.state_schema != installed.state_schema
+                {
+                    return Err(DaemonError::new(
+                        DomainErrorKind::UpdateRejected,
+                        "The running daemon does not match the installed release.",
+                    ));
+                }
+                Ok(true)
+            }
+        }
+    }
+    .await;
+    result.map_err(|error| DaemonError::new(error.kind(), format!(
+        "Updated zterm to {}, but the daemon could not start: {}. Run zterm daemon restart to try again.",
+        installed.version, error)))
 }
 
 fn require_identity_reset_session_force(
@@ -321,7 +379,7 @@ fn require_identity_reset_session_force(
         return Err(DaemonError::new(
             DomainErrorKind::Cancelled,
             format!(
-                "{} active session(s) would be interrupted; retry with --force",
+                "{} active session(s) would be interrupted; run again with -y",
                 preflight.active_session_count()
             ),
         ));
@@ -392,12 +450,26 @@ impl LocalRuntime {
         exact_tag: Option<&str>,
         force: bool,
     ) -> Result<UpdateResult, DaemonError> {
+        self.update_with_callbacks(exact_tag, force, confirmation_required, |_| {})
+            .await
+    }
+
+    /// Updates once, asking the frontend only when live ownership needs interruption.
+    pub async fn update_with_callbacks(
+        &self,
+        exact_tag: Option<&str>,
+        mut approved: bool,
+        mut confirm: impl FnMut(&SessionImpact) -> Result<(), DaemonError>,
+        mut progress: impl FnMut(UpdateStage),
+    ) -> Result<UpdateResult, DaemonError> {
         #[cfg(unix)]
         {
             let executable = self.launcher.executable();
             crate::distribution::validate_managed_executable(executable, self.paths.uid())?;
             let selection = crate::distribution::ReleaseSelection::parse(exact_tag)?;
+            progress(UpdateStage::Preparing);
             let prepared = crate::distribution::prepare_update(selection).await?;
+            progress(UpdateStage::Verified);
 
             let client = LocalClient::new(self.paths.socket());
             let (daemon_running, impact) = match client.status().await {
@@ -420,11 +492,15 @@ impl LocalRuntime {
                 ),
                 Err(error) => return Err(error),
             };
-            require_update_session_force(&impact, force)?;
-            if daemon_running {
-                client.stop(force).await?;
-                wait_until_stopped(&self.paths).await?;
-            }
+            require_interruption_approval(&impact, &mut approved, &mut confirm)?;
+            let ended = if daemon_running {
+                progress(UpdateStage::Stopping);
+                self.stop_with_confirmation(approved, &mut confirm)
+                    .await?
+                    .map_or_else(Vec::new, |impact| impact.active_session_names)
+            } else {
+                Vec::new()
+            };
 
             let state_present = managed_root_exists(&self.paths)?;
             let lifecycle = if state_present {
@@ -441,6 +517,7 @@ impl LocalRuntime {
                 None
             };
 
+            progress(UpdateStage::Activating);
             let mut source = fs::File::open(prepared.candidate()).map_err(|_| {
                 DaemonError::new(
                     DomainErrorKind::ReleaseArtifactInvalid,
@@ -482,15 +559,23 @@ impl LocalRuntime {
             })?;
             drop(lifecycle);
 
+            let daemon_started = finish_update_startup(
+                self.observe().await,
+                prepared.manifest(),
+                &mut progress,
+                || self.ensure(),
+            )
+            .await?;
             Ok(UpdateResult {
                 previous_version: zterm_core::BuildIdentity::current().version.to_owned(),
                 installed_version: prepared.version().to_owned(),
-                ended_session_names: impact.active_session_names,
+                ended_session_names: ended,
+                daemon_started,
             })
         }
         #[cfg(not(unix))]
         {
-            let _ = (exact_tag, force);
+            let _ = (exact_tag, approved, confirm, progress);
             Err(unsupported_command_platform())
         }
     }
@@ -1006,36 +1091,64 @@ impl LocalRuntime {
         }
     }
 
-    /// Stops the daemon if running; already-stopped is a successful no-op.
-    pub async fn stop(&self, force: bool) -> Result<Option<SessionImpact>, DaemonError> {
+    /// Stops the daemon if running; without approval live work is preserved.
+    pub async fn stop(&self, approved: bool) -> Result<Option<SessionImpact>, DaemonError> {
+        self.stop_with_confirmation(approved, confirmation_required)
+            .await
+    }
+
+    /// Keeps an admission race in the same invocation's confirmation flow.
+    pub async fn stop_with_confirmation(
+        &self,
+        mut approved: bool,
+        mut confirm: impl FnMut(&SessionImpact) -> Result<(), DaemonError>,
+    ) -> Result<Option<SessionImpact>, DaemonError> {
         let client = LocalClient::new(self.paths.socket());
-        match client.status().await {
-            Ok(status) => {
-                if status.active_session_count > 0 && !force {
-                    return Err(DaemonError::new(
-                        DomainErrorKind::Cancelled,
-                        format!(
-                            "{} active session(s) would be interrupted; retry with --force",
-                            status.active_session_count
-                        ),
-                    ));
-                }
-                client.stop(force).await.map(Some)
+        let mut impact = match client.update_preflight().await {
+            Ok(impact) => impact,
+            Err(error) if error.kind() == DomainErrorKind::DaemonStopped => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        loop {
+            require_interruption_approval(&impact, &mut approved, &mut confirm)?;
+            impact = match client.stop(approved).await {
+                Ok(impact) => impact,
+                Err(error) if error.kind() == DomainErrorKind::DaemonStopped => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            if impact.stopping {
+                #[cfg(unix)]
+                wait_until_stopped(&self.paths).await?;
+                return Ok(Some(impact));
             }
-            Err(error) if error.kind() == DomainErrorKind::DaemonStopped => Ok(None),
-            Err(error) => Err(error),
+            if approved {
+                return Err(DaemonError::new(
+                    DomainErrorKind::Cancelled,
+                    "The daemon did not accept the approved stop request.",
+                ));
+            }
+            // The server found work admitted after the observation. No shutdown
+            // began; display that impact before granting interruption authority.
         }
     }
 
-    /// Stops when needed, waits for shutdown, then explicitly ensures one daemon.
-    pub async fn restart(&self, force: bool) -> Result<DaemonReadiness, DaemonError> {
+    /// Stops when needed, then explicitly ensures one configured daemon.
+    pub async fn restart(&self, approved: bool) -> Result<DaemonReadiness, DaemonError> {
+        self.restart_with_confirmation(approved, confirmation_required)
+            .await
+    }
+
+    /// Restarts with frontend-owned conditional confirmation.
+    pub async fn restart_with_confirmation(
+        &self,
+        approved: bool,
+        confirm: impl FnMut(&SessionImpact) -> Result<(), DaemonError>,
+    ) -> Result<DaemonReadiness, DaemonError> {
         match self.observe().await? {
             ObservedState::NotConfigured => return Err(not_setup_for_command()),
             ObservedState::ConfiguredStopped(_) => {}
             ObservedState::Running(_) => {
-                if self.stop(force).await?.is_some() {
-                    wait_until_stopped(&self.paths).await?;
-                }
+                self.stop_with_confirmation(approved, confirm).await?;
             }
         }
         self.ensure().await
@@ -1705,12 +1818,16 @@ mod tests {
                 interruption_required: true,
             };
             assert_eq!(
-                require_update_session_force(&update_impact, false)
-                    .expect_err("update must refuse active Sessions without force")
-                    .kind(),
-                DomainErrorKind::UpdateRejected
+                require_interruption_approval(
+                    &update_impact,
+                    &mut false,
+                    &mut confirmation_required
+                )
+                .expect_err("update must refuse active Sessions without force")
+                .kind(),
+                DomainErrorKind::Cancelled
             );
-            require_update_session_force(&update_impact, true)
+            require_interruption_approval(&update_impact, &mut true, &mut confirmation_required)
                 .expect("forced update may cross the already-rendered impact boundary");
         }
 
@@ -1730,6 +1847,146 @@ mod tests {
         );
         require_identity_reset_session_force(&uninstall_impact, true)
             .expect("forced uninstall may cross the already-rendered impact boundary");
+    }
+
+    #[test]
+    fn interruption_approval_reads_once_only_for_actual_impact() {
+        let mut approved = false;
+        let mut calls = 0;
+        let mut confirm = |impact: &SessionImpact| {
+            calls += 1;
+            assert_eq!(impact.active_session_names, ["main"]);
+            Ok(())
+        };
+        let mut impact = SessionImpact {
+            active_session_count: 0,
+            active_session_names: Vec::new(),
+            stopping: false,
+            interruption_required: false,
+        };
+        require_interruption_approval(&impact, &mut approved, &mut confirm)
+            .expect("idle needs no approval");
+        assert!(!approved);
+        impact.active_session_count = 1;
+        impact.active_session_names.push("main".to_owned());
+        require_interruption_approval(&impact, &mut approved, &mut confirm)
+            .expect("newly admitted work asks");
+        require_interruption_approval(&impact, &mut approved, &mut confirm)
+            .expect("approval covers this invocation");
+        assert_eq!(calls, 1);
+        let mut declined = false;
+        assert!(
+            require_interruption_approval(&impact, &mut declined, &mut confirmation_required)
+                .is_err()
+        );
+        assert!(!declined);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn committed_update_starts_configured_state_and_checks_installed_identity() {
+        use zterm_core::release::{ReleaseClassification, ReleaseManifest};
+        let installed = ReleaseManifest {
+            schema: 1,
+            product: "zterm".into(),
+            version: "9.1.0".into(),
+            tag: "v9.1.0".into(),
+            classification: ReleaseClassification::Stable,
+            source_commit: "fixture".into(),
+            released_at: "fixture".into(),
+            wire_major: zterm_core::WIRE_MAJOR,
+            state_schema: zterm_core::STATE_SCHEMA_VERSION,
+            bootstrap_schema: 1,
+            public_key_id: "fixture".into(),
+            artifacts: Vec::new(),
+        };
+        let setup = BootstrapResult {
+            device_id: DeviceId::from_array([0x71; 32]),
+            endpoint_id: "fixture".into(),
+            config: crate::config::validate_setup_profile("update-host", "official-n0", None)
+                .expect("valid setup"),
+        };
+        let stopped = ObservedState::ConfiguredStopped(setup.clone());
+        let ready = DaemonReadiness {
+            version: installed.version.clone(),
+            started_at_unix: 1,
+            protocol: ProtocolStatus {
+                wire_major: installed.wire_major,
+                state_schema: installed.state_schema,
+                capabilities: Capabilities::LOCAL_LIFECYCLE,
+            },
+        };
+        let running = ObservedState::Running(DaemonStatus {
+            version: ready.version.clone(),
+            protocol: ready.protocol,
+            phase: "fixture".into(),
+            device_id: setup.device_id,
+            endpoint_id: setup.endpoint_id.clone(),
+            device_name: setup.config.device_name.clone(),
+            infrastructure_profile: "official-n0".into(),
+            started_at_unix: 1,
+            active_session_count: 0,
+            active_session_names: Vec::new(),
+            network: NetworkObservation::disabled(setup.device_id),
+        });
+        for observed in [stopped.clone(), running] {
+            let mut stages = Vec::new();
+            let mut starts = 0;
+            assert!(
+                finish_update_startup(
+                    Ok(observed),
+                    &installed,
+                    &mut |stage| stages.push(stage),
+                    || {
+                        starts += 1;
+                        std::future::ready(Ok(ready.clone()))
+                    }
+                )
+                .await
+                .expect("configured update starts")
+            );
+            assert_eq!(starts, 1);
+            assert_eq!(stages, [UpdateStage::Starting]);
+        }
+        assert!(
+            !finish_update_startup(
+                Ok(ObservedState::NotConfigured),
+                &installed,
+                &mut |_| panic!("no startup phase before setup"),
+                || -> std::future::Ready<Result<DaemonReadiness, DaemonError>> {
+                    panic!("must not start or create identity")
+                }
+            )
+            .await
+            .expect("binary-only update")
+        );
+        let failure = finish_update_startup(Ok(stopped.clone()), &installed, &mut |_| {}, || {
+            std::future::ready(Err(DaemonError::new(
+                DomainErrorKind::DaemonStartTimeout,
+                "fixture startup failure",
+            )))
+        })
+        .await
+        .expect_err("committed startup failure is partial completion");
+        assert!(
+            failure.to_string().contains("Updated zterm to 9.1.0")
+                && failure.to_string().contains("zterm daemon restart")
+        );
+        for field in 0..3 {
+            let mut wrong = ready.clone();
+            match field {
+                0 => wrong.version = zterm_core::BuildIdentity::current().version.into(),
+                1 => wrong.protocol.wire_major += 1,
+                _ => wrong.protocol.state_schema += 1,
+            }
+            assert!(
+                finish_update_startup(Ok(stopped.clone()), &installed, &mut |_| {}, || {
+                    std::future::ready(Ok(wrong))
+                })
+                .await
+                .is_err()
+            );
+        }
     }
 
     #[cfg(unix)]

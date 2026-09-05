@@ -265,7 +265,7 @@ impl LocalClient {
             active_session_count: response.active_session_count,
             active_session_names: response.active_session_names,
             stopping: response.stopping,
-            interruption_required: false,
+            interruption_required: !response.stopping,
         })
     }
 

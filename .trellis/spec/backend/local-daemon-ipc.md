@@ -174,7 +174,7 @@ No new crate, background owner, or second Session interpreter is introduced.
   test adapters. They never spawn a daemon, open SQLite, read `identity.key`, or
   bind Iroh. Public clap reaches them only through `LocalRuntime`, which owns
   committed-setup validation, singleflight daemon launch, exact target
-  freezing, destructive preflight, and the safe human/JSON projections. The
+  freezing, destructive preflight, and typed observations for human-readable output. The
   CLI never receives a socket path, `UserPaths`, store, identity key, Endpoint,
   route, or operation lease.
 - Public clap exposes setup/status/doctor/logs, pair create/accept, device
@@ -184,7 +184,13 @@ No new crate, background owner, or second Session interpreter is introduced.
   invocation is exactly local `main` create-or-attach. Help, version, parsing
   failures, status, doctor, logs, daemon status, and daemon stop never spawn.
   Setup and restart explicitly spawn; configured pair/device/connect/Session
-  commands may singleflight-start one daemon but never perform setup.
+  commands may singleflight-start one daemon but never perform setup. Public
+  --json flags are removed; hidden release self-check serialization is unchanged.
+  First setup defaults to official-n0 without prompting for a profile; repeated
+  setup retains the committed identity/config. Session list alone defaults its
+  omitted target to local. Pair accept uses --alias and rejects --name; its
+  success hint shell-quotes the actual alias. Pair create emits the ticket once
+  on stdout and TTL/receiver guidance on stderr.
 - Pair accept has no ticket positional argument, flag, or environment input.
   Its default owner is a no-echo TTY line reader; non-TTY input is rejected
   before reading unless `--stdin` explicitly selects the 16 KiB-bounded EOF
@@ -610,11 +616,23 @@ No new crate, background owner, or second Session interpreter is introduced.
   for readiness to disappear, the socket to be absent, and `daemon.lock` to be
   missing or unlocked before launching the replacement; socket disappearance
   alone is not daemon ownership release.
-- Daemon stop/restart with active Sessions requires explicit `--force`; the
-  public surface has no implicit interactive bypass. Close, revoke, and
-  identity reset instead use exact preflight plus interactive `yes` or
-  noninteractive `--yes`; identity reset additionally requires `--force` when
-  Sessions are active. Reset performs a bounded stop, acquires
+- Daemon stop/restart/update proceed without confirmation when idle or stopped.
+  With live Sessions, including detached ones, CLI lists names and asks in
+  English with `[y/N]`. Trimmed case-insensitive y/yes accepts; other input and
+  EOF cancel. `-y`/`--yes` bypasses input; noninteractive live impact requires
+  that flag. Connection count alone never triggers confirmation. Public
+  --force is removed; the internal LocalStopRequest.force boolean remains the
+  action-level interruption approval. CLI I/O stays outside LocalRuntime and
+  outside lifecycle/registry locks.
+- Session registry admission atomically rejects an unapproved stop with live,
+  provisional, cleanup-only or Starting ownership. Return stopping=false with
+  names/count without cancelling owners or closing admission; the same CLI
+  invocation then confirms that impact. Empty admission closes creation before
+  cleanup. Approved shutdown preserves bounded full ownership release.
+- Close/revoke/reset/uninstall share the same y/yes/-y input policy and retain
+  exact preflight. Reset/uninstall combine Session and deletion impact in one
+  confirmation; actual deletion still needs approval with zero Sessions. An
+  absent reset state root remains a no-op. Reset performs a bounded stop, acquires
   `lifecycle.lock`, rechecks stopped ownership and the confirmed identity, and
   removes only the validated managed state root. It sends no `RevokeSelf`,
   does not remove the binary, and does not run setup.
@@ -635,12 +653,20 @@ No new crate, background owner, or second Session interpreter is introduced.
   frontend's socket, one Session decoder, route adapter, target IDs, operation
   lease, resume checkpoint, and request correlation; none are projected into
   clap or renderer APIs.
-- Human and JSON status are projections of one typed daemon observation.
-  Running state comes from IPC; configured/stopped state may open SQLite only
+- Human status summarizes device name/version, daemon/infrastructure/network
+  state and Session names/count from one typed observation. Detailed network
+  diagnostics belong in doctor. Device/Session tables retain full IDs, show
+  direction-specific permissions and attachment state, and give actionable
+  empty output; unconnected is not proof of remote unreachability. Running
+  state comes from IPC; configured/stopped state may open SQLite only
   after the socket proves no `StoreActor` is live.
 - Doctor validates account, committed state, and socket/lock agreement without
   spawning. Linux lifecycle output names the `systemd-logind` logout limit but
   never changes linger or installs a service.
+- `logs [-n|--lines <n>]` reads the existing bounded tail once (100 default,
+  1,000 lines/1 MiB maximum). Missing logs get English guidance; no file creation,
+  autospawn, follow mode or continuous reader is allowed. Logging contracts
+  are defined in [Logging Guidelines](./logging-guidelines.md).
 
 ## 4. Validation & Error Matrix
 
@@ -710,8 +736,9 @@ No new crate, background owner, or second Session interpreter is introduced.
 | PTY test infers input readiness from viewport publication alone | invalid evidence; use the pure input-fence test or a bounded idempotent fixture probe |
 | target is short/prefix/uppercase ID, ambiguous full ID/alias, self ID without `local`, or inbound-only for Session access | exact selector/direction error; do not acquire remote demand |
 | ordinary attach finds a controller | `session_occupied`; do not input, resize, detach, or replace it |
-| daemon stop/restart or identity reset would end Sessions without `--force` | refuse before stop; report only the safe Session count/impact |
-| close/revoke/reset is noninteractive without `--yes` | refuse before mutation |
+| stop/restart/update encounters live work without prior approval | show names and request y/yes in this invocation; no mutation on cancel/EOF |
+| unapproved idle-stop request races Session admission | return stopping=false with impact; retain Session and daemon until approval |
+| live impact or close/revoke/reset/uninstall deletion is noninteractive without `-y`/`--yes` | refuse before mutation with English flag guidance |
 | identity-reset deadline fixture starts while a dropped listener can still transiently connect | invalid fixture evidence; settle the stale socket under a separate setup bound before starting the production stop deadline |
 | stop cleanup or response flush fails | keep listener/socket and ownership available for status/retry |
 | fatal accept while a child remains owned | exact-token rebind under held daemon lock; resume service |
@@ -723,6 +750,9 @@ No new crate, background owner, or second Session interpreter is introduced.
 - **Good:** authenticate peer credentials, decode one shared frame, dispatch to
   `SessionService` through `spawn_blocking`, and flush a terminal error before
   closing only the offending attachment.
+- **Good:** a Session created after the CLI observed zero is preserved by the
+  registry admission check and shown in the same invocation before approval.
+- **Bad:** treating an earlier zero count as permission to force a later stop.
 - **Base:** status/doctor/logs observe a stopped or running daemon without
   creating paths, allocating mutation leases, or starting a process.
 - **Good:** parse one public target, let `LocalRuntime` freeze it to `local` or
@@ -811,6 +841,11 @@ No new crate, background owner, or second Session interpreter is introduced.
   waits for Alternate 23x80 then Main 23x79 convergence at physical 24x80,
   proves another input advances model and presentation, detaches cleanly, and
   asserts the exact `<device> | local` row with no `not_synchronized`.
+- The same outer PTY fixture runs `daemon stop` against a detached `main`,
+  observes the English Session names and `[y/N]` before any stop, writes `y`,
+  and requires that invocation to finish stopping. A configured restart reaches
+  readiness with an empty Session registry. Unit input tests own cancellation,
+  EOF and explicit-yes bypass rather than repeating every process combination.
 - The `operations` identity-reset deadline fixture drops its stale Unix
   listener and, under a separate one-second setup bound, waits until an owner
   connection is refused before invoking the reset with its 40-millisecond
@@ -830,7 +865,7 @@ No new crate, background owner, or second Session interpreter is introduced.
   parse errors, every inspection command, daemon stop/restart, and each
   daemon-requiring command assert their exact create/spawn behavior. Pair tests
   prove no-echo restoration and zeroized/redacted success/error/panic paths;
-  reset tests prove exact confirmation, active-Session force, no-follow fixed
+  reset tests prove exact combined confirmation, active-Session approval, no-follow fixed
   inventory, retryable partial deletion, and no implicit setup.
 - `single_instance` and `detached_lifecycle` are harness-free multi-process
   executables using only task-private `UserPaths`; production argv has no state

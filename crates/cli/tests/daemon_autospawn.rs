@@ -123,6 +123,7 @@ fn run_terminal_child_if_requested() -> bool {
         }
         "bare-signal" => vec!["zterm"],
         "non-tty-connect" => vec!["zterm", "connect", "local"],
+        "stop-confirm" => vec!["zterm", "daemon", "stop"],
         _ => panic!("unknown terminal child mode"),
     };
     let tokio = tokio::runtime::Builder::new_current_thread()
@@ -133,9 +134,20 @@ fn run_terminal_child_if_requested() -> bool {
         let outcome = execute(
             Cli::try_parse_from(arguments).expect("terminal child command"),
             &runtime,
-            InteractionMode::NonInteractive,
+            if mode == "stop-confirm" {
+                InteractionMode::detect()
+            } else {
+                InteractionMode::NonInteractive
+            },
         )
         .await?;
+        if mode == "stop-confirm" {
+            let CommandOutcome::Text(text) = outcome else {
+                panic!("stop child did not return text: {outcome:?}");
+            };
+            print!("{text}");
+            return Ok(());
+        }
         let CommandOutcome::Terminal(request) = outcome else {
             panic!("terminal child command did not defer: {outcome:?}");
         };
@@ -168,9 +180,7 @@ fn run_terminal_child_if_requested() -> bool {
             },
             zterm_cli::CliError::TerminalDriverFailure => 75,
             zterm_cli::CliError::Io(_) => 76,
-            zterm_cli::CliError::Usage(_)
-            | zterm_cli::CliError::Serialization(_)
-            | zterm_cli::CliError::CreatedSessionAttach { .. } => 77,
+            zterm_cli::CliError::Usage(_) | zterm_cli::CliError::CreatedSessionAttach { .. } => 77,
         };
         std::process::exit(status);
     }
@@ -182,14 +192,7 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
     let first = run(
         &runtime,
         "initial setup",
-        [
-            "zterm",
-            "setup",
-            "--name",
-            "cli-host",
-            "--profile",
-            "official-n0",
-        ],
+        ["zterm", "setup", "--name", "cli-host"],
     )
     .await;
     assert!(first.contains("Configured cli-host"));
@@ -222,89 +225,20 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
     let human = run(&runtime, "running status", ["zterm", "status"]).await;
     assert!(human.contains("State: running"));
     assert!(human.contains("Network: disabled"));
-    assert!(human.contains("Endpoint bound: false"));
-    assert!(human.contains("Address publish: disabled"));
-    assert!(human.contains("Address lookup: disabled"));
-    assert!(human.contains("Paths: direct=0, relay=0"));
-    let json = run(
-        &runtime,
-        "running status JSON",
-        ["zterm", "status", "--json"],
-    )
-    .await;
-    let json: serde_json::Value = serde_json::from_str(&json).expect("running JSON");
-    assert_eq!(json["state"], "running");
-    assert_eq!(json["device_name"], "cli-host");
-    assert_eq!(json["active_session_count"], 0);
-    assert_eq!(json["network_state"], "disabled");
-    assert_eq!(json["endpoint_bound"], false);
-    assert_eq!(json["network_bind_attempts"], 0);
-    assert_eq!(json["address_publish_state"], "disabled");
-    assert_eq!(json["address_lookup_state"], "disabled");
-    assert_eq!(json["authenticated_connection_count"], 0);
-    assert_eq!(json["primary_connection_count"], 0);
-    assert_eq!(json["active_stream_count"], 0);
-    assert_eq!(json["direct_path_count"], 0);
-    assert_eq!(json["relay_path_count"], 0);
-    assert_eq!(json["network_diagnostic"], serde_json::Value::Null);
-    let doctor = run(
-        &runtime,
-        "running doctor JSON",
-        ["zterm", "doctor", "--json"],
-    )
-    .await;
-    let doctor: serde_json::Value = serde_json::from_str(&doctor).expect("running doctor JSON");
-    assert_eq!(doctor["healthy"], true);
-    let running_network = doctor["checks"]
-        .as_array()
-        .expect("running doctor checks")
-        .iter()
-        .find(|check| check["name"] == "network")
-        .expect("running network check");
-    assert_eq!(running_network["ok"], true);
-    assert!(
-        running_network["detail"]
-            .as_str()
-            .expect("running network detail")
-            .contains("state=disabled")
-    );
-
+    assert!(human.contains("Version:") && human.contains("Device: cli-host"));
+    let doctor = run(&runtime, "running doctor", ["zterm", "doctor"]).await;
+    assert!(doctor.contains("Endpoint bound: false"));
+    assert!(doctor.contains("Address publish: disabled"));
+    assert!(doctor.contains("Address lookup: disabled"));
+    assert!(doctor.contains("Paths: direct=0, relay=0"));
+    assert!(doctor.contains("state=disabled"));
     run(&runtime, "initial daemon stop", ["zterm", "daemon", "stop"]).await;
     wait_for_socket(&state.paths, false).await;
-    let stopped = run(
-        &runtime,
-        "stopped status JSON",
-        ["zterm", "status", "--json"],
-    )
-    .await;
-    let stopped: serde_json::Value = serde_json::from_str(&stopped).expect("stopped JSON");
-    assert_eq!(stopped["state"], "configured_stopped");
-    assert_eq!(stopped["network_state"], "stopped");
-    assert_eq!(stopped["endpoint_bound"], false);
-    assert_eq!(stopped["address_publish_state"], "disabled");
-    assert_eq!(stopped["address_lookup_state"], "disabled");
+    let stopped = run(&runtime, "stopped status", ["zterm", "status"]).await;
+    assert!(stopped.contains("configured_stopped") && stopped.contains("Network: stopped"));
     assert!(!state.paths.socket().exists(), "status does not restart");
-    let doctor = run(
-        &runtime,
-        "stopped doctor JSON",
-        ["zterm", "doctor", "--json"],
-    )
-    .await;
-    let doctor: serde_json::Value = serde_json::from_str(&doctor).expect("stopped doctor JSON");
-    assert_eq!(doctor["healthy"], true);
-    let stopped_network = doctor["checks"]
-        .as_array()
-        .expect("stopped doctor checks")
-        .iter()
-        .find(|check| check["name"] == "network")
-        .expect("stopped network check");
-    assert_eq!(stopped_network["ok"], true);
-    assert!(
-        stopped_network["detail"]
-            .as_str()
-            .expect("stopped network detail")
-            .contains("not attempted")
-    );
+    let doctor = run(&runtime, "stopped doctor", ["zterm", "doctor"]).await;
+    assert!(doctor.contains("not attempted"));
     assert!(!state.paths.socket().exists(), "doctor does not restart");
 
     run_non_tty_terminal_child(&state.paths);
@@ -346,7 +280,7 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
     )
     .await
     .expect_err("noninteractive identity reset requires confirmation");
-    assert!(unconfirmed_reset.to_string().contains("--yes"));
+    assert!(unconfirmed_reset.to_string().contains("-y"));
     assert!(
         !state.paths.socket().exists(),
         "reset preflight never autospawns"
@@ -411,17 +345,9 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
         .await
         .expect("connect local main after deferred TTY preflight");
     let main_id = main.session_id();
-    let sessions = run(
-        &runtime,
-        "local Session list JSON",
-        ["zterm", "session", "list", "local", "--json"],
-    )
-    .await;
-    let sessions: serde_json::Value = serde_json::from_str(&sessions).expect("session JSON");
-    assert_eq!(sessions.as_array().expect("session list").len(), 1);
-    assert_eq!(sessions[0]["session_id"], main_id.to_string());
-    assert_eq!(sessions[0]["name"], "main");
-    assert!(sessions[0].get("working_directory").is_none());
+    let sessions = run(&runtime, "local Session list", ["zterm", "session", "list"]).await;
+    assert!(sessions.contains(&main_id.to_string()) && sessions.contains("main"));
+    assert!(sessions.contains("Attached") && !sessions.contains("working_directory"));
     drop(main);
     wait_for_detach(&runtime, "local", &main_id.to_string()).await;
 
@@ -490,7 +416,7 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
     )
     .await
     .expect_err("noninteractive Session close requires confirmation");
-    assert!(unconfirmed_close.to_string().contains("--yes"));
+    assert!(unconfirmed_close.to_string().contains("-y"));
     assert_eq!(
         runtime
             .session_close_preflight("local", "review")
@@ -509,21 +435,21 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
     assert!(closed.contains(&build_id.to_string()));
     drop(build);
 
-    let reset_without_force = execute(
-        Cli::try_parse_from(["zterm", "reset", "--identity", "--yes"]).expect("reset parses"),
+    let reset_without_confirmation = execute(
+        Cli::try_parse_from(["zterm", "reset", "--identity"]).expect("reset parses"),
         &runtime,
         InteractionMode::NonInteractive,
     )
     .await
-    .expect_err("active main Session requires force");
-    assert!(reset_without_force.to_string().contains("--force"));
+    .expect_err("reset requires confirmation");
+    assert!(reset_without_confirmation.to_string().contains("-y"));
     assert!(state.paths.identity().exists());
     assert!(state.paths.socket().exists());
 
     let reset = run(
         &runtime,
         "forced identity reset",
-        ["zterm", "reset", "--identity", "--yes", "--force"],
+        ["zterm", "reset", "--identity", "-y"],
     )
     .await;
     assert!(reset.contains("Managed identity state removed"));
@@ -536,7 +462,7 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
     let retry = run(
         &runtime,
         "idempotent identity reset",
-        ["zterm", "reset", "--identity", "--yes", "--force"],
+        ["zterm", "reset", "--identity", "-y"],
     )
     .await;
     assert!(retry.contains("already absent"));
@@ -558,10 +484,37 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
     assert!(configured_again.contains("Configured cli-host-reset"));
     let replacement_key = std::fs::read(state.paths.identity()).expect("replacement identity");
     assert_ne!(replacement_key, key, "reset never performs automatic setup");
+    let detached = runtime
+        .attach("local", None, true, false, viewport)
+        .await
+        .expect("create Session for interactive stop");
+    let detached_id = detached.session_id();
+    drop(detached);
+    wait_for_detach(&runtime, "local", &detached_id.to_string()).await;
+    let confirmed = run_local_terminal_child(&runtime, &state.paths, "stop-confirm").await;
+    assert!(contains_bytes(
+        &confirmed,
+        b"Daemon stopped (1 sessions ended)."
+    ));
+    wait_for_socket(&state.paths, false).await;
+    let restarted = run(
+        &runtime,
+        "restart after confirmed stop",
+        ["zterm", "daemon", "restart"],
+    )
+    .await;
+    assert!(restarted.contains("Daemon ready"));
+    assert!(
+        runtime
+            .session_list("local")
+            .await
+            .expect("new daemon Sessions")
+            .is_empty()
+    );
     run(
         &runtime,
         "final forced daemon stop",
-        ["zterm", "daemon", "stop", "--force"],
+        ["zterm", "daemon", "stop", "-y"],
     )
     .await;
     wait_for_socket(&state.paths, false).await;
@@ -692,6 +645,7 @@ async fn run_local_terminal_child(
         "scroll" => b"ZTERM_SCROLL_PROBE".as_slice(),
         "copy" => TERMINAL_COPY_SCREEN,
         "bare-signal" => TERMINAL_BARE_MARKER,
+        "stop-confirm" => b"".as_slice(),
         _ => panic!("unsupported terminal PTY fixture mode"),
     };
 
@@ -733,6 +687,44 @@ async fn run_local_terminal_child(
         }
         bytes
     });
+
+    if mode == "stop-confirm" {
+        let deadline = std::time::Instant::now() + TERMINAL_TEST_TIMEOUT;
+        while !contains_bytes(&captured.lock().expect("captured stop prompt"), b"[y/N]:") {
+            if std::time::Instant::now() >= deadline {
+                terminate_failed_child(&mut child, "stop did not show its confirmation prompt");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let prompt = captured.lock().expect("captured stop prompt").clone();
+        if !contains_bytes(&prompt, b"The following sessions are running:")
+            || !contains_bytes(&prompt, b"  main\r\n")
+            || !contains_bytes(
+                &prompt,
+                b"Stopping the daemon will end all running sessions.",
+            )
+            || contains_bytes(&prompt, b"Daemon stopped")
+        {
+            terminate_failed_child(&mut child, "stop prompt omitted English Session impact");
+        }
+        let Ok(zterm_daemon::operations::ObservedState::Running(status)) = runtime.observe().await
+        else {
+            terminate_failed_child(&mut child, "daemon stopped before confirmation");
+        };
+        if status.active_session_names != ["main"] {
+            terminate_failed_child(&mut child, "Session was not retained before confirmation");
+        }
+        if master_writer.write_all(b"y\n").is_err() {
+            terminate_failed_child(&mut child, "could not confirm stop in the same invocation");
+        }
+        let status = wait_for_terminal_child(&mut child, mode);
+        assert_terminal_attributes_restored(tcgetattr(&probe).expect("stop termios"), original);
+        drop(probe);
+        drop(master_writer);
+        let bytes = reader.join().expect("stop PTY reader");
+        assert!(status.success(), "confirmed stop child failed: {status}");
+        return bytes;
+    }
 
     wait_for_terminal_raw_mode(&probe, &mut child, mode);
     let presentation_deadline = std::time::Instant::now() + TERMINAL_TEST_TIMEOUT;

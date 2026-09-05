@@ -875,7 +875,21 @@ impl SessionService {
         &self,
         deadline: Instant,
     ) -> Result<Vec<SessionSummary>, DaemonError> {
-        let cancelled_creations = self.inner.begin_shutdown()?;
+        match self.shutdown_with_approval_until(true, deadline)? {
+            ShutdownOutcome::Stopped(sessions) => Ok(sessions),
+            ShutdownOutcome::NeedsConfirmation(_) => unreachable!("approved shutdown"),
+        }
+    }
+
+    pub(crate) fn shutdown_with_approval_until(
+        &self,
+        approved: bool,
+        deadline: Instant,
+    ) -> Result<ShutdownOutcome, DaemonError> {
+        let cancelled_creations = match self.inner.begin_shutdown(approved) {
+            Ok(creations) => creations,
+            Err(names) => return Ok(ShutdownOutcome::NeedsConfirmation(names)),
+        };
         for creation in cancelled_creations {
             creation.cancel();
         }
@@ -940,7 +954,7 @@ impl SessionService {
                     self.inner.resume_after_failed_shutdown()?;
                     return Err(error);
                 }
-                return Ok(summaries);
+                return Ok(ShutdownOutcome::Stopped(summaries));
             }
             if Instant::now() >= deadline {
                 self.inner.resume_after_failed_shutdown()?;
@@ -1118,6 +1132,7 @@ impl SessionService {
                 "session publication was cancelled after PTY startup",
             ));
         }
+        tracing::info!(component = "session", operation = "created", session_id = %session_id, name = %name, "Session created");
         Ok(entry)
     }
 
@@ -1776,8 +1791,28 @@ impl RegistryInner {
         }
     }
 
-    fn begin_shutdown(&self) -> Result<Vec<Arc<CreationCell>>, DaemonError> {
+    fn begin_shutdown(&self, approved: bool) -> Result<Vec<Arc<CreationCell>>, Vec<String>> {
         let mut state = cleanup_lock(&self.state);
+        // Creation admission and the idle decision share this lock. Include
+        // reservations and cleanup owners, not only published live Sessions.
+        if !approved {
+            let mut names = state
+                .by_name
+                .keys()
+                .map(ToString::to_string)
+                .collect::<BTreeSet<_>>();
+            names.extend(
+                state
+                    .by_id
+                    .values()
+                    .chain(state.provisional.values())
+                    .chain(state.cleanup_only.iter())
+                    .map(|entry| entry.name.to_string()),
+            );
+            if !names.is_empty() || !cleanup_lock(&self.reservations).reservations.is_empty() {
+                return Err(names.into_iter().collect());
+            }
+        }
         state.accepting = false;
         let creations = state
             .by_name
@@ -1802,6 +1837,11 @@ impl RegistryInner {
         cleanup_lock(&self.state).accepting = true;
         Ok(())
     }
+}
+
+pub(crate) enum ShutdownOutcome {
+    Stopped(Vec<SessionSummary>),
+    NeedsConfirmation(Vec<String>),
 }
 
 struct RegistryState {
@@ -2622,9 +2662,11 @@ impl SessionActor {
         let startup = Arc::new(Mutex::new(Some(driver)));
         let thread_startup = Arc::clone(&startup);
         let thread_actor = Arc::clone(&actor);
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let spawned = thread::Builder::new()
             .name("zterm-session-actor".into())
             .spawn(move || {
+                let _dispatch = tracing::dispatcher::set_default(&dispatch);
                 let mut finalizer = ActorWorkerFinalizer::new(Arc::clone(&thread_actor));
                 let driver = thread_startup
                     .lock()
@@ -3049,7 +3091,10 @@ fn run_session_actor(
                 if let Some(driver) = runtime.driver.as_ref()
                     && driver.close_explicitly().is_ok()
                 {
-                    return finish_runtime(actor, runtime, SessionEndReason::DriverFailure);
+                    let reason = actor
+                        .requested_end_reason()
+                        .unwrap_or(SessionEndReason::DriverFailure);
+                    return finish_runtime(actor, runtime, reason);
                 }
             }
         }
@@ -3114,6 +3159,22 @@ fn finish_runtime(
             .send_replace(AttachmentLifecycle::SessionEnded(reason.clone()));
     }
     actor.update_cached(runtime, true);
+    let (reason_code, exit_code, signal) = match &reason {
+        SessionEndReason::NaturalExit { exit_code, signal } => {
+            ("natural_exit", Some(*exit_code), signal.as_deref())
+        }
+        SessionEndReason::ExplicitClose => ("explicit_close", None, None),
+        SessionEndReason::DaemonStop => ("daemon_stop", None, None),
+        SessionEndReason::DriverFailure => ("driver_failure", None, None),
+    };
+    if let Err(error) = &finalization {
+        tracing::warn!(component = "session", operation = "cleanup_failed", session_id = %actor.id, reason = error.kind().code(), "Session cleanup failed");
+    }
+    if reason == SessionEndReason::DriverFailure {
+        tracing::warn!(component = "session", operation = "ended", session_id = %actor.id, reason = reason_code, "Session ended after driver failure");
+    } else {
+        tracing::info!(component = "session", operation = "ended", session_id = %actor.id, reason = reason_code, exit_code, signal, "Session ended");
+    }
     finalization
 }
 
@@ -3146,7 +3207,21 @@ fn dispatch_command(
             revision,
             reply,
         } => respond(actor, meta, reply, || {
-            snapshot_applied(runtime, attachment_id, revision)
+            let was_active = runtime
+                .attachments
+                .get(&attachment_id)
+                .is_some_and(|attachment| attachment.ever_active);
+            let result = snapshot_applied(runtime, attachment_id, revision);
+            if result.is_ok()
+                && !was_active
+                && runtime
+                    .attachments
+                    .get(&attachment_id)
+                    .is_some_and(|attachment| attachment.ever_active)
+            {
+                tracing::info!(component = "session", operation = "controller_attached", session_id = %actor.id, attachment_id = ?attachment_id, "Controller attached");
+            }
+            result
         }),
         SessionCommand::NextUpdate {
             meta,
@@ -3424,14 +3499,12 @@ fn detach_for_remote_resume(
         return Err(lease_lost());
     };
     attachment.detached.store(true, Ordering::Release);
-    let active_controller = runtime
+    let was_controller = runtime
         .controller
-        .is_some_and(|controller| controller.attachment_id == attachment_id)
-        && matches!(attachment.sync, AttachmentSync::Active { .. });
-    if runtime
-        .controller
-        .is_some_and(|controller| controller.attachment_id == attachment_id)
-    {
+        .is_some_and(|controller| controller.attachment_id == attachment_id);
+    let active_controller =
+        was_controller && matches!(attachment.sync, AttachmentSync::Active { .. });
+    if was_controller {
         runtime.controller = None;
         runtime.controller_operation = None;
     }
@@ -3464,6 +3537,9 @@ fn detach_for_remote_resume(
     };
     reconcile_effect_target(runtime)?;
     actor.update_cached(runtime, false);
+    if was_controller {
+        tracing::info!(component = "session", operation = "controller_detached", session_id = %actor.id, attachment_id = ?attachment_id, reason = "transport_closed", "Controller detached");
+    }
     Ok(saved)
 }
 
@@ -3766,6 +3842,7 @@ fn takeover(
         lifecycle.send_replace(AttachmentLifecycle::Active { generation });
     }
     actor.update_cached(runtime, false);
+    tracing::info!(component = "session", operation = "controller_taken_over", session_id = %actor.id, attachment_id = ?attachment_id, "Controller taken over");
     Ok(())
 }
 
@@ -3783,6 +3860,7 @@ fn reap_detached(actor: &SessionActor, runtime: &mut SessionRuntime) -> Result<(
     if detached.is_empty() {
         return Ok(());
     }
+    let mut detached_controller = None;
     for attachment_id in detached {
         runtime.attachments.remove(&attachment_id);
         if runtime
@@ -3791,10 +3869,14 @@ fn reap_detached(actor: &SessionActor, runtime: &mut SessionRuntime) -> Result<(
         {
             runtime.controller = None;
             runtime.controller_operation = None;
+            detached_controller = Some(attachment_id);
         }
     }
     reconcile_effect_target(runtime)?;
     actor.update_cached(runtime, false);
+    if let Some(attachment_id) = detached_controller {
+        tracing::info!(component = "session", operation = "controller_detached", session_id = %actor.id, attachment_id = ?attachment_id, reason = "detached", "Controller detached");
+    }
     Ok(())
 }
 
@@ -5383,6 +5465,210 @@ mod tests {
         );
 
         service.shutdown().expect("mailbox fixture shuts down");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn operational_logs_capture_committed_events_without_terminal_or_state_contents() {
+        // Tracing callsite interest is process-wide. A dedicated helper keeps
+        // unrelated actor tests registering no-op dispatchers out of this
+        // subscriber's capture without installing a global subscriber.
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "session::tests::operational_logs_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .expect("isolated log fixture process");
+        assert!(
+            output.status.success(),
+            "log fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "isolated operational-log capture helper"]
+    fn operational_logs_child() {
+        use crate::network::{NetworkDiagnostic, NetworkReporter, NetworkState};
+        use std::io::Read as _;
+        let temporary = tempfile::tempdir().expect("logging/admission fixture succeeds");
+        let cwd = temporary.path().join("LOG_CWD_SENTINEL");
+        std::fs::create_dir(&cwd).expect("logging/admission fixture succeeds");
+        let capture = tempfile::tempfile().expect("logging/admission fixture succeeds");
+        let writer = capture
+            .try_clone()
+            .expect("logging/admission fixture succeeds");
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_target(true)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || {
+                writer
+                    .try_clone()
+                    .expect("logging/admission fixture succeeds")
+            })
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        let id = DeviceId::from_array([0x91; 32]);
+        let service = unix_fixture_service(id, cwd, "printf LOG_TERMINAL_SENTINEL; exec cat");
+        let principal = service.local_principal(AttachmentId::from_array([0x92; 16]));
+        let lease = service
+            .issue_operation_lease(principal)
+            .expect("logging/admission fixture succeeds");
+        let operation = OperationId { lease, sequence: 1 };
+        let name = SessionName::new("logged-session").expect("logging/admission fixture succeeds");
+        let created = service
+            .create(principal, operation, name.clone(), None, None)
+            .expect("logging/admission fixture succeeds");
+        let replay = service
+            .create(principal, operation, name, None, None)
+            .expect("logging/admission fixture succeeds");
+        assert_eq!(created.session_id, replay.session_id);
+        let attachment = service
+            .prepare_attach(
+                principal,
+                Some(SessionSelector::Id(created.session_id)),
+                false,
+                false,
+                None,
+            )
+            .expect("logging/admission fixture succeeds");
+        attachment
+            .attachment
+            .snapshot_applied(attachment.snapshot.revision)
+            .expect("logging/admission fixture succeeds");
+        attachment
+            .attachment
+            .write_input(b"LOG_INPUT_SENTINEL\n")
+            .expect("logging/admission fixture succeeds");
+        // Cancelling a prepared replacement never releases the current
+        // controller, whether cancellation is explicit or transport EOF.
+        for transport_closed in [false, true] {
+            let replacement = service
+                .prepare_attach(
+                    principal,
+                    Some(SessionSelector::Id(created.session_id)),
+                    false,
+                    true,
+                    None,
+                )
+                .expect("prepare replacement without taking control");
+            if transport_closed {
+                assert!(
+                    !replacement
+                        .attachment
+                        .detach_for_remote_resume_until(default_deadline())
+                        .expect("prepared replacement cannot save a controller checkpoint")
+                );
+            } else {
+                replacement.attachment.detach();
+            }
+            attachment
+                .attachment
+                .resize(created.viewport)
+                .expect("original controller retains input authority");
+        }
+        attachment.attachment.detach();
+        service
+            .close(
+                principal,
+                OperationId { lease, sequence: 2 },
+                created.session_id,
+            )
+            .expect("logging/admission fixture succeeds");
+        let (network, _) = NetworkReporter::initializing(id);
+        network.update(|observation| {
+            observation.state = NetworkState::Degraded;
+            observation.diagnostic = Some(NetworkDiagnostic::HomeRelayUnavailable);
+            observation.home_relay = Some("https://LOG_RELAY_SENTINEL.example".to_owned());
+        });
+        network.update(|observation| {
+            observation.bind_attempts += 1;
+        });
+        network.update(|observation| {
+            observation.state = NetworkState::Online;
+            observation.diagnostic = None;
+        });
+        let mut capture = capture;
+        use std::io::{Seek as _, SeekFrom};
+        capture
+            .seek(SeekFrom::Start(0))
+            .expect("logging/admission fixture succeeds");
+        let mut logs = String::new();
+        capture
+            .read_to_string(&mut logs)
+            .expect("logging/admission fixture succeeds");
+        assert_eq!(logs.matches("Session created").count(), 1);
+        assert!(logs.contains(&created.session_id.to_string()) && logs.contains("logged-session"));
+        assert!(
+            logs.contains("Session ended") && logs.contains("explicit_close"),
+            "captured events: {logs}"
+        );
+        assert!(logs.contains("Controller attached"));
+        assert_eq!(logs.matches("Controller detached").count(), 1);
+        assert_eq!(logs.matches("Network degraded").count(), 1);
+        assert_eq!(logs.matches("Network state changed").count(), 1);
+        assert!(logs.contains("home_relay_unavailable") && logs.contains("online"));
+        for sentinel in [
+            "LOG_CWD_SENTINEL",
+            "LOG_TERMINAL_SENTINEL",
+            "LOG_INPUT_SENTINEL",
+            "LOG_RELAY_SENTINEL",
+        ] {
+            assert!(!logs.contains(sentinel));
+        }
+        assert!(
+            !logs
+                .lines()
+                .any(|line| line.contains("WARN") && line.contains("detached"))
+        );
+    }
+
+    #[test]
+    fn idle_shutdown_serializes_with_creation_admission_without_cancelling_work() {
+        let registry = RegistryInner::default();
+        assert!(
+            registry
+                .owned_entries()
+                .expect("logging/admission fixture succeeds")
+                .is_empty()
+        );
+        let name = SessionName::new("admitted-after-observation")
+            .expect("logging/admission fixture succeeds");
+        let NameReservation::Owner(creation) = registry
+            .reserve_name(&name, false)
+            .expect("logging/admission fixture succeeds")
+        else {
+            panic!("new reservation")
+        };
+        assert_eq!(
+            registry
+                .begin_shutdown(false)
+                .err()
+                .expect("logging/admission fixture succeeds"),
+            vec![name.to_string()]
+        );
+        assert!(!creation.is_cancelled());
+        assert!(cleanup_lock(&registry.state).accepting);
+        assert_eq!(
+            registry
+                .begin_shutdown(true)
+                .expect("logging/admission fixture succeeds")
+                .len(),
+            1
+        );
+        let idle = RegistryInner::default();
+        assert!(
+            idle.begin_shutdown(false)
+                .expect("logging/admission fixture succeeds")
+                .is_empty()
+        );
+        assert!(idle.reserve_name(&name, false).is_err());
     }
 
     #[cfg(unix)]
