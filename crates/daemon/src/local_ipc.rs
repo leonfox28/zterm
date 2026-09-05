@@ -513,14 +513,6 @@ fn malformed(detail: impl Into<String>) -> DaemonError {
     DaemonError::new(DomainErrorKind::MalformedFrame, detail)
 }
 
-#[cfg(not(unix))]
-fn unsupported() -> DaemonError {
-    DaemonError::new(
-        DomainErrorKind::UnsupportedPlatform,
-        "local daemon IPC is Unix-only in the current milestone",
-    )
-}
-
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
