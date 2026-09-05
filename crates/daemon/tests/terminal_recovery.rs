@@ -185,7 +185,7 @@ async fn future_snapshot_ack_recovers_and_wrong_kind_is_stream_local() -> Result
             .any(|session| session.session_id == other.session_id)
     );
 
-    let stopped = unary.stop(false).await.map_err(session_fixture::display)?;
+    let stopped = unary.stop(true).await.map_err(session_fixture::display)?;
     assert_eq!(stopped.active_session_count, 2);
     server
         .await

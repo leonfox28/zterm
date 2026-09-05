@@ -187,7 +187,18 @@ async fn unary_mutations_and_duplex_reconnect_share_one_live_registry() -> Resul
         LocalAttachmentClient::connect_main(state.paths.socket(), Some(TerminalSize::new(30, 100)))
             .await
             .map_err(session_fixture::display)?;
-    let stopped = client.stop(false).await.map_err(session_fixture::display)?;
+    let declined = client.stop(false).await.map_err(session_fixture::display)?;
+    assert!(!declined.stopping && declined.interruption_required);
+    assert_eq!(declined.active_session_names, ["main"]);
+    assert_eq!(
+        client
+            .list_sessions()
+            .await
+            .map_err(session_fixture::display)?
+            .len(),
+        1
+    );
+    let stopped = client.stop(true).await.map_err(session_fixture::display)?;
     assert_eq!(stopped.active_session_count, 1);
     assert_eq!(stopped.active_session_names, ["main"]);
     let stop_deadline = Instant::now() + EVENT_DEADLINE;
@@ -341,7 +352,7 @@ async fn mutation_response_loss_replays_the_exact_completed_result_on_a_new_sock
         DomainErrorKind::OperationOutcomeUnknown.code()
     );
 
-    client.stop(false).await.map_err(session_fixture::display)?;
+    client.stop(true).await.map_err(session_fixture::display)?;
     server
         .await
         .map_err(session_fixture::display)?
@@ -434,7 +445,7 @@ async fn takeover_response_loss_reconnects_with_input_authority_while_old_stream
         .map_err(session_fixture::display)?;
     wait_for_wire_text(&mut replacement, b"TAKEOVER-RETRY-AUTHORITY").await?;
 
-    client.stop(false).await.map_err(session_fixture::display)?;
+    client.stop(true).await.map_err(session_fixture::display)?;
     server
         .await
         .map_err(session_fixture::display)?
@@ -538,7 +549,7 @@ async fn blocked_pty_input_does_not_stall_the_socket_runtime_or_an_unrelated_ses
     .await
     .map_err(|_| "independent child interruption did not release the blocked PTY owner".to_owned())?
     .map_err(session_fixture::display)?;
-    client.stop(false).await.map_err(session_fixture::display)?;
+    client.stop(true).await.map_err(session_fixture::display)?;
     server
         .await
         .map_err(session_fixture::display)?
@@ -615,7 +626,7 @@ async fn failed_bounded_stop_keeps_the_listener_available_until_session_ownershi
     ));
     let client = LocalClient::new(state.paths.socket());
     let failed_stop = client
-        .stop(false)
+        .stop(true)
         .await
         .expect_err("the daemon cannot acknowledge stop before cleanup finishes");
     assert_eq!(failed_stop.kind(), DomainErrorKind::DeadlineExceeded);
@@ -638,7 +649,7 @@ async fn failed_bounded_stop_keeps_the_listener_available_until_session_ownershi
             .is_empty()
     );
 
-    let stopped = client.stop(false).await.map_err(session_fixture::display)?;
+    let stopped = client.stop(true).await.map_err(session_fixture::display)?;
     assert!(stopped.stopping);
     server
         .await
@@ -689,7 +700,7 @@ async fn listener_accept_failure_preserves_live_session_ownership_and_retryabili
         .map_err(session_fixture::display)?;
     wait_for_wire_text(&mut attached, b"ACCEPT-RETRY-OWNER").await?;
 
-    client.stop(false).await.map_err(session_fixture::display)?;
+    client.stop(true).await.map_err(session_fixture::display)?;
     server
         .await
         .map_err(session_fixture::display)?
@@ -827,7 +838,7 @@ async fn fatal_listener_exit_rebinds_actual_daemon_loop_until_owned_child_can_st
         "recovered status must not outlive the retained child"
     );
 
-    let stopped = client.stop(false).await.map_err(session_fixture::display)?;
+    let stopped = client.stop(true).await.map_err(session_fixture::display)?;
     assert!(stopped.stopping);
     tokio::task::spawn_blocking(move || server.join())
         .await

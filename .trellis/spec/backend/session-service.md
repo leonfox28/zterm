@@ -24,6 +24,10 @@ SessionService::takeover(&self, principal, operation_id, attachment)
 SessionService::detach_remote_principal(&self, device_id: DeviceId)
     -> Result<PrincipalDetachImpact, DaemonError>
 SessionService::shutdown(&self) -> Result<Vec<SessionSummary>, DaemonError>
+// Daemon-internal admission boundary; adapters must preserve its outcome.
+SessionService::shutdown_with_approval_until(&self, approved: bool, deadline: Instant)
+    -> Result<ShutdownOutcome, DaemonError>
+// ShutdownOutcome = Stopped(Vec<SessionSummary>) | NeedsConfirmation(Vec<String>)
 
 SessionAttachment::snapshot_applied(revision) -> Result<(), DaemonError>
 SessionAttachment::next_update() -> Result<Option<AttachmentUpdate>, DaemonError>
@@ -231,6 +235,12 @@ they must not duplicate registry, replay, session-reservation, or controller log
 - Root exit and explicit close may race. Ending is idempotent and registry
   removal is compare-and-remove against the same actor, so reservation release
   occurs once and cannot remove a later session reusing the name.
+- Unapproved daemon stop checks the existing registry under the same lock as
+  creation admission. Live, provisional, cleanup-only and Starting ownership
+  cause a non-stopping impact response with current names/count; accepting and
+  all owners remain untouched. If empty, close admission atomically before
+  shutdown so a later creation cannot slip through. Explicit approval permits
+  this invocation to end all running Sessions, not just a frozen snapshot.
 - Explicit close uses child control separated from the potentially blocked PTY
   writer. Daemon shutdown requests interruption for every live/provisional
   owner before processing any summary error, then joins completed workers under
@@ -263,6 +273,8 @@ they must not duplicate registry, replay, session-reservation, or controller log
 | invalid incarnation/ordinal, retired lease, or evicted sequence | `operation_outcome_unknown`, no side effect |
 | same operation ID with a different semantic payload | `operation_outcome_unknown`, no replay or side effect |
 | command expires while queued | `deadline_exceeded`, no PTY/model/lease side effect |
+| unapproved shutdown races admitted creation | return impact without cancelling creation or closing admission |
+| approved shutdown or atomic empty admission | apply existing bounded cleanup and truthful ownership release |
 | shutdown deadline with owned session remaining | `deadline_exceeded`, daemon remains available |
 
 ## 5. Good / Base / Bad Cases
@@ -354,6 +366,9 @@ they must not duplicate registry, replay, session-reservation, or controller log
   explicit-detach assertion; a final observation-only reconnect must remain
   unacknowledged and end by transport EOF rather than duplicate detach without
   the activation barrier.
+- Idle-stop evidence admits creation before an unapproved stop and asserts
+  stopping=false, retained work and open admission; an actually idle stop
+  closes admission. Explicitly approved teardown retains cleanup behavior.
 - Concurrent shutdown evidence observes that every actor has received its end
   request before cleanup waiting, then separately requires all child PIDs and
   ownership to be released under the final absolute deadline. It must not use

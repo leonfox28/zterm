@@ -11,24 +11,36 @@ the complete current command surface.
 
 | Command | Starts a daemon | Purpose |
 | --- | --- | --- |
-| `zterm setup --name <name> --profile official-n0` | yes | Idempotently create/validate state and wait for readiness |
+| `zterm setup --name <name>` | yes | Idempotently create/validate state and wait for readiness |
 | `zterm setup --name <name> --profile self-hosted --relay-url <https-url>` | yes | Select one explicit self-hosted Relay profile |
-| `zterm status [--json]` | no | Report running, configured/stopped, or not configured |
-| `zterm doctor [--json]` | no | Check account home/shell, committed state, socket/lock state, and lifecycle limits |
-| `zterm daemon status [--json]` | no | Same typed state projection as `status` |
-| `zterm daemon stop [--force]` | no | Flush a graceful stop response; stopped is success |
-| `zterm daemon restart [--force]` | yes | Stop, wait, then explicitly start one daemon |
-| `zterm logs [--lines <n>]` | no | Read at most 1,000 recent lines and 1 MiB |
+| `zterm status` | no | Report running, configured/stopped, or not configured |
+| `zterm doctor` | no | Check account home/shell, committed state, socket/lock state, and lifecycle limits |
+| `zterm daemon status` | no | Same typed state projection as `status` |
+| `zterm daemon stop [-y|--yes]` | no | Flush a graceful stop response; stopped is success |
+| `zterm daemon restart [-y|--yes]` | yes | Stop, wait, then explicitly start one daemon |
+| `zterm logs [-n|--lines <n>]` | no | Read at most 1,000 recent lines and 1 MiB |
 
 After setup, running `zterm` with no command attaches local `main`; before setup
 it prints fixed setup guidance without creating an identity. `zterm --help`
 always prints help. The hidden daemon entry accepts no state-path argument and
 is omitted from help.
 
-First noninteractive setup requires both `--name` and `--profile`; self-hosted
-also requires `--relay-url`. An interactive terminal prompts for missing
-values and recommends `official-n0`. Repeating setup without overrides returns
+First setup defaults to `official-n0`. Noninteractive setup requires `--name`;
+interactive setup prompts for a missing name without asking for a profile.
+Explicit self-hosted setup also needs `--relay-url`, prompted interactively if
+omitted. Repeating setup without overrides returns
 the existing public identity and starts the daemon only when it is stopped.
+
+Stop/restart proceed directly with no live Sessions. Otherwise the CLI lists
+the names and asks for English `[y/N]` confirmation; `-y`/`--yes` skips input.
+Detached Sessions count as live work. The daemon atomically checks Session
+admission before accepting an unapproved idle stop, so a concurrent creation
+cannot be ended based on an earlier empty observation.
+
+`logs` reads recent records once and never starts the daemon. Key lifecycle,
+Session, network, connection and pairing events use the existing daemon log.
+The existing startup check rotates a log of at least 4 MiB to `daemon.log.1`;
+there is no continuous reader or runtime size cap.
 
 ## Per-user state
 

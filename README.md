@@ -29,37 +29,44 @@ Current public commands are:
 ```text
 zterm setup [--name <name>] [--profile <official-n0|self-hosted>]
             [--relay-url <https-url>]
-zterm status [--json]
-zterm doctor [--json]
+zterm status
+zterm doctor
 zterm pair create [--ttl <duration-with-s|m|h-suffix>]
-zterm pair accept [--stdin] [--name <alias>]
-zterm device list [--json]
+zterm pair accept [--stdin] [--alias <alias>]
+zterm device list
 zterm device rename <device> <alias>
-zterm device revoke <device> [--yes]
+zterm device revoke <device> [-y|--yes]
 zterm connect <device|local> [--session <name-or-id>] [--takeover]
               [--escape <ctrl-@..ctrl-_|ctrl-?|none>]
-zterm session list <device|local> [--json]
+zterm session list [<device|local>]
 zterm session new <device|local> <name> [--cwd <host-path>]
                    [--escape <ctrl-@..ctrl-_|ctrl-?|none>]
 zterm session attach <device|local> <session> [--takeover]
                       [--escape <ctrl-@..ctrl-_|ctrl-?|none>]
 zterm session rename <device|local> <session> <new-name>
-zterm session close <device|local> <session> [--yes]
-zterm daemon status [--json]
-zterm daemon stop [--force]
-zterm daemon restart [--force]
-zterm logs [--lines <n>]
-zterm reset --identity [--yes] [--force]
-zterm update [--version <vSEMVER>] [--force]
-zterm uninstall [--yes] [--force]
+zterm session close <device|local> <session> [-y|--yes]
+zterm daemon status
+zterm daemon stop [-y|--yes]
+zterm daemon restart [-y|--yes]
+zterm logs [-n|--lines <n>]
+zterm reset --identity [-y|--yes]
+zterm update [--version <vSEMVER>] [-y|--yes]
+zterm uninstall [-y|--yes]
 ```
 
-`setup` and `daemon restart` explicitly start the daemon. Pair, device,
-connect, and Session commands start it on demand only after validating an
+`setup`, `daemon restart`, and a successful update of a configured installation
+start the daemon. Pair, device, connect, and Session commands start it on demand
+only after validating an
 existing setup. Inspection, logs, stop, help/version, and parse failures never
 start it. With setup complete, bare `zterm` is equivalent to
 `zterm connect local --session main`; before setup it only prints setup
 guidance.
+
+First setup defaults to `official-n0`; `zterm setup --name <name>` is enough.
+Commands print human-readable text. Update, daemon stop and daemon restart list
+running Sessions and ask for English `[y/N]` confirmation only when they would
+end live work; use `-y` or `--yes` to confirm directly. `logs -n 100` reads recent
+records once.
 
 See [Remote sessions and the public CLI](docs/remote-cli.md) for the exact
 command, target, pairing, reconnect, takeover, raw-terminal, ambiguity, and

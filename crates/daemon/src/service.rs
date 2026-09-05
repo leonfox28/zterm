@@ -41,7 +41,7 @@ use crate::pairing_service::{LocalPairAcceptInput, LocalPairCreateInput, Pairing
 #[cfg(unix)]
 use crate::remote_session::RemoteSessionService;
 #[cfg(unix)]
-use crate::session::{SessionService, SessionSummary};
+use crate::session::{SessionService, SessionSummary, ShutdownOutcome};
 #[cfg(unix)]
 use crate::store::StoreHandle;
 
@@ -67,7 +67,7 @@ pub struct DaemonReadiness {
     pub started_at_unix: u64,
 }
 
-/// Current daemon status shared by CLI human and JSON renderers.
+/// Current typed daemon observation projected by human-facing frontends.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DaemonStatus {
     /// Supported protocol values.
@@ -499,6 +499,11 @@ impl DaemonService {
         deadline: Instant,
     ) -> ServiceReply {
         let request_id = frame.request_id;
+        let operation = if frame.kind == WireKind::LocalPairCreateRequest {
+            "create_request"
+        } else {
+            "accept_request"
+        };
         let Some(pairing) = self.pairing.clone() else {
             frame.payload.zeroize();
             return ServiceReply::error(
@@ -536,7 +541,16 @@ impl DaemonService {
         };
         match result {
             Ok(reply) => reply,
-            Err(error) => ServiceReply::error(request_id, &error),
+            Err(error) => {
+                tracing::warn!(
+                    component = "pairing",
+                    operation,
+                    request_id,
+                    reason = error.kind().code(),
+                    "Pairing request failed"
+                );
+                ServiceReply::error(request_id, &error)
+            }
         }
     }
 
@@ -628,6 +642,7 @@ impl DaemonService {
     #[cfg(unix)]
     async fn dispatch_device_until(&self, frame: DecodedFrame, deadline: Instant) -> ServiceReply {
         let request_id = frame.request_id;
+        let revoking = frame.kind == WireKind::LocalDeviceRevokeRequest;
         let Some(devices) = self.devices.clone() else {
             return ServiceReply::error(
                 request_id,
@@ -657,7 +672,18 @@ impl DaemonService {
         };
         match result {
             Ok(reply) => reply,
-            Err(error) => ServiceReply::error(request_id, &error),
+            Err(error) => {
+                if revoking {
+                    tracing::warn!(
+                        component = "authorization",
+                        operation = "revoke_failed",
+                        request_id,
+                        reason = error.kind().code(),
+                        "Authorization revocation failed"
+                    );
+                }
+                ServiceReply::error(request_id, &error)
+            }
         }
     }
 
@@ -757,6 +783,12 @@ impl DaemonService {
         })
         .await?;
         drop(guard);
+        tracing::info!(
+            component = "authorization",
+            operation = "revoked",
+            generation = generation.get(),
+            "Inbound authorization revoked"
+        );
 
         let device = self.device_summary(devices, device_id, deadline).await?;
         ServiceReply::message(
@@ -890,17 +922,23 @@ impl DaemonService {
                 )
             }
             WireKind::LocalStopRequest => {
-                let _: v2::LocalStopRequest = decode_request(&frame)?;
-                let sessions = self.sessions.shutdown_until(deadline)?;
+                let request: v2::LocalStopRequest = decode_request(&frame)?;
+                let (stopping, names) = match self
+                    .sessions
+                    .shutdown_with_approval_until(request.force, deadline)?
+                {
+                    ShutdownOutcome::Stopped(sessions) => (true, session_names(&sessions)),
+                    ShutdownOutcome::NeedsConfirmation(names) => (false, names),
+                };
                 ServiceReply::message(
                     WireKind::LocalStopResponse,
                     request_id,
                     &v2::LocalStopResponse {
-                        active_session_count: u32::try_from(sessions.len()).unwrap_or(u32::MAX),
-                        active_session_names: session_names(&sessions),
-                        stopping: true,
+                        active_session_count: u32::try_from(names.len()).unwrap_or(u32::MAX),
+                        active_session_names: names,
+                        stopping,
                     },
-                    true,
+                    stopping,
                 )
             }
             WireKind::LocalUpdatePreflightRequest => {

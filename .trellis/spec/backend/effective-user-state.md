@@ -22,7 +22,12 @@ identity, SQLite state, setup, and managed files.
   concurrent, failed, or resumed setup never rotates it.
 - Config schema v1 represents either official N0 or one explicit
   self-hosted-only HTTPS Relay. Mixed, staging, empty, or invalid profiles are
-  rejected without modifying identity or state.
+  rejected without modifying identity or state. First CLI setup defaults to
+  official-n0 when --profile is omitted, including noninteractive setup with
+  --name. Only the missing device name is prompted by default. Explicit
+  self-hosted still requires or prompts for its Relay URL. Repeated setup uses
+  committed configuration; the default cannot replace a self-hosted profile or
+  turn setup into a name/configuration editor.
 - SQLite is bundled, single-owner, `foreign_keys=ON`, rollback journal,
   `synchronous=FULL`, and transactionally migrated. `PRAGMA user_version` is
   the only schema version.
@@ -57,5 +62,6 @@ identity, SQLite state, setup, and managed files.
   loss through `StoreActor`.
 - CLI setup tests prove first noninteractive validation failure leaves the
   entire task-private state root absent and successful setup creates 0700/0600
-  nodes.
+  nodes. Cover omitted-profile defaults and repeated self-hosted setup without
+  identity or configuration drift.
 - Doctor tests cover missing/unsafe managed paths without creating them.

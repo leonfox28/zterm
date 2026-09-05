@@ -689,6 +689,20 @@ impl PairingManager {
         let result =
             self.inner
                 .execute_create(&request, expires_at_unix, monotonic_deadline, deadline);
+        match &result {
+            Ok(_) => tracing::info!(
+                component = "pairing",
+                operation = "offer_created",
+                ttl_seconds = request.ttl_seconds,
+                "Pairing ticket created"
+            ),
+            Err(error) => tracing::warn!(
+                component = "pairing",
+                operation = "offer_failed",
+                reason = DaemonError::from(*error).kind().code(),
+                "Pairing ticket creation failed"
+            ),
+        }
         cell.complete(result.clone());
         if let Err(error) = result {
             let mut state = state_lock(&self.inner.state);

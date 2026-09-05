@@ -284,7 +284,52 @@ impl NetworkReporter {
     }
 
     pub(crate) fn update(&self, update: impl FnOnce(&mut NetworkObservation)) {
-        self.sender.send_modify(update);
+        let mut transition = None;
+        self.sender.send_modify(|observation| {
+            let previous = (
+                observation.state,
+                observation.diagnostic,
+                observation.publish,
+                observation.lookup,
+            );
+            update(observation);
+            let current = (
+                observation.state,
+                observation.diagnostic,
+                observation.publish,
+                observation.lookup,
+            );
+            if previous != current {
+                transition = Some((previous.0, current));
+            }
+        });
+        // Emit after releasing the observation lock; metric/RTT refreshes are silent.
+        if let Some((previous, (state, diagnostic, publish, lookup))) = transition {
+            let reason = diagnostic.map_or("none", NetworkDiagnostic::code);
+            if state == NetworkState::Degraded {
+                tracing::warn!(
+                    component = "network",
+                    operation = "state_changed",
+                    previous = previous.as_str(),
+                    state = state.as_str(),
+                    reason,
+                    publish = publish.as_str(),
+                    lookup = lookup.as_str(),
+                    "Network degraded"
+                );
+            } else {
+                tracing::info!(
+                    component = "network",
+                    operation = "state_changed",
+                    previous = previous.as_str(),
+                    state = state.as_str(),
+                    reason,
+                    publish = publish.as_str(),
+                    lookup = lookup.as_str(),
+                    "Network state changed"
+                );
+            }
+        }
     }
 
     pub(crate) fn transport_metrics(

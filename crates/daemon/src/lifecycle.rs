@@ -353,7 +353,13 @@ fn run_daemon_with_network_mode(
             )
         }
     };
-    tracing::info!("local daemon ready");
+    tracing::info!(
+        component = "daemon",
+        operation = "ready",
+        version = zterm_core::BuildIdentity::current().version,
+        pid = std::process::id(),
+        "Local daemon ready"
+    );
 
     run_owned_daemon_listener(
         paths,
@@ -408,7 +414,12 @@ fn run_owned_daemon_listener(
             .map(|_| ());
         match (server_result, session_cleanup) {
             (Ok(()), Ok(())) => {
-                tracing::info!("local daemon stopping");
+                tracing::info!(
+                    component = "daemon",
+                    operation = "stopping",
+                    pid = std::process::id(),
+                    "Local daemon stopping"
+                );
                 let pairing_cleanup = match service.pairing() {
                     Some(pairing) => runtime.block_on(pairing.shutdown_until(cleanup_deadline)),
                     None => Ok(()),
@@ -488,7 +499,11 @@ fn run_owned_daemon_listener(
                     }
                 };
                 (listener, socket_ownership) = rebound;
-                tracing::info!("local daemon listener recovered");
+                tracing::info!(
+                    component = "daemon",
+                    operation = "listener_recovered",
+                    "Local daemon listener recovered"
+                );
             }
         }
     }
@@ -603,7 +618,8 @@ fn rotate_lifecycle_log(paths: &UserPaths) -> Result<(), DaemonError> {
 fn init_lifecycle_logging() {
     let _ = tracing_subscriber::fmt()
         .with_ansi(false)
-        .with_target(false)
+        .with_target(true)
+        .with_max_level(tracing::Level::INFO)
         .try_init();
 }
 

@@ -181,7 +181,7 @@ impl Harness {
     }
 
     async fn stop(self) {
-        self.local_client().stop(false).await.expect("daemon stop");
+        self.local_client().stop(true).await.expect("daemon stop");
         self.server
             .await
             .expect("local listener task")
