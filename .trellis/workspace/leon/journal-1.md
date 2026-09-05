@@ -279,3 +279,25 @@ Unified local and remote daemon attachment semantics behind a frontend-owned Ses
 ### Status
 
 [OK] **Completed**
+
+
+## Session 12: Simplify terminal architecture and bound client control
+<!-- trellis-session: v=2 fp=33aef6839ee31169 -->
+
+**Date**: 2026-09-05
+**Task**: Simplify terminal architecture and bound client control
+**Branch**: `fix-zterm-herdr-not-synchronized-attachment-snapshot`
+
+### Summary
+
+Completed the single-agent architecture review and implementation: separated SessionClient transport/session/view/ipc ownership, bounded control deadlines and deferred buffers, removed repeated projections and surface clones, and centralized UI transitions. Updated four executable specs. just check passed (507 tests passed, 6 ignored); Herdr black-box passed. Windows cross-check was limited by missing host SDK. User approved the work commit, task archival and subsequent standard PR/release flow.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `0c21738` | refactor: simplify terminal architecture and bound client control |
+
+### Status
+
+[OK] **Completed**
