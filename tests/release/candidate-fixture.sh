@@ -29,7 +29,8 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 if [ "$slurp" = true ]; then
-    jq -s -r "$query" "$source"
+    [ -z "$query" ] || { echo 'gh does not support --slurp with --jq' >&2; exit 1; }
+    jq -s . "$source"
 else
     jq -r "$query" "$source"
 fi
@@ -41,11 +42,11 @@ jq -n --arg commit "$commit" '{
     status: "completed", conclusion: "success", path: ".github/workflows/ci.yml",
     run_attempt: 3
 }' >"$fixture/run.json"
-jq -n --arg commit "$commit" '{artifacts: [1, 2] | map({
+jq -n --arg commit "$commit" '[1, 2] | .[] | {artifacts: [{
     id: (100 + .), name: ("release-candidate-" + $commit + "-" + tostring),
     expired: false, digest: ("sha256:" + ("ab" * 32)),
     workflow_run: {id: 123, head_branch: "main", head_sha: $commit}
-})}' >"$fixture/artifacts.json"
+}]}' >"$fixture/artifacts.json"
 
 lookup() {
     CANDIDATE_FIXTURE="$fixture" PATH="$fixture/bin:$PATH" \

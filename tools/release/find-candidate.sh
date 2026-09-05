@@ -25,11 +25,12 @@ verified_run=$(gh api \
         and .conclusion == \"success\" and .path == \".github/workflows/ci.yml\")
         | .id")
 [ "$verified_run" = "$run_id" ] || fail "run is not exact green main CI"
-artifact_id=$(gh api --paginate --slurp \
+artifact_pages=$(gh api --paginate --slurp \
     -H 'Accept: application/vnd.github+json' \
     -H 'X-GitHub-Api-Version: 2022-11-28' \
-    "repos/$repository/actions/runs/$run_id/artifacts?per_page=100" \
-    --jq "[.[].artifacts[]
+    "repos/$repository/actions/runs/$run_id/artifacts?per_page=100")
+# gh rejects --slurp combined with --jq; query only the successfully fetched pages.
+artifact_id=$(printf '%s\n' "$artifact_pages" | jq -r "[.[].artifacts[]
         | select(.name | test(\"^release-candidate-$commit-[0-9]+$\"))
         | select(.expired == false and .workflow_run.head_sha == \"$commit\"
             and .workflow_run.head_branch == \"main\"
