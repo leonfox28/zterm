@@ -240,6 +240,27 @@ impl fmt::Debug for v2::LocalSessionUnaryRequest {
     }
 }
 
+impl fmt::Debug for v2::LocalSessionTunnelOpenRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LocalSessionTunnelOpenRequest")
+            .field("protocol_version", &self.protocol_version)
+            .field("target_device_id", &"[REDACTED]")
+            .field("target_device_id_present", &self.target_device_id.is_some())
+            .finish()
+    }
+}
+
+impl fmt::Debug for v2::LocalSessionTunnelData {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LocalSessionTunnelData")
+            .field("bytes", &"[REDACTED]")
+            .field("bytes_len", &self.bytes.len())
+            .finish()
+    }
+}
+
 impl fmt::Debug for v2::LocalStatusResponse {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -370,6 +391,10 @@ pub const STATE_SCHEMA_VERSION: u32 = zterm_core::STATE_SCHEMA_VERSION;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum concrete control-message payload size.
 pub const MAX_CONTROL_PAYLOAD_BYTES: usize = 1024 * 1024;
+/// Version of the same-UID-only opaque Session tunnel envelope.
+pub const LOCAL_SESSION_TUNNEL_VERSION: u32 = 1;
+/// Maximum opaque Session bytes carried by one local tunnel Data frame.
+pub const MAX_LOCAL_SESSION_TUNNEL_DATA_BYTES: usize = 64 * 1024;
 /// Maximum bytes in an unsigned 64-bit varint prefix.
 pub const MAX_VARINT_BYTES: usize = 10;
 
@@ -425,6 +450,18 @@ pub enum WireKind {
     LocalTargetResolveResponse = 23,
     /// Same-UID envelope containing one preencoded remote Session unary.
     LocalSessionUnaryRequest = 24,
+    /// Same-UID request for one opaque authenticated Session service stream.
+    LocalSessionTunnelOpenRequest = 25,
+    /// Confirmation that the remote service stream is ready.
+    LocalSessionTunnelOpened = 26,
+    /// One bounded opaque chunk of target Session bytes.
+    LocalSessionTunnelData = 27,
+    /// Address-free path and RTT sideband for this tunnel epoch.
+    LocalSessionTunnelPath = 28,
+    /// Directional end-of-data marker for one tunnel half.
+    LocalSessionTunnelHalfClose = 29,
+    /// Content-free terminal outcome for one tunnel epoch.
+    LocalSessionTunnelClosed = 30,
     /// Controller opens a pairing handshake.
     PairBegin = 100,
     /// Host responds to a pairing handshake.
@@ -477,7 +514,7 @@ pub enum WireKind {
     TerminalLeaseLost = 309,
     /// The root shell and session have ended.
     TerminalSessionEnded = 310,
-    /// Latest daemon-owned remote attachment transport state for one local view.
+    /// Same-UID-only frontend attachment transport-state projection.
     TerminalTransportStateEvent = 311,
     /// Same-UID-only selected connection path and RTT projection.
     TerminalConnectionStatusEvent = 314,
@@ -520,6 +557,11 @@ impl WireKind {
     pub const fn max_control_payload_bytes(self) -> usize {
         if self.is_pair_hello() {
             MAX_PAIR_HELLO_FRAME_BYTES
+        } else if matches!(self, Self::LocalSessionTunnelData) {
+            // One field tag plus the three-byte encoded length at this fixed
+            // ceiling. This makes a one-byte-oversized canonical Data message
+            // fail before it can enter the tunnel adapter.
+            MAX_LOCAL_SESSION_TUNNEL_DATA_BYTES + 4
         } else {
             MAX_CONTROL_PAYLOAD_BYTES
         }
@@ -555,6 +597,12 @@ impl TryFrom<u32> for WireKind {
             22 => Self::LocalTargetResolveRequest,
             23 => Self::LocalTargetResolveResponse,
             24 => Self::LocalSessionUnaryRequest,
+            25 => Self::LocalSessionTunnelOpenRequest,
+            26 => Self::LocalSessionTunnelOpened,
+            27 => Self::LocalSessionTunnelData,
+            28 => Self::LocalSessionTunnelPath,
+            29 => Self::LocalSessionTunnelHalfClose,
+            30 => Self::LocalSessionTunnelClosed,
             100 => Self::PairBegin,
             101 => Self::PairChallenge,
             102 => Self::PairProof,
@@ -2353,6 +2401,38 @@ mod tests {
     }
 
     #[test]
+    fn local_session_tunnel_envelope_is_bounded_and_redacted() {
+        const SECRET: &[u8] = b"TUNNEL_PAYLOAD_SECRET_22e8";
+        let target = DeviceId::from_array([0x7a; DeviceId::LENGTH]);
+        let open = v2::LocalSessionTunnelOpenRequest {
+            protocol_version: LOCAL_SESSION_TUNNEL_VERSION,
+            target_device_id: Some(target.into()),
+        };
+        assert_message_round_trip(WireKind::LocalSessionTunnelOpenRequest, open.clone());
+        let open_debug = format!("{open:?}");
+        assert!(!open_debug.contains(&target.to_string()));
+
+        let maximum = v2::LocalSessionTunnelData {
+            bytes: vec![0x5a; MAX_LOCAL_SESSION_TUNNEL_DATA_BYTES],
+        };
+        assert_message_round_trip(WireKind::LocalSessionTunnelData, maximum);
+        let oversized = v2::LocalSessionTunnelData {
+            bytes: vec![0x5a; MAX_LOCAL_SESSION_TUNNEL_DATA_BYTES + 1],
+        };
+        assert!(matches!(
+            encode_message(WireKind::LocalSessionTunnelData, 0, 0, &oversized),
+            Err(ProtocolError::ControlPayloadTooLarge(_))
+        ));
+
+        let secret = v2::LocalSessionTunnelData {
+            bytes: SECRET.to_vec(),
+        };
+        let debug = format!("{secret:?}");
+        assert!(debug.contains(&format!("bytes_len: {}", SECRET.len())));
+        assert!(!debug.contains(std::str::from_utf8(SECRET).expect("ASCII secret")));
+    }
+
+    #[test]
     fn decoder_rejects_unknown_major_kind_and_incomplete_or_malformed_lengths() {
         let unknown_major = v2::WireFrame {
             wire_major: 1,
@@ -2621,6 +2701,30 @@ mod tests {
             (
                 WireKind::LocalSessionUnaryRequest,
                 v2::MessageKind::LocalSessionUnaryRequest as u32,
+            ),
+            (
+                WireKind::LocalSessionTunnelOpenRequest,
+                v2::MessageKind::LocalSessionTunnelOpenRequest as u32,
+            ),
+            (
+                WireKind::LocalSessionTunnelOpened,
+                v2::MessageKind::LocalSessionTunnelOpened as u32,
+            ),
+            (
+                WireKind::LocalSessionTunnelData,
+                v2::MessageKind::LocalSessionTunnelData as u32,
+            ),
+            (
+                WireKind::LocalSessionTunnelPath,
+                v2::MessageKind::LocalSessionTunnelPath as u32,
+            ),
+            (
+                WireKind::LocalSessionTunnelHalfClose,
+                v2::MessageKind::LocalSessionTunnelHalfClose as u32,
+            ),
+            (
+                WireKind::LocalSessionTunnelClosed,
+                v2::MessageKind::LocalSessionTunnelClosed as u32,
             ),
             (WireKind::PairBegin, v2::MessageKind::PairBegin as u32),
             (

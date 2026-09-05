@@ -6,6 +6,9 @@ Apply this contract to the per-user daemon, Unix socket service, peer
 credentials, detached launch, setup/status/doctor/log commands, and lifecycle
 locks. It also covers the Unix raw-terminal UI, its host mouse capture,
 attachment-local history viewport, and Zterm-owned status/scrollbar chrome.
+Use it whenever a frontend establishes either a direct local Session stream or
+an opaque remote Session tunnel through its local viewer daemon, including
+viewer-daemon restart and remote attachment resume.
 Apply the presentation rules whenever a transport transition decides whether
 the last observed connection path/RTT is still valid and whether stdout should
 receive another complete frame.
@@ -51,6 +54,19 @@ LocalRuntime::attach(
 LocalRuntime::reset_identity(&self, expected_device_id: Option<DeviceId>, force: bool)
     -> Result<IdentityResetResult, DaemonError>
 
+LocalAttachmentClient::connect_resolved(socket, target, selector, create_main, takeover, viewport)
+    -> Result<LocalAttachmentClient, DaemonError>
+LocalAttachmentClient::set_remote_daemon_restarter(
+    &mut self,
+    restarter: Arc<dyn RemoteDaemonRestarter>,
+)
+RemoteDaemonRestarter::ensure_running(&self) -> Future<Result<(), DaemonError>>
+
+RemoteSessionService::serve_tunnel(stream, first, limits, deadline)
+    -> Result<(), DaemonError>
+serve_remote_session_tunnel(broker, target, local_stream, first, limits, deadline)
+    -> Result<(), DaemonError>
+
 run_terminal(request: TerminalRequest, runtime: &LocalRuntime)
     -> Result<(), CliError>
 
@@ -60,7 +76,7 @@ AttachmentSurface::from_snapshot(snapshot: &TerminalSurfaceSnapshot)
     -> Result<AttachmentSurface, CliError>
 AttachmentSurface::candidate_after_delta(delta: &TerminalSurfaceDelta)
     -> Result<Option<AttachmentSurface>, CliError>
-ChromeLayout::new(physical: TerminalSize, remote: bool, screen: ActiveScreen)
+ChromeLayout::new(physical: TerminalSize, screen: ActiveScreen)
     -> ChromeLayout
 ScrollbarGeometry::new(track_rows: u16, metrics: TerminalScrollMetrics)
     -> Option<ScrollbarGeometry>
@@ -102,6 +118,11 @@ spawn_inside_runtime<T>(runtime: &tokio::runtime::Runtime, spawn: impl FnOnce() 
 Unary IPC is `varint length + WireFrame + write-half EOF -> one response`.
 `TerminalAttachRequest` selects the duplex stream; lease allocation is the
 strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
+For a remote view, the frontend first sends
+`LocalSessionTunnelOpenRequest -> LocalSessionTunnelOpened` on that same
+per-frontend IPC socket, then carries unchanged Session bytes in bounded
+`Data` envelopes. `Path`, `HalfClose`, and `Closed` are local-only
+sideband envelopes and are never valid on the normal Iroh Session stream.
 
 ## 3. Contracts
 
@@ -186,30 +207,46 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   `operation_outcome_unknown`. Only a read-only outer request may retry once;
   stateful lease allocation uses one outer attempt and one remote service-stream
   attempt, returning its typed post-write failure without allocating again. The
-  daemon-owned remote client alone owns the one possible Iroh mutation retry.
-- A remote-target `TerminalAttachRequest` creates one daemon-owned desired-view
-  bridge behind the same-UID duplex connection. The bridge keeps one stable
-  local attachment ID and one `ConnectionDemand` for the view lifetime, while
-  each remote stream receives a fresh host attachment ID. It emits local-only
-  `Preparing`, `Synchronizing`, `Active`, and `Reconnecting` events, rewrites
-  attachment IDs at the boundary, drops input while reconnecting/freshly
-  synchronizing, and retains only the latest validated semantic surface/window.
-  The bridge may structurally decode a terminal frame to validate bounds,
-  revision, correlation, and request identity, rewrite its private attachment
-  ID, then re-encode it. It never interprets cells, converts representation,
-  composes chrome, or constructs ANSI. Within one
-  already-active stream epoch, replacement snapshot synchronization records
-  `controller_was_active` and may forward the same controller's input/history
-  operations through the server's narrow visual-sync fence. A new
-  epoch, initial attach, or takeover cannot inherit that privilege. Every open,
-  initial exchange, full-sync
-  exchange, remote write, local write, detach, and control forward is bounded by
-  an existing absolute attempt/operation deadline; active reads remain
-  long-lived and local EOF/detach remains authoritative. If a post-`Active`
-  replacement attach for the frozen SessionId races the old host reader's EOF
-  and receives `SessionOccupied`, the bridge closes that rejected epoch and
-  waits a fixed cancellable 250 ms while continuing the same input-drop and
-  latest-history-target rules. A first-ever `SessionOccupied` remains terminal.
+  daemon-owned `RemoteUnaryClient` alone owns the one possible Iroh mutation
+  retry for this unary path; live terminal Session ownership remains in the
+  frontend client described below.
+- Every frontend view owns exactly one same-UID IPC connection and exactly one
+  transport-independent Session client. A local view sends Session frames
+  directly on that socket. A remote view uses the local-only tunnel envelope;
+  its daemon owns identity, the single Iroh Endpoint, one shared broker
+  connection per device pair, and one admitted service stream per tunnel.
+  Multiple frontends therefore have independent IPC sockets and service
+  streams while sharing the peer connection. No frontend creates an Endpoint
+  and no IPC byte stream is shared between frontend processes.
+- The tunnel daemon validates same-UID admission, exact non-self outbound
+  DeviceId, protocol version, frame headers, and a 64 KiB nonempty Data ceiling.
+  It then pumps bytes with direct bounded backpressure and one owner per writer.
+  It never decodes inner Session frames and never owns a SessionId,
+  AttachmentId, ResumeViewId, revision, viewport, acknowledgement decision,
+  operation lease, or pending control. One malformed, stalled, reset, or
+  cancelled tunnel releases only its demand/stream/socket ownership and cannot
+  close the shared peer connection or another tunnel.
+- The frontend Session client freezes the target and SessionId, generates one
+  stable ResumeViewId, accepts target-issued attachment IDs unchanged, tracks
+  the latest successfully presented revision and desired viewport, and owns
+  request correlation plus mutation ambiguity. On retryable remote loss it
+  resolves an outstanding history query once as a content-free Gap, emits
+  `Reconnecting`, opens a fresh tunnel/service stream, and attaches with the
+  same ResumeViewId and SessionId plus the latest applied revision/viewport.
+  Every successful replacement epoch projects `Synchronizing` and then an
+  explicit frontend-owned `Unknown` path before any collected Direct/Relay
+  samples or target state. Consecutive identical path samples are suppressed.
+  It never blindly replays input, resize, snapshot acknowledgement, history, or
+  a possibly committed takeover. A reconnect may accept only a target snapshot
+  or a delta contiguous with the advertised applied revision.
+- A production remote view receives one narrow daemon-restart capability from
+  `LocalRuntime`. If opening its replacement IPC socket reports
+  `DaemonStopped`, that capability calls the ordinary `DaemonLauncher::ensure`
+  with the same `UserPaths`; the lifecycle lock provides cross-frontend
+  singleflight, after which each frontend independently reopens its tunnel.
+  A local view never receives this capability because its target Session ended
+  with the stopped daemon and cannot be resumed into a new daemon incarnation.
+  Network-only failures never launch the viewer daemon.
 - Remote history has exactly one renderer-neutral operation:
   `TerminalHistoryWindowRequest` kind 317 followed by one correlated
   `TerminalSemanticHistoryWindowFrame` kind 318 on the authenticated attachment
@@ -227,15 +264,17 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   whose revision is not older than the saved query, then emits `Reconnecting`.
   The query is never replayed on another epoch and the daemon/Session stores no
   attachment scroll target.
-- `TerminalConnectionStatusEvent` is same-UID/local-only. The bridge emits an
+- `LocalSessionTunnelPath` is same-UID/local-only. The tunnel emits an
   initial/reattachment unknown sample and changed selected-path/RTT samples no
-  faster than once per second; operations combine them with the attach-time
-  frozen validated alias. Device IDs, addresses, relay URLs, tickets, and
-  terminal bytes never enter this event, Debug, status text, or logs.
+  faster than once per second; the frontend projects it as connection status
+  beside immutable `TerminalViewTarget { route, display_name }` metadata.
+  Device IDs, addresses, relay URLs, tickets, and terminal bytes never enter
+  this sideband, Debug, status text, or logs. A display name never selects a
+  route and a local view rejects network-path sideband.
 - `TerminalClipboardWrite` kind 322 is a transient semantic host effect, not a
   terminal revision or replayable control response. Terminal ingress validates
   child OSC 52 once, Session targets only the controller that exists at effect
-  publication time, and remote/local bridges rewrite and revalidate only typed
+  publication time, and the one frontend Session client validates the target
   attachment identity plus bounded text. Operations owns a separate
   latest-only clipboard slot with a payload-free wakeup, so a slow UI cannot
   fill or block the capacity-eight lifecycle queue. Target changes, stream loss,
@@ -279,21 +318,29 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   resize-state, and in-flight-snapshot ordering. The multiprocess PTY fixture
   uses the production `run_terminal` entry and bounded idempotent shell probes;
   it must not add renderer markers or test branches to the product loop.
-- The raw-terminal UI distinguishes physical size from child size: remote views
-  reserve the physical bottom row when rows are at least two, local/one-row
-  views do not. Before both initial attach and every resize, the sole child-size
+- Snapshot acknowledgement uses the transport state captured when a semantic
+  delta enters the UI handler. An entry-`Active` delta may change
+  Main/Alternate geometry and start a new resize synchronization epoch, but it
+  must not acknowledge itself as that epoch's replacement state. A contiguous
+  delta that entered while already `Synchronizing` is presented first and
+  then acknowledges its exact `to_revision`. Target Session validation remains
+  strict; route metadata and application identity never enter this decision.
+- The raw-terminal UI distinguishes physical size from child size: every local
+  and remote view reserves the physical bottom row when rows are at least two;
+  a one-row view gives its only row to the child. Before both initial attach and
+  every resize, the sole child-size
   projection clamps rows and columns to the shared `ResourceLimits` viewport
   maximum; the daemon and wire boundary still reject an independently supplied
-  oversized viewport. Status placement continues to use the uncapped physical
-  bottom row. The remote-only row is exactly
-  `<device> | <direct|relay|--> | <integer ms|-->`, uses theme-default reverse
-  video across every cell, clips on display-cell boundaries, and saves/resets/
-  restores child cursor and style. Wheel/Page routing depends only on
+  oversized viewport. Status placement uses the uncapped physical bottom row.
+  Local is exactly `<device> | local`, with no latency field. Remote is exactly
+  `<device> | <direct|relay|--> | <integer ms|-->`. Both use theme-default
+  reverse video across every cell, clip on display-cell boundaries, and
+  save/reset/restore child cursor and style. Wheel/Page routing depends only on
   authoritative main/alternate, mouse, and alternate-scroll modes; there are
   no tmux/Herdr/application-name branches.
 - On the main screen, usable widths greater than four reserve exactly the final
   column for Zterm chrome; the child receives `N-1` columns. Widths 1–4 and the
-  alternate screen give the child the full usable width. A remote status row is
+  alternate screen give the child the full usable width. The status row is
   outside both the child and gutter. A pinned history presentation remains
   effectively Main even if background child output enters alternate, so it is
   not resized or overwritten until return-to-live. Main/alternate transitions
@@ -374,7 +421,7 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   changes first converge as one semantic `ComposedFrame`. The sole
   `DesktopPresenter` then emits one buffered outer transaction: DEC 2026 begin,
   terminal/history cells and chrome, cursor/mode policy, `HOST_INPUT_CAPTURE`,
-  DEC 2026 end, one `write_all`, and exactly one flush. No daemon/model/bridge
+  DEC 2026 end, one `write_all`, and exactly one flush. No daemon/model/tunnel
   path constructs presentation ANSI. Child modes may change semantic input
   routing but cannot leave physical outer capture disabled. A partial write or
   flush failure clears the presenter's committed baseline, makes a best-effort
@@ -472,16 +519,13 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   authoritative event, one content-free normalized closure is returned. Raw OS
   or `terminal attachment driver closed` text is never user-visible, and no
   command is replayed.
-- A bridge retains at most eight correlated lease/takeover controls. Epoch loss
-  completes every sent lease request with its original typed transport failure
-  and every sent takeover with `operation_outcome_unknown`; neither is replayed.
-  A correlated ordinary `ServiceError` preserves its typed code and request
-  correlation but discards the untrusted peer message, re-encodes one stable
-  content-free local detail, and removes only its pending cell. An uncorrelated
-  response or fatal authorization, wire,
-  protocol, Session, or lease outcome terminates the view. A fatal bridge error
-  is flushed as one typed local service error before the duplex connection
-  closes.
+- The frontend Session client owns its bounded correlated lease, takeover, and
+  history state. Epoch loss completes a sent takeover as
+  `operation_outcome_unknown` and a pending history query as one Gap; neither
+  is replayed. A correlated ordinary `ServiceError` preserves its typed code
+  and request correlation but discards untrusted peer text. An uncorrelated
+  response or fatal authorization, wire, protocol, Session, or lease outcome
+  terminates only that view.
 - Lifecycle stop first performs bounded concurrent session cleanup. Only full
   ownership release may produce a successful stop response; that response is
   flushed and its socket shut down before listener exit is signaled. A cleanup
@@ -537,9 +581,11 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   launcher or from a `#[tokio::test]`.
 - Local session and terminal calls use the single transport-independent
   `SessionService`; they never pair, resolve an alias, bind Iroh, or self-dial.
-  `LocalAttachmentClient` is a daemon-internal/test-facing real socket adapter,
-  retained below the public raw-terminal UI; the CLI never owns its socket,
-  decoder, operation lease, route, or remote transport.
+  `LocalAttachmentClient` is library-internal, but each instance executes in
+  the frontend process below the public raw-terminal UI. It owns that
+  frontend's socket, one Session decoder, route adapter, target IDs, operation
+  lease, resume checkpoint, and request correlation; none are projected into
+  clap or renderer APIs.
 - Human and JSON status are projections of one typed daemon observation.
   Running state comes from IPC; configured/stopped state may open SQLite only
   after the socket proves no `StoreActor` is live.
@@ -553,13 +599,20 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
 | --- | --- |
 | peer effective UID differs from daemon owner | close with zero response bytes before frame decode |
 | unary request has trailing bytes, missing EOF, malformed frame, or excessive size | typed/connection-local protocol failure; listener remains usable |
+| tunnel Open is wrong-version, zero-request, self-targeted, unknown/revoked, or not outbound-authorized | correlated local service error; acquire no unauthorized service stream |
+| post-Open tunnel envelope has nonzero request/deadline, an invalid kind, zero-byte Data, or Data above 64 KiB | one `ProtocolError` Closed best effort, then end only that tunnel |
+| remote tunnel read/write resets or peer connection is lost | one `TransportLost` Closed best effort; frontend emits Reconnecting and independently resumes its attachment |
+| replacement remote tunnel cannot open because the viewer daemon stopped | lifecycle-singleflight `ensure` the same configured viewer daemon, then retry with the frozen SessionId/ResumeViewId/revision/viewport; surface launch failure; local views never auto-restart |
+| initial or replacement snapshot acknowledgement loses its tunnel write | remain Reconnecting/Synchronizing; never emit Active for the dead epoch |
+| entry-Active delta changes Main/Alternate geometry and submits resize | present it and enter Synchronizing, but do not acknowledge the old delta as the new resize epoch |
+| contiguous delta entered while already Synchronizing | present it, record its exact `to_revision` as applied, acknowledge that revision, then process any later coalesced resize |
 | request deadline expires before dispatch | `deadline_exceeded`, no effect begins |
 | request times out after actor start | drop only waiter; accepted effect completes into replay state |
 | ambiguous same-UID loss on a local-target mutation | retry once with identical bytes/ID/deadline |
 | remote mutation outer envelope was partially/fully written but has no fully validated correlated response | `operation_outcome_unknown`; do not reconnect or replay the envelope |
 | read-only remote outer envelope has a post-write failure | retry once with identical envelope bytes and the same deadline |
-| remote attachment stream is lost with a pending lease / takeover | original typed transport failure / `operation_outcome_unknown`; remove the pending cell and never replay it |
-| remote attachment stream is lost with a pending history-window response | resolve its original correlation once as a content-free nonzero Gap not older than the saved query, then reconnect; remove the pending query and never replay it |
+| remote Session stream is lost with a pending lease / takeover | original typed transport failure / `operation_outcome_unknown`; remove the pending cell and never replay it |
+| remote Session stream is lost with a pending history-window response | resolve its original correlation once as a content-free nonzero Gap not older than the saved query, then reconnect; remove the pending query and never replay it |
 | history-window frame is uncorrelated, predates/contradicts its request, exceeds 240 rows, contains invalid semantic rows, or does not contain the exact requested range | malformed frame scoped to the view; retain the prior complete cache/presentation and never partially install rows |
 | live wheel occurs during fresh synchronization | swallow Zterm gutter/history navigation and do not forward it to the child; an already-pinned view may continue only across background replacement sync |
 | child declares mouse reporting / alternate+alternate-scroll | forward exactly one mouse report / one cursor-key sequence; do not move Zterm history |
@@ -595,7 +648,7 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
 | post-active frozen-session attach receives `session_occupied` while the old host reader is half-open | close the rejected epoch, remain reconnecting, drain/drop input and coalesce viewport for 250 ms, then retry the same SessionId without `create_main` |
 | first-ever attach receives `session_occupied` | flush the typed terminal error and close the local view; do not retry |
 | active remote stream returns a correlated ordinary service error | forward it, remove the pending cell, and keep the attachment alive |
-| remote attachment frame is malformed or fatally unauthorized/incompatible | flush a typed local service error, then close only that local view |
+| inner remote Session frame is malformed or fatally unauthorized/incompatible | target/ frontend Session validation terminates only that view; the tunnel daemon never decodes or rewrites it |
 | definitive outcome unknown | do not retry that mutation under a new lease |
 | a daemon-requiring public command observes no committed setup | `not_setup` with `zterm setup` guidance; do not create identity or state |
 | pair accept uses a non-TTY without `--stdin` | usage error before reading ticket bytes or starting ticket parsing |
@@ -619,6 +672,18 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   creating paths, allocating mutation leases, or starting a process.
 - **Good:** parse one public target, let `LocalRuntime` freeze it to `local` or
   a full DeviceId, and pass only the typed request/view to the CLI renderer.
+- **Good:** give every frontend one IPC socket and Session client; map a remote
+  socket one-to-one onto an admitted service stream while reusing the broker's
+  one active peer connection.
+- **Base:** local and remote routes feed the same Session interpreter and
+  renderer contract. Only their establishment adapters differ: direct
+  same-UID Session bytes versus local tunnel envelopes.
+- **Good:** when several remote frontends lose the same viewer daemon, each
+  requests the narrow restart capability, the lifecycle lock starts at most one
+  daemon, and each frontend then resumes its own independent tunnel. A local
+  view ends instead of attaching its dead SessionId to the new incarnation.
+- **Bad:** decode Session frames, cache revisions/viewports, rewrite attachment
+  IDs, or decide acknowledgement inside the tunnel daemon.
 - **Good:** prove shell-ready and eventual interactive echo through the
   production terminal entry; exercise resize plus signal restoration separately
   from prefix detach, while pure tests own the exact Active input fence.
@@ -649,7 +714,11 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   in-epoch visual sync, paint it with the replacement snapshot, and let the
   following `Active` event perform state/input work without an unchanged frame.
 - **Base:** a fresh attachment or true reconnect shows unknown connection
-  details until that connection epoch reports a validated path and RTT.
+  details until that connection epoch reports a validated path and RTT. On a
+  replacement epoch, the frontend must enqueue that `Unknown` projection
+  itself before replaying collected tunnel path samples; it must not depend on
+  the tunnel pump delivering an initial sideband. Consecutive duplicate samples
+  are suppressed without reordering later Direct/Relay/Unknown transitions.
 - **Bad:** derive chrome from the most recently received coalesced frame, clear
   the gutter while a replacement snapshot is pending, or retain metrics across
   a resize/reconnect merely because the old terminal pixels are still visible.
@@ -682,6 +751,11 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
 - Multi-process tests prove concurrent launch singleflight, live/stale socket
   behavior, detach, bounded stop, restart identity preservation, and no
   spontaneous post-crash restart.
+- The real outer-pseudo-TTY `daemon_autospawn` path drives production
+  `run_terminal`, has the fixture shell emit generic DECSET/DECRST 1049,
+  waits for Alternate 23x80 then Main 23x79 convergence at physical 24x80,
+  proves another input advances model and presentation, detaches cleanly, and
+  asserts the exact `<device> | local` row with no `not_synchronized`.
 - The `operations` identity-reset deadline fixture drops its stale Unix
   listener and, under a separate one-second setup bound, waits until an owner
   connection is refused before invoking the reset with its 40-millisecond
@@ -726,21 +800,29 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
   listener and its live session, and an injected fatal accept in the actual
   `run_daemon` listener loop rebinds while a HUP-resistant child remains owned,
   then accepts a truthful stop retry.
-- `remote_attachment` proves stable-local/fresh-remote ID mapping, bounded
-  reconnect cancellation and writes, snapshot-first input gating, semantic
-  history-window coalescing, replacement-sync forwarding only for an
-  already-active controller, typed nonzero Gap completion on epoch loss,
-  request-bound history-window validation,
-  paused-time half-open occupancy retry, first-ever occupancy termination,
-  correlated control completion, other terminal error projection, and
-  state-event ordering over pure fake streams. The local attachment client
-  separately proves routing and validated transport-state consumption over a
-  real same-UID Unix duplex connection. Clipboard regressions additionally
-  prove Active-only and previously-active same-epoch admission, exact local-ID
-  rewrite, request ID zero, wrong-phase/ID rejection, no reconnect retention,
-  and a real child PTY OSC 52 reaching the same-UID controller as one typed
-  `TerminalClipboardWrite`.
-- `terminal_ui` pure tests cover remote rows-minus-one/one-row geometry,
+- `remote_tunnel` tests prove opaque queued Data forwarding, one-way
+  half-close, terminal close reason, malformed-stream isolation, and sibling
+  liveness. `local_ipc` adapter tests prove split inner frames, multiple inner
+  frames in one chunk, immediate Path delivery, zero-byte rejection, incomplete
+  inner EOF, and Data-after-half-close rejection.
+  `direct_and_tunnel_adapters_share_one_session_trace_and_command_interpreter`
+  compares identical target IDs/revisions/events plus byte-identical target-
+  visible acknowledgement, resize, input, and sync commands.
+  `stopped_viewer_restart_opens_a_tunnel_and_resumes_the_same_frontend_state`
+  proves one stopped-socket restart hook accepts a replacement tunnel and
+  receives the same ResumeViewId, frozen SessionId, applied revision, and latest
+  viewport before issuing a new target AttachmentId. The
+  `shared_peer_loss_keeps_each_frontend_resume_checkpoint_independent` test
+  proves two affected frontends retain distinct resume cells, while
+  `reconnecting_frontends_resume_independently_through_one_viewer_listener`
+  makes both cells resume concurrently through one viewer listener with their
+  own SessionId, ResumeViewId, applied revision, viewport, and new target-issued
+  AttachmentId. `single_instance` supplies the multi-process lifecycle-lock
+  evidence that concurrent `ensure` calls start at most one daemon.
+  Target-side `session_wire` tests continue to prove strict authenticated
+  attachment identity, synchronization, clipboard, and takeover behavior
+  without any viewer-daemon ID rewrite.
+- `terminal_ui` pure tests cover universal rows-minus-one/one-row geometry,
   oversized physical-to-bounded child projection for initial attach and resize,
   stable main gutter/alternate reclaim, all scrollbar positions and drag
   clamping, same-delivery wheel-burst reduction, non-sliding 16 ms deadlines,
@@ -812,6 +894,11 @@ strict unary `SessionOperationLeaseRequest -> SessionOperationLeaseResponse`.
 ### Wrong
 
 ```rust
+// The viewer daemon becomes a second Session client and rewrites identity.
+let remote = daemon.decode_session_frames(tunnel)?;
+daemon.cache_revision_and_viewport(remote);
+daemon.rewrite_attachment_id_for_frontend(remote);
+
 let request = decode(stream.read().await?)?; // peer not authenticated
 service.dispatch(request);                   // may block Tokio inline
 remove_file(socket_path)?;                   // pathname may be replaced
@@ -825,6 +912,18 @@ send_history_window_without_saving_query(query).await?;
 ### Correct
 
 ```rust
+// The frontend owns one Session client regardless of route.
+let transport = match target.route {
+    Local => SessionTransport::Direct(open_ipc()?),
+    Remote => SessionTransport::Tunnel(open_ipc_tunnel(target.device_id)?),
+};
+let session = FrontendSessionClient::new(transport, frozen_target, resume_view_id);
+
+// The daemon owns only network admission and bounded opaque forwarding.
+let demand = broker.demand(target.device_id, deadline).await?;
+let service_stream = demand.open_bi(StreamPurpose::Service, deadline).await?;
+pump_bounded_opaque_bytes(ipc_tunnel, service_stream).await?;
+
 verify_same_uid(&stream)?;
 let request = read_one_strict_frame_and_eof(&mut stream).await?;
 let reply = spawn_blocking(move || service.dispatch(request)).await??;
@@ -955,8 +1054,10 @@ assert_eq!(error.kind(), DomainErrorKind::DeadlineExceeded);
 
 ## Forbidden patterns
 
-- A second frame decoder, session registry, replay engine, or peer-auth policy in
-  the CLI or remote adapter.
+- A Session frame decoder, attachment registry, replay engine, revision/
+  viewport cache, acknowledgement decision, or ID translation in the daemon
+  tunnel. The frontend tunnel adapter owns exactly one outer-envelope decoder
+  and the transport-independent client owns exactly one inner Session decoder.
 - Calling a blocking `SessionService`/PTY operation inline on the current-thread
   Tokio runtime.
 - Calling `tokio::spawn` from synchronous daemon startup outside the exact

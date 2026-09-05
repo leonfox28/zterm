@@ -162,16 +162,19 @@ the generated Rust module are exactly `proto/zterm/v2`, `zterm.v2`, and `v2`.
   structured text; its domain cap remains stricter than the control cap.
   Unknown protobuf fields remain compatible, while unknown kind or wire major
   is an explicit connection-local error.
-- Model/driver/Session/local IPC/remote bridge pass semantic values only. A
-  bridge may structurally decode cells to validate shape, content bounds,
-  revision, correlation, and request identity, rewrite its private attachment
-  ID, then re-encode. It must not interpret application content, convert
-  representation, construct ANSI, or perform presentation.
+- Model/driver/Session and the frontend-owned route-neutral Session client pass
+  semantic values only. The remote tunnel in the viewer daemon passes bounded
+  opaque bytes and never decodes a Session frame. The frontend client
+  structurally decodes semantic frames to validate shape, content bounds,
+  revision, correlation, request identity, and the target-issued attachment ID;
+  it must not interpret application content, convert representation, construct
+  ANSI, or perform presentation.
 - Raw child OSC 52 never crosses the terminal ingress boundary. A clipboard
   effect is controller-at-publication-time, latest-only, non-broadcast,
   non-replayable, and absent from snapshots, deltas, history, checkpoints,
-  operation leases, persistence, and formatted diagnostics. Attachment bridges
-  may rewrite only their private attachment ID after revalidation.
+  operation leases, persistence, and formatted diagnostics. There is no local
+  attachment-ID translation: local and remote adapters retain the exact ID
+  issued by the target Session after validation.
 - `TerminalConnectionStatusEvent` is same-UID only and contains attachment ID,
   unknown/direct/relay, and optional bounded integer RTT. It is invalid on the
   remote normal ALPN and contains no address, relay URL, DeviceId, or ticket.
@@ -206,8 +209,8 @@ the generated Rust module are exactly `proto/zterm/v2`, `zterm.v2`, and `v2`.
 - **Good:** validate a history response against its saved complete query, then
   install only one complete semantic row window.
 - **Bad:** accept `(epoch, revision) = (0, 0)` as a generic unsupported sentinel,
-  infer a response without its query, send a retired kind, or recreate ANSI in
-  the daemon/bridge.
+  infer a response without its query, send a retired kind, recreate ANSI in a
+  non-presenter layer, or decode/rewrite Session semantics in the daemon tunnel.
 
 ## 6. Tests Required
 
@@ -222,9 +225,9 @@ the generated Rust module are exactly `proto/zterm/v2`, `zterm.v2`, and `v2`.
   history, malformed Changed/Gap epoch/revision identity, clipboard
   ID/text/request-zero validation and redaction, and unknown keyboard bits.
 - Daemon/local/remote tests trace kinds 301/302/317/318/322 through initial full,
-  merged delta, gap/resync, reconnect, takeover, final drain, correlation/ID
-  rewrite, stream-loss Gap, controller-at-event-time clipboard targeting,
-  latest-only wakeup, observer exclusion, and no replay. No
+  merged delta, gap/resync, reconnect, takeover, final drain, exact target ID
+  validation without rewriting, stream-loss Gap, controller-at-event-time
+  clipboard targeting, latest-only wakeup, observer exclusion, and no replay. No
   negotiation/fallback matrix remains.
 - `tests/source-policy.sh` rejects v1 protobuf, retired terminal kinds, legacy
   presentation types, `TerminalState`, a second CLI parser, application-name
@@ -241,7 +244,7 @@ if peer_capabilities.contains(LEGACY_VIEWPORT) {
     request_ansi_history_page().await?;
 }
 
-bridge.write(encode_ansi(decoded_cells));
+viewer_daemon.decode_and_rewrite_session(inner_bytes)?;
 ```
 
 ### Correct
@@ -252,13 +255,16 @@ if let Some(query) = query {
     save_query_then_send_kind_317(query).await?;
 }
 
-let frame = decode_validate_history_kind_318(saved_query, bytes)?;
-let rewritten = frame.with_attachment_id(local_view_id);
-forward_semantic(rewritten).await?;
+let frame = frontend.decode_validate_history_kind_318(saved_query, bytes)?;
+assert_eq!(frame.attachment_id(), target_attachment_id);
+forward_semantic(frame).await?;
+
+viewer_daemon.pump_bounded_opaque_bytes(ipc_tunnel, service_stream).await?;
 ```
 
-The boundary may decode structurally, but only the platform presenter interprets
-the semantic surface for physical output.
+The frontend Session boundary may decode structurally, the viewer-daemon tunnel
+may not decode at all, and only the platform presenter interprets the semantic
+surface for physical output.
 
 ## Forbidden patterns
 

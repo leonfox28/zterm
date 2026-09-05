@@ -61,12 +61,13 @@ mod unix {
     use zterm_core::viewport_cache::{
         CachedViewportWindow, ViewportAnchorObservation, ViewportCache, ViewportCacheUpdate,
     };
-    use zterm_core::{DomainErrorKind, RESERVED_DEVICE_ALIAS, SessionId};
+    use zterm_core::{DomainErrorKind, SessionId};
     use zterm_daemon::error::DaemonError;
     use zterm_daemon::operations::{
         LocalRuntime, PreparedTerminalView, TerminalViewConnectionPath,
         TerminalViewConnectionStatus, TerminalViewEndReason, TerminalViewEvent,
-        TerminalViewHistoryWindow, TerminalViewTransportState,
+        TerminalViewHistoryWindow, TerminalViewRoute, TerminalViewTarget,
+        TerminalViewTransportState,
     };
 
     use super::super::{CliError, TerminalRequest, TerminalRequestKind};
@@ -237,9 +238,7 @@ mod unix {
             return Err(cancellation.error(None));
         }
         let initial_physical_size = terminal_size(stdout)?;
-        let remote_request = terminal_request_is_remote(&request);
-        let initial_layout =
-            ChromeLayout::new(initial_physical_size, remote_request, ActiveScreen::Main);
+        let initial_layout = ChromeLayout::new(initial_physical_size, ActiveScreen::Main);
         let initial_size = initial_layout.child;
         let escape = request.escape;
         let stateful_prepare = matches!(
@@ -267,7 +266,6 @@ mod unix {
                 resize_coalescer: &mut resize_coalescer,
                 current_input_epoch,
                 preserve_submitted_result: stateful_prepare,
-                remote: remote_request,
             },
         )
         .await?
@@ -291,7 +289,6 @@ mod unix {
         let mut physical_size = terminal_size(stdout)?;
         let latest_layout = ChromeLayout::new(
             physical_size,
-            remote_request,
             prepared.initial_snapshot().surface.active_screen,
         );
         let latest_size = latest_layout.child;
@@ -299,22 +296,13 @@ mod unix {
             let _ = resize_coalescer.observe(latest_size, transport_state);
         }
 
-        let remote_alias = prepared.remote_alias().map(str::to_owned);
-        if remote_alias.is_some() != remote_request {
-            drop(prepared);
-            stdin_pump.shutdown()?;
-            return Err(terminal_daemon_error(
-                DomainErrorKind::MalformedFrame,
-                "resolved terminal target changed local/remote class",
-            ));
-        }
-
+        let view_target = prepared.target().clone();
         let mut surface = AttachmentSurface::from_snapshot(prepared.initial_snapshot())?;
         let mut presenter = DesktopPresenter::default();
         let mut selection = SelectionController::default();
         let initial_scroll_metrics = prepared.initial_snapshot().surface.scroll_metrics;
         let mut viewport = ViewportController::with_layout(latest_layout, initial_scroll_metrics);
-        let mut status_renderer = StatusRenderer::new(remote_alias, physical_size);
+        let mut status_renderer = StatusRenderer::new(view_target, physical_size);
         reconcile_presenter_selection(&mut selection, &viewport, &surface, &mut presenter);
         present_surface_stdout(
             &surface,
@@ -345,7 +333,6 @@ mod unix {
                 resize_coalescer: &mut resize_coalescer,
                 current_input_epoch,
                 preserve_submitted_result: false,
-                remote: remote_request,
             },
         )
         .await?
@@ -444,7 +431,6 @@ mod unix {
                     physical_size = latest_physical;
                     let layout = ChromeLayout::new(
                         latest_physical,
-                        remote_request,
                         viewport.effective_screen(surface.active_screen()),
                     );
                     let latest = layout.child;
@@ -618,7 +604,6 @@ mod unix {
                             viewport.observe_snapshot(snapshot.surface.scroll_metrics);
                             let layout = ChromeLayout::new(
                                 physical_size,
-                                remote_request,
                                 viewport.effective_screen(snapshot.surface.active_screen),
                             );
                             viewport.set_layout(layout);
@@ -639,6 +624,7 @@ mod unix {
                             viewport_pacer.mark_presented(Instant::now());
                             prefix.clear_pending();
                             sync_requested = false;
+                            writer.revision_applied(snapshot.revision);
                             if let Err(error) = writer.snapshot_applied(snapshot.revision).await {
                                 break Err(error.into());
                             }
@@ -649,6 +635,12 @@ mod unix {
                             }
                         }
                         TerminalViewEvent::Delta(delta) => {
+                            // A delta may itself change Main/Alternate layout and submit a
+                            // resize below. That resize starts a *new* snapshot epoch, so the
+                            // old delta is an activation barrier only when this view was already
+                            // synchronizing as the event entered the handler.
+                            let acknowledges_existing_sync =
+                                delta_acknowledges_existing_sync(transport_state);
                             let rendered_live = viewport.is_live();
                             if rendered_live {
                                 viewport_pacer.cancel();
@@ -665,6 +657,7 @@ mod unix {
                             match delta_result {
                                 Ok(DeltaRender::Applied) => {
                                     sync_requested = false;
+                                    writer.revision_applied(delta.to_revision);
                                     if rendered_live {
                                         viewport.observe_presentation();
                                         viewport_pacer.mark_presented(Instant::now());
@@ -701,7 +694,7 @@ mod unix {
                                             &mut viewport_pacer,
                                         );
                                     }
-                                    if transport_state == TerminalViewTransportState::Synchronizing
+                                    if acknowledges_existing_sync
                                         && let Err(error) = writer
                                             .snapshot_applied(delta.to_revision)
                                             .await
@@ -1181,7 +1174,6 @@ mod unix {
         resize_coalescer: &'a mut ResizeCoalescer,
         current_input_epoch: u64,
         preserve_submitted_result: bool,
-        remote: bool,
     }
 
     async fn await_while_inactive<T>(
@@ -1197,7 +1189,6 @@ mod unix {
             resize_coalescer,
             current_input_epoch,
             preserve_submitted_result,
-            remote,
         } = context;
         tokio::pin!(future);
         loop {
@@ -1226,7 +1217,7 @@ mod unix {
                             "SIGWINCH handler closed",
                         ));
                     }
-                    let latest = child_terminal_size(terminal_size(stdout)?, remote);
+                    let latest = child_terminal_size(terminal_size(stdout)?);
                     let _ = resize_coalescer.observe(
                         latest,
                         TerminalViewTransportState::Synchronizing,
@@ -1482,15 +1473,8 @@ mod unix {
         }
     }
 
-    fn terminal_request_is_remote(request: &TerminalRequest) -> bool {
-        match &request.kind {
-            TerminalRequestKind::Attach { target, .. }
-            | TerminalRequestKind::Create { target, .. } => target != RESERVED_DEVICE_ALIAS,
-        }
-    }
-
-    fn child_terminal_size(physical: TerminalSize, remote: bool) -> TerminalSize {
-        ChromeLayout::new(physical, remote, ActiveScreen::Main).child
+    fn child_terminal_size(physical: TerminalSize) -> TerminalSize {
+        ChromeLayout::new(physical, ActiveScreen::Main).child
     }
 
     fn preserve_created_session<T>(
@@ -2259,6 +2243,10 @@ mod unix {
         last_submitted: TerminalSize,
     }
 
+    fn delta_acknowledges_existing_sync(state: TerminalViewTransportState) -> bool {
+        state == TerminalViewTransportState::Synchronizing
+    }
+
     impl ResizeCoalescer {
         const fn new(initial_size: TerminalSize) -> Self {
             Self {
@@ -2307,16 +2295,16 @@ mod unix {
     }
 
     struct StatusRenderer {
-        device: Option<String>,
+        target: TerminalViewTarget,
         physical_size: TerminalSize,
         path: TerminalViewConnectionPath,
         rtt_ms: Option<u32>,
     }
 
     impl StatusRenderer {
-        fn new(device: Option<String>, physical_size: TerminalSize) -> Self {
+        fn new(target: TerminalViewTarget, physical_size: TerminalSize) -> Self {
             Self {
-                device,
+                target,
                 physical_size,
                 path: TerminalViewConnectionPath::Unknown,
                 rtt_ms: None,
@@ -2324,11 +2312,11 @@ mod unix {
         }
 
         fn enabled(&self) -> bool {
-            self.device.is_some() && self.physical_size.rows > 1
+            self.physical_size.rows > 1
         }
 
         fn is_remote(&self) -> bool {
-            self.device.is_some()
+            self.target.route() == TerminalViewRoute::Remote
         }
 
         fn resize(&mut self, physical_size: TerminalSize) {
@@ -2336,10 +2324,10 @@ mod unix {
         }
 
         fn observe(&mut self, status: TerminalViewConnectionStatus) -> Result<(), CliError> {
-            if self.device.as_deref() != Some(status.device()) {
+            if !self.is_remote() {
                 return Err(terminal_daemon_error(
                     DomainErrorKind::MalformedFrame,
-                    "terminal connection status changed its frozen device alias",
+                    "local terminal received remote connection status",
                 ));
             }
             self.path = status.path();
@@ -2355,7 +2343,13 @@ mod unix {
         }
 
         fn composed_text(&self, transport_state: TerminalViewTransportState) -> Option<String> {
-            let device = self.device.as_deref().filter(|_| self.enabled())?;
+            if !self.enabled() {
+                return None;
+            }
+            let device = self.target.display_name();
+            if !self.is_remote() {
+                return Some(format!("{device} | local"));
+            }
             let (path, latency) = if transport_state != TerminalViewTransportState::Reconnecting {
                 match self.path {
                     TerminalViewConnectionPath::Direct => {
@@ -3883,13 +3877,8 @@ mod unix {
             return Ok(DeltaRender::Gap);
         };
         let render_live = viewport.is_live();
-        let live_layout = render_live.then(|| {
-            ChromeLayout::new(
-                status.physical_size,
-                status.is_remote(),
-                candidate.active_screen(),
-            )
-        });
+        let live_layout =
+            render_live.then(|| ChromeLayout::new(status.physical_size, candidate.active_screen()));
         let viewport_plan = viewport.preview_delta(&candidate, delta.scroll_metrics, live_layout);
         let mut candidate_selection = *selection;
         if render_live {
@@ -4610,6 +4599,34 @@ mod unix {
         }
 
         #[test]
+        fn delta_acknowledgement_uses_event_entry_state_before_mode_resize() {
+            assert!(delta_acknowledges_existing_sync(
+                TerminalViewTransportState::Synchronizing
+            ));
+            assert!(!delta_acknowledges_existing_sync(
+                TerminalViewTransportState::Active
+            ));
+            assert!(!delta_acknowledges_existing_sync(
+                TerminalViewTransportState::Preparing
+            ));
+            assert!(!delta_acknowledges_existing_sync(
+                TerminalViewTransportState::Reconnecting
+            ));
+
+            let main = TerminalSize::new(23, 79);
+            let alternate = TerminalSize::new(23, 80);
+            let mut coalescer = ResizeCoalescer::new(main);
+            let entry_state = TerminalViewTransportState::Active;
+            assert_eq!(coalescer.observe(alternate, entry_state), Some(alternate));
+            let post_resize_state = TerminalViewTransportState::Synchronizing;
+            assert_eq!(post_resize_state, TerminalViewTransportState::Synchronizing);
+            assert!(
+                !delta_acknowledges_existing_sync(entry_state),
+                "the delta that starts a resize epoch must not acknowledge that new epoch"
+            );
+        }
+
+        #[test]
         fn attachment_surface_validates_snapshots_and_applies_deltas_transactionally() {
             let size = TerminalSize::new(2, 4);
             let snapshot = test_snapshot(size, ActiveScreen::Main, Revision::new(4));
@@ -4688,7 +4705,7 @@ mod unix {
         #[test]
         fn semantic_history_uses_one_cache_and_moves_one_line_locally() {
             let physical = TerminalSize::new(4, 10);
-            let layout = ChromeLayout::new(physical, false, ActiveScreen::Main);
+            let layout = ChromeLayout::new(physical, ActiveScreen::Main);
             let live = TerminalScrollMetrics {
                 epoch: Revision::new(2),
                 revision: Revision::new(7),
@@ -4752,7 +4769,7 @@ mod unix {
         #[test]
         fn composed_frame_owns_live_gutter_status_and_alternate_layout() {
             let physical = TerminalSize::new(4, 12);
-            let main_layout = ChromeLayout::new(physical, true, ActiveScreen::Main);
+            let main_layout = ChromeLayout::new(physical, ActiveScreen::Main);
             let mut viewport = ViewportController::with_layout(
                 main_layout,
                 Some(TerminalScrollMetrics {
@@ -4776,7 +4793,10 @@ mod unix {
             };
             let surface =
                 AttachmentSurface::from_snapshot(&snapshot).expect("test snapshot is valid");
-            let mut status = StatusRenderer::new(Some("node".to_owned()), physical);
+            let mut status = StatusRenderer::new(
+                TerminalViewTarget::for_display("node", TerminalViewRoute::Remote),
+                physical,
+            );
             status.path = TerminalViewConnectionPath::Direct;
             status.rtt_ms = Some(8);
             let frame = ComposedFrame::compose(
@@ -4803,7 +4823,7 @@ mod unix {
                 "node | direc"
             );
 
-            let alternate_layout = ChromeLayout::new(physical, true, ActiveScreen::Alternate);
+            let alternate_layout = ChromeLayout::new(physical, ActiveScreen::Alternate);
             viewport.set_layout(alternate_layout);
             let alternate = test_snapshot(
                 alternate_layout.child,
@@ -4826,9 +4846,74 @@ mod unix {
         }
 
         #[test]
+        fn universal_chrome_uses_exact_local_status_and_screen_specific_child_size() {
+            let physical = TerminalSize::new(24, 80);
+            let main = ChromeLayout::new(physical, ActiveScreen::Main);
+            assert_eq!(main.child, TerminalSize::new(23, 79));
+            assert_eq!(main.status_row, Some(23));
+            assert_eq!(main.gutter_column, Some(80));
+
+            let alternate = ChromeLayout::new(physical, ActiveScreen::Alternate);
+            assert_eq!(alternate.child, TerminalSize::new(23, 80));
+            assert_eq!(alternate.status_row, Some(23));
+            assert_eq!(alternate.gutter_column, None);
+
+            let local = StatusRenderer::new(
+                TerminalViewTarget::for_display("Mac", TerminalViewRoute::Local),
+                physical,
+            );
+            assert_eq!(
+                local.composed_text(TerminalViewTransportState::Active),
+                Some("Mac | local".to_owned())
+            );
+            assert_eq!(
+                local.composed_text(TerminalViewTransportState::Reconnecting),
+                Some("Mac | local".to_owned())
+            );
+
+            let mut remote = StatusRenderer::new(
+                TerminalViewTarget::for_display("Mac", TerminalViewRoute::Remote),
+                physical,
+            );
+            assert_eq!(
+                remote.composed_text(TerminalViewTransportState::Active),
+                Some("Mac | -- | --".to_owned())
+            );
+            remote.path = TerminalViewConnectionPath::Direct;
+            remote.rtt_ms = Some(7);
+            assert_eq!(
+                remote.composed_text(TerminalViewTransportState::Active),
+                Some("Mac | direct | 7 ms".to_owned())
+            );
+            assert_eq!(
+                remote.composed_text(TerminalViewTransportState::Reconnecting),
+                Some("Mac | -- | --".to_owned())
+            );
+            remote.path = TerminalViewConnectionPath::Relay;
+            remote.rtt_ms = None;
+            assert_eq!(
+                remote.composed_text(TerminalViewTransportState::Active),
+                Some("Mac | relay | --".to_owned())
+            );
+
+            let one_row = TerminalSize::new(1, 80);
+            let fallback = ChromeLayout::new(one_row, ActiveScreen::Main);
+            assert_eq!(fallback.child, one_row);
+            assert_eq!(fallback.status_row, None);
+            let local = StatusRenderer::new(
+                TerminalViewTarget::for_display("Mac", TerminalViewRoute::Local),
+                one_row,
+            );
+            assert_eq!(
+                local.composed_text(TerminalViewTransportState::Active),
+                None
+            );
+        }
+
+        #[test]
         fn composed_frame_preserves_wide_spans_combining_text_and_styled_blanks() {
             let size = TerminalSize::new(1, 5);
-            let layout = ChromeLayout::new(size, false, ActiveScreen::Alternate);
+            let layout = ChromeLayout::new(size, ActiveScreen::Alternate);
             let viewport = ViewportController::with_layout(layout, None);
             let style = TerminalStyle {
                 background: TerminalColor::Rgb(1, 2, 3),
@@ -4860,7 +4945,10 @@ mod unix {
                 },
             ];
             snapshot.validate().expect("valid exact semantic row");
-            let status = StatusRenderer::new(None, size);
+            let status = StatusRenderer::new(
+                TerminalViewTarget::for_display("local", TerminalViewRoute::Local),
+                size,
+            );
             let frame = ComposedFrame::compose(
                 &snapshot.surface,
                 None,
@@ -4880,10 +4968,13 @@ mod unix {
         #[test]
         fn compositor_is_sparse_for_huge_physical_row_numbers() {
             let physical = TerminalSize::new(u16::MAX, 6);
-            let layout = ChromeLayout::new(physical, true, ActiveScreen::Main);
+            let layout = ChromeLayout::new(physical, ActiveScreen::Main);
             let snapshot = test_snapshot(layout.child, ActiveScreen::Main, Revision::new(2));
             let viewport = ViewportController::with_layout(layout, snapshot.surface.scroll_metrics);
-            let status = StatusRenderer::new(Some("node".to_owned()), physical);
+            let status = StatusRenderer::new(
+                TerminalViewTarget::for_display("node", TerminalViewRoute::Remote),
+                physical,
+            );
             let frame = ComposedFrame::compose(
                 &snapshot.surface,
                 None,
@@ -4906,10 +4997,13 @@ mod unix {
             let surface =
                 AttachmentSurface::from_snapshot(&snapshot).expect("test snapshot is valid");
             let viewport = ViewportController::with_layout(
-                ChromeLayout::new(size, false, ActiveScreen::Alternate),
+                ChromeLayout::new(size, ActiveScreen::Alternate),
                 None,
             );
-            let status = StatusRenderer::new(None, size);
+            let status = StatusRenderer::new(
+                TerminalViewTarget::for_display("local", TerminalViewRoute::Local),
+                size,
+            );
             let desired = ComposedFrame::compose(
                 &surface.surface,
                 None,
@@ -4943,10 +5037,13 @@ mod unix {
             let size = TerminalSize::new(1, 2);
             let snapshot = test_snapshot(size, ActiveScreen::Alternate, Revision::new(2));
             let viewport = ViewportController::with_layout(
-                ChromeLayout::new(size, false, ActiveScreen::Alternate),
+                ChromeLayout::new(size, ActiveScreen::Alternate),
                 None,
             );
-            let status = StatusRenderer::new(None, size);
+            let status = StatusRenderer::new(
+                TerminalViewTarget::for_display("local", TerminalViewRoute::Local),
+                size,
+            );
             let frame = ComposedFrame::compose(
                 &snapshot.surface,
                 None,
@@ -4989,10 +5086,13 @@ mod unix {
             let size = TerminalSize::new(1, 2);
             let snapshot = test_snapshot(size, ActiveScreen::Alternate, Revision::new(2));
             let viewport = ViewportController::with_layout(
-                ChromeLayout::new(size, false, ActiveScreen::Alternate),
+                ChromeLayout::new(size, ActiveScreen::Alternate),
                 None,
             );
-            let status = StatusRenderer::new(None, size);
+            let status = StatusRenderer::new(
+                TerminalViewTarget::for_display("local", TerminalViewRoute::Local),
+                size,
+            );
             let frame = ComposedFrame::compose(
                 &snapshot.surface,
                 None,
@@ -5023,10 +5123,13 @@ mod unix {
             let size = TerminalSize::new(1, 4);
             let snapshot = test_snapshot(size, ActiveScreen::Alternate, Revision::new(2));
             let viewport = ViewportController::with_layout(
-                ChromeLayout::new(size, false, ActiveScreen::Alternate),
+                ChromeLayout::new(size, ActiveScreen::Alternate),
                 None,
             );
-            let status = StatusRenderer::new(None, size);
+            let status = StatusRenderer::new(
+                TerminalViewTarget::for_display("local", TerminalViewRoute::Local),
+                size,
+            );
             let frame = ComposedFrame::compose(
                 &snapshot.surface,
                 None,
@@ -5087,13 +5190,16 @@ mod unix {
         fn hidden_history_delta_synchronizes_only_host_input_modes_and_preserves_selection_elevation()
          {
             let physical = TerminalSize::new(3, 8);
-            let layout = ChromeLayout::new(physical, false, ActiveScreen::Main);
+            let layout = ChromeLayout::new(physical, ActiveScreen::Main);
             let snapshot = test_snapshot(layout.child, ActiveScreen::Main, Revision::new(2));
             let mut surface =
                 AttachmentSurface::from_snapshot(&snapshot).expect("valid history surface");
             let mut viewport =
                 ViewportController::with_layout(layout, snapshot.surface.scroll_metrics);
-            let status = StatusRenderer::new(None, physical);
+            let status = StatusRenderer::new(
+                TerminalViewTarget::for_display("local", TerminalViewRoute::Local),
+                physical,
+            );
             let mut presenter = DesktopPresenter::default();
             let mut selection = SelectionController::default();
             let mut output = ViewportFrameWriter::default();
@@ -5355,13 +5461,16 @@ mod unix {
                 ("history shrink", Revision::new(1), 0),
             ] {
                 let physical = TerminalSize::new(3, 8);
-                let layout = ChromeLayout::new(physical, false, ActiveScreen::Main);
+                let layout = ChromeLayout::new(physical, ActiveScreen::Main);
                 let snapshot = test_snapshot(layout.child, ActiveScreen::Main, Revision::new(2));
                 let mut surface =
                     AttachmentSurface::from_snapshot(&snapshot).expect("valid history surface");
                 let mut viewport =
                     ViewportController::with_layout(layout, snapshot.surface.scroll_metrics);
-                let status = StatusRenderer::new(None, physical);
+                let status = StatusRenderer::new(
+                    TerminalViewTarget::for_display("local", TerminalViewRoute::Local),
+                    physical,
+                );
                 let mut presenter = DesktopPresenter::default();
                 let mut setup_output = ViewportFrameWriter::default();
                 present_surface_with_writer(
@@ -5510,13 +5619,16 @@ mod unix {
 
             for point in [FailurePoint::Write, FailurePoint::Flush] {
                 let physical = TerminalSize::new(3, 8);
-                let layout = ChromeLayout::new(physical, false, ActiveScreen::Main);
+                let layout = ChromeLayout::new(physical, ActiveScreen::Main);
                 let snapshot = test_snapshot(layout.child, ActiveScreen::Main, Revision::new(2));
                 let mut surface =
                     AttachmentSurface::from_snapshot(&snapshot).expect("valid history surface");
                 let mut viewport =
                     ViewportController::with_layout(layout, snapshot.surface.scroll_metrics);
-                let status = StatusRenderer::new(None, physical);
+                let status = StatusRenderer::new(
+                    TerminalViewTarget::for_display("local", TerminalViewRoute::Local),
+                    physical,
+                );
                 let mut presenter = DesktopPresenter::default();
                 let mut setup_output = ViewportFrameWriter::default();
                 present_surface_with_writer(
@@ -5652,13 +5764,16 @@ mod unix {
             }
 
             let physical = TerminalSize::new(3, 8);
-            let layout = ChromeLayout::new(physical, false, ActiveScreen::Main);
+            let layout = ChromeLayout::new(physical, ActiveScreen::Main);
             let snapshot = test_snapshot(layout.child, ActiveScreen::Main, Revision::new(2));
             let mut surface =
                 AttachmentSurface::from_snapshot(&snapshot).expect("valid live surface");
             let mut viewport =
                 ViewportController::with_layout(layout, snapshot.surface.scroll_metrics);
-            let status = StatusRenderer::new(None, physical);
+            let status = StatusRenderer::new(
+                TerminalViewTarget::for_display("local", TerminalViewRoute::Local),
+                physical,
+            );
             let mut presenter = DesktopPresenter::default();
             let mut setup_output = ViewportFrameWriter::default();
             present_surface_with_writer(
@@ -5777,10 +5892,13 @@ mod unix {
             let size = TerminalSize::new(1, 3);
             let snapshot = test_snapshot(size, ActiveScreen::Alternate, Revision::new(2));
             let viewport = ViewportController::with_layout(
-                ChromeLayout::new(size, false, ActiveScreen::Alternate),
+                ChromeLayout::new(size, ActiveScreen::Alternate),
                 None,
             );
-            let status = StatusRenderer::new(None, size);
+            let status = StatusRenderer::new(
+                TerminalViewTarget::for_display("local", TerminalViewRoute::Local),
+                size,
+            );
             let desired = ComposedFrame::compose(
                 &snapshot.surface,
                 None,
@@ -5850,10 +5968,13 @@ mod unix {
             let size = TerminalSize::new(1, 3);
             let snapshot = test_snapshot(size, ActiveScreen::Alternate, Revision::new(2));
             let viewport = ViewportController::with_layout(
-                ChromeLayout::new(size, false, ActiveScreen::Alternate),
+                ChromeLayout::new(size, ActiveScreen::Alternate),
                 None,
             );
-            let status = StatusRenderer::new(None, size);
+            let status = StatusRenderer::new(
+                TerminalViewTarget::for_display("local", TerminalViewRoute::Local),
+                size,
+            );
             let desired = ComposedFrame::compose(
                 &snapshot.surface,
                 None,
@@ -6105,7 +6226,7 @@ mod unix {
         #[test]
         fn pointer_router_selects_exactly_one_owner_for_selection_child_history_and_gutter() {
             let physical = TerminalSize::new(3, 8);
-            let layout = ChromeLayout::new(physical, false, ActiveScreen::Main);
+            let layout = ChromeLayout::new(physical, ActiveScreen::Main);
             let snapshot = test_snapshot(layout.child, ActiveScreen::Main, Revision::new(7));
             let mut surface =
                 AttachmentSurface::from_snapshot(&snapshot).expect("valid pointer surface");
@@ -6221,7 +6342,7 @@ mod unix {
         #[test]
         fn pointer_router_preserves_modified_native_selection_and_cancelled_drag_capture() {
             let physical = TerminalSize::new(2, 7);
-            let layout = ChromeLayout::new(physical, false, ActiveScreen::Main);
+            let layout = ChromeLayout::new(physical, ActiveScreen::Main);
             let snapshot = test_snapshot(layout.child, ActiveScreen::Main, Revision::new(3));
             let surface =
                 AttachmentSurface::from_snapshot(&snapshot).expect("valid pointer surface");
@@ -6270,7 +6391,7 @@ mod unix {
         #[test]
         fn pointer_router_invalidates_a_pinned_selection_before_history_navigation() {
             let physical = TerminalSize::new(3, 8);
-            let layout = ChromeLayout::new(physical, false, ActiveScreen::Main);
+            let layout = ChromeLayout::new(physical, ActiveScreen::Main);
             let snapshot = test_snapshot(layout.child, ActiveScreen::Main, Revision::new(7));
             let surface =
                 AttachmentSurface::from_snapshot(&snapshot).expect("valid history surface");
@@ -6359,10 +6480,13 @@ mod unix {
                 ..TerminalCell::default()
             };
             let viewport = ViewportController::with_layout(
-                ChromeLayout::new(size, false, ActiveScreen::Alternate),
+                ChromeLayout::new(size, ActiveScreen::Alternate),
                 None,
             );
-            let status = StatusRenderer::new(None, size);
+            let status = StatusRenderer::new(
+                TerminalViewTarget::for_display("local", TerminalViewRoute::Local),
+                size,
+            );
             let initial = ComposedFrame::compose(
                 &snapshot.surface,
                 None,

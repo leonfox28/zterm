@@ -118,7 +118,9 @@ fn run_terminal_child_if_requested() -> bool {
         DaemonLauncher::for_test("/does/not/exist".into(), "--must-not-run".to_owned()),
     );
     let arguments = match mode {
-        "connect" | "scroll" | "copy" => vec!["zterm", "connect", "local"],
+        "connect" | "screen-switch" | "scroll" | "copy" => {
+            vec!["zterm", "connect", "local"]
+        }
         "bare-signal" => vec!["zterm"],
         "non-tty-connect" => vec!["zterm", "connect", "local"],
         _ => panic!("unknown terminal child mode"),
@@ -364,12 +366,24 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
 
     let connect_output = run_local_terminal_child(&runtime, &state.paths, "connect").await;
     assert!(contains_bytes(&connect_output, TERMINAL_RESTORE_BYTES));
+    assert!(
+        contains_bytes(&connect_output, b"cli-host | local"),
+        "the real local-daemon view must render the exact two-field local status"
+    );
     let ui_sessions = runtime
         .session_list("local")
         .await
         .expect("list local UI Session");
     assert_eq!(ui_sessions.len(), 1);
     let ui_main_id = ui_sessions[0].session_id;
+    wait_for_detach(&runtime, "local", &ui_main_id.to_string()).await;
+
+    let switch_output = run_local_terminal_child(&runtime, &state.paths, "screen-switch").await;
+    assert!(contains_bytes(&switch_output, TERMINAL_RESTORE_BYTES));
+    assert!(
+        !contains_bytes(&switch_output, b"not_synchronized"),
+        "generic Main/Alternate transitions must not trip snapshot acknowledgement"
+    );
     wait_for_detach(&runtime, "local", &ui_main_id.to_string()).await;
 
     let scroll_output = run_local_terminal_child(&runtime, &state.paths, "scroll").await;
@@ -674,6 +688,7 @@ async fn run_local_terminal_child(
 
     let input_probe = match mode {
         "connect" => TERMINAL_CONNECT_MARKER,
+        "screen-switch" => b"ZTERM_TEST_DECSET_1049".as_slice(),
         "scroll" => b"ZTERM_SCROLL_PROBE".as_slice(),
         "copy" => TERMINAL_COPY_SCREEN,
         "bare-signal" => TERMINAL_BARE_MARKER,
@@ -726,7 +741,7 @@ async fn run_local_terminal_child(
             &format!("local terminal {mode} did not commit its initial semantic presentation"),
         );
     }
-    let active_revision = wait_for_active_viewport(runtime, 24, 79).await;
+    let active_revision = wait_for_active_viewport(runtime, 23, 79).await;
     // Validate the real input -> PTY -> model -> semantic presentation path
     // through protocol-visible progress. Raw presenter bytes are intentionally
     // not treated as a reconstruction of the final screen.
@@ -827,12 +842,50 @@ async fn run_local_terminal_child(
             settled_copy_revision, copy_revision,
             "local copy must not reach or mutate the child PTY"
         );
+    } else if mode == "screen-switch" {
+        let alternate_revision = wait_for_active_viewport(runtime, 23, 80).await;
+        assert!(
+            alternate_revision.get() >= quiescent_revision.get(),
+            "DECSET 1049 must converge on the Alternate-screen viewport"
+        );
+
+        master_writer
+            .write_all(b"ZTERM_TEST_DECRST_1049\r")
+            .expect("write generic DECRST 1049 command");
+        let main_revision = wait_for_active_viewport(runtime, 23, 79).await;
+        assert!(
+            main_revision.get() > alternate_revision.get(),
+            "DECRST 1049 must return to the Main-screen viewport"
+        );
+        let main_quiescent = wait_for_terminal_quiescence(runtime, &presentation_count, mode).await;
+        assert!(
+            main_quiescent.get() >= main_revision.get(),
+            "the replacement Main snapshot must reach a stable presentation boundary"
+        );
+
+        let probe_revision = current_controller_revision(runtime).await;
+        let probe_presentation = presentation_count.load(Ordering::Acquire);
+        master_writer
+            .write_all(b"printf 'ZTERM_AFTER_SWITCH\\n'\r")
+            .expect("write input after returning to Main");
+        let continued = wait_for_terminal_progress(
+            runtime,
+            &presentation_count,
+            probe_revision,
+            probe_presentation,
+            "screen-switch-after-return",
+        )
+        .await;
+        assert!(
+            continued.get() > main_revision.get(),
+            "input must continue after Main/Alternate/Main synchronization"
+        );
     }
     if mode == "bare-signal" {
         set_terminal_child_size(&master_writer, 1, 5);
         kill(Pid::from_raw(child.id() as i32), Signal::SIGWINCH)
             .expect("notify narrow one-row viewport change");
-        let narrow_revision = wait_for_active_viewport(runtime, 1, 4).await;
+        let narrow_revision = wait_for_active_viewport(runtime, 1, 5).await;
         assert!(
             narrow_revision.get() > active_revision.get(),
             "one-row SIGWINCH must advance the authoritative terminal revision"
@@ -843,7 +896,7 @@ async fn run_local_terminal_child(
             kill(Pid::from_raw(child.id() as i32), Signal::SIGWINCH)
                 .expect("notify rapid viewport change");
         }
-        let resized_revision = wait_for_active_viewport(runtime, 26, 81).await;
+        let resized_revision = wait_for_active_viewport(runtime, 25, 81).await;
         assert!(
             resized_revision.get() > narrow_revision.get(),
             "rapid SIGWINCH coalescing must publish the final authoritative viewport"
@@ -955,7 +1008,11 @@ async fn wait_for_terminal_progress(
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "local terminal {mode} input did not advance both the model and atomic presentation"
+            "local terminal {mode} input did not advance both the model and atomic presentation; revision={}/{}, presentations={}/{}",
+            revision.get(),
+            revision_baseline.get(),
+            presentation_count.load(Ordering::Acquire),
+            presentation_baseline,
         );
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }

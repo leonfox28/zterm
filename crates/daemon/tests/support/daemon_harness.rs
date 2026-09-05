@@ -95,7 +95,7 @@ fn terminal_fixture_sessions(
                     zterm_platform::pty::ExplicitPtyCommand::new(&shell, &working_directory)
                         .arg("-c")
                         .arg(
-                            "printf 'ZTERM_LOCAL_UI_SHELL_READY\\r\\n'; while IFS= read -r line; do printf '%s\\r\\n%s\\r\\n' \"$line\" \"$line\"; done",
+                            "printf 'ZTERM_LOCAL_UI_SHELL_READY\\r\\n'; while IFS= read -r line; do case \"$line\" in ZTERM_TEST_DECSET_1049) printf '\\033[?1049hZTERM_ALT_READY\\r\\n' ;; ZTERM_TEST_DECRST_1049) printf '\\033[?1049lZTERM_MAIN_READY\\r\\n' ;; *) printf '%s\\r\\n%s\\r\\n' \"$line\" \"$line\" ;; esac; done",
                         ),
                     zterm_platform::pty::PtySize::new(size.rows, size.columns),
                 )

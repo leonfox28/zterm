@@ -39,6 +39,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         ".zterm.v2.LocalPairCreateResponse",
         ".zterm.v2.LocalPairAcceptRequest",
         ".zterm.v2.LocalSessionUnaryRequest",
+        ".zterm.v2.LocalSessionTunnelOpenRequest",
+        ".zterm.v2.LocalSessionTunnelData",
         ".zterm.v2.LocalStatusResponse",
         ".zterm.v2.LocalValidateSetupRequest",
         ".zterm.v2.RelayRouteCacheV1",

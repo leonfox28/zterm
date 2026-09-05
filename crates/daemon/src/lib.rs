@@ -3,9 +3,9 @@
 //! Local readiness remains owned by the same-UID Unix socket and does not wait
 //! for network availability. The daemon also owns one Iroh endpoint, pairing,
 //! directional device authorization, the normal connection broker, and the
-//! authenticated inbound and outbound Session unary and reconnecting attachment
-//! adapters. The final raw-terminal UI remains a later slice of the active
-//! milestone.
+//! authenticated inbound Session service, outbound unary calls, and opaque
+//! per-frontend remote service-stream tunnels. Session attachment and resume
+//! semantics remain in the frontend process for both local and remote views.
 
 pub mod authorization;
 pub mod bootstrap;
@@ -23,9 +23,9 @@ pub mod pair_framing;
 pub mod pairing;
 pub mod pairing_service;
 #[cfg(unix)]
-mod remote_attachment;
-#[cfg(unix)]
 mod remote_session;
+#[cfg(unix)]
+mod remote_tunnel;
 pub mod route;
 pub mod service;
 pub mod session;
