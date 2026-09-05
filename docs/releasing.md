@@ -1,130 +1,141 @@
 # Release operations
 
-The maintainer interface is deliberately split at the irreversible boundary:
+The default publication scope is **macOS arm64, Linux arm64, and Linux x64**.
+macOS Intel, Windows CI/distribution, and relay image publication are paused.
+Restore any of them only when a future task explicitly requests it. Existing
+immutable Releases and already published relay images remain historical assets.
+This platform matrix belongs to the release tool. Installed updaters require
+and validate only their own target entry in the authenticated manifest; they
+do not enforce the presence, number, or support policy of other platforms.
 
 ```text
-just release-prepare VERSION
-  -> release/vVERSION branch -> release PR -> human merge
-  -> exact-SHA main CI and four native readiness builds
-
-just release-publish VERSION
-  -> one annotated vVERSION tag
-  -> four frozen native builds -> assemble -> protected sign
-  -> four final installer proofs -> immutable native Release
-  -> explicit multi-architecture relay image publication
+reviewed feature branch + version commit in one PR
+  -> PR CI -> merge the exact reviewed head
+  -> exact-SHA main CI + three native builds + verified unsigned candidate
+  -> annotated vVERSION tag -> select that main candidate by artifact ID
+  -> protected signing -> three final installer proofs -> immutable Release
 ```
 
-`VERSION` is canonical SemVer without the `v` prefix or build metadata. A
-prerelease such as `0.2.0-rc.1` is supported. Run `just doctor` first; neither
-operator command installs global tools or changes repository settings.
+`VERSION` is canonical SemVer without the `v` prefix or build metadata.
+Prereleases such as `0.2.0-rc.1` are supported. Run `just doctor` first. The
+operator never installs global tools or changes repository protection settings.
 
-## Prepare the release pull request
+## Prepare one reviewable PR
 
-Start from a clean local `main` that exactly matches `origin/main`:
+For an immediately released fix, commit the reviewed product changes on a clean
+feature branch that contains current `origin/main`, then run (preferably before
+the first PR push, or on an already open feature PR):
 
 ```bash
 just release-prepare 0.2.0
 ```
 
-Before creating a branch, the command verifies GitHub authentication and the
-canonical repository, branch/tag/Release vacancy, and a strictly newer version
-through the Rust `semver` owner. It then creates `release/v0.2.0`, changes only
-the workspace version in `Cargo.toml`, runs `cargo +1.98.0 update --workspace`
-to refresh Cargo-generated `Cargo.lock`, and validates the result with locked
-metadata, the workspace-version check, and an exact two-file inventory. It then
-commits, pushes only the release branch, and opens a PR. The command does not
-repeat `just check`; the required release PR `CI gate` owns the complete format,
-Clippy, test, docs, dependency, and portable-policy suite.
+This keeps the current feature branch, updates only the workspace version and
+Cargo-generated lockfile, adds one version commit, pushes the same branch, and
+creates or reuses its PR. New feature PRs derive their title/body from the
+product commits. An existing PR keeps its description. Code and version are
+reviewed together, so no second version PR/CI cycle is needed.
 
-If generation or focused validation fails, no tag or public release state
-exists. The dirty local release branch and diff are intentionally retained for
-diagnosis and are not auto-resumed; inspect and finish that partial branch
-manually. If branch push or PR creation returns an ambiguous network error
-after the exact clean release commit exists, restore connectivity and rerun the
-same `just release-prepare 0.2.0` command. Resume succeeds only when the commit
-is directly based on current `origin/main`, has the exact message, version, and
-two-file inventory, and any remote branch/open PR names that same SHA. A moved
-main, divergent branch, closed/mismatched PR, extra commit, or dirty tree is
-rejected rather than repaired or overwritten.
+When accumulating changes for a later release, the same command from clean,
+exact `origin/main` creates a standalone `release/v0.2.0` branch and version PR.
 
-Merge the PR only after `CI gate` is green. Then wait for the new `main` push
-run to succeed. That exact run, including all four native readiness builds, is
-the source eligibility record consumed by publication.
+Cargo's `semver` owner validates the next version. `cargo +1.98.0 update
+--workspace` owns lockfile generation; locked metadata, workspace-version checks,
+and the exact two-file version-commit inventory validate it. Preparation does
+not repeat `just check`; the required PR `CI gate` owns the full remote gate.
 
-## Publish the frozen version
+If generation fails, inspect the retained dirty diff. Resume after a push/PR
+network ambiguity is accepted only from the exact clean version commit on the
+same branch, still containing current main. Remote branch and open-PR identities
+must agree; divergence, a moved main, or closed/ambiguous PR state is rejected.
 
-Update local `main` to the exact remote commit and run:
+## Finish an authorized release
+
+Once the PR is reviewed and publication is authorized:
+
+```bash
+just release 0.2.0 42
+```
+
+This command is an explicit request to merge and publish PR 42. It requires the
+local clean HEAD to equal the open PR head and contain the requested version,
+waits for required checks, merges with `--match-head-commit`, waits for CI on the
+returned main merge SHA, and publishes from a private detached worktree. It
+preserves the caller's branch and removes only its own clean temporary worktree.
+The normal repository PR/protection rules still apply; no admin bypass is used.
+
+The PR, merge SHA, Actions run and annotated tag are the recovery record. Rerun
+the same command after an interrupted wait; an already merged PR is not merged
+again, and an already pushed matching tag rejoins its original workflow. There
+is no parallel local release database. Watchers use GitHub CLI's compact view.
+
+Publication remains available independently from a clean checkout of exact
+`origin/main`:
 
 ```bash
 just release-publish 0.2.0
 ```
 
-Before creating a tag, the command verifies a clean exact `origin/main`, the
-Cargo version, readable/enforced `main` protection, local/remote tag and GitHub
-Release vacancy, and one successful completed `ci.yml` main-push run for the
-exact commit. It creates one annotated `v0.2.0` tag, pushes that tag once,
-discovers the corresponding `release.yml` run and watches it to completion.
+Before a new tag is pushed, this checks version, enforced main protection,
+Release vacancy, completed successful exact-SHA `ci.yml` main-push evidence,
+and an unexpired candidate with a server digest. If main has advanced beyond the
+reviewed merge, it stops before tagging instead of including unreviewed changes.
+A retained local annotated tag may be pushed only if it already names that exact
+source; remote tags and Release assets are never replaced.
 
-The watcher can appear idle at **Approve and sign exact manifest bytes**. This
-is the protected `release` Environment waiting for its reviewer; it is not a
-second test suite. Confirm immutable Releases remain enabled, inspect the
-validated source/build status, and approve access to the signing key. If the
-local watcher exits, use the exact `gh run watch ... --exit-status` resume
-command printed by the operator.
+## Build once, publish the verified bytes
 
-## What the tag workflow does
+Main CI runs the normal test/policy graph and builds only the three shipped
+native binaries. Linux uses the pinned glibc 2.28 builder; macOS declares the
+13.0 deployment floor. The candidate jobs explicitly embed the exact source SHA.
+Ordinary PR and development builds retain their development identity.
 
-The tag workflow intentionally does not rerun formatting, Clippy, workspace
-tests, docs, cargo-deny, or the relay test bundle. Exact green `main` already
-owns those facts. It performs only release-boundary work:
+One Ubuntu job creates deterministic archives, the manifest, installer and SBOM,
+verifies the unsigned inventory, and ShellChecks the generated installer. The
+candidate uses the source commit timestamp and is uploaded as
+`release-candidate-SHA-ATTEMPT`, retained for seven days. The main `CI gate`
+requires this job to succeed.
 
-1. validate the annotated tag, Cargo version, vacancy, and exact green main CI;
-2. build only the shipped `zterm` binary on macOS arm64/Intel and glibc 2.28
-   Linux arm64/x64, checking architecture and deployment floor;
-3. build the private release tool once on Ubuntu, create deterministic
-   archives, manifest, checksums, installer and SBOM, verify the unsigned
-   inventory, and ShellCheck the generated installer;
-4. wait for the protected Environment, build the reviewed signer before secret
-   exposure, sign the exact manifest bytes and self-verify;
-5. execute POSIX syntax plus authenticated local-HTTPS install and negative
-   cases against every final signed target;
-6. create a late draft, download and verify its exact bytes, attest them,
-   publish, and require the API response to report `immutable: true`;
-7. explicitly call the reusable relay workflow for the same frozen commit,
-   tag and stable/prerelease classification.
+A failed-job rerun may reuse successful native jobs from an earlier attempt.
+Intermediate per-target uploads may therefore be replaced within that same CI
+run; the assembled candidate always receives a new immutable artifact ID. The
+lookup chooses the newest retained assembly from the **exact successful main
+run**, never a PR run or another commit. Tag validation fixes that artifact ID,
+and the downloader treats digest mismatches as errors.
 
-The most recent measured run before this refactor spent roughly seven minutes
-building/assembling, eight minutes awaiting human approval, and under two
-minutes signing, testing final installers and publishing. Cache hits can reduce
-downloads, but formal binaries are always rebuilt from the frozen tag and are
-never promoted from ordinary CI artifacts.
+The tag workflow does not rebuild `zterm` or rerun ordinary CI. It rebuilds the
+small reviewed signing tool before exposing the key, re-verifies the candidate
+and source SHA, signs the exact manifest, and tests the final signed installers
+on all three targets. It then creates one late draft, downloads and verifies its
+assets, attests those exact bytes, publishes, and requires `immutable: true`.
+There are eight native assets and no companion relay image publication.
 
-## Failure and recovery boundaries
+Only **Approve and sign exact manifest bytes** uses the protected `release`
+Environment. Confirm immutable Releases remain enabled, inspect the exact green
+main/candidate status, and approve access to the signing key. No second signing
+approval or extra full test suite is introduced.
 
-- During release preparation, a dirty partial branch is retained only for
-  manual diagnosis. An exact clean release commit may be resumed with the same
-  `release-prepare` command after an ambiguous push/PR response; the operator
-  reuses only the same-SHA remote branch and matching open PR.
-- Before the tag push, fix the precondition and rerun. If annotated tag
-  creation succeeded locally but its push failed, first prove the remote tag is
-  absent, inspect the retained tag, and push that exact tag manually.
-- Before draft creation, a workflow failure has no GitHub Release state. Rerun
-  the failed job only for the same immutable tag/SHA.
-- A failure after draft creation leaves nonpublic evidence for explicit
-  inspection. Automation never deletes a Release, replaces assets, uses
-  `--clobber`, or force-moves a tag.
-- After immutable native publication, a native defect requires a new version
-  and tag. Published assets are never repaired in place.
-- GitHub Release and GHCR are separate services, so publication is not atomic.
-  If native publication succeeds and relay publication fails, keep the correct
-  immutable native Release and rerun only the relay job for that same frozen
-  commit/tag with
-  `gh run rerun <release-run-id> --failed --repo leonfox28/zterm`. In this state
-  the native publish dependency is already successful, so the failed-job rerun
-  targets relay publication and its summary. Do not recreate or replace the
-  native Release.
+## Failure and recovery
 
-Repository administrators separately own immutable Releases, the protected
-`release` Environment/signing secret, and the `main` protection checklist in
-[Development and CI](development.md). The operator checks visible
-preconditions but never calls an administration API to change them.
+- Dirty preparation retains the local diff for diagnosis; it is not an automatic
+  recovery checkpoint.
+- Failed PR/main checks stop the operator. Fix the owning failure; no tag is
+  pushed. Failed-job reruns can retain the same successful candidate.
+- An expired/deleted candidate fails before a new tag. Rerun main CI for the
+  exact source, then retry; publication never silently compiles a replacement.
+- An interrupted tag push is reconciled against the exact annotated source.
+  An existing remote tag rejoins the same `release.yml` run.
+- Before draft creation, a failed release job can be rerun for the same tag.
+  Signed inventories and fixture uploads use attempt-specific names; downstream
+  jobs use the signing job's artifact IDs, including when only failed jobs rerun.
+  After draft creation, inspect the nonpublic evidence before deciding recovery;
+  automation never deletes drafts, clobbers assets, or force-moves tags.
+- A defect in an immutable published Release needs a new version and tag.
+- Removing Intel changes the manifest target inventory. Versions through
+  0.1.17 require all four old targets and cannot update directly from a
+  three-target manifest. Follow the one-time binary migration in
+  [Install, update, and uninstall](install.md#one-time-migration-from-the-four-target-updater).
+
+Repository administrators own immutable Releases, the signing Environment/key,
+and [main protection](development.md#branch-and-pull-request-flow). The operator
+checks visible prerequisites and never changes those settings.

@@ -7,8 +7,12 @@
 - Trigger this spec when changing native Release assets, manifest/build identity,
   installer hidden entries, executable activation, `zterm update`, `zterm
   uninstall`, or managed `install.json`.
-- The only shipped targets are `aarch64/x86_64-apple-darwin` and
+- Default publication targets are `aarch64-apple-darwin` and
   `aarch64/x86_64-unknown-linux-gnu`; floors are macOS 13.0 and glibc 2.28.
+  macOS Intel, Windows CI/distribution, and relay image publication are paused
+  by explicit user direction. Restore them only in a future task that expressly
+  requests it. Historical assets and unrelated platform/runtime boundaries are
+  not removed by this publication policy.
 - This contract must not introduce background checks, package-manager channels,
   mirrors, services/login items, sudo installation, or a second signature
   format/verifier.
@@ -81,9 +85,25 @@ workspace version.
 
 - `zterm-release.json` authenticates schema/product/version/tag/classification,
   40-lowercase-hex source commit, second-resolution UTC timestamp, wire/state/
-  bootstrap schema, public-key ID, and exactly four artifacts. Each artifact has
-  fixed filename/immutable GitHub URL, compressed length/SHA-256, one platform
-  floor, and a complete embedded build identity.
+  bootstrap schema, public-key ID, and target entries within one 64 KiB document.
+  Runtime verification authenticates the exact bytes and validates common
+  release metadata, then `artifact_for_target` requires exactly one current
+  target and validates only that entry. No runtime platform allowlist or
+  platform-count limit exists. Other platforms may be omitted or unknown;
+  their URLs, archives, floors, and optional platform fields are not validated
+  by the current platform's updater. Schema-v1 common field types still apply.
+  A missing current target returns `UnsupportedTarget`, mapped to the existing
+  `UnsupportedPlatform` domain error; duplicate current entries are rejected.
+  The candidate self-check must equal that selected artifact's build identity;
+  it cannot choose a different platform entry by reporting its own target.
+  `PUBLISHED_RELEASE_TARGETS` lives only in the private release tool. That tool
+  requires its exact planned target set and validates every artifact before
+  signing/publishing. Historical four-target signatures remain verifiable.
+  Already installed versions through 0.1.17 require four targets and cannot
+  consume three-target updates; first migration uses the authenticated installer
+  and existing atomic activation boundary documented in `docs/install.md`.
+  Each artifact has fixed filename/immutable GitHub URL, compressed length/
+  SHA-256, one platform floor, and a complete embedded build identity.
 - Authenticate the bounded exact JSON bytes with one raw 64-byte Ed25519
   signature before JSON parsing. `release/public-key.hex` is reviewed source;
   `UNCONFIGURED`, malformed, or all-zero values fail closed.
@@ -91,7 +111,8 @@ workspace version.
   versions, key ID, and stable/prerelease classification. Release builds set
   `ZTERM_SOURCE_COMMIT`; deterministic archive creation requires
   `SOURCE_DATE_EPOCH`. Ordinary development/CI builds remain `development`;
-  ambient `GITHUB_SHA` is not managed-distribution authority.
+  ambient `GITHUB_SHA` is not managed-distribution authority. The protected-main
+  candidate job explicitly sets `ZTERM_SOURCE_COMMIT`; PR test jobs do not.
 - The non-product `zterm-release-tool` alone handles release seed material.
   `derive-public-key` accepts the bounded seed only on stdin, zeroizes both its
   encoded and decoded owners, and writes only the Ring-derived public key.
@@ -100,7 +121,7 @@ workspace version.
   before initial key generation; never put the seed in argv, a repository
   file, logs/debug output, an Action artifact, or a build/test job.
 - Archive inventory is exactly one regular `zterm`, mode `0700`, uid/gid 0,
-  with fixed tar/gzip timestamps. Formal assets are the four archives,
+  with fixed tar/gzip timestamps. Formal assets are the three archives,
   manifest/signature, `SHA256SUMS`, generated installer, and SPDX JSON.
 - The mutable bootstrap selects latest stable or one canonical exact tag. The
   generated immutable installer performs target/floor/destination validation
@@ -129,17 +150,17 @@ workspace version.
 - Uninstall first proves the exact running managed executable, then reuses identity
   reset/Session force/managed-inventory deletion and removes the executable
   last. It never sends `RevokeSelf` or performs setup.
-- A successful `ci.yml` push run on `main` owns release-mode compilation on all
-  four native distribution platforms while retaining Windows shared-boundary
-  validation. The stable aggregate owner is named `CI gate`; normal substantive
-  work and the release-version commit reach protected `main` through a PR. A
-  human may push the exact annotated `v` + Cargo-version tag only afterward.
-  Formal versions must not contain SemVer build metadata because the same text
-  is also an OCI tag and `+` is not legal there.
+- A successful `ci.yml` push run on `main` owns the three native candidate
+  builds plus deterministic unsigned assembly and generated-installer checks.
+  The aggregate `CI gate` requires both ordinary evidence and this candidate.
+  Code and version preparation may share one PR. Publication requires one
+  annotated `v` + Cargo-version tag after exact green main evidence and a
+  retained candidate are proven; SemVer build metadata remains unsupported.
 - The host-only `zterm-terminal` crate and pinned official
-  `alacritty_terminal` dependency compile in every native release build and in
-  the hosted Windows shared boundary. They are Rust-linked into the product
-  binary and must not add a separately distributed terminal dynamic library.
+  `alacritty_terminal` dependency compile in every native release build.
+  Windows hosted validation is paused until explicitly requested. They are
+  Rust-linked into the product binary and must not add a separately distributed
+  terminal dynamic library.
   `zterm-core` and `zterm-proto` remain engine-free for remote/mobile clients;
   this isolation is not a claim of mobile local-PTY support.
 - Wire-major-two releases are coordinated cutovers. Every node that may connect
@@ -156,18 +177,27 @@ workspace version.
   derived from the runtime `$HOME` (for example `$HOME/.cargo/bin`), never from
   the container user's assumed passwd home such as `/root`.
 - `.github/workflows/release.yml` is tag-triggered, GitHub-hosted, and
-  action/image digest-pinned. It rejects a tag without a successful `ci.yml`
-  `push` run on `main` for that exact commit before signing or Release state.
-  Each of the four native jobs builds, self-checks and uploads only its shipped
-  raw `zterm` binary plus identity. The Ubuntu assembly job builds
-  `zterm-release-tool` once for deterministic archive/manifest/SBOM assembly;
-  target jobs never compile or upload that private tool. Separate pre-secret
-  signing and pre-publication verification boundaries still rebuild the
-  reviewed tool from the frozen source.
-  The Ubuntu assembly owner must require ShellCheck exactly once over the
-  generated formal installer before protected signing. The four-platform
-  installer matrix must not assume ShellCheck is installed; every entry still
-  runs POSIX syntax validation and the authenticated local-HTTPS fixture.
+  action/image digest-pinned. It selects an unexpired assembled candidate from
+  a completed successful `ci.yml` main-push run for the exact source commit.
+  `find-candidate.sh` binds the workflow/event/branch/SHA and a server-digested
+  artifact ID; the downloader fails on a digest mismatch. It cannot select PR
+  artifacts or another commit. Failed-job retries may reuse an earlier
+  successful assembly within that exact run.
+- Main native jobs build/self-check only the shipped binary and upload its raw
+  bytes plus identity. Their ephemeral per-target uploads may be replaced during
+  a CI retry. Ubuntu assembles deterministic archives and the exact unsigned
+  inventory once; each assembly attempt has a new immutable artifact ID named
+  `release-candidate-SHA-ATTEMPT`, retained for seven days. The tag workflow never
+  recompiles `zterm` or re-archives its bytes. Missing/expired candidates require
+  an explicit main-CI rerun before a new tag.
+- Small signing and pre-publication verification tools are rebuilt from the
+  frozen source. Signing re-verifies the unsigned inventory and exact manifest
+  source SHA before key exposure. Signed/fixture uploads include the run attempt
+  in their names and expose artifact IDs as signing-job outputs; retries never
+  overwrite those bytes, and downstream jobs retain the successful signing
+  attempt's IDs. Main assembly owns the single ShellCheck of
+  the generated installer. The three-target final installer matrix retains
+  POSIX syntax and authenticated local-HTTPS execution.
   That fixture binds its numeric loopback address through the test-only
   `TCPServer` path, publishes the already-bound address, and performs no
   hostname/FQDN lookup; this is fixture portability, not product behavior.
@@ -232,19 +262,20 @@ workspace version.
 ### 6. Tests Required
 
 - `cargo test -p zterm-core release::tests` asserts exact-byte authentication,
-  schema/inventory/size/classification boundaries, monotonic versions, and
-  bounded streaming digest.
+  common schema/classification boundaries, current-target uniqueness and
+  artifact checks, one-target and unknown/more-than-four-target inventories,
+  selected candidate identity, monotonic versions, and bounded streaming digest.
 - `cargo test -p zterm-release-tool` asserts byte-identical archives, that a
-  four-target manifest mechanically renders POSIX-valid installer metadata,
-  and that `derive-public-key` matches RFC 8032 while rejecting oversized input
-  without stdout or seed-bearing diagnostics.
-- `cargo test -p zterm-daemon distribution::tests` asserts valid preparation,
+  three-target manifest mechanically renders POSIX-valid installer metadata,
+  exact planned publication inventory, and that `derive-public-key` matches
+  RFC 8032 while rejecting oversized input without stdout or seed-bearing diagnostics.
+- `cargo test -p zterm-daemon distribution::tests` asserts single-platform
+  preparation, unrelated-target independence, missing-current-target rejection,
   bad archive rejection before candidate execution, and canonical exact/latest
   selection.
 - Source/dependency policy and hosted native jobs verify the exact official
-  Alacritty pin, license/advisory status, core/proto graph isolation, explicit
-  Windows `zterm-terminal` compilation, and unchanged artifact dynamic-library
-  inventory.
+  Alacritty pin, license/advisory status, core/proto graph isolation and unchanged artifact dynamic-library inventory.
+  Windows compilation evidence is currently paused.
 - Platform executable tests assert installed-file owner/mode/symlink rejection,
   install-directory shape, no-clobber install, retained-backup rollback, and
   exact removal.
@@ -254,15 +285,17 @@ workspace version.
   The signed hosted candidate owns positive pre-setup/configured uninstall and
   reinstall identity-rotation evidence.
 - `sh tests/release/static.sh` asserts exact-tag triggering, an annotated tag
-  without build metadata, exact green-main-CI gating, stable PR `CI gate`, four
-  main-push release-mode builds, pinned release dependencies/caches/timeouts, one
-  Environment/secret reference, runtime-HOME Cargo path, exact non-wildcard
-  container `safe.directory`, one fail-closed Ubuntu generated-installer
+  without build metadata, exact green-main-CI gating, stable PR `CI gate`, three
+  main-push native candidate builds and one unsigned assembly, pinned release
+  dependencies/caches/timeouts, one Environment/secret reference, runtime-HOME
+  Cargo path, exact non-wildcard container `safe.directory`, one fail-closed
+  Ubuntu generated-installer
   ShellCheck owner before signing, no ShellCheck assumption in the installer
   matrix, centralized raw-candidate archiving, absence of ordinary CI commands
-  after the tag, direct numeric-loopback fixture binding with no FQDN path,
+  and product rebuilds after the tag, direct numeric-loopback fixture binding
+  with no FQDN path,
   verified draft publication, and installer no-side-effect tokens.
-  Exact-main CI ShellChecks maintained shell sources. Hosted four-target jobs
+  Exact-main CI ShellChecks maintained shell sources. Hosted three-target jobs
   own POSIX syntax, a local HTTPS happy path through an existing default
   `0775` directory created under `umask 0002` without `chmod`,
   existing-destination preflight, digest failure, native execution,
@@ -377,9 +410,10 @@ sh tests/workspace-version.sh
 
 ### 3. Contracts
 
-- Fresh prepare starts on a clean `main` exactly equal to fetched
-  `origin/main`, proves branch/tag/Release vacancy, and validates the next
-  version before creating `release/vVERSION`.
+- Fresh prepare on clean exact `origin/main` creates `release/vVERSION`.
+  On a clean feature branch containing current main, it keeps that branch and
+  prepares the version in the same PR. Version/tag/Release preflight is shared;
+  the version commit alone must contain exactly the two version files.
 - After editing exactly one `[workspace.package].version`, `cargo update
   --workspace` is the only lockfile-generation owner. Locked metadata and the
   workspace-version script validate the result; they are not generation APIs.
@@ -388,24 +422,33 @@ sh tests/workspace-version.sh
   expected and actual sorted sets.
 - Prepare does not run `just check`. The required release PR `CI gate` owns the
   complete format, Clippy, test, docs, dependency, and portable policy evidence;
-  merged `main` CI owns exact-SHA release readiness.
+  merged `main` CI owns the exact-SHA assembled candidate.
 - Resume is accepted only while already on the clean expected release branch.
-  Its HEAD is one commit directly above current fetched `origin/main`, has the
+  Its HEAD is an ordinary version commit, contains current fetched main, has the
   exact subject `chore: prepare vVERSION release`, contains only the two version
   files, resolves the requested workspace version, and passes locked metadata
   plus workspace-version validation.
 - A missing remote release branch may be pushed. An existing remote branch may
-  be reused only when its SHA exactly equals local HEAD; divergence is never
-  overwritten. One open PR may be reused only when its head SHA, head branch,
-  and base `main` match. Missing PR state may be created; closed, merged,
+  be reused when its SHA equals local HEAD, or advanced by a normal fast-forward
+  push from an ancestor of local HEAD; divergence is never overwritten. One
+  open PR may be reused only when its head SHA, head branch, and base `main`
+  match. Missing PR state may be created; closed, merged,
   multiple, malformed, or unavailable PR state fails closed.
 - Push/PR network ambiguity is recovered by rerunning the same command after
   connectivity returns. The operator does not persist a parallel state file,
   infer success from an error, force-push, delete evidence, or repair dirty
   branches.
-- `release-publish`, exact-green main, annotated tags, protected signing,
-  immutable native Release, and relay publication retain their existing
-  contracts.
+- `just release VERSION PR` / `operator.sh finish VERSION PR` requires an
+  authorized reviewed PR. It waits for exact PR CI, verifies required checks,
+  merges with an exact-head guard, waits for the returned main merge SHA, and
+  publishes from a clean private detached worktree. The caller's branch is
+  preserved. PR/merge/run/tag state is authoritative; no parallel state file is
+  maintained. A merged PR or pushed matching tag resumes without repetition.
+- Before a new tag, publish requires exact current main, enforced protection,
+  green CI and its retained candidate. An existing local/remote annotated tag
+  is reusable only for its exact source; it is never replaced. A remote tag
+  rejoins its original release run. Private worktrees are removed only when
+  clean. Signing approval and immutable publication retain their boundaries.
 
 ### 4. Validation & Error Matrix
 
@@ -415,10 +458,11 @@ sh tests/workspace-version.sh
 | Locked metadata or workspace-version validation fails | Stop with the generated diff retained; no branch push, PR, or tag |
 | Inventory is missing `Cargo.lock` or contains an extra path | Print expected and actual sorted inventories; do not commit/push |
 | Fresh invocation sees an existing local/remote release branch | Reject; only an invocation already on an exact clean release commit can enter resume |
-| Resume branch is dirty, has an extra commit/file, wrong subject/version, or parent differs from current `origin/main` | Reject without modifying local or remote state |
+| Resume branch is dirty, has an extra commit/file, wrong subject/version, or no longer contains current `origin/main` | Reject without modifying local or remote state |
 | Remote release branch is absent | Push the exact local release commit once, then reconcile PR state |
 | Remote release branch SHA equals local HEAD | Reuse it; do not force-push or create a second branch |
-| Remote release branch SHA differs | Reject and report both sides; never overwrite it |
+| Remote release branch is an ancestor of local HEAD | Push normally, preserving the same feature PR |
+| Remote release branch diverges | Reject and report both sides; never overwrite it |
 | One open PR matches exact head SHA/branch and base `main` | Reuse its URL and complete prepare |
 | No PR matches after the exact remote branch is proven | Create one PR |
 | PR query is unavailable, ambiguous, closed, merged, or mismatched | Reject; do not guess or create competing review state |
@@ -437,7 +481,7 @@ sh tests/workspace-version.sh
 - Bad: mocking `cargo metadata` to rewrite `Cargo.lock`, because production
   Cargo does not provide that effect and the fixture would hide the failure.
 - Bad: adding a generic state machine that accepts arbitrary existing branches,
-  commits, or PRs, or rerunning the full local gate already required by PR CI.
+  commits, or PRs without proving the exact version commit and ancestry, or rerunning the full local gate already required by PR CI.
 
 ### 6. Tests Required
 
@@ -452,7 +496,12 @@ sh tests/workspace-version.sh
   inventory diagnostics, exact clean-commit resume with same remote SHA/open PR,
   missing remote/PR continuation where applicable, and remote/commit/PR
   divergence rejection. It asserts no tag in every prepare path.
-- `sh tests/release/static.sh`, ShellCheck, shell syntax, task context validation,
+- The operator fixture covers preparation on an existing feature branch,
+  failure after merge but before tagging, exact-source finish/resume, missing
+  candidate rejection and private-worktree cleanup. `candidate-fixture.sh`
+  executes the actual jq selectors against REST-shaped responses for successful
+  retries, expired/mismatched candidates and rejected PR authority.
+- `sh tests/release/static.sh`, ShellCheck, shell syntax,
   `git diff --check`, and the repository broad gate remain required before
   merge. No fixture contacts the production GitHub repository.
 

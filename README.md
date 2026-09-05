@@ -74,13 +74,12 @@ the signed native Release path and its trust/recovery boundaries.
 zterm uses one lockstep SemVer for the product rather than independent
 component versions. The root `[workspace.package].version` is the only source
 for all product crates; future CLI, daemon, desktop/mobile apps, protocol
-artifacts, and the zterm Relay wrapper advance together.
+artifacts advance together. Relay image publication is currently paused.
 
 A GitHub Release tag must equal `v` plus Cargo's resolved workspace version.
-The same tag is used unchanged for the versioned GHCR image, and a stable
-release also advances the `latest` alias. GitHub prereleases and manual builds
-publish only to `zterm-relay-dev`; manual tags are used unchanged except that
-`latest` is reserved. Internal validation tools such as the isolated Relay
+Default releases include macOS arm64 and Linux arm64/x64. macOS Intel,
+Windows CI/distribution, and relay image publication require an explicit future
+task before being restored. Internal validation tools such as the isolated Relay
 handshake probe are not product deliverables and keep their own non-product
 version.
 
@@ -89,17 +88,14 @@ version.
 - `crates/` — six Rust crates owning core, protocol, platform, terminal-engine, daemon, and CLI boundaries.
 - `proto/zterm/v2/` — the semantic product wire schema compiled with vendored `protoc` binaries.
 - `deploy/relay/` — official relay artifact verification and Compose deployment.
-- `.github/workflows/relay-image.yml` — multi-platform publisher for the
-  separate `zterm-relay` production and `zterm-relay-dev` development GHCR
-  packages.
 - `tests/relay/` — architecture, checksum, minimal configuration, and health checks.
 - `install/` and `tools/release/` — the reviewed bootstrap/template and private
   signed native-asset assembler.
 - `.github/workflows/release.yml` — protected exact-tag native Release workflow
-  for the four supported Unix targets.
+  for the three supported Unix targets, reusing exact main CI candidates.
 - `docs/development.md` — exact local toolchain baseline and repeatable commands.
-- `docs/releasing.md` — release PR, exact-green tag, approval, native/relay
-  publication, and failure recovery.
+- `docs/releasing.md` — one-PR version preparation, exact main candidates, signing,
+  publication, and resumable operator commands.
 - `docs/relay.md` — relay trust boundary, publication, and deployment.
 - `docs/phase-zero-verification.md` — evidence from the completed local gate.
 - `docs/core-local-daemon.md` — current M2–M3 behavior, state, CLI, and exclusions.

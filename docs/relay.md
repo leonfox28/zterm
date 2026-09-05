@@ -57,7 +57,6 @@ or direct TLS/ACME/QAD variant.
 Run each contract once at its owning boundary:
 
 ```bash
-sh tests/relay/publication-channels.sh
 sh tests/relay/static.sh
 sh tests/relay/verify-upstream.sh
 sh tests/relay/build-platforms.sh
@@ -84,39 +83,17 @@ It passes `RelayConfig::new(url, None)` because this deployment has no UDP QAD
 endpoint. It performs one connection attempt; restart/reconnect and rollback
 exercises are not part of normal release acceptance.
 
-## Release mapping
+## Publication status
 
-The root Cargo workspace version is the product version source. After immutable
-native publication, `release.yml` explicitly calls the reusable relay publisher
-with the frozen commit, exact `v${workspace_version}` tag and prerelease flag.
-The publisher asks Cargo for the inherited `zterm-core` version and requires
-that exact tag before any image build. The tag is used unchanged as the
-versioned OCI tag.
+Publication is paused. Native zterm releases do not build or publish a companion
+GHCR image, and the automated/manual image publisher has been removed. Restore
+publication only when a future task explicitly requests it.
 
-For workspace version `0.1.1`, a stable GitHub Release named `v0.1.1`
-publishes one `linux/amd64` + `linux/arm64` image under:
-
-```text
-ghcr.io/leonfox28/zterm-relay:v0.1.1
-ghcr.io/leonfox28/zterm-relay:latest
-```
-
-GitHub prereleases use the same direct tag spelling but publish only to
-`ghcr.io/leonfox28/zterm-relay-dev`. Manual workflow runs also target only that
-development package, use their valid OCI input tag unchanged, and cannot use
-the reserved `latest` alias. The production and development packages are
-separate so a manual build cannot replace the stable image.
-
-The reusable workflow checks out and proves the exact frozen commit, pins every
-third-party Action by full commit SHA, has only `contents: read` and
-`packages: write`, verifies the official Iroh archive during the build, and
-pushes one dual-architecture image. Manual dispatch remains a development-only
-path. Formal publication does not rely on a `release: published` event because
-a Release created with `GITHUB_TOKEN` does not reliably start another workflow.
-
-Historical release `v0.1.0` and image tag `:0.1.0` remain unchanged. The direct
-`v...` image-tag convention starts with `v0.1.1`; old tags are not renamed or
-deleted.
+The existing `ghcr.io/leonfox28/zterm-relay` images and deployed infrastructure
+remain historical assets; their `latest` tag no longer tracks new native zterm
+versions. Existing Compose deployments and isolated relay build/runtime tests
+retain their current behavior. Historical production/development publication
+evidence is recorded in [Phase Zero verification](phase-zero-verification.md).
 
 ## Manual deployment and updates
 

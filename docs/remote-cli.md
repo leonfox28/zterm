@@ -276,5 +276,6 @@ Developer macOS runs may compile this target but must never execute its real
 Iroh case. Hosted Linux owns its actual runtime result. A broader remote
 Session or pairing workflow target should be added only together with its
 hosted job and run evidence, using the same fixture instead of another
-daemon-like harness. Hosted Windows owns shared compile/Clippy evidence; a
-macOS cross-compile cannot substitute for it.
+daemon-like harness. Windows CI is currently paused; restoring shared
+compile/Clippy evidence requires an explicit task and a hosted Windows run.
+A macOS cross-compile cannot substitute for it.

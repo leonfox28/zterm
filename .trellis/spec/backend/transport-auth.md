@@ -288,8 +288,10 @@ outbound-known and inbound-authorization directions explicit.
   together: service method, command variant, dispatch match arm, and helper.
   Gating only the caller leaves dead private code in the Windows shared build.
   Do not hide this drift with `allow(dead_code)` or `expect(dead_code)`.
-- Hosted Windows Clippy for workspace `--lib --bins --all-features` with
-  `-D warnings` is the authoritative boundary. A macOS cross-check may stop in
+- Windows CI is currently paused by the distribution policy. If a future task
+  explicitly restores it, hosted Windows Clippy for workspace
+  `--lib --bins --all-features` with `-D warnings` owns this boundary.
+  A macOS cross-check may stop in
   native C/assembly dependencies before project code and does not replace the
   hosted result. Current interactive attachment is Unix-only; the shared
   Windows command surface must compile cleanly and return typed
@@ -477,7 +479,8 @@ outbound-known and inbound-authorization directions explicit.
   pairing and remote Session suites retain workflow, replay, response-loss,
   reconnect, no-HOL, revoke, and cleanup evidence without duplicating Endpoint
   owners. Foundation Case C separately owns official-n0 Relay runtime evidence.
-  Hosted Windows owns shared compile evidence, including:
+  Historical Windows shared compile evidence used the commands below. Running
+  them as hosted gates again requires an explicit task restoring Windows CI:
 
   ```sh
   cargo clippy --workspace --lib --bins --all-features -- -D warnings

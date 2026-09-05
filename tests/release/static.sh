@@ -82,34 +82,43 @@ fi
 if grep -Fq 'self-hosted' "$workflow"; then
     fail "release workflow must use only GitHub-hosted runners"
 fi
-if grep -Eq 'image: .*@sha256:[0-9a-f]{64}$' "$workflow"; then
+if grep -Eq 'image: .*@sha256:[0-9a-f]{64}$' "$ci_workflow"; then
     :
 else
     fail "Linux glibc-floor image must be digest-pinned"
 fi
 
-unpinned_actions=$(grep -E '^[[:space:]]*uses:' "$workflow" \
+unpinned_actions=$(grep -E '^[[:space:]]*(- )?uses:' "$workflow" \
     | grep -Ev 'uses: [.]?/[.]github/workflows/|@[0-9a-f]{40}([[:space:]]|$)' || true)
 [ -z "$unpinned_actions" ] || fail "all release actions must use commit SHAs"
-unpinned_ci_actions=$(grep -E '^[[:space:]]*uses:' "$ci_workflow" \
-    | grep -Ev '@[0-9a-f]{40}([[:space:]]|$)' || true)
+unpinned_ci_actions=$(grep -hE '^[[:space:]]*(- )?uses:' "$ci_workflow" \
+    "$repo_root/.github/actions/setup-ci-tools/action.yml" \
+    | grep -Ev 'uses: [.]?/[.]github/actions/|@[0-9a-f]{40}([[:space:]]|$)' || true)
 [ -z "$unpinned_ci_actions" ] \
     || fail "all CI actions used by the release gate must use commit SHAs"
+for artifact_boundary in \
+    "signed-release-\${{ github.ref_name }}-\${{ github.run_attempt }}" \
+    "installer-fixture-\${{ github.ref_name }}-\${{ github.run_attempt }}" \
+    "artifact-ids: \${{ needs.sign.outputs.signed_artifact_id }}" \
+    "artifact-ids: \${{ needs.sign.outputs.fixture_artifact_id }}"; do
+    grep -Fq "$artifact_boundary" "$workflow" \
+        || fail "release retries must preserve and identify signed artifacts: $artifact_boundary"
+done
 
 secret_references=$(grep -Ec \
     'secrets[.]ZTERM_RELEASE_SIGNING_KEY' "$workflow" || true)
 [ "$secret_references" -eq 1 ] \
     || fail "the signing secret must be referenced by exactly one step"
 frozen_checkouts=$(grep -Fc "ref: \${{ needs.validate.outputs.commit }}" "$workflow" || true)
-[ "$frozen_checkouts" -eq 6 ] \
+[ "$frozen_checkouts" -eq 3 ] \
     || fail "every downstream release job must check out the validated commit"
 grep -Fq 'target/release/zterm-release-tool sign release-output' "$workflow" \
     || fail "the signing step must execute the tool built before secret exposure"
 grep -Fq "git rev-list -n 1 \"\$RELEASE_TAG\"" "$workflow" \
     || fail "publication must recheck the existing tag against the validated commit"
 
-assemble_job=$(sed -n '/^  assemble:/,/^  sign:/p' "$workflow")
-release_shellcheck_requirements=$(grep -Fc 'command -v shellcheck' "$workflow" || true)
+assemble_job=$(sed -n '/^  candidate:/,/^  gate:/p' "$ci_workflow")
+release_shellcheck_requirements=$(grep -Fc 'command -v shellcheck' "$ci_workflow" || true)
 [ "$release_shellcheck_requirements" -eq 1 ] \
     || fail "release must have exactly one fail-closed ShellCheck requirement"
 printf '%s\n' "$assemble_job" | grep -Fq 'runs-on: ubuntu-24.04' \
@@ -129,7 +138,7 @@ grep -Fq 'shellcheck -s sh install/install.sh tests/release/*.sh' "$justfile" \
 
 installer_job=$(sed -n '/^  installer:/,/^  publish:/p' "$workflow")
 if printf '%s\n' "$installer_job" | grep -Fiq 'shellcheck'; then
-    fail "the four-platform installer matrix must not assume ShellCheck is preinstalled"
+    fail "the three-platform installer matrix must not assume ShellCheck is preinstalled"
 fi
 printf '%s\n' "$installer_job" \
     | grep -Fq 'sh -n install/install.sh tests/release/installer-fixture.sh' \
@@ -153,15 +162,34 @@ done
 grep -Fq "sh tools/release/find-green-main-ci.sh \"\$commit\"" "$workflow" \
     || fail "tag validation bypasses the shared exact-main CI lookup"
 
-macos_build_job=$(sed -n '/^  macos-artifacts:/,/^  linux-artifacts:/p' "$workflow")
-linux_build_job=$(sed -n '/^  linux-artifacts:/,/^  assemble:/p' "$workflow")
+macos_build_job=$(sed -n '/^  candidates-macos:/,/^  candidates-linux:/p' "$ci_workflow")
+linux_build_job=$(sed -n '/^  candidates-linux:/,/^  dependencies:/p' "$ci_workflow")
 for native_job in "$macos_build_job" "$linux_build_job"; do
-    printf '%s\n' "$native_job" | grep -Fq 'sh tools/release/build-native.sh formal release-input' \
-        || fail "formal native build bypasses the shared shipped-binary owner"
+    printf '%s\n' "$native_job" | grep -Fq 'sh tools/release/build-native.sh release-input' \
+        || fail "main candidates bypass the shared shipped-binary owner"
+    printf '%s\n' "$native_job" | grep -Fq "ZTERM_SOURCE_COMMIT=\"\$GITHUB_SHA\"" \
+        || fail "main candidates must embed the exact source commit"
     if printf '%s\n' "$native_job" | grep -Fq 'zterm-release-tool'; then
-        fail "formal native jobs must not build the private release tool"
+        fail "native jobs must not build the private release tool"
     fi
 done
+if grep -Fq 'build-native.sh' "$workflow"; then
+    fail "tag publication must reuse the verified main candidate, not rebuild the product"
+fi
+for candidate_boundary in 'sh tools/release/find-candidate.sh' \
+    "artifact-ids: \${{ needs.validate.outputs.candidate_id }}" \
+    "run-id: \${{ needs.validate.outputs.ci_run_id }}" 'digest-mismatch: error'; do
+    grep -Fq "$candidate_boundary" "$workflow" \
+        || fail "tag publication bypasses the exact candidate boundary: $candidate_boundary"
+done
+grep -Fq "release-candidate-\${{ github.sha }}-\${{ github.run_attempt }}" "$ci_workflow" \
+    || fail "main must retain an immutable candidate for each assembly attempt"
+if grep -Eq 'macos-15-intel|windows-latest|x86_64-apple-darwin|ci-windows' "$ci_workflow" "$workflow"; then
+    fail "Intel macOS and Windows require an explicit future task"
+fi
+if grep -Eq 'relay-image.yml|packages: write|docker/build-push-action' "$workflow"; then
+    fail "native releases must not publish relay images"
+fi
 printf '%s\n' "$assemble_job" | grep -Fq 'zterm-release-tool archive' \
     || fail "Ubuntu assembly must own deterministic archives"
 if printf '%s\n' "$assemble_job" | grep -Fq 'tests/release/static.sh'; then
@@ -174,23 +202,21 @@ for ordinary_ci in 'fmt --all' 'clippy --workspace' 'test --workspace' \
     fi
 done
 
-main_release_gates=$(grep -Fc \
-    "if: github.event_name == 'push' && github.ref == 'refs/heads/main'" \
+main_release_gates=$(grep -Fxc \
+    "    if: github.event_name == 'push' && github.ref == 'refs/heads/main'" \
     "$ci_workflow" || true)
-[ "$main_release_gates" -eq 2 ] \
-    || fail "CI must have exactly two main-push-only native release-mode jobs"
-grep -Fq 'windows-latest' "$ci_workflow" \
-    || fail "CI must retain the Windows shared-boundary runner"
-rust_job=$(sed -n '/^  rust:/,/^  release-readiness-macos:/p' "$ci_workflow")
-[ "$(printf '%s\n' "$rust_job" | grep -Ec '^[[:space:]]{12}profile: (unix|windows)$')" -eq 5 ] \
-    || fail "Rust matrix must retain five hosted OS entries"
+[ "$main_release_gates" -eq 3 ] \
+    || fail "CI must have two main native builders and one main-only candidate assembly"
+rust_job=$(sed -n '/^  rust:/,/^  candidates-macos:/p' "$ci_workflow")
+[ "$(printf '%s\n' "$rust_job" | grep -Ec '^[[:space:]]{10}- label:')" -eq 3 ] \
+    || fail "Rust matrix must retain three hosted OS entries"
 [ "$(printf '%s\n' "$rust_job" | grep -Fc 'run: sh tests/source-policy.sh')" -eq 1 ] \
     || fail "every expanded Rust matrix entry must share one source-policy step"
 rust_first_steps=$(printf '%s\n' "$rust_job" \
     | grep -E '^[[:space:]]{6}- (uses:|name:)' | sed -n '1,2p')
 [ "$rust_first_steps" = "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check source checkout policy" ] \
-    || fail "all five expanded Rust entries must run source-policy immediately after checkout"
+    || fail "all three expanded Rust entries must run source-policy immediately after checkout"
 checkout_line=$(printf '%s\n' "$rust_job" | grep -n 'uses: actions/checkout@' | sed -n '1s/:.*//p')
 source_line=$(printf '%s\n' "$rust_job" | grep -n 'run: sh tests/source-policy.sh' | sed -n '1s/:.*//p')
 toolchain_line=$(printf '%s\n' "$rust_job" | grep -n 'name: Install exact Rust toolchain' | sed -n '1s/:.*//p')
@@ -199,8 +225,9 @@ if ! [ "$checkout_line" -lt "$source_line" ] \
     fail "source-policy must run after checkout and before Rust tooling/compilation"
 fi
 linux_readiness_job=$(sed -n \
-    '/^  release-readiness-linux:/,/^  dependencies:/p' "$ci_workflow")
-for linux_policy_job in "$linux_readiness_job" "$linux_build_job"; do
+    '/^  candidates-linux:/,/^  dependencies:/p' "$ci_workflow")
+linux_policy_job=$linux_readiness_job
+{
     linux_first_steps=$(printf '%s\n' "$linux_policy_job" \
         | grep -E '^[[:space:]]{6}- (uses:|name:)' | sed -n '1,4p')
     printf '%s\n' "$linux_first_steps" | sed -n '1p' \
@@ -215,8 +242,8 @@ for linux_policy_job in "$linux_readiness_job" "$linux_build_job"; do
     printf '%s\n' "$linux_first_steps" | sed -n '4p' \
         | grep -Fq -- '- name: Prepare the pinned glibc builder' \
         || fail "shared glibc setup must follow source-policy"
-done
-for target in aarch64-apple-darwin x86_64-apple-darwin \
+}
+for target in aarch64-apple-darwin \
     aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
     grep -Fq "target: $target" "$ci_workflow" \
         || fail "CI release-mode matrix is missing $target"
@@ -234,11 +261,11 @@ grep -Fq 'name: CI gate' "$ci_workflow" \
     || fail "CI lacks the stable branch-protection gate"
 grep -Fq 'if: always()' "$ci_workflow" \
     || fail "CI gate must aggregate failed, cancelled, and skipped owners"
-[ "$(grep -Fc 'timeout-minutes:' "$ci_workflow")" -eq 7 ] \
+[ "$(grep -Fc 'timeout-minutes:' "$ci_workflow")" -eq 8 ] \
     || fail "every CI job must have an explicit timeout"
 grep -Fq 'actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7' "$ci_workflow" \
     || fail "CI must use the pinned cache owner"
-for profile in 'just ci-policy' 'just ci-unix' 'just ci-windows' \
+for profile in 'just ci-policy' 'just ci-unix' \
     'just ci-dependencies' 'just ci-relay'; do
     grep -Fq "$profile" "$ci_workflow" \
         || fail "CI bypasses repository command owner: $profile"
@@ -251,7 +278,8 @@ done
     || fail "docs must appear only in local check and the one matrix profile"
 [ "$(grep -Fc 'smoke: true' "$ci_workflow")" -eq 2 ] \
     || fail "CLI smoke must have exactly one Linux and one macOS owner"
-for container_workflow in "$ci_workflow" "$workflow"; do
+container_workflow=$ci_workflow
+{
     [ "$(grep -Fc 'sh tools/release/setup-glibc-builder.sh' "$container_workflow")" -eq 1 ] \
         || fail "container workflow bypasses the shared glibc setup: $container_workflow"
     if grep -Fq '/root/.cargo/bin' "$container_workflow"; then
@@ -265,7 +293,7 @@ for container_workflow in "$ci_workflow" "$workflow"; do
     if grep -F 'safe.directory' "$container_workflow" | grep -Fq '*'; then
         fail "container workflow must never trust a wildcard Git safe.directory"
     fi
-done
+}
 grep -Fq "echo \"\$HOME/.cargo/bin\" >>\"\$GITHUB_PATH\"" "$glibc_setup" \
     || fail "container setup must use the runtime HOME Cargo path"
 if grep -Fq '/root/.cargo/bin' "$glibc_setup"; then

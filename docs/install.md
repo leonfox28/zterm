@@ -1,9 +1,10 @@
 # Install, update, and uninstall
 
 zterm's official native channel is one signed GitHub Release per lockstep Cargo
-version. It supports Apple Silicon and Intel macOS 13 or newer, plus arm64 and
+version. It supports Apple Silicon macOS 13 or newer, plus arm64 and
 x86_64 GNU/Linux with glibc 2.28 or newer. Windows, Alpine/musl, and NixOS are
-not supported by this installer. Package-manager channels and background
+not supported by this installer. Intel macOS is no longer published; its
+historical Releases remain available. Package-manager channels and background
 updates are intentionally absent.
 
 ## Install
@@ -64,7 +65,7 @@ The small mutable repository bootstrap selects latest stable or an exact tag,
 then downloads that Release's immutable `zterm-install.sh`. This first HTTPS
 hop cannot defend against simultaneous compromise of the reviewed bootstrap
 source and GitHub. The versioned script embeds its exact tag, manifest digest,
-and four-target artifact table.
+and that release's authenticated artifact table.
 
 Before publishing a binary, the versioned script checks target/support floor,
 absolute directory shape and basic writability, bounded download sizes, exact
@@ -106,6 +107,13 @@ are rejected. Manifest signature, target, version monotonicity, archive
 length/hash, and candidate self-check all finish before zterm contacts or
 stops the daemon.
 
+The updater requires only its own target's package. Other platforms may be
+absent or newly introduced without blocking this machine's update. The signed
+manifest's common metadata is authenticated first; the selected entry must be
+unique and pass URL, support-floor, length, digest, and build-identity checks.
+No package for this platform produces an explicit unsupported-platform error.
+The full publication matrix is checked by maintainer tooling, not the updater.
+
 Update and uninstall are available only from an official managed Release
 binary. A source-tree, ordinary-CI, or `UNCONFIGURED` build is rejected before
 an update request reaches the network and before uninstall observes or deletes
@@ -121,6 +129,37 @@ update does not restart the daemon; the next command starts it on demand.
 Binary rollback does not imply persistent-state rollback. A future release
 that changes the state schema must provide its own migration and recovery
 contract before publication.
+
+## One-time migration from the four-target updater
+
+Versions through **0.1.17** require exactly four manifest targets. They reject a
+new three-target manifest before downloading an update, even on supported
+Apple Silicon/Linux hosts. A future binary cannot change that already installed
+verifier. The new verifier accepts historical signed inventories and the new
+three-target inventory without a platform allowlist or count requirement;
+a missing current target returns `unsupported_platform` to the CLI.
+
+For the first migration, use the existing authenticated installer/recovery path:
+
+1. Download and review the bootstrap above, select the exact new release, and
+   install it into an empty temporary directory with `--install-dir`. This
+   authenticates the candidate before touching the current executable or daemon.
+2. Stop the existing daemon with the old binary's `daemon stop`. If Sessions are
+   active, finish them first; `--force` remains a separate explicit choice.
+3. Retain the old executable at a fresh backup path, leaving its original
+   destination empty. Do not run `uninstall` or remove `~/.zterm`: pairing and
+   identity must remain intact.
+4. Run the already authenticated candidate's
+   `--internal-release-install <original-absolute-executable-path>` entry. It
+   uses the existing fsynced, atomic no-clobber installer. If activation fails,
+   restore the retained old executable; do not overwrite an unexpected file.
+5. Check the installed `--version`, then resume normal use. Subsequent updates
+   use `zterm update` again. Coordinate the CLI/daemon versions across connected
+   hosts according to the existing release compatibility policy.
+
+This is a one-time maintenance procedure using the existing verified activation
+boundary, not a new background updater or identity reset. Historical Intel
+installations stay on their last published compatible release.
 
 ## Uninstall and recovery
 
@@ -162,7 +201,7 @@ Before any formal tag is pushed, a repository administrator must have:
    its reviewed public key, and stored the lowercase seed as the Environment
    secret `ZTERM_RELEASE_SIGNING_KEY`;
 4. reviewed a successful `ci.yml` push run on `main` for the exact commit,
-   including all four native release-mode builds.
+   including the three native candidate builds and verified unsigned assembly.
 
 The default workflow token cannot read the repository Administration setting,
 so the workflow does not pretend to verify immutable Releases through an
@@ -170,12 +209,12 @@ underprivileged API call and does not request a PAT. The environment reviewer
 must confirm that immutable Releases remain enabled before approving the sole
 seed-bearing signing job.
 
-CI never creates a tag. `release-prepare` creates a reviewable version PR;
-`release-publish` creates the annotated tag only after the merged exact main
-commit has a successful CI run. The GitHub-hosted workflow rebuilds four native
-assets, tests all four signed installers, round-trips one late draft, emits
-provenance attestations, requires immutable publication, and then explicitly
-publishes the matching relay image.
+CI never creates a tag. `release-prepare` prepares the version in the feature
+PR, or creates a standalone version PR from main. `release-publish` tags only
+after exact main CI and its retained candidate pass; `just release VERSION PR`
+coordinates the required waits and merge. The tag workflow reuses that candidate,
+tests three signed installers, round-trips one late draft, emits provenance
+attestations, and requires immutable publication. Relay images are not published.
 
 A normal key rotation first ships a binary that trusts the next reviewed key
 through a manifest signed by the current key. If the current private key may be

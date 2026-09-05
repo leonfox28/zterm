@@ -2,7 +2,7 @@
 
 fn main() {
     let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown-target".to_owned());
-    // Only the reviewed native-release workflow may opt a build into managed
+    // Only the reviewed main candidate workflow may opt a build into managed
     // distribution lifecycle operations. `GITHUB_SHA` is ambient in ordinary
     // CI and therefore is not evidence that a binary is an official Release.
     let source_commit =

@@ -16,7 +16,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  JUST_VERSION: 1.42.4
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   policy:
@@ -31,27 +31,18 @@ jobs:
         run: >-
           rustup toolchain install 1.98.0 --profile minimal
           --component rustfmt
-      - name: Restore portable-tool and Cargo caches
+      - name: Restore dependency downloads
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            ~/.cargo/bin/just
-            ~/go/bin/actionlint
-          key: ci-policy-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-just-1.42.4-actionlint-1.7.12-${{ hashFiles('Cargo.lock') }}
-      - name: Install exact local command owners
-        shell: bash
-        run: |
-          set -euo pipefail
-          command -v just >/dev/null 2>&1 \
-            || cargo +1.98.0 install just --version "$JUST_VERSION" --locked
-          test "$(just --version)" = "just $JUST_VERSION"
-          if [ ! -x "$HOME/go/bin/actionlint" ]; then
-            go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
-          fi
-          echo "$HOME/go/bin" >> "$GITHUB_PATH"
-          "$HOME/go/bin/actionlint" -version
+          key: cargo-downloads-v2-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-downloads-v2-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-
+      - uses: ./.github/actions/setup-ci-tools
+        with:
+          profile: policy
       - name: Run the canonical portable policy profile
         run: just ci-policy
       - name: Explain reproduction on failure
@@ -68,27 +59,14 @@ jobs:
         include:
           - label: macOS arm64
             os: macos-latest
-            profile: unix
             docs: false
             smoke: true
-          - label: macOS Intel
-            os: macos-15-intel
-            profile: unix
-            docs: false
-            smoke: false
           - label: Linux x64
             os: ubuntu-24.04
-            profile: unix
             docs: true
             smoke: true
           - label: Linux arm64
             os: ubuntu-24.04-arm
-            profile: unix
-            docs: false
-            smoke: false
-          - label: Windows shared boundary
-            os: windows-latest
-            profile: windows
             docs: false
             smoke: false
     steps:
@@ -102,45 +80,51 @@ jobs:
         run: >-
           rustup toolchain install 1.98.0 --profile minimal
           --component clippy --component rust-src
-      - name: Restore Rust cache
+      - name: Restore dependency downloads
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            ~/.cargo/bin/just
-            ~/.cargo/bin/just.exe
-            target
-          key: ci-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-${{ matrix.profile }}-${{ hashFiles('Cargo.lock') }}-just-1.42.4
+          key: cargo-downloads-v2-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ci-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-${{ matrix.profile }}-
-      - name: Install exact just command owner
-        shell: bash
-        run: |
-          set -euo pipefail
-          command -v just >/dev/null 2>&1 \
-            || cargo +1.98.0 install just --version "$JUST_VERSION" --locked
-          test "$(just --version)" = "just $JUST_VERSION"
+            cargo-downloads-v2-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-
+      - name: Restore compiled dependencies
+        id: compiled
+        uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            target/debug/deps
+            target/debug/build
+            target/debug/.fingerprint
+          key: ci-compiled-v2-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ci-compiled-v2-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-
+      - uses: ./.github/actions/setup-ci-tools
+        with:
+          profile: rust
       - name: Run full Unix platform evidence
-        if: matrix.profile == 'unix'
         shell: bash
         run: just ci-unix "${{ matrix.docs }}" "${{ matrix.smoke }}"
-      - name: Run Windows shared-boundary evidence
-        if: matrix.profile == 'windows'
-        shell: bash
-        run: just ci-windows
+      - name: Bound the main compiled dependency cache
+        id: trim
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.compiled.outputs.cache-hit != 'true'
+        run: sh tools/ci/trim-rust-cache.sh
+      - name: Save main compiled dependencies
+        if: steps.trim.outputs.cacheable == 'true'
+        uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            target/debug/deps
+            target/debug/build
+            target/debug/.fingerprint
+          key: ${{ steps.compiled.outputs.cache-primary-key }}
       - name: Explain reproduction on failure
         if: failure()
-        shell: bash
-        run: |
-          if [ "${{ matrix.profile }}" = windows ]; then
-            echo "Reproduce on Windows with just ci-windows." >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "Reproduce on the matching Unix host with just ci-unix ${{ matrix.docs }} ${{ matrix.smoke }}." >> "$GITHUB_STEP_SUMMARY"
-          fi
+        run: echo 'Reproduce on the matching Unix host with just ci-unix ${{ matrix.docs }} ${{ matrix.smoke }}.' >> "$GITHUB_STEP_SUMMARY"
 
-  release-readiness-macos:
-    name: Release readiness / ${{ matrix.target }}
+  candidates-macos:
+    name: Release candidate / ${{ matrix.target }}
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
@@ -150,8 +134,6 @@ jobs:
         include:
           - runner: macos-latest
             target: aarch64-apple-darwin
-          - runner: macos-15-intel
-            target: x86_64-apple-darwin
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -160,24 +142,38 @@ jobs:
         run: sh tests/source-policy.sh
       - name: Install exact Rust toolchain
         run: rustup toolchain install 1.98.0 --profile minimal
-      - name: Restore release-readiness cache
+      - name: Restore dependency downloads
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ci-readiness-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-downloads-v2-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-downloads-v2-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-
       - name: Build and inspect the shipped binary boundary
         env:
           RELEASE_TARGET: ${{ matrix.target }}
-        run: sh tools/release/build-native.sh readiness
+        run: |
+          export ZTERM_SOURCE_COMMIT="$GITHUB_SHA"
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+          export SOURCE_DATE_EPOCH
+          sh tools/release/build-native.sh release-input
+      - name: Upload the native candidate and identity
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-${{ matrix.target }}
+          path: release-input/
+          overwrite: true
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
       - name: Explain reproduction on failure
         if: failure()
-        run: echo "Reproduce on the exact native host with RELEASE_TARGET=${{ matrix.target }} sh tools/release/build-native.sh readiness." >> "$GITHUB_STEP_SUMMARY"
+        run: echo "Reproduce on the exact native host with RELEASE_TARGET=${{ matrix.target }} sh tools/release/build-native.sh release-input with explicit ZTERM_SOURCE_COMMIT and SOURCE_DATE_EPOCH." >> "$GITHUB_STEP_SUMMARY"
 
-  release-readiness-linux:
-    name: Release readiness / ${{ matrix.target }} / glibc 2.28
+  candidates-linux:
+    name: Release candidate / ${{ matrix.target }} / glibc 2.28
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
@@ -212,21 +208,35 @@ jobs:
           sh tests/source-policy.sh
       - name: Prepare the pinned glibc builder
         run: sh tools/release/setup-glibc-builder.sh
-      - name: Restore release-readiness cache
+      - name: Restore dependency downloads
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ci-readiness-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-downloads-v2-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-downloads-v2-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-
       - name: Build and inspect the shipped binary boundary
         env:
           RELEASE_TARGET: ${{ matrix.target }}
-        run: sh tools/release/build-native.sh readiness
+        run: |
+          export ZTERM_SOURCE_COMMIT="$GITHUB_SHA"
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+          export SOURCE_DATE_EPOCH
+          sh tools/release/build-native.sh release-input
+      - name: Upload the native candidate and identity
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-${{ matrix.target }}
+          path: release-input/
+          overwrite: true
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
       - name: Explain reproduction on failure
         if: failure()
-        run: echo "Reproduce in the pinned Debian container with RELEASE_TARGET=${{ matrix.target }} sh tools/release/build-native.sh readiness." >> "$GITHUB_STEP_SUMMARY"
+        run: echo "Reproduce in the pinned Debian container with RELEASE_TARGET=${{ matrix.target }} sh tools/release/build-native.sh release-input with explicit ZTERM_SOURCE_COMMIT and SOURCE_DATE_EPOCH." >> "$GITHUB_STEP_SUMMARY"
 
   dependencies:
     name: Dependency policy
@@ -238,25 +248,18 @@ jobs:
           persist-credentials: false
       - name: Install exact Rust toolchain
         run: rustup toolchain install 1.98.0 --profile minimal
-      - name: Restore dependency-tool cache
+      - name: Restore dependency downloads
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            ~/.cargo/bin/just
-            ~/.cargo/bin/cargo-deny
-          key: ci-dependencies-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-just-1.42.4-deny-0.20.2-${{ hashFiles('Cargo.lock', 'tests/relay/handshake-probe/Cargo.lock') }}
-      - name: Install exact command owners
-        shell: bash
-        run: |
-          set -euo pipefail
-          command -v just >/dev/null 2>&1 \
-            || cargo +1.98.0 install just --version "$JUST_VERSION" --locked
-          command -v cargo-deny >/dev/null 2>&1 \
-            || cargo +1.98.0 install cargo-deny --version 0.20.2 --locked
-          test "$(just --version)" = "just $JUST_VERSION"
-          cargo deny --version | grep -F '0.20.2'
+          key: cargo-downloads-v2-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-downloads-v2-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-
+      - uses: ./.github/actions/setup-ci-tools
+        with:
+          profile: dependencies
       - name: Run both dependency-policy owners
         run: just ci-dependencies
       - name: Explain reproduction on failure
@@ -275,22 +278,18 @@ jobs:
         run: >-
           rustup toolchain install 1.98.0 --profile minimal
           --component clippy --component rustfmt
-      - name: Restore relay cache
+      - name: Restore dependency downloads
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            ~/.cargo/bin/just
-            tests/relay/handshake-probe/target
-          key: ci-relay-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-just-1.42.4-${{ hashFiles('tests/relay/handshake-probe/Cargo.lock', 'deploy/relay/Dockerfile') }}
-      - name: Install exact just command owner
-        shell: bash
-        run: |
-          set -euo pipefail
-          command -v just >/dev/null 2>&1 \
-            || cargo +1.98.0 install just --version "$JUST_VERSION" --locked
-          test "$(just --version)" = "just $JUST_VERSION"
+          key: cargo-downloads-v2-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-downloads-v2-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-
+      - uses: ./.github/actions/setup-ci-tools
+        with:
+          profile: rust
       - name: Register cross-architecture emulation
         uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
       - name: Create a BuildKit builder
@@ -301,14 +300,92 @@ jobs:
         if: failure()
         run: echo "Reproduce on Docker-capable Linux with just ci-relay." >> "$GITHUB_STEP_SUMMARY"
 
+  candidate:
+    name: Assemble the exact release candidate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs:
+      - candidates-macos
+      - candidates-linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out the exact main commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install exact Rust toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal
+
+      - name: Restore dependency downloads
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-downloads-v2-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-downloads-v2-rust-1.98.0-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Download the three native candidates
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: native-*
+          path: release-input
+          merge-multiple: true
+
+      - name: Build the single archive and manifest owner
+        run: cargo +1.98.0 build --locked --release --package zterm-release-tool
+
+      - name: Archive the three raw native candidates once
+        run: |
+          set -eu
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+          export SOURCE_DATE_EPOCH
+          for target in \
+            aarch64-apple-darwin \
+            aarch64-unknown-linux-gnu \
+            x86_64-unknown-linux-gnu; do
+            chmod 700 "release-input/zterm-$target"
+            target/release/zterm-release-tool archive \
+              "release-input/zterm-$target" \
+              "release-input/zterm-$target.tar.gz"
+          done
+
+      - name: Assemble and verify the exact unsigned inventory
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          set -eu
+          version=$(cargo +1.98.0 metadata --locked --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "zterm-cli") | .version')
+          released_at=$(date -u -d "@$(git show -s --format=%ct HEAD)" '+%Y-%m-%dT%H:%M:%SZ')
+          target/release/zterm-release-tool \
+            prepare release-input release-output "v$version" "$SOURCE_COMMIT" "$released_at"
+          target/release/zterm-release-tool verify-unsigned release-output
+
+      - name: Check the generated installer with ShellCheck
+        run: |
+          command -v shellcheck
+          shellcheck -s sh release-output/zterm-install.sh
+
+      - name: Upload the unsigned exact inventory
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-candidate-${{ github.sha }}-${{ github.run_attempt }}
+          path: release-output/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
+
   gate:
     name: CI gate
     if: always()
     needs:
       - policy
       - rust
-      - release-readiness-macos
-      - release-readiness-linux
+      - candidate
       - dependencies
       - relay
     runs-on: ubuntu-24.04
@@ -321,8 +398,7 @@ jobs:
           REF_NAME: ${{ github.ref }}
           POLICY_RESULT: ${{ needs.policy.result }}
           RUST_RESULT: ${{ needs.rust.result }}
-          MACOS_READINESS_RESULT: ${{ needs.release-readiness-macos.result }}
-          LINUX_READINESS_RESULT: ${{ needs.release-readiness-linux.result }}
+          CANDIDATE_RESULT: ${{ needs.candidate.result }}
           DEPENDENCY_RESULT: ${{ needs.dependencies.result }}
           RELAY_RESULT: ${{ needs.relay.result }}
         run: |
@@ -332,21 +408,16 @@ jobs:
             if [ "$result" != success ]; then failed=true; fi
           done
           if [ "$EVENT_NAME" = push ] && [ "$REF_NAME" = refs/heads/main ]; then
-            for result in "$MACOS_READINESS_RESULT" "$LINUX_READINESS_RESULT"; do
-              if [ "$result" != success ]; then failed=true; fi
-            done
+            if [ "$CANDIDATE_RESULT" != success ]; then failed=true; fi
           else
-            for result in "$MACOS_READINESS_RESULT" "$LINUX_READINESS_RESULT"; do
-              if [ "$result" != skipped ]; then failed=true; fi
-            done
+            if [ "$CANDIDATE_RESULT" != skipped ]; then failed=true; fi
           fi
           {
             echo '## CI ownership summary'
             echo "- policy: $POLICY_RESULT (just ci-policy)"
-            echo "- Rust matrix: $RUST_RESULT (just ci-unix / just ci-windows)"
+            echo "- Rust matrix: $RUST_RESULT (just ci-unix)"
             echo "- dependencies: $DEPENDENCY_RESULT (just ci-dependencies)"
             echo "- relay: $RELAY_RESULT (just ci-relay)"
-            echo "- macOS readiness: $MACOS_READINESS_RESULT"
-            echo "- Linux readiness: $LINUX_READINESS_RESULT"
+            echo "- three-platform release candidate: $CANDIDATE_RESULT"
           } >> "$GITHUB_STEP_SUMMARY"
           [ "$failed" = false ] || exit 1

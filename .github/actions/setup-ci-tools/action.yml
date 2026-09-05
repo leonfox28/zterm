@@ -1,0 +1,47 @@
+name: Exact CI tools
+description: Cache command owners independently of the product version and Cargo lockfile.
+inputs:
+  profile:
+    description: rust, policy, or dependencies
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+      id: tools
+      with:
+        path: |
+          ~/.cargo/bin/just
+          ~/.cargo/bin/cargo-deny
+          ~/go/bin/actionlint
+        key: ci-tools-v2-${{ runner.os }}-${{ runner.arch }}-${{ inputs.profile }}-rust-1.98.0-just-1.42.4-deny-0.20.2-actionlint-1.7.12
+    - name: Install and verify exact command owners
+      shell: bash
+      env:
+        TOOL_PROFILE: ${{ inputs.profile }}
+      run: |
+        set -euo pipefail
+        case "$TOOL_PROFILE" in rust|policy|dependencies) ;; *) exit 64 ;; esac
+        command -v just >/dev/null 2>&1 \
+          || cargo +1.98.0 install just --version 1.42.4 --locked
+        test "$(just --version)" = 'just 1.42.4'
+        if [ "$TOOL_PROFILE" = policy ]; then
+          if [ ! -x "$HOME/go/bin/actionlint" ]; then
+            go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          fi
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+          # go install reports the module version, including its v prefix.
+          test "$("$HOME/go/bin/actionlint" -version | sed -n '1p')" = 'v1.7.12'
+        elif [ "$TOOL_PROFILE" = dependencies ]; then
+          command -v cargo-deny >/dev/null 2>&1 \
+            || cargo +1.98.0 install cargo-deny --version 0.20.2 --locked
+          test "$(cargo deny --version)" = 'cargo-deny 0.20.2'
+        fi
+    - uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.tools.outputs.cache-hit != 'true'
+      with:
+        path: |
+          ~/.cargo/bin/just
+          ~/.cargo/bin/cargo-deny
+          ~/go/bin/actionlint
+        key: ${{ steps.tools.outputs.cache-primary-key }}

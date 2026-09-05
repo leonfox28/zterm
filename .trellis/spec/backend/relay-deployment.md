@@ -57,7 +57,7 @@ before adding another infrastructure profile or validation layer.
   publication is relay-only; peers still exchange and test direct candidates
   through Iroh's connection machinery.
 - Product version source: root `Cargo.toml` `[workspace.package].version`.
-- Stable self-hosted Relay image example:
+- Historical stable self-hosted Relay image example (publication is paused):
 
   ```text
   workspace:      0.1.1
@@ -66,7 +66,7 @@ before adding another infrastructure profile or validation layer.
   server image:   ghcr.io/leonfox28/zterm-relay:latest
   ```
 
-- Development package: `ghcr.io/leonfox28/zterm-relay-dev`.
+- Historical development package: `ghcr.io/leonfox28/zterm-relay-dev`.
 - Optional self-hosted URL: `https://relay.zenithconsulting.cn`.
 - Reverse-proxy upstream: `http://127.0.0.1:38451`.
 - Server Compose root: `/opt/1panel/docker/compose/zterm-relay`.
@@ -138,43 +138,14 @@ before adding another infrastructure profile or validation layer.
 
 #### Publication
 
-- A GitHub Release tag must equal the literal `v` prefix plus the Cargo-resolved
-  workspace product version. The same Release tag is used unchanged as the OCI
-  image tag. Formal versions containing SemVer build metadata are rejected
-  before native publication because `+` is not an OCI tag character.
-- The immutable native Release explicitly calls `relay-image.yml` as a reusable
-  workflow with the frozen commit, exact tag, and prerelease classification.
-  Formal publication must not depend on a `release: published` event produced
-  by `GITHUB_TOKEN`. Manual dispatch remains development-only.
-- Stable releases publish only to `zterm-relay` and also update `latest`.
-  GitHub prereleases and manual runs publish only to `zterm-relay-dev` and never
-  update `latest`.
-- Manual development input is rejected only when empty, equal to `latest`, or
-  not a legal OCI tag. Do not reimplement Cargo SemVer or validate trusted
-  GitHub owner syntax.
-- The workflow builds one linux/amd64 + linux/arm64 image with minimal
-  `contents: read` / `packages: write` permissions and full-commit Action pins.
-- The image build verifies the official Iroh 1.0.3 artifact SHA-256 once. Do
-  not add deployment-time digest validation, immutable-reference requirements,
-  or attestations without a current verifier or consumer.
-
-#### Optional self-hosted image and operation
-
-- The runtime is scratch-based, shell-free, and runs as UID/GID 65532.
-- The image default command is
-  `--config-path /etc/iroh-relay/relay.toml`; Compose does not repeat it.
-- `relay.toml` binds Relay HTTP to container TCP 38451, explicitly disables QAD
-  and metrics, uses `access = "everyone"`, and omits limits and TLS.
-- `deploy/relay/compose.yaml` is the only supported self-hosted Compose file.
-  Its project and explicit single container are both named `zterm-relay`.
-- Compose uses the literal production `:latest` image, a read-only bind mount
-  for `relay.toml`, host-loopback TCP 38451, `restart: unless-stopped`, and
-  Docker `logging.driver: local`.
-- Compose has no `build`, `.env` image indirection, automatic pull policy,
-  metrics port, command/environment/configs abstraction, container
-  healthcheck, custom health binary, stop timeout, or rollback automation.
-- Updates are manual. After one successful post-update health and authenticated
-  handshake acceptance, stop; do not restart or perform a recovery drill.
+- Publication is paused by explicit user direction. Native releases do not call
+  a relay publisher, and the image publication workflow/resolver has been
+  removed. Restore image publication only in a future task that explicitly
+  requests it; do not infer it from a native release request.
+- Historical production/development GHCR images and running deployments are
+  retained. Their tags no longer track new native versions. Optional local
+  image builds, upstream artifact verification, and relay runtime tests remain
+  separate from publication.
 
 ### 4. Validation & Error Matrix
 
@@ -194,10 +165,7 @@ before adding another infrastructure profile or validation layer.
 | A physical endpoint resolves an official Relay/QAD name into `198.18.0.0/15` | Classify the run as transparent-proxy/fake-IP interception, not QAD reachability or NAT failure; restore real DNS and Direct UDP before retesting |
 | QAD traffic has outbound bytes to fake-IP UDP 7842 but zero replies and no WAN NAT | Stop NAT-type diagnosis; the probe has not reached official QAD |
 | Both physical peers report Direct during one active interactive stream | Accept the physical official-n0 Direct claim for that topology and preserve the evidence without endpoint IDs or public addresses |
-| Release tag differs from `v${workspace_version}` | Stop publication before image build |
-| Stable release resolves outside `zterm-relay` or does not own `latest` | Stop publication |
-| Prerelease/manual run resolves outside `zterm-relay-dev` or updates `latest` | Stop publication |
-| Native Release succeeds but the explicit GHCR call fails | Keep the immutable native Release, leave the overall run red, and retry only relay publication for the same frozen commit/tag |
+| Native release attempts companion image publication without an explicit future task | Reject the workflow change |
 | Official artifact checksum differs | Stop image build |
 | Self-hosted Compose publishes anything except host-loopback TCP 38451 | Reject the deployment model |
 | Post-update health or authenticated Iroh handshake fails | Deployment is not accepted; report the observed failure |
@@ -228,8 +196,8 @@ before adding another infrastructure profile or validation layer.
 - **Bad product profile:** copies official URLs into production code, mixes the
   optional self-hosted Relay into the default map, or treats QAD as the Relay
   forwarding transport.
-- **Good release:** workspace `0.1.1` plus Release `v0.1.1` publishes
-  `zterm-relay:v0.1.1` and `zterm-relay:latest`.
+- **Good release:** native publication completes without building or publishing
+  a companion image. Historical GHCR tags are left unchanged.
 - **Good optional deployment:** one explicit pull/up recreates the stateless
   container; loopback health and one public authenticated handshake pass.
 - **Bad optional deployment:** adds digest pinning, unused metrics/QAD/direct

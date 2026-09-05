@@ -24,10 +24,9 @@ check:
     cargo +1.98.0 fmt --manifest-path tests/relay/handshake-probe/Cargo.toml -- --check
     cargo +1.98.0 clippy --locked --manifest-path tests/relay/handshake-probe/Cargo.toml -- -D warnings
     sh -n deploy/relay/*.sh tests/relay/*.sh
-    sh tests/relay/publication-channels.sh
     sh tests/relay/verify-upstream.sh
     if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then sh tests/relay/static.sh; else echo 'HOSTED-ONLY: relay Compose metadata requires Docker Compose'; fi
-    @echo 'HOSTED-ONLY: other macOS/Linux architectures, Windows, glibc 2.28, Docker/QEMU image execution, protected signing, final installers, attestation, and immutable publication run in GitHub Actions.'
+    @echo 'HOSTED-ONLY: other supported macOS/Linux hosts, glibc 2.28, Docker/QEMU relay tests, protected signing, final installers, attestation, and immutable publication run in GitHub Actions.'
 
 # Canonical portable CI owner: version, format, workflow/release policy, shell, and Python syntax.
 ci-policy:
@@ -37,6 +36,7 @@ ci-policy:
     actionlint
     sh tests/release/static.sh
     sh tests/release/operator-fixture.sh
+    sh tests/release/candidate-fixture.sh
     shellcheck -s sh install/install.sh tests/release/*.sh tests/secret-scan*.sh tests/terminal-dependency-policy.sh $(find tools/ci tools/release -type f -name '*.sh' -print)
     sh tools/ci/check-python-syntax.sh tests/release/https_fixture.py tests/release/https_fixture_bind_test.py
 
@@ -49,11 +49,6 @@ ci-unix docs='false' smoke='false':
     if [ {{ quote(docs) }} = true ]; then cargo +1.98.0 doc --workspace --no-deps; fi
     if [ {{ quote(smoke) }} = true ]; then cargo +1.98.0 run --quiet --package zterm-cli; fi
 
-# Hosted Windows shared/unsupported-platform boundary.
-ci-windows:
-    cargo +1.98.0 clippy --workspace --lib --bins --all-features -- -D warnings
-    cargo +1.98.0 test -p zterm-core -p zterm-proto -p zterm-platform -p zterm-terminal -p zterm-daemon --lib --all-features
-
 # Workspace and isolated relay-probe dependency policy.
 ci-dependencies:
     cargo +1.98.0 deny check
@@ -65,17 +60,20 @@ ci-relay:
     cargo +1.98.0 clippy --locked --manifest-path tests/relay/handshake-probe/Cargo.toml -- -D warnings
     sh -n deploy/relay/*.sh tests/relay/*.sh
     sh tests/relay/static.sh
-    sh tests/relay/publication-channels.sh
     sh tests/relay/verify-upstream.sh
     sh tests/relay/build-platforms.sh
     sh tests/relay/smoke.sh
     sh tests/secret-scan.sh
     sh tests/secret-scan-fixture.sh
 
-# Create and open a reviewable release PR; never creates a tag.
+# Prepare the version in the current feature PR, or open a standalone release PR from main.
 release-prepare version:
     sh tools/release/operator.sh prepare {{ quote(version) }}
 
 # Tag exact protected green main and watch the formal release workflow.
 release-publish version:
     sh tools/release/operator.sh publish {{ quote(version) }}
+
+# Finish a reviewed release PR: wait, merge exact head, wait main, tag, and publish.
+release version pr:
+    sh tools/release/operator.sh finish {{ quote(version) }} {{ quote(pr) }}
