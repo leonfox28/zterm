@@ -321,6 +321,11 @@ they must not duplicate registry, replay, session-reservation, or controller log
   state, and survival of the same Session/PTY.
 - `session_limits` covers the eighth/ninth session, maximum viewport, resize
   validation without mutation, and the absence of terminal-memory admission.
+  Its rejected-resize assertion compares the stable Session identity and
+  accepted viewport, not the whole `SessionSummary`: PTY output may
+  independently advance the authoritative terminal revision between two
+  `list` calls. Do not add a sleep or quiescence barrier to freeze unrelated
+  output merely to make that assertion byte-for-byte equal.
 - `local_session_ipc` and `terminal_recovery` prove the same service through a
   real peer-authorized Unix socket, including daemon stop and connection-local
   protocol failure.
@@ -415,6 +420,17 @@ let first_window = read_history_window()?;
 spawn("print_history_with_final_crlf; printf history-ready; cat")?;
 wait_for_terminal_text("history-ready")?;
 let first_window = read_history_window()?;
+```
+
+Negative mutation tests must assert fields owned by the rejected operation:
+
+```rust
+// Wrong: live PTY output may advance `revision` between these observations.
+assert_eq!(before_summary, after_summary);
+
+// Correct: rejection owns the accepted viewport, not unrelated PTY output.
+assert_eq!(before_summary.session_id, after_summary.session_id);
+assert_eq!(before_summary.viewport, after_summary.viewport);
 ```
 
 ## Forbidden patterns
