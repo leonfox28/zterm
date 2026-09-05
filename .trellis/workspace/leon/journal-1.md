@@ -337,3 +337,38 @@ Preserved explicit resume delta ACK authority across the shared client/view/UI b
 ### Next Steps
 
 - Merge the fix PR, prepare v0.1.17, require exact green main CI, approve normal protected signing and verify immutable native plus relay publication.
+
+
+## Session 14: Simplify CLI workflows and daemon diagnostics
+<!-- trellis-session: v=2 fp=eb6d83a60da07470 -->
+
+**Date**: 2026-09-05
+**Task**: Simplify CLI workflows and daemon diagnostics
+**Branch**: `zterm-cli-commands-execution`
+
+### Summary
+
+Implemented human-readable CLI commands, English y/yes and -y confirmation, atomic Session shutdown admission, update startup and existing daemon event logging. User approved commit/archive and v0.1.19 release flow.
+
+### Main Changes
+
+- Removed public JSON/force flags; simplified setup, pairing aliases, Session lists and one-shot logs -n without follow.
+- Added existing-owner operational events and corrected controller-detach and requested-close reason semantics.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `b4941e0` | feat: simplify CLI workflows and daemon diagnostics |
+
+### Testing
+
+- [OK] Independent Trellis check and full just check passed; real PTY confirmation, CLI/daemon/IPC and isolated log privacy tests passed.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- Prepare and publish v0.1.19 through the repository PR/CI/signing workflow.
