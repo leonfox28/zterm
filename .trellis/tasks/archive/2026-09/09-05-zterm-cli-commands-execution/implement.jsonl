@@ -1,0 +1,9 @@
+{"file":".trellis/tasks/09-05-zterm-cli-commands-execution/research/local-lifecycle-contracts.md","reason":"Focused source-referenced daemon/CLI contract summary; original local-daemon spec exceeds injection size. Read referenced source sections when editing their owners."}
+{"file":".trellis/spec/backend/distribution-lifecycle.md","reason":"Authenticated candidate preparation, executable activation/rollback and release verification; approved PRD replaces stopped-after-update behavior."}
+{"file":".trellis/spec/backend/session-service.md","reason":"Atomic Session creation admission, retained cleanup ownership and bounded truthful shutdown."}
+{"file":".trellis/spec/backend/effective-user-state.md","reason":"Existing setup/identity boundaries, managed state validation and test-private paths."}
+{"file":".trellis/spec/guides/evidence-driven-simplicity.md","reason":"Keep one interruption owner, focused meaningful tests, and one implement worker followed by one independent checker."}
+{"file":".trellis/tasks/09-05-zterm-cli-commands-execution/research/lifecycle-ux.md","reason":"Current public JSON consumers, ignored internal stop flag, reusable launcher/readiness and update transaction evidence."}
+{"file":".trellis/tasks/09-05-zterm-cli-commands-execution/research/additional-cli-ux.md","reason":"Selected confirmations, tables, default setup, pairing alias and session-list conveniences; logs remains one-shot with -n, no follow."}
+{"file":".trellis/tasks/09-05-zterm-cli-commands-execution/research/logging-gap-analysis.md","reason":"Existing tracing event owners, sensitive-content boundaries and bounded log reading; no extra recording or follow subsystem."}
+{"file":".trellis/spec/backend/logging-guidelines.md","reason":"Implemented logging owner/field/level contracts, one-shot bounded tail and unchanged startup rotation; verify no follow subsystem or content leakage."}
