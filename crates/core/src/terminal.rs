@@ -556,6 +556,16 @@ impl TerminalSurfaceDelta {
         baseline_revision: Revision,
         baseline: &mut TerminalSurface,
     ) -> Result<(), TerminalSurfaceError> {
+        *baseline = self.candidate(baseline_revision, baseline)?;
+        Ok(())
+    }
+
+    /// Builds one validated candidate without changing the committed baseline.
+    pub fn candidate(
+        &self,
+        baseline_revision: Revision,
+        baseline: &TerminalSurface,
+    ) -> Result<TerminalSurface, TerminalSurfaceError> {
         self.validate()?;
         if baseline_revision != self.from_revision
             || baseline.size != self.size
@@ -563,6 +573,7 @@ impl TerminalSurfaceDelta {
         {
             return Err(TerminalSurfaceError::IncompatibleBaseline);
         }
+        baseline.validate(baseline_revision)?;
         let mut candidate = baseline.clone();
         for patch in &self.row_patches {
             candidate.rows[usize::from(patch.row)] = patch.replacement.clone();
@@ -571,8 +582,7 @@ impl TerminalSurfaceDelta {
         candidate.modes = self.modes;
         candidate.scroll_metrics = self.scroll_metrics;
         candidate.validate(self.to_revision)?;
-        *baseline = candidate;
-        Ok(())
+        Ok(candidate)
     }
 }
 
@@ -1096,6 +1106,15 @@ mod tests {
         };
         assert_eq!(delta.apply_to(revision, &mut applied), Ok(()));
         assert_eq!(applied.rows[1], delta.row_patches[0].replacement);
+
+        let mut incomplete = surface.clone();
+        incomplete.rows.pop();
+        let incomplete_before = incomplete.clone();
+        assert_eq!(
+            delta.apply_to(revision, &mut incomplete),
+            Err(TerminalSurfaceError::InvalidRowCount)
+        );
+        assert_eq!(incomplete, incomplete_before);
 
         let before = applied.clone();
         let mut malformed = delta.clone();

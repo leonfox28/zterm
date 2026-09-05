@@ -34,7 +34,12 @@ TerminalSurfaceDelta::apply_to(
     &self,
     current_revision: Revision,
     surface: &mut TerminalSurface,
-) -> Result<Revision, TerminalSurfaceError>
+) -> Result<(), TerminalSurfaceError>
+TerminalSurfaceDelta::candidate(
+    &self,
+    baseline_revision: Revision,
+    baseline: &TerminalSurface,
+) -> Result<TerminalSurface, TerminalSurfaceError>
 TerminalSurfaceHistoryWindowFrame::validate_for(
     &self,
     query: TerminalHistoryWindowQuery,
@@ -119,6 +124,12 @@ the generated Rust module are exactly `proto/zterm/v2`, `zterm.v2`, and `v2`.
   and applies transactionally. Callers install the candidate only after the
   complete delta validates; a mismatch retains the last complete surface and
   requests resynchronization.
+- `candidate` owns the single validated candidate construction. `apply_to`
+  delegates and assigns once on success; a presenter obtains the candidate
+  directly and commits only after output succeeds. Validate the public
+  baseline before indexing its rows, returning a typed shape error for an
+  incomplete baseline. Never clone the complete UI surface before calling
+  the transactional `apply_to`, which would clone it again.
 - History-window requests contain an immutable epoch/revision/extent/viewport
   anchor, absolute target, and bounded margins. `response_shape` is the single
   authority for disposition, translated target, signed first row, and exact row
@@ -189,6 +200,7 @@ the generated Rust module are exactly `proto/zterm/v2`, `zterm.v2`, and `v2`.
 | frame prefix is malformed/non-canonical, body truncated, kind unknown, or wire major not 2 | connection-local protocol error; listener remains healthy |
 | frame exceeds 8 MiB or control payload exceeds 1 MiB | reject before concrete-message allocation/dispatch |
 | semantic surface has invalid size/row count/cell text/wide pair/cursor/metrics | reject transactionally; retain previous complete surface |
+| delta baseline has fewer rows than its advertised height | `InvalidRowCount`; no indexing panic and no partial assignment |
 | semantic delta does not advance exact baseline or has duplicate/out-of-range patches | reject; request full sync and do not partially apply |
 | history query has invalid anchor/size/target/margins | reject before Session/model/cache mutation |
 | history Frame contradicts its query, exceeds 240 rows, or has invalid semantic rows | reject before cache/presentation; retain prior complete window |
@@ -219,6 +231,8 @@ the generated Rust module are exactly `proto/zterm/v2`, `zterm.v2`, and `v2`.
   clipboard empty/NUL/exact-cap/over-cap and redacted Debug, all keyboard flag
   combinations/unknown bits, range direction/wide/combining/blank/wrap/cap
   extraction, and renderer-neutral cache/slice-identity transitions.
+- An incomplete public delta baseline returns `InvalidRowCount` and remains
+  unchanged; candidate/flush-failure UI tests retain the last committed surface.
 - Proto tests cover v2 round trip, unknown fields/kinds, major mismatch,
   non-canonical/malformed varints, truncated bodies, both size limits, exact
   kind registry including 322, semantic Unicode/wide/style rows, request-bound
@@ -238,6 +252,9 @@ the generated Rust module are exactly `proto/zterm/v2`, `zterm.v2`, and `v2`.
 ### Wrong
 
 ```rust
+let mut candidate = surface.clone();
+delta.apply_to(revision, &mut candidate)?; // a second complete candidate copy
+
 if peer_capabilities.contains(LEGACY_VIEWPORT) {
     send_kind_315(action).await?;
 } else {
@@ -250,6 +267,10 @@ viewer_daemon.decode_and_rewrite_session(inner_bytes)?;
 ### Correct
 
 ```rust
+let candidate = delta.candidate(revision, &surface)?;
+present(&candidate)?;
+surface = candidate;
+
 let query = cache.set_target(target).request;
 if let Some(query) = query {
     save_query_then_send_kind_317(query).await?;

@@ -30,9 +30,8 @@ impl AttachmentSurface {
         if self.revision != delta.from_revision {
             return Ok(None);
         }
-        let mut surface = self.surface.clone();
-        delta
-            .apply_to(self.revision, &mut surface)
+        let surface = delta
+            .candidate(self.revision, &self.surface)
             .map_err(|_| semantic_surface_error("semantic terminal delta is incompatible"))?;
         Ok(Some(Self {
             revision: delta.to_revision,

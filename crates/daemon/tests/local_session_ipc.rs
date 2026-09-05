@@ -128,12 +128,15 @@ async fn unary_mutations_and_duplex_reconnect_share_one_live_registry() -> Resul
     .await
     .map_err(session_fixture::display)?;
     assert_eq!(reattached.session_id(), session_id);
+    let initial = reattached
+        .take_initial_snapshot()
+        .expect("initial snapshot");
     assert!(initial_snapshot_contains(
-        reattached.initial_snapshot(),
+        &initial,
         b"SOCKET-RECONNECT-MARKER"
     ));
 
-    synchronize(&mut reattached)
+    synchronize_from(&mut reattached, initial.revision)
         .await
         .map_err(|error| format!("reattachment synchronization failed: {error}"))?;
     reattached
@@ -492,8 +495,9 @@ async fn blocked_pty_input_does_not_stall_the_socket_runtime_or_an_unrelated_ses
         LocalAttachmentClient::connect_main(state.paths.socket(), Some(TerminalSize::new(24, 80)))
             .await
             .map_err(session_fixture::display)?;
-    let ready_in_initial = initial_snapshot_contains(blocked.initial_snapshot(), b"BLOCK-READY");
-    synchronize(&mut blocked).await?;
+    let initial = blocked.take_initial_snapshot().expect("initial snapshot");
+    let ready_in_initial = initial_snapshot_contains(&initial, b"BLOCK-READY");
+    synchronize_from(&mut blocked, initial.revision).await?;
     if !ready_in_initial {
         blocked
             .request_sync(Revision::ZERO)
@@ -900,7 +904,17 @@ fn shell_path() -> Result<PathBuf, String> {
 }
 
 async fn synchronize(client: &mut LocalAttachmentClient) -> Result<(), String> {
-    let mut revision = client.initial_snapshot().revision;
+    let revision = client
+        .take_initial_snapshot()
+        .expect("initial snapshot")
+        .revision;
+    synchronize_from(client, revision).await
+}
+
+async fn synchronize_from(
+    client: &mut LocalAttachmentClient,
+    mut revision: Revision,
+) -> Result<(), String> {
     loop {
         client
             .snapshot_applied(revision)

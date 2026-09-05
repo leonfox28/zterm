@@ -54,12 +54,16 @@ LocalRuntime::attach(
 LocalRuntime::reset_identity(&self, expected_device_id: Option<DeviceId>, force: bool)
     -> Result<IdentityResetResult, DaemonError>
 
-LocalAttachmentClient::connect_resolved(socket, target, selector, create_main, takeover, viewport)
-    -> Result<LocalAttachmentClient, DaemonError>
-LocalAttachmentClient::set_remote_daemon_restarter(
+SessionClient::connect_resolved(socket, target, selector, create_main, takeover, viewport)
+    -> Result<SessionClient, DaemonError>
+SessionClient::set_remote_daemon_restarter(
     &mut self,
     restarter: Arc<dyn RemoteDaemonRestarter>,
 )
+SessionClient::take_initial_snapshot(&mut self) -> Option<TerminalSurfaceSnapshot>
+SessionClient::begin_takeover(&mut self) -> Result<LocalTakeoverRetryToken, DaemonError>
+PreparedTerminalView::new(client: SessionClient, takeover: bool, target: TerminalViewTarget)
+    -> Result<PreparedTerminalView, DaemonError>
 RemoteDaemonRestarter::ensure_running(&self) -> Future<Result<(), DaemonError>>
 
 RemoteSessionService::serve_tunnel(stream, first, limits, deadline)
@@ -123,6 +127,14 @@ For a remote view, the frontend first sends
 per-frontend IPC socket, then carries unchanged Session bytes in bounded
 `Data` envelopes. `Path`, `HalfClose`, and `Closed` are local-only
 sideband envelopes and are never valid on the normal Iroh Session stream.
+
+The implementation boundary is `zterm_daemon::client`: `transport` owns Direct/
+Tunnel bytes and epoch disposal; `session::SessionClient` owns the one attachment
+interpreter, correlation and resume; `view` owns typed commands/events and the
+bounded driver; `ipc` owns unary clients. `local_ipc` owns the server listener and
+ingress, and retains existing low-level client re-exports only. `operations`
+owns command use cases and lifecycle; CLI view code imports `client::view`.
+No new crate, background owner, or second Session interpreter is introduced.
 
 ## 3. Contracts
 
@@ -519,6 +531,35 @@ sideband envelopes and are never valid on the normal Iroh Session stream.
   authoritative event, one content-free normalized closure is returned. Raw OS
   or `terminal attachment driver closed` text is never user-visible, and no
   command is replayed.
+- Frontend control submission creates one absolute five-second deadline covering
+  bounded-channel admission, dequeue and transport I/O. Expired or abandoned
+  queued commands cannot write. The UI retains its existing two-second detach
+  wait; normal idle event reads have no control timeout. History remains an
+  asynchronous correlated response and never blocks the command owner.
+- Initial attach and each reconnect attempt share one establishment deadline
+  across Open, attach write and initial response. Initial metadata and unrelated
+  frames collected while waiting for a lease are bounded to eight entries;
+  deferred frame payload plus bounded path metadata may not exceed 8 MiB.
+  Overflow returns `resource_exhausted` and discards the epoch, without silently
+  skipping a delta. Takeover lease acquisition, write and its pending correlated
+  response share one five-second deadline. A silent lease expires definitively;
+  an unanswered sent takeover is `operation_outcome_unknown` and is not replayed.
+- A write future temporarily owns its transport epoch. Timeout or cancellation
+  drops that socket, preventing any later write from following a partial frame.
+  A write-half closure may retain only the existing 100 ms typed-outcome read
+  drain; the Session client rejects every subsequent write on that epoch.
+  Remote recovery creates a fresh epoch and preserves existing non-replay rules.
+- Prepared view construction takes the initial snapshot exactly once. Running
+  clients retain identity, applied revision and size, with no obsolete initial
+  screen. Semantic protobuf snapshot/delta/history conversions consume their
+  messages directly after decoding; they do not deep-clone before conversion.
+- `TerminalUiSession` owns the live UI fields and transport/event transitions.
+  `run` funnels both loop outcomes and propagated handler errors through the
+  single `finish_terminal_view` cleanup. Repeated prefix/viewport operations
+  and transport transitions call owner methods. The delta handler captures its
+  entry sync decision before candidate presentation or resize; semantic surface,
+  pinned history and the presenter's last committed physical frame remain
+  distinct state owners with their existing successful-flush commit contracts.
 - The frontend Session client owns its bounded correlated lease, takeover, and
   history state. Epoch loss completes a sent takeover as
   `operation_outcome_unknown` and a pending history query as one Gap; neither
@@ -581,7 +622,7 @@ sideband envelopes and are never valid on the normal Iroh Session stream.
   launcher or from a `#[tokio::test]`.
 - Local session and terminal calls use the single transport-independent
   `SessionService`; they never pair, resolve an alias, bind Iroh, or self-dial.
-  `LocalAttachmentClient` is library-internal, but each instance executes in
+  `SessionClient` is library-internal, but each instance executes in
   the frontend process below the public raw-terminal UI. It owns that
   frontend's socket, one Session decoder, route adapter, target IDs, operation
   lease, resume checkpoint, and request correlation; none are projected into
@@ -644,6 +685,11 @@ sideband envelopes and are never valid on the normal Iroh Session stream.
 | command write closure races a buffered typed lifecycle event | publish the typed event; suppress raw `Broken pipe`/OS text and do not retry the command |
 | terminal driver command sender/response owner closes after its final typed event/error entered the event queue | suppress the command-channel fallback and let the queued event win; if no event is confirmed within the same bounded window, return normalized `daemon_stopped` |
 | `create_main` request was written but no complete correlated initial result is validated | `operation_outcome_unknown`; do not claim the default Session was absent or retry under a new identity |
+| control command expires during queue admission / before dequeue | `deadline_exceeded`; no write from the expired command |
+| peer never reads input / lease peer remains silent | bounded control failure; release the current epoch |
+| waiting lease receives more than eight deferred frames/paths or over 8 MiB payload | `resource_exhausted`; close the epoch, never discard deltas and continue |
+| sent takeover has no correlated outcome before its deadline | `operation_outcome_unknown`; no new-lease retry |
+| write future is cancelled after a partial frame | socket ownership drops with the future; next command cannot reuse it |
 | existing-session initial attach receives states but no snapshot before its total deadline | `deadline_exceeded`; close only that view |
 | post-active frozen-session attach receives `session_occupied` while the old host reader is half-open | close the rejected epoch, remain reconnecting, drain/drop input and coalesce viewport for 250 ms, then retry the same SessionId without `create_main` |
 | first-ever attach receives `session_occupied` | flush the typed terminal error and close the local view; do not retry |
@@ -790,7 +836,7 @@ sideband envelopes and are never valid on the normal Iroh Session stream.
   available until ownership is released. `terminal_recovery` proves
   resynchronization and that an invalid attachment kind does not poison other
   sessions or the listener.
-- `local_ipc` additionally proves a dropped mutation response is retried once
+- `client::ipc` additionally proves a dropped mutation response is retried once
   with byte-identical request bytes and one server execution, and that a typed
   outcome-unknown response is not retried and rotates the lease only on the
   next independent mutation. It also proves a remote mutation outer envelope
@@ -802,7 +848,7 @@ sideband envelopes and are never valid on the normal Iroh Session stream.
   then accepts a truthful stop retry.
 - `remote_tunnel` tests prove opaque queued Data forwarding, one-way
   half-close, terminal close reason, malformed-stream isolation, and sibling
-  liveness. `local_ipc` adapter tests prove split inner frames, multiple inner
+  liveness. `client::session` adapter tests prove split inner frames, multiple inner
   frames in one chunk, immediate Path delivery, zero-byte rejection, incomplete
   inner EOF, and Data-after-half-close rejection.
   `direct_and_tunnel_adapters_share_one_session_trace_and_command_interpreter`
@@ -888,6 +934,15 @@ sideband envelopes and are never valid on the normal Iroh Session stream.
   bounded reap, and panic cleanup. Stress it sequentially and concurrently,
   then assert no fixture daemon is orphaned. No diagnostic may contain
   terminal/cwd bytes.
+
+Client boundary regressions additionally assert silent lease expiry, ordinary idle
+read survival, deferred frame count/byte bounds, tunnel path bounds, partial-write
+timeout and cancellation disposal, sent-takeover ambiguity, queue admission
+expiry, and a write using only the remaining queue budget. Initial-state fixtures
+transfer their snapshot once and retain its revision for later acknowledgement.
+Existing route parity, close correlation, clipboard and history tests move with
+their owning client modules; platform/runtime coverage must not be inferred from
+module extraction alone.
 
 ## 7. Wrong vs Correct
 

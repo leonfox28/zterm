@@ -1,0 +1,30 @@
+{
+  "id": "zterm-architecture-review",
+  "name": "zterm-architecture-review",
+  "title": "重新审视 zterm 架构与实现简洁性",
+  "description": "基于代码、架构契约和测试证据审查 zterm 的模块边界、状态所有权、性能热点与冗余，形成可执行的简化方案；全程单代理。",
+  "status": "completed",
+  "dev_type": null,
+  "scope": "architecture",
+  "package": null,
+  "priority": "P2",
+  "creator": "leon",
+  "assignee": "leon",
+  "createdAt": "2026-09-05",
+  "completedAt": "2026-09-05",
+  "branch": "fix-zterm-herdr-not-synchronized-attachment-snapshot",
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": "0c21738",
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {
+    "execution_policy": "{\"owner\":\"main-session\",\"subagents\":false,\"reason\":\"explicit user instruction\"}",
+    "quality_gate": "passed: just check; Herdr black-box; 507 passed, 6 ignored",
+    "next_step": "3.5: approved work commit complete; archive and journal, then authorized release flow"
+  }
+}

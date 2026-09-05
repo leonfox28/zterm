@@ -76,6 +76,10 @@ blocking PtyReader
   returns `None`, while a behind checkpoint returns one merged semantic delta
   or resync. Session next/final update paths must use `sync_changed` so a
   snapshot acknowledgement cannot create an `ack -> resync -> ack` loop.
+- Both synchronization APIs call `TerminalModel::capture` once under the model
+  lock and retain its returned checkpoint. The exact-equal `sync_changed`
+  branch still returns before any projection. No second checkpoint capture or
+  shared screen cache is needed.
 - At startup the driver consumes `PtySession` into three owner-only parts: one
   reader, one `PtyIo` writer/master, and independent `PtyChild` control. A PTY
   write/flush or resize may hold only the I/O mutex; it cannot prevent the

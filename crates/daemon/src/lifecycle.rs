@@ -15,8 +15,8 @@ use zterm_platform::user_state::UserPaths;
 #[cfg(unix)]
 use zterm_platform::user_state::{FileLock, validate_regular_file};
 
+use crate::client::LocalClient;
 use crate::error::DaemonError;
-use crate::local_ipc::LocalClient;
 use crate::service::DaemonReadiness;
 #[cfg(unix)]
 use crate::service::DaemonService;

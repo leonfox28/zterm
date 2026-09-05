@@ -6,7 +6,7 @@ use zterm_core::terminal::{
     ActiveScreen, TerminalCell, TerminalModes, TerminalScrollMetrics, TerminalSize, TerminalStyle,
     TerminalSurface,
 };
-use zterm_daemon::operations::TerminalViewTransportState;
+use zterm_daemon::client::view::TerminalViewTransportState;
 
 use super::{CliError, StatusRenderer, ViewportController};
 

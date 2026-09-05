@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 11
+- **Total Sessions**: 12
 - **Last Active**: 2026-09-05
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~281 | Active |
+| `journal-1.md` | ~303 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 12 | 2026-09-05 | Simplify terminal architecture and bound client control | `0c21738` | `fix-zterm-herdr-not-synchronized-attachment-snapshot` |
 | 11 | 2026-09-05 | Unify local and remote terminal attachments | `4328e2e`, `c343146` | `fix-zterm-herdr-not-synchronized-attachment-snapshot` |
 | 10 | 2026-09-04 | Harden release preparation | `367a7f9` | `fix/release-prepare-reliability` |
 | 9 | 2026-09-01 | Update Trellis to 0.6.16 | `b91b942` | `main` |
