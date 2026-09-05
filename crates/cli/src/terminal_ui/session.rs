@@ -451,6 +451,7 @@ impl TerminalUiSession {
         stdin: &impl AsFd,
         event: TerminalViewEvent,
     ) -> Result<Option<TerminalCompletion>, CliError> {
+        let resume_barrier = matches!(&event, TerminalViewEvent::ResumeDelta(_));
         match event {
             TerminalViewEvent::TransportState(state) => {
                 if should_defer_active_for_paste(state, &self.viewport, &self.input_codec) {
@@ -495,27 +496,18 @@ impl TerminalUiSession {
                     )?;
                     self.transport_state = TerminalViewTransportState::Synchronizing;
                 }
-                self.viewport
-                    .observe_snapshot(snapshot.surface.scroll_metrics);
-                let layout = ChromeLayout::new(
-                    self.physical_size,
-                    self.viewport
-                        .effective_screen(snapshot.surface.active_screen),
-                );
-                self.viewport.set_layout(layout);
-                let _ = self
-                    .resize_coalescer
-                    .observe(layout.child, self.transport_state);
-                let history_refill = self.viewport.refetch_history_window();
-                let rendered = install_snapshot_stdout(
+                install_snapshot_stdout(
                     &mut self.surface,
                     &mut self.presenter,
                     &snapshot,
-                    &self.viewport,
+                    &mut self.viewport,
                     &self.status_renderer,
                     self.transport_state,
-                );
-                rendered?;
+                )?;
+                let _ = self
+                    .resize_coalescer
+                    .observe(self.viewport.content_size(), self.transport_state);
+                let history_refill = self.viewport.refetch_history_window();
                 self.viewport.observe_presentation();
                 self.viewport_pacer.mark_presented(Instant::now());
                 self.prefix.clear_pending();
@@ -528,14 +520,11 @@ impl TerminalUiSession {
                     return Err(error.into());
                 }
             }
-            TerminalViewEvent::Delta(delta) => {
-                // A delta may itself change Main/Alternate layout and submit a
-                // resize below. That resize starts a *new* snapshot epoch, so the
-                // old delta is an activation barrier only when this view was already
-                // synchronizing as the event entered the handler.
-                let acknowledges_existing_sync =
-                    delta_acknowledges_existing_sync(self.transport_state);
-                let rendered_live = self.viewport.is_live();
+            TerminalViewEvent::Delta(delta) | TerminalViewEvent::ResumeDelta(delta) => {
+                // Only the correlated reconnect response is an ACK barrier. A
+                // queued ordinary delta may cross any resize/sync transition.
+                let rendered_live = self.viewport.is_live()
+                    || (resume_barrier && self.viewport.is_resume_pending());
                 if rendered_live {
                     self.viewport_pacer.cancel();
                 }
@@ -547,6 +536,7 @@ impl TerminalUiSession {
                     &mut self.selection,
                     &self.status_renderer,
                     self.transport_state,
+                    resume_barrier,
                 );
                 match delta_result {
                     Ok(DeltaRender::Applied) => {
@@ -572,11 +562,8 @@ impl TerminalUiSession {
                                 &mut self.viewport_pacer,
                             );
                         }
-                        if acknowledges_existing_sync
-                            && let Err(error) =
-                                self.writer.snapshot_applied(delta.to_revision).await
-                        {
-                            return Err(error.into());
+                        if resume_barrier {
+                            self.writer.snapshot_applied(delta.to_revision).await?;
                         }
                     }
                     Ok(DeltaRender::Gap) => {
@@ -741,7 +728,6 @@ impl TerminalUiSession {
             &self.viewport,
             &self.status_renderer,
             next,
-            resume_input.is_some(),
         )? {
             self.viewport.observe_presentation();
             self.viewport_pacer.mark_presented(Instant::now());
@@ -757,4 +743,10 @@ impl TerminalUiSession {
         self.transport_state = next;
         Ok(())
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    include!("session_tests.rs");
 }

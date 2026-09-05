@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 12
+- **Total Sessions**: 13
 - **Last Active**: 2026-09-05
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~303 | Active |
+| `journal-1.md` | ~339 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 13 | 2026-09-05 | Fix shared terminal synchronization and return-to-live presentation | `1573745` | `fix/terminal-sync-scroll` |
 | 12 | 2026-09-05 | Simplify terminal architecture and bound client control | `0c21738` | `fix-zterm-herdr-not-synchronized-attachment-snapshot` |
 | 11 | 2026-09-05 | Unify local and remote terminal attachments | `4328e2e`, `c343146` | `fix-zterm-herdr-not-synchronized-attachment-snapshot` |
 | 10 | 2026-09-04 | Harden release preparation | `367a7f9` | `fix/release-prepare-reliability` |

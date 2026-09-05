@@ -330,13 +330,17 @@ No new crate, background owner, or second Session interpreter is introduced.
   resize-state, and in-flight-snapshot ordering. The multiprocess PTY fixture
   uses the production `run_terminal` entry and bounded idempotent shell probes;
   it must not add renderer markers or test branches to the product loop.
-- Snapshot acknowledgement uses the transport state captured when a semantic
-  delta enters the UI handler. An entry-`Active` delta may change
-  Main/Alternate geometry and start a new resize synchronization epoch, but it
-  must not acknowledge itself as that epoch's replacement state. A contiguous
-  delta that entered while already `Synchronizing` is presented first and
-  then acknowledges its exact `to_revision`. Target Session validation remains
-  strict; route metadata and application identity never enter this decision.
+- Snapshot ACK authority belongs to the update's origin, never to the UI's
+  current or entry transport state. `SessionClient` emits
+  `LocalAttachmentEvent::ResumeDelta(TerminalSurfaceDelta)` only for the correlated
+  reconnect response contiguous with its advertised applied revision. The view
+  driver preserves it as `TerminalViewEvent::ResumeDelta`; ordinary streamed
+  updates remain `Delta` even across queued resize/sync/Active transitions.
+  Full snapshots and explicit resume deltas ACK their exact revision once after
+  successful application/presentation. Ordinary deltas only advance the applied
+  revision. `Synchronizing` still fences input and coalesces resize; it grants no
+  ACK authority. No wire-format change, server tolerance, route/application
+  branch, retry, or delay participates in this distinction.
 - The raw-terminal UI distinguishes physical size from child size: every local
   and remote view reserves the physical bottom row when rows are at least two;
   a one-row view gives its only row to the child. Before both initial attach and
@@ -454,8 +458,9 @@ No new crate, background owner, or second Session interpreter is introduced.
   authoritative replacement snapshot atomically paints live content,
   offset-zero scrollbar, status row, capture, and cursor state; the following
   `Active` event still completes the input fence, buffered-input forwarding,
-  and pending-resize state, but does not repaint an already-complete visual
-  result. A true `Reconnecting` transition is the connection-observation epoch
+  and pending-resize state. It passes the desired frame to `DesktopPresenter`,
+  which skips actual equality and presents any changed cursor/modes/chrome;
+  resume completion alone must never suppress that comparison. A true `Reconnecting` transition is the connection-observation epoch
   boundary: clear path/RTT before any replacement-stream synchronization and
   show unknown until a new validated status observation arrives.
 - The only history path is a client-owned
@@ -485,8 +490,11 @@ No new crate, background owner, or second Session interpreter is introduced.
   outer DEC-2026 transaction succeeds. When a painted history view enters
   `ResumePending`, it snapshots that baseline rather than the cache target. A
   `SyncRequired` chrome repair continues to use those metrics; after the
-  authoritative replacement snapshot is observed, that same atomic snapshot
-  transaction uses the new valid live metrics at offset zero. It must never
+  authoritative replacement snapshot is presented, that same atomic snapshot
+  transaction explicitly uses `compose_live_candidate` with the new live cells
+  and offset-zero metrics while the viewport remains `ResumePending` for input.
+  `install_snapshot_with_writer` commits surface, layout and snapshot readiness
+  only after successful write/flush; pinned History stays pinned. It must never
   render an unseen target or empty gutter between those two complete states. A
   resize clears retained metrics whose `viewport_rows` no longer match, and a
   true reconnect clears both live and retained metrics because the new stream
@@ -646,7 +654,8 @@ No new crate, background owner, or second Session interpreter is introduced.
 | replacement remote tunnel cannot open because the viewer daemon stopped | lifecycle-singleflight `ensure` the same configured viewer daemon, then retry with the frozen SessionId/ResumeViewId/revision/viewport; surface launch failure; local views never auto-restart |
 | initial or replacement snapshot acknowledgement loses its tunnel write | remain Reconnecting/Synchronizing; never emit Active for the dead epoch |
 | entry-Active delta changes Main/Alternate geometry and submits resize | present it and enter Synchronizing, but do not acknowledge the old delta as the new resize epoch |
-| contiguous delta entered while already Synchronizing | present it, record its exact `to_revision` as applied, acknowledge that revision, then process any later coalesced resize |
+| ordinary delta consumed while Synchronizing (including snapshot -> Active -> deferred resize) | apply and record `to_revision`; never send snapshot ACK |
+| correlated ResumeDelta | present the valid contiguous candidate, mark resume presentation ready, ACK exact `to_revision` once; Active completes the input fence |
 | request deadline expires before dispatch | `deadline_exceeded`, no effect begins |
 | request times out after actor start | drop only waiter; accepted effect completes into replay state |
 | ambiguous same-UID loss on a local-target mutation | retry once with identical bytes/ID/deadline |
@@ -883,10 +892,14 @@ No new crate, background owner, or second Session interpreter is introduced.
   resize refill, request/Changed/Gap frame retention, and exact-once input
   across Live/History/ResumePending/background sync. They must trace the full
   `History -> ResumePending -> SyncRequired -> Snapshot -> Active` sequence and
-  assert every emitted chrome frame: the pre-snapshot frame retains the last
+  assert actual child cells before any subsequent input/output, as well as
+  every emitted chrome frame: the pre-snapshot frame retains the last
   painted thumb, the snapshot frame contains validated offset-zero chrome in
   the same DEC-2026 transaction, and the Active transition does not repair a
-  blank intermediate or emit an unchanged repaint. For remote views, the same
+  blank intermediate or emit an unchanged repaint. It must still restore a
+  hidden live cursor. Snapshot write/flush failure leaves the surface, layout,
+  metrics and retained input uncommitted. The real outer-PTY scroll test must
+  return to live and compare all child cells; frame counts alone are insufficient. For remote views, the same
   regression asserts the exact transaction count and requires every emitted
   in-epoch frame to contain the stable path/RTT status row. A separate true-
   reconnect regression resets that observation and proves it cannot reappear
@@ -959,6 +972,8 @@ service.dispatch(request);                   // may block Tokio inline
 remove_file(socket_path)?;                   // pathname may be replaced
 
 if process_name == "herdr" { forward_wheel() } // application heuristic
+if state == Synchronizing { snapshot_applied(delta.to_revision).await?; } // lost origin
+if resumed_from_snapshot { return Ok(false); } // suppresses necessary presentation
 
 clear_screen_and_show_loading();
 send_history_window_without_saving_query(query).await?;
@@ -967,6 +982,17 @@ send_history_window_without_saving_query(query).await?;
 ### Correct
 
 ```rust
+// Correlation is retained through the typed boundary.
+match event {
+    TerminalViewEvent::Delta(delta) => apply_and_record(delta)?,
+    TerminalViewEvent::ResumeDelta(delta) => {
+        apply_and_present(delta)?;
+        writer.snapshot_applied(delta.to_revision).await?;
+    }
+    // Full snapshots also ACK only after their candidate presentation commits.
+    _ => { /* existing event handling */ }
+}
+
 // The frontend owns one Session client regardless of route.
 let transport = match target.route {
     Local => SessionTransport::Direct(open_ipc()?),

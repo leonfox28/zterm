@@ -129,3 +129,16 @@ For non-trivial bugs, the active task's `prd.md` or research note must preserve:
 
 Future implementers and reviewers must reload that record. Chat history alone is
 not an acceptable source of the task's architectural goal.
+
+## Queued events and apparent route differences
+
+- Preserve event meaning at the owner that has request correlation. A consumer's
+  current state cannot reconstruct whether a queued update was a synchronization
+  barrier when it was produced.
+- Compare the actual failing workflow and versions before attributing different
+  local/remote outcomes to transport. An unrecorded successful run does not prove
+  route correctness or a particular latency cause.
+- Test the real consumer's emitted commands and committed cells. A test of the
+  same state predicate, an adapter-only TUI smoke, or a frame count can all pass
+  while the owning UI contract remains broken. See
+  [Local Daemon and IPC](../backend/local-daemon-ipc.md).

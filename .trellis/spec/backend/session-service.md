@@ -131,6 +131,11 @@ they must not duplicate registry, replay, session-reservation, or controller log
 - A fresh attach or pending takeover must acknowledge its first full semantic
   snapshot at the exact revision before input or contiguous history-window
   operations.
+  ACK while not Awaiting remains `not_synchronized`. An ordinary streamed
+  delta is never an ACK barrier: a queued stale delta ACK can first cause a
+  replacement snapshot while Awaiting, then make the duplicate exact ACK fail
+  after activation. Fix the client update-origin contract rather than relaxing
+  this target authority.
   A mismatch discards the checkpoint and returns a latest snapshot; input is
   not queued by the Session. Resize is replaceable controller state and retains
   its existing broader allowance while an Active-target snapshot is in flight.
@@ -140,7 +145,7 @@ they must not duplicate registry, replay, session-reservation, or controller log
   `ever_active` fence handles the duplex ordering race without admitting a
   fresh attachment, pending takeover, stale generation, or different
   controller. Contiguous live deltas may arrive before an activation barrier;
-  adapters advance the acknowledged revision through that chain, while a gap
+  adapters advance the successfully applied revision through that chain, while a gap
   requests a fresh authoritative sync and never silently activates it.
 - A contiguous history-window request is controller-only and passes one fully
   validated anchor/target/margin query through the same initial-versus-

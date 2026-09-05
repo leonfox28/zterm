@@ -301,3 +301,39 @@ Completed the single-agent architecture review and implementation: separated Ses
 ### Status
 
 [OK] **Completed**
+
+
+## Session 13: Fix shared terminal synchronization and return-to-live presentation
+<!-- trellis-session: v=2 fp=a044cd65746d58d3 -->
+
+**Date**: 2026-09-05
+**Task**: Fix shared terminal synchronization and return-to-live presentation
+**Branch**: `fix/terminal-sync-scroll`
+
+### Summary
+
+Preserved explicit resume delta ACK authority across the shared client/view/UI boundary and made return-to-live snapshot presentation atomic. Native quality gate and real local/remote Herdr validation passed. User approved commit and v0.1.17 publication; proceeding through normal protected PR/CI/release flow.
+
+### Main Changes
+
+- Ordinary deltas never acquire snapshot ACK semantics from UI synchronization state.
+- Resume snapshots commit live cells, layout and readiness after successful flush; Active compares actual desired frames.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `1573745` | fix: preserve terminal sync barriers and live presentation |
+
+### Testing
+
+- [OK] Final just check and Herdr blackbox PASS; local persistent Herdr 3/3 and actual paired dev primed-server smoke passed.
+- [OK] Restoring either old defect makes its maintained regression fail.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- Merge the fix PR, prepare v0.1.17, require exact green main CI, approve normal protected signing and verify immutable native plus relay publication.

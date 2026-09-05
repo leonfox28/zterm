@@ -1,0 +1,42 @@
+{
+  "id": "fix-terminal-sync-scroll",
+  "name": "fix-terminal-sync-scroll",
+  "title": "修复共享终端同步确认与滚回底部呈现",
+  "description": "修复 v0.1.16 共享同步确认契约和滚回最新位置的呈现缺陷；保持单代理执行。",
+  "status": "completed",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P1",
+  "creator": "leon",
+  "assignee": "leon",
+  "createdAt": "2026-09-05",
+  "completedAt": "2026-09-05",
+  "branch": "fix/terminal-sync-scroll",
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [
+    "crates/daemon/src/client/session.rs",
+    "crates/daemon/src/client/view.rs",
+    "crates/daemon/tests/local_session_ipc.rs",
+    "crates/cli/src/terminal_ui.rs",
+    "crates/cli/src/terminal_ui/session.rs",
+    "crates/cli/src/terminal_ui/session_tests.rs",
+    "crates/cli/tests/daemon_autospawn.rs"
+  ],
+  "notes": "",
+  "meta": {
+    "execution_policy": "{\"owner\":\"main-session\",\"subagents\":false,\"reason\":\"explicit user instruction\"}",
+    "next_step": "3.4: commit approved fix; archive/journal, then normal PR and v0.1.17 release workflow",
+    "baseline": "v0.1.16 / 13600e67952e2c448dcf0f1241609e2366c03b58",
+    "evidence": "Unchanged-library local persistent Herdr fails 3/3; unchanged-library actual dev route also reports NotSynchronized at 40x140; observed local/remote traces prove ordinary-delta ACK -> stale ACK replacement -> duplicate snapshot ACK cascade; monolithic control shows safe event order; R2 four-case stale presentation probe retained. No product edits.",
+    "implementation_approval": "User: 好 按你说的改吧；fix common root cause, no local/remote symptom patches.",
+    "validation": "Final just check exit 0; Herdr blackbox PASS; local persistent Herdr 3/3 and actual dev primed-server smoke successful; remote test close ambiguity resolved by read-only absence check. See validation.md.",
+    "commit_release_approval": "2026-09-05 user: 提交，走发布流程吧。 Authorizes reviewed work commit, normal PR/CI/merge, next patch release, protected signing approval and publication; no subagents."
+  }
+}

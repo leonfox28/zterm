@@ -17,7 +17,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 #[cfg(unix)]
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 
@@ -699,6 +699,8 @@ async fn run_local_terminal_child(
     let reader_presentation_count = Arc::clone(&presentation_count);
     let clipboard_count = Arc::new(AtomicUsize::new(0));
     let reader_clipboard_count = Arc::clone(&clipboard_count);
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let reader_captured = Arc::clone(&captured);
     let reader = std::thread::spawn(move || {
         let mut master = master;
         let mut bytes = Vec::new();
@@ -708,6 +710,10 @@ async fn run_local_terminal_child(
                 Ok(0) => break,
                 Ok(read) => {
                     bytes.extend_from_slice(&buffer[..read]);
+                    reader_captured
+                        .lock()
+                        .expect("outer presentation fixture succeeds")
+                        .extend_from_slice(&buffer[..read]);
                     let begin_count = bytes
                         .windows(TERMINAL_SYNC_BEGIN.len())
                         .filter(|window| *window == TERMINAL_SYNC_BEGIN)
@@ -772,6 +778,11 @@ async fn run_local_terminal_child(
     );
     let quiescent_revision = wait_for_terminal_quiescence(runtime, &presentation_count, mode).await;
     if mode == "scroll" {
+        let live_rows = project_outer_child_rows(
+            &captured
+                .lock()
+                .expect("outer presentation fixture succeeds"),
+        );
         let presentation_baseline = presentation_count.load(Ordering::Acquire);
         let history_revision = quiescent_revision;
         let scroll_deadline = std::time::Instant::now() + TERMINAL_TEST_TIMEOUT;
@@ -801,6 +812,34 @@ async fn run_local_terminal_child(
             current_controller_revision(runtime).await,
             history_revision,
             "host-owned history scrolling must not forward the wheel to or mutate the child PTY"
+        );
+        let history_rows = project_outer_child_rows(
+            &captured
+                .lock()
+                .expect("outer presentation fixture succeeds"),
+        );
+        assert_ne!(
+            history_rows, live_rows,
+            "wheel-up must actually display history cells"
+        );
+        let before_resume = presentation_count.load(Ordering::Acquire);
+        master_writer
+            .write_all(&b"\x1b[<65;10;10M".repeat(32))
+            .expect("wheel back to latest");
+        wait_for_presentation_after(
+            &presentation_count,
+            before_resume,
+            "return to live did not present",
+        );
+        wait_for_terminal_quiescence(runtime, &presentation_count, "scroll-resume").await;
+        assert_eq!(
+            project_outer_child_rows(
+                &captured
+                    .lock()
+                    .expect("outer presentation fixture succeeds")
+            ),
+            live_rows,
+            "return-to-live must restore every child cell before any click, input or new child output"
         );
     } else if mode == "copy" {
         let selection_revision = quiescent_revision;
@@ -1255,4 +1294,75 @@ fn assert_terminal_attributes_restored(
     assert_eq!(actual.control_chars, expected.control_chars);
     assert_eq!(cfgetispeed(&actual), cfgetispeed(&expected));
     assert_eq!(cfgetospeed(&actual), cfgetospeed(&expected));
+}
+
+// Reuse the product's sole terminal model through a disposable SessionService.
+// The outer ANSI is replayed verbatim by a PTY child; no test ANSI interpreter or
+// direct CLI -> terminal-engine dependency is introduced.
+#[cfg(unix)]
+fn project_outer_child_rows(bytes: &[u8]) -> Vec<Vec<zterm_core::terminal::TerminalCell>> {
+    use zterm_core::{AttachmentId, DeviceId, DomainErrorKind, ResourceLimits};
+    use zterm_daemon::error::DaemonError;
+    use zterm_daemon::session::SessionService;
+    use zterm_platform::pty::{ExplicitPtyCommand, PtyHost, PtySize};
+
+    let temporary = tempfile::tempdir().expect("outer frame fixture");
+    let transcript = temporary.path().join("frame.ansi");
+    std::fs::write(&transcript, bytes).expect("retain exact outer output");
+    let cwd = temporary.path().to_path_buf();
+    let sessions = SessionService::with_spawner(
+        DeviceId::from_array([0x42; 32]),
+        ResourceLimits::default(),
+        move |size, _| {
+            let command = ExplicitPtyCommand::new("/bin/sh", &cwd)
+                .arg("-c")
+                .arg(r#"cat "$1"; printf '\033[24;75HSYNCED'; read -r hold"#)
+                .arg("outer-frame")
+                .arg(&transcript);
+            let pty = PtyHost::new()
+                .spawn(command, PtySize::new(size.rows, size.columns))
+                .map_err(|error| {
+                    DaemonError::new(DomainErrorKind::InvalidWorkingDirectory, error.to_string())
+                })?;
+            Ok((pty, cwd.clone()))
+        },
+    );
+    let principal = sessions.local_principal(AttachmentId::from_array([0x43; 16]));
+    let prepared = sessions
+        .prepare_attach(
+            principal,
+            None,
+            true,
+            false,
+            Some(TerminalSize::new(24, 80)),
+        )
+        .expect("outer presentation fixture succeeds");
+    let deadline = std::time::Instant::now() + TERMINAL_TEST_TIMEOUT;
+    let rows = loop {
+        let snapshot = prepared
+            .attachment
+            .sync_latest(Revision::ZERO)
+            .expect("outer presentation fixture succeeds");
+        let status: String = snapshot.surface.rows[23]
+            .cells
+            .iter()
+            .map(|cell| cell.contents.as_str())
+            .collect();
+        if status.ends_with("SYNCED") {
+            break snapshot.surface.rows[..23]
+                .iter()
+                .map(|row| row.cells[..79].to_vec())
+                .collect();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "outer frame replay did not finish"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    drop(prepared);
+    sessions
+        .shutdown()
+        .expect("outer presentation fixture succeeds");
+    rows
 }
