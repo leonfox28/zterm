@@ -19,9 +19,9 @@ pub(super) struct ChromeLayout {
 }
 
 impl ChromeLayout {
-    pub(super) fn new(physical: TerminalSize, remote: bool, screen: ActiveScreen) -> Self {
+    pub(super) fn new(physical: TerminalSize, screen: ActiveScreen) -> Self {
         let limits = ResourceLimits::default();
-        let status_row = (remote && physical.rows > 1).then_some(physical.rows);
+        let status_row = (physical.rows > 1).then(|| physical.rows - 1);
         let status_rows = u16::from(status_row.is_some());
         let usable_rows = physical
             .rows
@@ -29,8 +29,10 @@ impl ChromeLayout {
             .min(limits.max_viewport_rows)
             .max(1);
         let usable_columns = physical.columns.min(limits.max_viewport_columns).max(1);
-        let gutter_column =
-            (screen == ActiveScreen::Main && usable_columns > 4).then_some(usable_columns);
+        let gutter_column = (physical.rows > 1
+            && screen == ActiveScreen::Main
+            && usable_columns > 4)
+            .then_some(usable_columns);
         let child_columns = usable_columns.saturating_sub(u16::from(gutter_column.is_some()));
         Self {
             child: TerminalSize::new(usable_rows, child_columns.max(1)),

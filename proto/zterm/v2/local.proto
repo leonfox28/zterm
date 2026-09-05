@@ -3,6 +3,7 @@ syntax = "proto3";
 package zterm.v2;
 
 import "zterm/v2/common.proto";
+import "zterm/v2/terminal.proto";
 
 message LocalReadinessRequest {}
 
@@ -83,4 +84,44 @@ message LocalTargetResolveResponse { TargetSelector target = 1; }
 message LocalSessionUnaryRequest {
   DeviceId target_device_id = 1;
   bytes frame = 2;
+}
+
+// Same-UID-only request for one opaque authenticated Session service stream.
+// The Unix socket itself identifies the tunnel; there is no multiplexing or
+// caller-selected ALPN/purpose inside this envelope.
+message LocalSessionTunnelOpenRequest {
+  uint32 protocol_version = 1;
+  DeviceId target_device_id = 2;
+}
+
+// Emitted only after exact-target validation, connection demand, remote
+// authorization, and service-stream admission have all succeeded.
+message LocalSessionTunnelOpened {
+  uint32 protocol_version = 1;
+}
+
+// Opaque target Session bytes. Chunk boundaries have no Session meaning.
+message LocalSessionTunnelData { bytes bytes = 1; }
+
+// Address-free path sideband for this exact service-stream epoch.
+message LocalSessionTunnelPath {
+  TerminalConnectionPath path = 1;
+  optional uint32 rtt_ms = 2;
+}
+
+// The sender will write no further Data frames in this direction.
+message LocalSessionTunnelHalfClose {}
+
+enum LocalSessionTunnelCloseReason {
+  LOCAL_SESSION_TUNNEL_CLOSE_REASON_UNSPECIFIED = 0;
+  LOCAL_SESSION_TUNNEL_CLOSE_REASON_REMOTE_EOF = 1;
+  LOCAL_SESSION_TUNNEL_CLOSE_REASON_TRANSPORT_LOST = 2;
+  LOCAL_SESSION_TUNNEL_CLOSE_REASON_DAEMON_STOPPING = 3;
+  LOCAL_SESSION_TUNNEL_CLOSE_REASON_PROTOCOL_ERROR = 4;
+}
+
+// One content-free terminal outcome for this tunnel epoch. Target-generated
+// Session errors remain opaque Data and are never translated into this type.
+message LocalSessionTunnelClosed {
+  LocalSessionTunnelCloseReason reason = 1;
 }

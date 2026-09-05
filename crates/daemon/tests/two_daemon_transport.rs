@@ -7,7 +7,9 @@
 
 use std::time::{Duration, Instant};
 
-use zterm_core::{AuthorizationStatus, TransportLimits};
+use zterm_core::{AuthorizationStatus, DomainErrorKind, TransportLimits};
+use zterm_daemon::connection_broker::{AuthenticatedBiStream, StreamPurpose};
+use zterm_proto::{FrameDecoder, WireKind, encode_message, v2};
 
 #[path = "support/two_daemon_fixture.rs"]
 mod two_daemon_fixture;
@@ -147,6 +149,36 @@ async fn two_daemon_owners_reuse_endpoint_for_pair_and_normal_confirmation() {
     assert_eq!(a.broker().observe().snapshot().primary_connection_count, 1);
     assert_eq!(b.broker().observe().snapshot().primary_connection_count, 1);
 
+    let mut first_service = first
+        .open_bi(StreamPurpose::Service, normal_deadline)
+        .await
+        .expect("open first service stream on the promoted primary");
+    let mut second_service = reused
+        .open_bi(StreamPurpose::Service, normal_deadline)
+        .await
+        .expect("open second service stream on the same promoted primary");
+    assert_eq!(first_service.candidate(), first_primary);
+    assert_eq!(second_service.candidate(), first_primary);
+    let two_streams = b.broker().peer_observation(a_id).await;
+    assert_eq!(two_streams.primary, Some(first_primary));
+    assert_eq!(two_streams.candidate_count, 1);
+    assert_eq!(two_streams.active_stream_count, 2);
+    assert_eq!(b.broker().observe().snapshot().primary_connection_count, 1);
+
+    complete_fallback_service_exchange(&mut first_service, 701).await;
+    drop(first_service);
+    let one_stream = b.broker().peer_observation(a_id).await;
+    assert_eq!(one_stream.primary, Some(first_primary));
+    assert_eq!(one_stream.candidate_count, 1);
+    assert_eq!(one_stream.active_stream_count, 1);
+    complete_fallback_service_exchange(&mut second_service, 702).await;
+    drop(second_service);
+    let no_streams = b.broker().peer_observation(a_id).await;
+    assert_eq!(no_streams.primary, Some(first_primary));
+    assert_eq!(no_streams.candidate_count, 1);
+    assert_eq!(no_streams.active_stream_count, 0);
+    assert_eq!(b.broker().observe().snapshot().primary_connection_count, 1);
+
     let host_auth = a.authorization_snapshot(b_id);
     assert_eq!(host_auth.status, AuthorizationStatus::Authorized);
     assert_eq!(host_auth.generation, first_confirmation.generation());
@@ -179,6 +211,46 @@ async fn two_daemon_owners_reuse_endpoint_for_pair_and_normal_confirmation() {
     drop(reused);
     b.shutdown().await;
     a.shutdown().await;
+}
+
+async fn complete_fallback_service_exchange(stream: &mut AuthenticatedBiStream, request_id: u64) {
+    let request = encode_message(
+        WireKind::SessionListRequest,
+        request_id,
+        1_000,
+        &v2::SessionListRequest {
+            target: Some(v2::TargetSelector {
+                target: Some(v2::target_selector::Target::Local(true)),
+            }),
+        },
+    )
+    .expect("encode valid service request");
+    stream
+        .send
+        .write_all(&request)
+        .await
+        .expect("write one service request");
+    stream.send.finish().expect("finish one service request");
+    let response = stream
+        .recv
+        .read_to_end(zterm_proto::MAX_FRAME_BYTES)
+        .await
+        .expect("read one service response");
+    let mut decoder = FrameDecoder::new();
+    let mut frames = decoder
+        .feed(&response)
+        .expect("decode one service response");
+    decoder
+        .finish()
+        .expect("service response ends on a complete frame");
+    assert_eq!(frames.len(), 1);
+    let frame = frames.remove(0);
+    assert_eq!(frame.kind, WireKind::ServiceErrorResponse);
+    assert_eq!(frame.request_id, request_id);
+    let error: v2::ServiceError = frame
+        .decode_message(WireKind::ServiceErrorResponse)
+        .expect("decode fallback service response");
+    assert_eq!(error.code, DomainErrorKind::ServiceNotImplemented.code());
 }
 
 fn assert_linux_before_bind() {

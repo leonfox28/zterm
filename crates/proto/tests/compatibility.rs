@@ -431,6 +431,12 @@ fn wire_kind_registry_is_unique_and_centrally_mapped() {
         WireKind::LocalTargetResolveRequest,
         WireKind::LocalTargetResolveResponse,
         WireKind::LocalSessionUnaryRequest,
+        WireKind::LocalSessionTunnelOpenRequest,
+        WireKind::LocalSessionTunnelOpened,
+        WireKind::LocalSessionTunnelData,
+        WireKind::LocalSessionTunnelPath,
+        WireKind::LocalSessionTunnelHalfClose,
+        WireKind::LocalSessionTunnelClosed,
         WireKind::PairBegin,
         WireKind::PairChallenge,
         WireKind::PairProof,
@@ -477,6 +483,8 @@ fn wire_kind_registry_is_unique_and_centrally_mapped() {
     assert_eq!(WireKind::LocalDeviceRevokeResponse as u32, 21);
     assert_eq!(WireKind::LocalTargetResolveRequest as u32, 22);
     assert_eq!(WireKind::LocalSessionUnaryRequest as u32, 24);
+    assert_eq!(WireKind::LocalSessionTunnelOpenRequest as u32, 25);
+    assert_eq!(WireKind::LocalSessionTunnelClosed as u32, 30);
     assert_eq!(WireKind::PairBegin as u32, 100);
     assert_eq!(WireKind::ConnectionWelcome as u32, 105);
     assert_eq!(WireKind::TerminalSemanticSnapshot as u32, 301);

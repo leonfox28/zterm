@@ -1,9 +1,10 @@
-//! Daemon-owned outbound Session unary forwarding.
+//! Daemon-owned outbound Session unary forwarding and opaque tunnel admission.
 //!
 //! This module is the only outbound owner of connection demand, service-stream
-//! attempts, strict response framing, and ambiguity retry classification. It
-//! forwards one caller-preencoded Session frame unchanged and never owns
-//! Session, replay, endpoint, route, or persistent-store state.
+//! attempts, strict unary response framing, and ambiguity retry classification.
+//! It also admits one opaque local tunnel onto one authenticated service stream.
+//! It never owns attachment IDs, revisions, viewports, acknowledgement, or
+//! resume state.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -14,13 +15,13 @@ use std::time::Instant;
 use prost::Message;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use zeroize::Zeroize;
-use zterm_core::{AttachmentId, DeviceId, DomainErrorKind, OperationLease, Revision, SessionName};
+use zterm_core::{DeviceId, DomainErrorKind, OperationLease, Revision, SessionName};
 use zterm_proto::{DecodedFrame, FrameDecoder, WireKind, v2};
 
 use crate::connection_broker::{ConnectionBroker, ConnectionDemand, StreamPurpose};
 use crate::device_directory::{DeviceDirectory, ResolvedSessionTarget};
 use crate::error::DaemonError;
-use crate::remote_attachment::RemoteAttachmentClient;
+use crate::remote_tunnel::{decode_tunnel_open, serve_remote_session_tunnel};
 use crate::service::protocol_error;
 use crate::session::SessionSummary;
 use crate::session_wire::{FirstFrame, SessionWireLimits};
@@ -34,7 +35,7 @@ pub(crate) struct RemoteSessionService {
     own_device_id: DeviceId,
     directory: DeviceDirectory,
     client: Option<RemoteUnaryClient>,
-    attachments: Option<RemoteAttachmentClient>,
+    tunnel_broker: Option<ConnectionBroker>,
 }
 
 impl RemoteSessionService {
@@ -53,7 +54,7 @@ impl RemoteSessionService {
                     broker: unary_broker,
                 },
             ))),
-            attachments: Some(RemoteAttachmentClient::production(broker)),
+            tunnel_broker: Some(broker),
         }
     }
 
@@ -63,7 +64,7 @@ impl RemoteSessionService {
             own_device_id,
             directory,
             client: None,
-            attachments: None,
+            tunnel_broker: None,
         }
     }
 
@@ -124,10 +125,10 @@ impl RemoteSessionService {
             .await
     }
 
-    pub(crate) async fn bridge_attachment<Stream>(
+    /// Opens one opaque same-UID tunnel to an authenticated remote Session
+    /// service stream. Session frames and state remain owned by the caller.
+    pub(crate) async fn serve_tunnel<Stream>(
         &self,
-        target: DeviceId,
-        local_view_id: AttachmentId,
         mut stream: Stream,
         first: FirstFrame,
         limits: SessionWireLimits,
@@ -136,6 +137,15 @@ impl RemoteSessionService {
     where
         Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        let request_id = first.frame.request_id;
+        let target = match decode_tunnel_open(&first) {
+            Ok(target) => target,
+            Err(error) => {
+                write_local_attachment_error_best_effort(&mut stream, request_id, &error, deadline)
+                    .await;
+                return Err(error);
+            }
+        };
         let validation = if target == self.own_device_id {
             Err(DaemonError::new(
                 DomainErrorKind::InvalidTargetSelector,
@@ -151,32 +161,20 @@ impl RemoteSessionService {
             .await
         };
         if let Err(error) = validation {
-            write_local_attachment_error_best_effort(
-                &mut stream,
-                first.frame.request_id,
-                &error,
-                deadline,
-            )
-            .await;
+            write_local_attachment_error_best_effort(&mut stream, request_id, &error, deadline)
+                .await;
             return Err(error);
         }
-        let Some(client) = self.attachments.as_ref() else {
+        let Some(broker) = self.tunnel_broker.as_ref() else {
             let error = DaemonError::new(
                 DomainErrorKind::TransportUnavailable,
-                "remote attachment transport is unavailable in this local-only daemon",
+                "remote Session tunnel transport is unavailable in this local-only daemon",
             );
-            write_local_attachment_error_best_effort(
-                &mut stream,
-                first.frame.request_id,
-                &error,
-                deadline,
-            )
-            .await;
+            write_local_attachment_error_best_effort(&mut stream, request_id, &error, deadline)
+                .await;
             return Err(error);
         };
-        client
-            .serve(target, local_view_id, stream, first, limits, deadline)
-            .await
+        serve_remote_session_tunnel(broker, target, stream, first, limits, deadline).await
     }
 }
 
@@ -720,21 +718,13 @@ fn malformed(detail: impl Into<String>) -> DaemonError {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use std::collections::BTreeSet;
     use std::collections::{BTreeMap, VecDeque};
     use std::fs;
     use std::path::{Path, PathBuf};
-    #[cfg(unix)]
-    use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, MutexGuard};
-    #[cfg(unix)]
-    use std::task::{Context, Poll};
     use std::time::Duration;
 
-    #[cfg(unix)]
-    use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
     use tokio::sync::{mpsc, oneshot};
     use zterm_core::{
@@ -747,11 +737,6 @@ mod tests {
 
     use super::*;
     use crate::authorization::AuthorizationRegistry;
-    #[cfg(unix)]
-    use crate::remote_attachment::{
-        BoxAttachmentStream, OpenedAttachmentEpoch, RemoteAttachmentDemand,
-        RemoteAttachmentTransport,
-    };
     use crate::session::SessionService;
     use crate::session_wire::{SessionRequestContext, SessionWireLimits, SessionWireServer};
     use crate::store::{DeviceAuthorization, StateStore, StoreActor};
@@ -803,59 +788,6 @@ mod tests {
         release_retry: oneshot::Sender<()>,
     }
 
-    #[derive(Clone)]
-    #[cfg(unix)]
-    struct TaskPrivateSharedTransport {
-        server: SessionWireServer,
-        context: SessionRequestContext,
-        state: Arc<Mutex<TaskPrivateTransportState>>,
-    }
-
-    #[derive(Default)]
-    #[cfg(unix)]
-    struct TaskPrivateTransportState {
-        owned_targets: BTreeSet<DeviceId>,
-        attachment_demands: usize,
-        active_attachment_demands: usize,
-        dropped_attachment_demands: usize,
-        attachment_opens: usize,
-        unary_demands: usize,
-        dropped_unary_demands: usize,
-        unary_exchanges: usize,
-        streams: VecDeque<BoxAttachmentStream>,
-    }
-
-    #[cfg(unix)]
-    struct SharedAttachmentDemand {
-        state: Arc<Mutex<TaskPrivateTransportState>>,
-    }
-
-    #[cfg(unix)]
-    struct SharedUnaryDemand {
-        transport: TaskPrivateSharedTransport,
-    }
-
-    #[cfg(unix)]
-    struct ObservedPendingWriteStream {
-        inner: DuplexStream,
-        first_pending: Option<oneshot::Sender<()>>,
-    }
-
-    #[cfg(unix)]
-    struct AbortOnDrop<T> {
-        task: Option<tokio::task::JoinHandle<T>>,
-    }
-
-    #[cfg(unix)]
-    struct LocalBridgePeer {
-        stream: DuplexStream,
-        decoder: FrameDecoder,
-        queued: VecDeque<DecodedFrame>,
-        session_id: SessionId,
-        attachment_id: AttachmentId,
-        next_request_id: u64,
-    }
-
     impl FakeTransport {
         fn scripted(outcomes: impl IntoIterator<Item = ScriptedOutcome>) -> Self {
             Self {
@@ -871,297 +803,6 @@ mod tests {
             self.state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-        }
-    }
-
-    #[cfg(unix)]
-    impl TaskPrivateSharedTransport {
-        fn new(
-            server: SessionWireServer,
-            context: SessionRequestContext,
-            streams: impl IntoIterator<Item = BoxAttachmentStream>,
-        ) -> Self {
-            Self {
-                server,
-                context,
-                state: Arc::new(Mutex::new(TaskPrivateTransportState {
-                    streams: streams.into_iter().collect(),
-                    ..TaskPrivateTransportState::default()
-                })),
-            }
-        }
-
-        fn state(&self) -> MutexGuard<'_, TaskPrivateTransportState> {
-            self.state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-        }
-    }
-
-    #[cfg(unix)]
-    impl RemoteAttachmentTransport for TaskPrivateSharedTransport {
-        fn demand<'a>(
-            &'a self,
-            target: DeviceId,
-            _deadline: Instant,
-        ) -> BoxFuture<'a, Result<Box<dyn RemoteAttachmentDemand>, DaemonError>> {
-            Box::pin(async move {
-                let mut state = self.state();
-                state.owned_targets.insert(target);
-                state.attachment_demands += 1;
-                state.active_attachment_demands += 1;
-                drop(state);
-                Ok(Box::new(SharedAttachmentDemand {
-                    state: Arc::clone(&self.state),
-                }) as Box<dyn RemoteAttachmentDemand>)
-            })
-        }
-    }
-
-    #[cfg(unix)]
-    impl RemoteAttachmentDemand for SharedAttachmentDemand {
-        fn open<'a>(
-            &'a mut self,
-            _deadline: Instant,
-        ) -> BoxFuture<'a, Result<OpenedAttachmentEpoch, DaemonError>> {
-            let stream = {
-                let mut state = self
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                state.attachment_opens += 1;
-                state.streams.pop_front()
-            };
-            Box::pin(async move {
-                stream
-                    .map(OpenedAttachmentEpoch::unobserved)
-                    .ok_or_else(|| {
-                        DaemonError::new(
-                            DomainErrorKind::ResourceExhausted,
-                            "task-private transport fixture exhausted its bounded attachment streams",
-                        )
-                    })
-            })
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for SharedAttachmentDemand {
-        fn drop(&mut self) {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.active_attachment_demands = state.active_attachment_demands.saturating_sub(1);
-            state.dropped_attachment_demands += 1;
-        }
-    }
-
-    #[cfg(unix)]
-    impl RemoteUnaryTransport for TaskPrivateSharedTransport {
-        fn demand<'a>(
-            &'a self,
-            target: DeviceId,
-            _deadline: Instant,
-        ) -> BoxFuture<'a, Result<Box<dyn RemoteUnaryDemand>, DaemonError>> {
-            Box::pin(async move {
-                let mut state = self.state();
-                state.owned_targets.insert(target);
-                state.unary_demands += 1;
-                drop(state);
-                Ok(Box::new(SharedUnaryDemand {
-                    transport: self.clone(),
-                }) as Box<dyn RemoteUnaryDemand>)
-            })
-        }
-    }
-
-    #[cfg(unix)]
-    impl RemoteUnaryDemand for SharedUnaryDemand {
-        fn exchange<'a>(
-            &'a mut self,
-            request: &'a [u8],
-            deadline: Instant,
-        ) -> BoxFuture<'a, Result<DecodedFrame, RemoteAttemptError>> {
-            Box::pin(async move {
-                self.transport.state().unary_exchanges += 1;
-                let (response, _) = exchange_with_session_wire(
-                    &self.transport.server,
-                    &self.transport.context,
-                    request,
-                    deadline,
-                )
-                .await?;
-                Ok(response)
-            })
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for SharedUnaryDemand {
-        fn drop(&mut self) {
-            self.transport.state().dropped_unary_demands += 1;
-        }
-    }
-
-    #[cfg(unix)]
-    impl AsyncRead for ObservedPendingWriteStream {
-        fn poll_read(
-            mut self: Pin<&mut Self>,
-            context: &mut Context<'_>,
-            buffer: &mut ReadBuf<'_>,
-        ) -> Poll<std::io::Result<()>> {
-            Pin::new(&mut self.inner).poll_read(context, buffer)
-        }
-    }
-
-    #[cfg(unix)]
-    impl AsyncWrite for ObservedPendingWriteStream {
-        fn poll_write(
-            mut self: Pin<&mut Self>,
-            context: &mut Context<'_>,
-            bytes: &[u8],
-        ) -> Poll<std::io::Result<usize>> {
-            let result = Pin::new(&mut self.inner).poll_write(context, bytes);
-            if result.is_pending()
-                && let Some(first_pending) = self.first_pending.take()
-            {
-                let _ = first_pending.send(());
-            }
-            result
-        }
-
-        fn poll_flush(
-            mut self: Pin<&mut Self>,
-            context: &mut Context<'_>,
-        ) -> Poll<std::io::Result<()>> {
-            Pin::new(&mut self.inner).poll_flush(context)
-        }
-
-        fn poll_shutdown(
-            mut self: Pin<&mut Self>,
-            context: &mut Context<'_>,
-        ) -> Poll<std::io::Result<()>> {
-            Pin::new(&mut self.inner).poll_shutdown(context)
-        }
-    }
-
-    #[cfg(unix)]
-    impl<T> AbortOnDrop<T> {
-        fn new(task: tokio::task::JoinHandle<T>) -> Self {
-            Self { task: Some(task) }
-        }
-
-        fn is_finished(&self) -> bool {
-            self.task
-                .as_ref()
-                .is_none_or(tokio::task::JoinHandle::is_finished)
-        }
-
-        fn abort(&self) {
-            if let Some(task) = self.task.as_ref() {
-                task.abort();
-            }
-        }
-
-        async fn join(mut self) -> Result<T, tokio::task::JoinError> {
-            let result = self.task.as_mut().expect("guarded task exists").await;
-            self.task.take();
-            result
-        }
-    }
-
-    #[cfg(unix)]
-    impl<T> Drop for AbortOnDrop<T> {
-        fn drop(&mut self) {
-            if let Some(task) = self.task.take() {
-                task.abort();
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    impl LocalBridgePeer {
-        fn pair(session_id: SessionId, attachment_id: AttachmentId) -> (Self, DuplexStream) {
-            let (stream, bridge) = duplex(1024 * 1024);
-            (
-                Self {
-                    stream,
-                    decoder: FrameDecoder::new(),
-                    queued: VecDeque::new(),
-                    session_id,
-                    attachment_id,
-                    next_request_id: 2,
-                },
-                bridge,
-            )
-        }
-
-        async fn next_before(&mut self, deadline: Instant) -> DecodedFrame {
-            if let Some(frame) = self.queued.pop_front() {
-                return frame;
-            }
-            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
-                let mut buffer = [0_u8; 4 * 1024];
-                loop {
-                    let read = self
-                        .stream
-                        .read(&mut buffer)
-                        .await
-                        .expect("read socket-free local bridge frame");
-                    assert!(read > 0, "local bridge closed before its expected frame");
-                    self.queued.extend(
-                        self.decoder
-                            .feed(&buffer[..read])
-                            .expect("decode socket-free local bridge frame"),
-                    );
-                    if let Some(frame) = self.queued.pop_front() {
-                        return frame;
-                    }
-                }
-            })
-            .await
-            .expect("local bridge frame arrived before the absolute deadline")
-        }
-
-        async fn send_before<Message: prost::Message>(
-            &mut self,
-            kind: WireKind,
-            message: &Message,
-            deadline: Instant,
-        ) {
-            let request_id = self.next_request_id;
-            self.next_request_id = self
-                .next_request_id
-                .checked_add(1)
-                .expect("socket-free local bridge request IDs remain bounded");
-            let bytes = encode_message(kind, request_id, 0, message)
-                .expect("encode bounded socket-free local bridge frame");
-            tokio::time::timeout_at(
-                tokio::time::Instant::from_std(deadline),
-                self.stream.write_all(&bytes),
-            )
-            .await
-            .expect("local bridge write completed before the absolute deadline")
-            .expect("write socket-free local bridge frame");
-        }
-
-        async fn detach_before(&mut self, deadline: Instant) {
-            self.send_before(
-                WireKind::TerminalDetach,
-                &v2::TerminalDetach {
-                    attachment_id: Some(self.attachment_id.into()),
-                },
-                deadline,
-            )
-            .await;
-            tokio::time::timeout_at(
-                tokio::time::Instant::from_std(deadline),
-                self.stream.shutdown(),
-            )
-            .await
-            .expect("local bridge shutdown completed before the absolute deadline")
-            .expect("shutdown socket-free local bridge peer");
         }
     }
 
@@ -2151,346 +1792,6 @@ mod tests {
             .expect_err("read-only ambiguity is not projected as mutation outcome unknown");
         assert_eq!(error.kind(), DomainErrorKind::TransportUnavailable);
         assert_eq!(transport.state().requests, [request.clone(), request]);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn task_private_shared_transport_keeps_attachment_and_unary_streams_independent() {
-        let host = device(0xa1);
-        let remote = device(0xa2);
-        let accepted_generation = AuthGeneration::new(9).expect("non-zero generation");
-        let authorization = authorized_registry(remote, accepted_generation);
-        let temporary = tempfile::tempdir().expect("temporary stream-isolation fixture");
-        let spawn_count = Arc::new(AtomicUsize::new(0));
-        let sessions = counted_session_service(
-            host,
-            temporary.path().to_path_buf(),
-            Arc::clone(&spawn_count),
-        );
-        let creator = sessions.local_principal(AttachmentId::from_array([0xa3; 16]));
-        let creator_lease = sessions
-            .issue_operation_lease(creator)
-            .expect("stream-isolation creator lease");
-        let summary = sessions
-            .create(
-                creator,
-                OperationId {
-                    lease: creator_lease,
-                    sequence: 1,
-                },
-                SessionName::new("stream-isolation").expect("fixture session name"),
-                None,
-                None,
-            )
-            .expect("stream-isolation session creates");
-        assert_eq!(spawn_count.load(Ordering::Acquire), 1);
-
-        let server = SessionWireServer::new(sessions.clone());
-        let context = SessionRequestContext::RemoteAuthenticated {
-            own_device_id: host,
-            remote_device_id: remote,
-            accepted_generation,
-            authorization,
-            commit_first_poll_observer: None,
-        };
-        let deadline = Instant::now() + Duration::from_secs(5);
-
-        // This fixture models only one task-private owner and independent
-        // bounded streams. Production ConnectionBroker ownership/admission is
-        // covered by its own socket-free and Linux real-Iroh gates.
-        let (blocked_bridge, blocked_peer) = duplex(1);
-        let (first_pending, first_pending_receiver) = oneshot::channel();
-        let blocked_bridge = ObservedPendingWriteStream {
-            inner: blocked_bridge,
-            first_pending: Some(first_pending),
-        };
-        let (healthy_bridge, healthy_server_stream) = duplex(1024 * 1024);
-        let transport = Arc::new(TaskPrivateSharedTransport::new(
-            server.clone(),
-            context.clone(),
-            [
-                Box::new(blocked_bridge) as BoxAttachmentStream,
-                Box::new(healthy_bridge) as BoxAttachmentStream,
-            ],
-        ));
-        let attachment_client = RemoteAttachmentClient::with_test_transport(transport.clone());
-
-        let first_local_id = AttachmentId::from_array([0xa4; 16]);
-        let (first_local, first_local_stream) =
-            LocalBridgePeer::pair(summary.session_id, first_local_id);
-        let first_frame = existing_attachment_first_frame(host, summary.session_id, 1);
-        let first_client = attachment_client.clone();
-        let first_bridge_task = AbortOnDrop::new(tokio::spawn(async move {
-            tokio::task::unconstrained(first_client.serve(
-                host,
-                first_local_id,
-                first_local_stream,
-                first_frame,
-                SessionWireLimits::default(),
-                deadline,
-            ))
-            .await
-        }));
-        tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline),
-            first_pending_receiver,
-        )
-        .await
-        .expect("first attachment write reached its deterministic barrier")
-        .expect("first attachment write observer remained live");
-        assert!(
-            !first_bridge_task.is_finished(),
-            "a proven-pending attachment write must still own only its task and stream",
-        );
-
-        let healthy_server = server.clone();
-        let healthy_context = context.clone();
-        let healthy_server_task = AbortOnDrop::new(tokio::spawn(async move {
-            healthy_server
-                .handle_remote_stream(
-                    healthy_server_stream,
-                    healthy_context,
-                    SessionWireLimits::default(),
-                    deadline,
-                )
-                .await
-        }));
-        let second_local_id = AttachmentId::from_array([0xa5; 16]);
-        let (mut second_local, second_local_stream) =
-            LocalBridgePeer::pair(summary.session_id, second_local_id);
-        let second_frame = existing_attachment_first_frame(host, summary.session_id, 2);
-        let second_client = attachment_client;
-        let second_bridge_task = AbortOnDrop::new(tokio::spawn(async move {
-            second_client
-                .serve(
-                    host,
-                    second_local_id,
-                    second_local_stream,
-                    second_frame,
-                    SessionWireLimits::default(),
-                    deadline,
-                )
-                .await
-        }));
-
-        let unary_client = RemoteUnaryClient::new(transport.clone());
-        let unary_request = list_request(host, 3);
-        let unary_task = AbortOnDrop::new(tokio::spawn(async move {
-            unary_client
-                .execute_preencoded(host, 3, &unary_request, deadline)
-                .await
-        }));
-
-        let _second_revision = activate_bridge_before(&mut second_local, deadline).await;
-        let unary_response =
-            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), unary_task.join())
-                .await
-                .expect("unary RPC progressed while the first attachment write remained pending")
-                .expect("unary task joins")
-                .expect("unary RPC succeeds through the real Session wire server");
-        assert_eq!(unary_response.kind, WireKind::SessionListResponse);
-        let listed: v2::SessionListResponse = unary_response
-            .decode_message(WireKind::SessionListResponse)
-            .expect("decode isolated unary response");
-        assert_eq!(listed.sessions.len(), 1);
-        let listed_id: SessionId = listed.sessions[0]
-            .session_id
-            .clone()
-            .expect("listed session has an ID")
-            .try_into()
-            .expect("listed session ID is valid");
-        assert_eq!(listed_id, summary.session_id);
-        assert!(
-            !first_bridge_task.is_finished(),
-            "the stalled stream must remain isolated after peer streams complete work",
-        );
-        assert!(
-            !second_bridge_task.is_finished(),
-            "the healthy attachment remains active until its local view detaches",
-        );
-
-        {
-            let state = transport.state();
-            assert_eq!(state.owned_targets, BTreeSet::from([host]));
-            assert_eq!(state.attachment_demands, 2);
-            assert_eq!(state.active_attachment_demands, 2);
-            assert_eq!(state.dropped_attachment_demands, 0);
-            assert_eq!(state.attachment_opens, 2);
-            assert_eq!(state.unary_demands, 1);
-            assert_eq!(state.dropped_unary_demands, 1);
-            assert_eq!(state.unary_exchanges, 1);
-            assert!(state.streams.is_empty());
-        }
-
-        second_local.detach_before(deadline).await;
-
-        tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline),
-            second_bridge_task.join(),
-        )
-        .await
-        .expect("healthy attachment bridge releases before the absolute deadline")
-        .expect("healthy attachment bridge joins")
-        .expect("healthy attachment bridge exits cleanly");
-        tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline),
-            healthy_server_task.join(),
-        )
-        .await
-        .expect("healthy Session wire task releases before the absolute deadline")
-        .expect("healthy Session wire task joins")
-        .expect("healthy Session wire task exits cleanly");
-        first_bridge_task.abort();
-        let first_join = tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline),
-            first_bridge_task.join(),
-        )
-        .await
-        .expect("stalled attachment bridge releases before the absolute deadline")
-        .expect_err("stalled attachment bridge is explicitly cancelled after isolation proof");
-        assert!(first_join.is_cancelled());
-        drop(first_local);
-        drop(blocked_peer);
-
-        {
-            let state = transport.state();
-            assert_eq!(state.active_attachment_demands, 0);
-            assert_eq!(state.dropped_attachment_demands, 2);
-            assert_eq!(state.dropped_unary_demands, 1);
-            assert!(state.streams.is_empty());
-        }
-        assert_eq!(
-            Arc::strong_count(&transport),
-            1,
-            "all client, demand, and task ownership returns to the fixture owner",
-        );
-        let surviving = sessions.list().expect("Session survives stream teardown");
-        assert_eq!(surviving.len(), 1);
-        assert_eq!(surviving[0].session_id, summary.session_id);
-        sessions
-            .shutdown()
-            .expect("stream-isolation fixture shuts down");
-    }
-
-    #[cfg(unix)]
-    async fn activate_bridge_before(client: &mut LocalBridgePeer, deadline: Instant) -> Revision {
-        let mut saw_preparing = false;
-        let mut saw_synchronizing = false;
-        let snapshot_revision = loop {
-            let frame = client.next_before(deadline).await;
-            match frame.kind {
-                WireKind::TerminalTransportStateEvent => {
-                    let state: v2::TerminalTransportStateEvent = frame
-                        .decode_message(WireKind::TerminalTransportStateEvent)
-                        .expect("decode local bridge transport state");
-                    let attachment_id: AttachmentId = state
-                        .attachment_id
-                        .expect("local bridge transport state has an attachment ID")
-                        .try_into()
-                        .expect("local bridge transport attachment ID is valid");
-                    assert_eq!(attachment_id, client.attachment_id);
-                    let state = v2::TerminalTransportState::try_from(state.state)
-                        .expect("known local transport state");
-                    match state {
-                        v2::TerminalTransportState::Preparing => saw_preparing = true,
-                        v2::TerminalTransportState::Synchronizing => {
-                            assert!(saw_preparing);
-                            saw_synchronizing = true;
-                        }
-                        _ => panic!("initial bridge state advanced out of order"),
-                    }
-                }
-                WireKind::TerminalSemanticSnapshot => {
-                    let snapshot: v2::TerminalSemanticSnapshot = frame
-                        .decode_message(WireKind::TerminalSemanticSnapshot)
-                        .expect("decode authoritative local bridge snapshot");
-                    assert!(saw_preparing && saw_synchronizing);
-                    let session_id: SessionId = snapshot
-                        .session_id
-                        .expect("local bridge snapshot has a Session ID")
-                        .try_into()
-                        .expect("local bridge snapshot Session ID is valid");
-                    let attachment_id: AttachmentId = snapshot
-                        .attachment_id
-                        .expect("local bridge snapshot has an attachment ID")
-                        .try_into()
-                        .expect("local bridge snapshot attachment ID is valid");
-                    assert_eq!(session_id, client.session_id);
-                    assert_eq!(attachment_id, client.attachment_id);
-                    let revision = Revision::new(snapshot.revision);
-                    let local_attachment_id = client.attachment_id;
-                    client
-                        .send_before(
-                            WireKind::TerminalSnapshotApplied,
-                            &v2::TerminalSnapshotApplied {
-                                attachment_id: Some(local_attachment_id.into()),
-                                revision: revision.get(),
-                            },
-                            deadline,
-                        )
-                        .await;
-                    break revision;
-                }
-                _ => panic!("healthy bridge omitted its authoritative initial snapshot"),
-            }
-        };
-
-        let frame = client.next_before(deadline).await;
-        assert_eq!(frame.kind, WireKind::TerminalTransportStateEvent);
-        let state: v2::TerminalTransportStateEvent = frame
-            .decode_message(WireKind::TerminalTransportStateEvent)
-            .expect("decode local bridge activation state");
-        let attachment_id: AttachmentId = state
-            .attachment_id
-            .expect("local bridge activation state has an attachment ID")
-            .try_into()
-            .expect("local bridge activation attachment ID is valid");
-        assert_eq!(attachment_id, client.attachment_id);
-        assert_eq!(
-            v2::TerminalTransportState::try_from(state.state),
-            Ok(v2::TerminalTransportState::Active)
-        );
-        snapshot_revision
-    }
-
-    #[cfg(unix)]
-    fn existing_attachment_first_frame(
-        target: DeviceId,
-        session_id: SessionId,
-        request_id: u64,
-    ) -> FirstFrame {
-        let bytes = encode_message(
-            WireKind::TerminalAttachRequest,
-            request_id,
-            5_000,
-            &v2::TerminalAttachRequest {
-                target: Some(wire_target(target)),
-                session_id: Some(session_id.into()),
-                takeover: false,
-                session_name: String::new(),
-                create_main: false,
-                viewport: Some(v2::TerminalViewport {
-                    rows: 24,
-                    columns: 80,
-                }),
-                resume_view_id: None,
-                known_revision: None,
-            },
-        )
-        .expect("encode bounded attachment first frame");
-        let mut decoder = FrameDecoder::new();
-        let mut queued = VecDeque::from(
-            decoder
-                .feed(&bytes)
-                .expect("decode bounded attachment first frame"),
-        );
-        let frame = queued.pop_front().expect("one attachment first frame");
-        assert!(queued.is_empty());
-        FirstFrame {
-            frame,
-            decoder,
-            queued,
-        }
     }
 
     fn device(byte: u8) -> DeviceId {
