@@ -1,0 +1,9 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "Package guidelines and quality/check entry points"}
+{"file": ".trellis/spec/backend/terminal-model.md", "reason": "Sole Alacritty grid, bounded ingress/replies, semantic projection; update documented color exclusions"}
+{"file": ".trellis/spec/backend/terminal-driver.md", "reason": "Ordered model mutations, reply publication and independent PTY interruption"}
+{"file": ".trellis/spec/backend/core-wire-domain.md", "reason": "Canonical semantic DTOs, transactional frames, required color metadata and wire kind retirement"}
+{"file": ".trellis/spec/guides/evidence-driven-simplicity.md", "reason": "One owner, bounded mechanisms, focused checks and native delegation budget"}
+{"file": ".trellis/tasks/09-06-zterm-themes/research/color-protocol-contracts.md", "reason": "Authoritative supported grammar, resets, mode5, stack and capability subset"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Required verification, target-platform boundaries and regression quality"}
+{"file": ".trellis/tasks/09-06-zterm-themes/research/color-theme-capability-audit.md", "reason": "Verify C05–C18 coverage and C13 supported-sibling defect against original audit"}
+{"file": ".trellis/tasks/09-06-zterm-themes/research/implementation-context.md", "reason": "Focused large-spec/research context, final decisions and exact source sections to read without truncated injection"}

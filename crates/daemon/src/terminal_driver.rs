@@ -342,6 +342,15 @@ impl TerminalDriver {
                 .name("zterm-terminal-model".into())
                 .spawn(move || {
                     while let Some(bytes) = model_queue.pop() {
+                        let _commit = match lock(&model_shared.commit, "terminal commit") {
+                            Ok(guard) => guard,
+                            Err(error) => {
+                                model_queue.complete();
+                                model_shared.fail(error);
+                                model_queue.abort();
+                                return;
+                            }
+                        };
                         let update = match model_shared.ingest(&bytes) {
                             Ok(update) => update,
                             Err(error) => {
@@ -469,13 +478,42 @@ impl TerminalDriver {
 
     /// Resizes both the native PTY and the authoritative terminal model.
     pub fn resize(&self, size: TerminalSize) -> Result<Revision, TerminalDriverError> {
-        let mut model = lock(&self.shared.model, "terminal model")?;
-        model.preflight_resize(size)?;
+        let _commit = lock(&self.shared.commit, "terminal commit")?;
+        lock(&self.shared.model, "terminal model")?.preflight_resize(size)?;
         lock(&self.io, "PTY I/O")?.resize(PtySize::new(size.rows, size.columns))?;
-        let revision = model.resize(size)?.revision;
-        drop(model);
+        let revision = lock(&self.shared.model, "terminal model")?
+            .resize(size)?
+            .revision;
         self.shared.publish_revision(revision)?;
         Ok(revision)
+    }
+
+    /// Installs controller observations in the same reply/publication order as output.
+    /// Returns a revision only if this operation changed the base, never for
+    /// unrelated PTY output that arrived before acquiring the commit mutex.
+    pub fn update_base_colors(
+        &self,
+        base: zterm_core::terminal::TerminalColorProfile,
+    ) -> Result<Option<Revision>, TerminalDriverError> {
+        let _commit = lock(&self.shared.commit, "terminal commit")?;
+        let (update, changed) = {
+            let mut model = lock(&self.shared.model, "terminal model")?;
+            let before = model.revision();
+            let update = model.update_base_colors(base)?;
+            let changed = update.revision != before;
+            (update, changed)
+        };
+        if !update.replies.is_empty()
+            && let Err(error) = lock(&self.io, "PTY I/O")
+                .and_then(|mut io| io.write_input(&update.replies).map_err(Into::into))
+        {
+            self.shared.fail(error.clone());
+            return Err(error);
+        }
+        if changed {
+            self.shared.publish_revision(update.revision)?;
+        }
+        Ok(changed.then_some(update.revision))
     }
 
     /// Subscribes to the latest revision without retaining per-revision events.
@@ -758,6 +796,7 @@ impl Drop for TerminalAttachment {
 }
 
 struct SharedTerminal {
+    commit: Mutex<()>,
     model: Mutex<TerminalModel>,
     revision: AtomicU64,
     revision_wait: Mutex<RevisionState>,
@@ -779,6 +818,7 @@ impl SharedTerminal {
         let revision = model.revision();
         let (revision_sender, _) = watch::channel(revision);
         Self {
+            commit: Mutex::new(()),
             model: Mutex::new(model),
             revision: AtomicU64::new(revision.get()),
             revision_wait: Mutex::new(RevisionState {
@@ -1387,5 +1427,119 @@ mod tests {
                 thread::sleep(Duration::from_millis(5));
             }
         }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn color_base_commits_cannot_overtake_a_query_blocked_on_pty_io() {
+        use zterm_core::terminal::{
+            COLOR_BACKGROUND, TerminalAppearance, TerminalColorProfile, TerminalColorValue,
+        };
+        let temporary = tempfile::tempdir().expect("color ordering fixture");
+        let session = PtyHost::new().spawn(
+            ExplicitPtyCommand::new("/bin/sh",temporary.path()).arg("-c").arg("stty -echo -icanon min 1 time 0; printf 'READY'; dd bs=1 count=33 of=replies 2>/dev/null; printf 'DONE'; exec /bin/cat"),
+            PtySize::new(3,32),
+        ).expect("spawn color ordering fixture");
+        let mut model = TerminalModel::new(TerminalSize::new(3, 32), 0).expect("color model");
+        let mut base = TerminalColorProfile {
+            appearance: TerminalAppearance::Light,
+            ..Default::default()
+        };
+        base.values[COLOR_BACKGROUND] = TerminalColorValue::Rgb(80, 80, 80);
+        model
+            .update_base_colors(base.clone())
+            .expect("initial base");
+        model.ingest(b"\x1b[?2031h").expect("subscribe child");
+        let driver =
+            TerminalDriver::start(session, model, TerminalDriverConfig::default()).expect("driver");
+        let attachment = driver.attach();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let snapshot = driver.latest_snapshot().expect("ready snapshot");
+            if snapshot.surface.rows.iter().any(|row| {
+                row.cells
+                    .iter()
+                    .map(|c| c.contents.as_str())
+                    .collect::<String>()
+                    .contains("READY")
+            }) {
+                break;
+            }
+            attachment
+                .wait_for_revision_after(
+                    snapshot.revision,
+                    deadline.saturating_duration_since(Instant::now()),
+                )
+                .expect("ready output");
+        }
+        let before = driver.latest_revision();
+        let io_guard = driver.io.lock().expect("hold PTY writer gate");
+        assert!(driver.queue.push(b"\x1b]11;?\x07".to_vec()));
+        let query_revision = loop {
+            let revision = driver
+                .shared
+                .model
+                .lock()
+                .expect("model remains available during I/O")
+                .revision();
+            if revision > before {
+                break revision;
+            }
+            assert!(Instant::now() < deadline, "query never entered commit gate");
+            thread::yield_now();
+        };
+        assert!(
+            driver.shared.commit.try_lock().is_err(),
+            "query retains ordered commit ownership through I/O"
+        );
+        assert_eq!(
+            driver.latest_revision(),
+            before,
+            "unwritten replies cannot be published"
+        );
+        thread::scope(|scope| {
+            let update = scope.spawn(|| {
+                assert_eq!(
+                    driver
+                        .update_base_colors(base.clone())
+                        .expect("unchanged base"),
+                    None,
+                    "concurrent query output must not count as a base change"
+                );
+                base.values[COLOR_BACKGROUND] = TerminalColorValue::Rgb(90, 90, 90);
+                driver.update_base_colors(base).expect("ordered new base")
+            });
+            drop(io_guard);
+            let revision = update
+                .join()
+                .expect("base writer joins")
+                .expect("changed base revision");
+            assert!(revision > query_revision);
+        });
+        let expected = b"\x1b]11;rgb:5050/5050/5050\x07\x1b[?997;2n";
+        loop {
+            let snapshot = driver.latest_snapshot().expect("completion snapshot");
+            if snapshot.surface.rows.iter().any(|row| {
+                row.cells
+                    .iter()
+                    .map(|c| c.contents.as_str())
+                    .collect::<String>()
+                    .contains("DONE")
+            }) {
+                break;
+            }
+            attachment
+                .wait_for_revision_after(
+                    snapshot.revision,
+                    deadline.saturating_duration_since(Instant::now()),
+                )
+                .expect("reply capture completion");
+        }
+        assert_eq!(
+            std::fs::read(temporary.path().join("replies")).expect("captured replies"),
+            expected
+        );
+        assert!(driver.latest_revision() > query_revision);
+        drop(attachment);
+        drop(driver);
     }
 }

@@ -48,6 +48,14 @@ they must not duplicate registry, replay, session-reservation, or controller log
 
 ## 3. Contracts
 
+Initial profiles, takeover staging, per-attachment observation sequences and
+replacement snapshot ACKs follow [Terminal Colors](./terminal-colors.md).
+Create fingerprints include colors, installed before PTY spawn. Detach retains
+base/overrides/stack; reset after takeover uses the new controller base. A fresh
+takeover whose colors invalidate its prepared snapshot must wait for the new ACK
+before gaining ever-active input privilege.
+
+
 - A `SessionService` owns one in-memory ID/name registry per daemon. A session
   owns one login-shell PTY, one `TerminalDriver`, attachment checkpoints, one
   controller lease, one `zterm-terminal` authoritative model, and one

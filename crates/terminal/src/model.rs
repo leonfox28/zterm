@@ -59,6 +59,8 @@ impl TerminalCheckpoint {
 /// Errors produced at the host terminal-model boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TerminalError {
+    /// A base profile contains an invalid dynamic role.
+    InvalidColors,
     /// A viewport dimension was zero.
     InvalidSize(TerminalSize),
     /// Checked grid-size arithmetic could not represent the requested model.
@@ -77,6 +79,7 @@ pub enum TerminalError {
 impl fmt::Display for TerminalError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidColors => formatter.write_str("invalid terminal colors"),
             Self::InvalidSize(size) => write!(
                 formatter,
                 "terminal size must be non-zero, got {}x{}",
@@ -155,15 +158,46 @@ impl TerminalModel {
 
         let next_revision = self.next_revision()?;
         let mut output = UpdateCollector::new();
+        self.engine.grid_input = false;
         self.ingress.process(bytes, &mut self.engine, &mut output)?;
+        self.engine.colors.commit(next_revision);
         self.revision = next_revision;
-        self.refresh_history_epoch_after_ingest();
+        if self.engine.grid_input {
+            self.refresh_history_epoch_after_ingest();
+        }
         let (replies, events, host_effect) = output.finish();
         Ok(TerminalUpdate {
             revision: self.revision,
             replies,
             events,
             host_effect,
+        })
+    }
+
+    /// Installs observations from the authorized controller without waiting on it.
+    pub fn update_base_colors(
+        &mut self,
+        base: zterm_core::terminal::TerminalColorProfile,
+    ) -> Result<TerminalUpdate, TerminalError> {
+        if !base.is_valid() {
+            return Err(TerminalError::InvalidColors);
+        }
+        if self.engine.colors.base == base {
+            return self.ingest(&[]);
+        }
+        let next = self.next_revision()?;
+        self.engine.colors.base = base;
+        self.engine.colors.commit(next);
+        self.revision = next;
+        Ok(TerminalUpdate {
+            revision: next,
+            replies: if self.engine.colors.subscribed {
+                self.engine.colors.appearance_reply()
+            } else {
+                Vec::new()
+            },
+            events: Vec::new(),
+            host_effect: None,
         })
     }
 
@@ -259,6 +293,7 @@ impl TerminalModel {
             })
             .collect();
         let delta = TerminalSurfaceDelta {
+            colors: latest.colors.clone(),
             from_revision: checkpoint.revision,
             to_revision: self.revision,
             size: latest.size,
@@ -341,6 +376,7 @@ impl TerminalModel {
             .map(|line| project_row(&self.engine, Line(line)).to_surface_row())
             .collect();
         let frame = TerminalSurfaceHistoryWindowFrame {
+            colors: self.engine.colors.snapshot.clone(),
             disposition: shape.disposition,
             anchor: current,
             target_offset_from_bottom: shape.target_offset_from_bottom,

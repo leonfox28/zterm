@@ -1444,7 +1444,9 @@ fn project_outer_child_rows(bytes: &[u8]) -> Vec<Vec<zterm_core::terminal::Termi
         move |size, _| {
             let command = ExplicitPtyCommand::new("/bin/sh", &cwd)
                 .arg("-c")
-                .arg(r#"cat "$1"; printf '\033[24;75HSYNCED'; read -r hold"#)
+                // Replayed color/status queries receive real terminal replies.
+                // They are input to this fixture, not echoed presentation.
+                .arg(r#"stty -echo; cat "$1"; printf '\033[24;75HSYNCED'; read -r hold"#)
                 .arg("outer-frame")
                 .arg(&transcript);
             let pty = PtyHost::new()

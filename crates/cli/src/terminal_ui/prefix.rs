@@ -88,6 +88,7 @@ impl CommandMode {
     ) -> Result<Vec<PrefixAction>, CliError> {
         self.expire(now);
         match event {
+            HostInputEvent::TerminalReply { .. } => Ok(Vec::new()),
             HostInputEvent::Bytes(bytes) => self.feed(&bytes, now, report_events),
             HostInputEvent::EnhancedKey(ref key) => {
                 let action = match self.key(KeyInput::Enhanced(key), now, report_events)? {
@@ -286,6 +287,9 @@ mod tests {
                             HostInputEvent::PageUp => forwarded.extend(PAGE_UP),
                             HostInputEvent::PageDown => forwarded.extend(PAGE_DOWN),
                             HostInputEvent::Mouse(mouse) => forwarded.extend(mouse.raw),
+                            HostInputEvent::TerminalReply { .. } => {
+                                panic!("physical reply must not be routed as input")
+                            }
                         },
                     }
                 }

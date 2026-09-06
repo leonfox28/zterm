@@ -4,15 +4,16 @@ use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::vte::ansi::{Color, NamedColor};
 use zterm_core::terminal::{
-    ActiveScreen, TerminalCell, TerminalColor, TerminalCursor, TerminalKeyboardFlags,
-    TerminalModes, TerminalMouseEncoding, TerminalMouseMode, TerminalScrollMetrics, TerminalSize,
-    TerminalStyle, TerminalSurface, TerminalSurfaceRow,
+    ActiveScreen, TerminalCell, TerminalColor, TerminalColorSnapshot, TerminalCursor,
+    TerminalKeyboardFlags, TerminalModes, TerminalMouseEncoding, TerminalMouseMode,
+    TerminalScrollMetrics, TerminalSize, TerminalStyle, TerminalSurface, TerminalSurfaceRow,
+    TerminalUnderline,
 };
 
 use crate::MAX_CELL_TEXT_BYTES;
 use crate::engine::AlacrittyEngine;
 
-pub(crate) const CHECKPOINT_FORMAT_VERSION: u16 = 2;
+pub(crate) const CHECKPOINT_FORMAT_VERSION: u16 = 3;
 
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct InlineCellText {
@@ -86,6 +87,7 @@ impl ProjectedRow {
 
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct ProjectedScreen {
+    pub(crate) colors: TerminalColorSnapshot,
     pub(crate) version: u16,
     pub(crate) size: TerminalSize,
     pub(crate) active_screen: ActiveScreen,
@@ -104,6 +106,7 @@ impl ProjectedScreen {
         scroll_metrics: Option<TerminalScrollMetrics>,
     ) -> TerminalSurface {
         TerminalSurface {
+            colors: self.colors.clone(),
             size: self.size,
             active_screen: self.active_screen,
             rows: self.rows.iter().map(ProjectedRow::to_surface_row).collect(),
@@ -132,6 +135,7 @@ pub(crate) fn project(engine: &AlacrittyEngine) -> ProjectedScreen {
         .min(usize::from(size.columns).saturating_sub(1));
     ProjectedScreen {
         version: CHECKPOINT_FORMAT_VERSION,
+        colors: engine.colors.snapshot.clone(),
         size,
         active_screen: engine.active_screen(),
         rows,
@@ -184,14 +188,30 @@ fn projected_cell(cell: &Cell) -> ProjectedCell {
     }
 }
 
-fn terminal_style(cell: &Cell) -> TerminalStyle {
+pub(crate) fn terminal_style(cell: &Cell) -> TerminalStyle {
     TerminalStyle {
         foreground: terminal_color(cell.fg),
         background: terminal_color(cell.bg),
         bold: cell.flags.contains(Flags::BOLD),
         dim: cell.flags.contains(Flags::DIM),
         italic: cell.flags.contains(Flags::ITALIC),
-        underline: cell.flags.intersects(Flags::ALL_UNDERLINES),
+        underline: if cell.flags.contains(Flags::DOUBLE_UNDERLINE) {
+            TerminalUnderline::Double
+        } else if cell.flags.contains(Flags::UNDERCURL) {
+            TerminalUnderline::Curly
+        } else if cell.flags.contains(Flags::DOTTED_UNDERLINE) {
+            TerminalUnderline::Dotted
+        } else if cell.flags.contains(Flags::DASHED_UNDERLINE) {
+            TerminalUnderline::Dashed
+        } else if cell.flags.contains(Flags::UNDERLINE) {
+            TerminalUnderline::Single
+        } else {
+            TerminalUnderline::None
+        },
+        underline_color: cell
+            .underline_color()
+            .map(terminal_color)
+            .unwrap_or_default(),
         inverse: cell.flags.contains(Flags::INVERSE),
     }
 }

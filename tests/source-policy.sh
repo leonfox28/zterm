@@ -78,7 +78,7 @@ if [ -n "$legacy_terminal_presentation" ]; then
     printf '%s\n' "$legacy_terminal_presentation" >&2
     exit 1
 fi
-legacy_terminal_kinds=$(grep -nE '= (312|313|315|316|319|320|321);' proto/zterm/v2/wire.proto || true)
+legacy_terminal_kinds=$(grep -nE '= (202|300|312|313|315|316|319|320|321);' proto/zterm/v2/wire.proto || true)
 if [ -n "$legacy_terminal_kinds" ]; then
     echo "retired terminal wire kinds must stay absent from wire major 2:" >&2
     printf '%s\n' "$legacy_terminal_kinds" >&2

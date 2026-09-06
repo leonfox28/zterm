@@ -13,6 +13,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+use zterm_core::terminal::TerminalColorProfile;
 
 use iroh::SecretKey;
 use tokio::sync::watch;
@@ -145,9 +146,16 @@ pub(crate) struct RemoteResumeRequest {
     pub(crate) known_revision: Option<Revision>,
 }
 
+/// Initial model geometry and observations installed before starting a PTY.
+pub(crate) struct InitialTerminal {
+    pub(crate) viewport: Option<TerminalSize>,
+    pub(crate) colors: TerminalColorProfile,
+}
+
 /// Fully validated remote-only attachment preparation arguments.
 #[cfg(unix)]
 pub(crate) struct RemoteAttachmentRequest {
+    pub(crate) base_colors: TerminalColorProfile,
     pub(crate) selector: Option<SessionSelector>,
     pub(crate) create_main: bool,
     pub(crate) takeover: bool,
@@ -346,6 +354,22 @@ impl SessionAttachment {
         self.resize_until(size, default_deadline())
     }
 
+    pub(crate) fn update_colors_until(
+        &self,
+        sequence: u64,
+        base_colors: TerminalColorProfile,
+        deadline: Instant,
+    ) -> Result<(), DaemonError> {
+        self.actor
+            .request(deadline, |meta, reply| SessionCommand::UpdateColors {
+                meta,
+                attachment_id: self.attachment_id,
+                sequence,
+                base_colors,
+                reply,
+            })
+    }
+
     pub(crate) fn resize_until(
         &self,
         size: TerminalSize,
@@ -522,7 +546,34 @@ impl SessionService {
         viewport: Option<TerminalSize>,
         deadline: Instant,
     ) -> Result<SessionSummary, DaemonError> {
+        self.create_with_colors_until(
+            principal,
+            operation_id,
+            name,
+            working_directory,
+            crate::session::InitialTerminal {
+                viewport,
+                colors: TerminalColorProfile::default(),
+            },
+            deadline,
+        )
+    }
+
+    pub(crate) fn create_with_colors_until(
+        &self,
+        principal: AttachmentPrincipal,
+        operation_id: OperationId,
+        name: SessionName,
+        working_directory: Option<PathBuf>,
+        initial: InitialTerminal,
+        deadline: Instant,
+    ) -> Result<SessionSummary, DaemonError> {
+        let InitialTerminal {
+            viewport,
+            colors: base_colors,
+        } = initial;
         let fingerprint = OperationFingerprint::Create {
+            base_colors: base_colors.clone(),
             name: name.clone(),
             working_directory: working_directory.clone(),
             viewport,
@@ -532,7 +583,14 @@ impl SessionService {
             if name.is_main() {
                 return Err(reserved_main());
             }
-            self.create_inner(name, working_directory, viewport, false, deadline)
+            self.create_inner(
+                name,
+                working_directory,
+                viewport,
+                false,
+                deadline,
+                base_colors,
+            )
         })
     }
 
@@ -627,6 +685,32 @@ impl SessionService {
         initial_viewport: Option<TerminalSize>,
         deadline: Instant,
     ) -> Result<PreparedAttachment, DaemonError> {
+        self.prepare_attach_with_colors_until(
+            principal,
+            selector,
+            create_main,
+            takeover,
+            crate::session::InitialTerminal {
+                viewport: initial_viewport,
+                colors: TerminalColorProfile::default(),
+            },
+            deadline,
+        )
+    }
+
+    pub(crate) fn prepare_attach_with_colors_until(
+        &self,
+        principal: AttachmentPrincipal,
+        selector: Option<SessionSelector>,
+        create_main: bool,
+        takeover: bool,
+        initial: InitialTerminal,
+        deadline: Instant,
+    ) -> Result<PreparedAttachment, DaemonError> {
+        let InitialTerminal {
+            viewport: initial_viewport,
+            colors: base_colors,
+        } = initial;
         ensure_before_deadline(deadline)?;
         if let Some(size) = initial_viewport {
             validate_viewport(self.limits, size)?;
@@ -637,7 +721,7 @@ impl SessionService {
                     "default main attach must not include a selector",
                 ));
             }
-            self.default_main(initial_viewport, deadline)?
+            self.default_main(initial_viewport, deadline, base_colors.clone())?
         } else {
             let selector =
                 selector.ok_or_else(|| invalid_session("session selector is required"))?;
@@ -647,6 +731,7 @@ impl SessionService {
             meta,
             principal,
             takeover,
+            base_colors,
             resume: None,
             reply,
         })
@@ -674,7 +759,11 @@ impl SessionService {
                     "default main attach must not include a selector",
                 ));
             }
-            self.default_main(request.initial_viewport, deadline)?
+            self.default_main(
+                request.initial_viewport,
+                deadline,
+                request.base_colors.clone(),
+            )?
         } else {
             let selector = request
                 .selector
@@ -685,6 +774,7 @@ impl SessionService {
             meta,
             principal,
             takeover: request.takeover,
+            base_colors: request.base_colors,
             resume: Some(request.resume),
             reply,
         })
@@ -989,6 +1079,7 @@ impl SessionService {
         &self,
         initial_viewport: Option<TerminalSize>,
         deadline: Instant,
+        base_colors: TerminalColorProfile,
     ) -> Result<Arc<SessionActor>, DaemonError> {
         let name = SessionName::main();
         match self.inner.reserve_name(&name, true)? {
@@ -997,7 +1088,14 @@ impl SessionService {
                 creation.wait_until(deadline)?.map(|entry| entry.actor)
             }
             NameReservation::Owner(creation) => self
-                .create_reserved(name, None, initial_viewport, creation, deadline)
+                .create_reserved(
+                    name,
+                    None,
+                    initial_viewport,
+                    creation,
+                    deadline,
+                    base_colors,
+                )
                 .map(|entry| entry.actor),
         }
     }
@@ -1009,13 +1107,21 @@ impl SessionService {
         viewport: Option<TerminalSize>,
         allow_main: bool,
         deadline: Instant,
+        base_colors: TerminalColorProfile,
     ) -> Result<SessionSummary, DaemonError> {
         if name.is_main() && !allow_main {
             return Err(reserved_main());
         }
         match self.inner.reserve_name(&name, false)? {
             NameReservation::Owner(creation) => self
-                .create_reserved(name, working_directory, viewport, creation, deadline)?
+                .create_reserved(
+                    name,
+                    working_directory,
+                    viewport,
+                    creation,
+                    deadline,
+                    base_colors,
+                )?
                 .summary(),
             NameReservation::Existing(_) | NameReservation::Waiting(_) => {
                 Err(session_already_exists(&name))
@@ -1030,6 +1136,7 @@ impl SessionService {
         viewport: Option<TerminalSize>,
         creation: Arc<CreationCell>,
         deadline: Instant,
+        base_colors: TerminalColorProfile,
     ) -> Result<SessionEntry, DaemonError> {
         let mut owner = CreationOwner::new(
             Arc::clone(&self.inner),
@@ -1041,7 +1148,10 @@ impl SessionService {
             self.create_reserved_inner(
                 name,
                 working_directory,
-                viewport,
+                crate::session::InitialTerminal {
+                    viewport,
+                    colors: base_colors,
+                },
                 &creation,
                 deadline,
                 &mut owner,
@@ -1055,11 +1165,15 @@ impl SessionService {
         &self,
         name: SessionName,
         working_directory: Option<PathBuf>,
-        viewport: Option<TerminalSize>,
+        initial: InitialTerminal,
         creation: &Arc<CreationCell>,
         deadline: Instant,
         owner: &mut CreationOwner,
     ) -> Result<SessionEntry, DaemonError> {
+        let InitialTerminal {
+            viewport,
+            colors: base_colors,
+        } = initial;
         ensure_before_deadline(deadline)?;
         if creation.is_cancelled() {
             return Err(DaemonError::new(
@@ -1079,9 +1193,12 @@ impl SessionService {
             .reserve_creation_session(&name, creation, self.limits)?;
         owner.set_session_id(session_id);
 
-        let model = TerminalModel::new(size, self.limits.recent_history_rows)
+        let mut model = TerminalModel::new(size, self.limits.recent_history_rows)
             .map_err(map_terminal_error)?;
         ensure_before_deadline(deadline)?;
+        model
+            .update_base_colors(base_colors)
+            .map_err(map_terminal_error)?;
         let (session, actual_cwd) = (self.spawner)(size, working_directory.as_deref())?;
         let mut spawned = SpawnedPtyOwner::new(session);
         #[cfg(test)]
@@ -1253,6 +1370,7 @@ impl SessionService {
 #[derive(Clone, Eq, PartialEq)]
 enum OperationFingerprint {
     Create {
+        base_colors: TerminalColorProfile,
         name: SessionName,
         working_directory: Option<PathBuf>,
         viewport: Option<TerminalSize>,
@@ -1273,6 +1391,7 @@ impl fmt::Debug for OperationFingerprint {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Create {
+                base_colors: _,
                 name,
                 working_directory,
                 viewport,
@@ -2445,6 +2564,9 @@ struct SessionRuntime {
 }
 
 struct ActorAttachment {
+    base_colors: TerminalColorProfile,
+    color_sequence: u64,
+    pending_color_snapshot: Option<TerminalSurfaceSnapshot>,
     principal: AttachmentPrincipal,
     #[cfg(unix)]
     resume_view_id: Option<ResumeViewId>,
@@ -2537,7 +2659,15 @@ impl<R> CommandWaiter<R> {
 }
 
 enum SessionCommand {
+    UpdateColors {
+        meta: CommandMeta,
+        attachment_id: AttachmentId,
+        sequence: u64,
+        base_colors: TerminalColorProfile,
+        reply: SyncSender<Result<(), DaemonError>>,
+    },
     PrepareAttach {
+        base_colors: TerminalColorProfile,
         meta: CommandMeta,
         principal: AttachmentPrincipal,
         takeover: bool,
@@ -3185,13 +3315,14 @@ fn dispatch_command(
 ) {
     match command {
         SessionCommand::PrepareAttach {
+            base_colors,
             meta,
             principal,
             takeover,
             resume,
             reply,
         } => respond(actor, meta, reply, || {
-            prepare_attach(actor, runtime, principal, takeover, resume)
+            prepare_attach(actor, runtime, principal, takeover, resume, base_colors)
         }),
         #[cfg(unix)]
         SessionCommand::DetachForRemoteResume {
@@ -3258,6 +3389,32 @@ fn dispatch_command(
             reply,
         } => respond(actor, meta, reply, || {
             write_input(runtime, attachment_id, &bytes)
+        }),
+        SessionCommand::UpdateColors {
+            meta,
+            attachment_id,
+            sequence,
+            base_colors,
+            reply,
+        } => respond(actor, meta, reply, || {
+            require_resize_controller(runtime, attachment_id)?;
+            let attachment = runtime
+                .attachments
+                .get_mut(&attachment_id)
+                .ok_or_else(lease_lost)?;
+            if sequence == 0 || sequence <= attachment.color_sequence {
+                return Err(invalid_session("stale color observation sequence"));
+            }
+            runtime
+                .driver
+                .as_ref()
+                .ok_or_else(session_not_found)?
+                .update_base_colors(base_colors.clone())
+                .map_err(map_driver_error)?;
+            attachment.base_colors = base_colors;
+            attachment.color_sequence = sequence;
+            actor.update_cached(runtime, false);
+            Ok(())
         }),
         SessionCommand::Resize {
             meta,
@@ -3351,6 +3508,7 @@ fn prepare_attach(
     principal: AttachmentPrincipal,
     takeover: bool,
     resume: Option<RemoteResumeRequest>,
+    base_colors: TerminalColorProfile,
 ) -> Result<PreparedAttachment, DaemonError> {
     reap_detached(actor, runtime)?;
     #[cfg(unix)]
@@ -3380,6 +3538,15 @@ fn prepare_attach(
     }
     let attachment_id = next_attachment_id(&runtime.attachments)?;
     let driver = runtime.driver.as_ref().ok_or_else(session_not_found)?;
+    if runtime.controller.is_none() {
+        runtime
+            .next_generation
+            .checked_add(1)
+            .ok_or_else(|| resource_error("controller generation exhausted"))?;
+        driver
+            .update_base_colors(base_colors.clone())
+            .map_err(map_driver_error)?;
+    }
     let mut terminal = resumed_terminal.unwrap_or_else(|| driver.attach());
     #[cfg(unix)]
     let effect_broker = terminal.effect_broker();
@@ -3431,6 +3598,9 @@ fn prepare_attach(
     runtime.attachments.insert(
         attachment_id,
         ActorAttachment {
+            base_colors,
+            color_sequence: 0,
+            pending_color_snapshot: None,
             principal,
             #[cfg(unix)]
             resume_view_id,
@@ -3552,6 +3722,7 @@ fn snapshot_applied(
         .attachments
         .get_mut(&attachment_id)
         .ok_or_else(lease_lost)?;
+    attachment.pending_color_snapshot = None;
     let AttachmentSync::Awaiting {
         revision: expected,
         target,
@@ -3604,6 +3775,9 @@ fn next_update(
         .attachments
         .get_mut(&attachment_id)
         .ok_or_else(lease_lost)?;
+    if let Some(snapshot) = attachment.pending_color_snapshot.take() {
+        return Ok(Some(AttachmentUpdate::Snapshot(snapshot)));
+    }
     let target = match attachment.sync {
         AttachmentSync::Active { generation } => SyncTarget::Active { generation },
         AttachmentSync::PreparedTakeover => SyncTarget::PreparedTakeover,
@@ -3673,6 +3847,7 @@ fn sync_latest(
         .attachments
         .get_mut(&attachment_id)
         .ok_or_else(lease_lost)?;
+    attachment.pending_color_snapshot = None;
     let target = match attachment.sync {
         AttachmentSync::Active { generation } => SyncTarget::Active { generation },
         AttachmentSync::PreparedTakeover => SyncTarget::PreparedTakeover,
@@ -3798,6 +3973,17 @@ fn takeover(
         .checked_add(1)
         .ok_or_else(|| resource_error("controller generation exhausted"))?;
     let generation = runtime.next_generation;
+    let base = runtime
+        .attachments
+        .get(&attachment_id)
+        .ok_or_else(lease_lost)?
+        .base_colors
+        .clone();
+    let driver = runtime.driver.as_ref().ok_or_else(session_not_found)?;
+    let colors_changed = driver
+        .update_base_colors(base)
+        .map_err(map_driver_error)?
+        .is_some();
     let old_lifecycle = if let Some(old) = runtime.controller
         && old.attachment_id != attachment_id
         && let Some(mut attachment) = runtime.attachments.remove(&old.attachment_id)
@@ -3816,6 +4002,7 @@ fn takeover(
         .attachments
         .get_mut(&attachment_id)
         .ok_or_else(lease_lost)?;
+    let previously_active = attachment.ever_active;
     let active_lifecycle = match attachment.sync {
         AttachmentSync::PreparedTakeover => {
             attachment.sync = AttachmentSync::Active { generation };
@@ -3833,6 +4020,24 @@ fn takeover(
             None
         }
         _ => unreachable!("takeover readiness was validated above"),
+    };
+    let active_lifecycle = if colors_changed {
+        attachment.ever_active = previously_active;
+        attachment.terminal.discard_checkpoint();
+        let snapshot = full_sync(&mut attachment.terminal)?;
+        attachment.sync = AttachmentSync::Awaiting {
+            revision: snapshot.revision,
+            target: SyncTarget::Active { generation },
+        };
+        attachment
+            .lifecycle
+            .send_replace(AttachmentLifecycle::AwaitingSnapshot {
+                revision: snapshot.revision,
+            });
+        attachment.pending_color_snapshot = Some(snapshot);
+        None
+    } else {
+        active_lifecycle
     };
     reconcile_effect_target(runtime)?;
     if let Some(lifecycle) = old_lifecycle {
@@ -4201,6 +4406,11 @@ fn outcome_unknown() -> DaemonError {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    mod color_tests {
+        include!("session_color_tests.rs");
+    }
+
     use super::*;
 
     #[cfg(unix)]
@@ -4235,6 +4445,8 @@ mod tests {
             viewport: TerminalSize::new(47, 163),
         };
         let fingerprint = OperationFingerprint::Create {
+            base_colors: Default::default(),
+
             name: summary.name.clone(),
             working_directory: Some(PathBuf::from(cwd_sentinel)),
             viewport: Some(summary.viewport),
@@ -4254,6 +4466,8 @@ mod tests {
         assert_ne!(
             fingerprint,
             OperationFingerprint::Create {
+                base_colors: Default::default(),
+
                 name: summary.name.clone(),
                 working_directory: Some(PathBuf::from("/private/tmp/a-different-cwd")),
                 viewport: Some(summary.viewport),
@@ -4698,6 +4912,8 @@ mod tests {
         };
         let view_id = ResumeViewId::from_array([0x83; 16]);
         let request = |known_revision| RemoteAttachmentRequest {
+            base_colors: Default::default(),
+
             selector: Some(SessionSelector::Id(summary.session_id)),
             create_main: false,
             takeover: false,
@@ -4870,6 +5086,8 @@ mod tests {
         };
         let view_id = ResumeViewId::from_array([0xa3; 16]);
         let request = |known_revision| RemoteAttachmentRequest {
+            base_colors: Default::default(),
+
             selector: Some(SessionSelector::Id(summary.session_id)),
             create_main: false,
             takeover: false,

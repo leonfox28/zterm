@@ -1834,6 +1834,8 @@ mod tests {
             request_id,
             1_000,
             &v2::SessionCreateRequest {
+                base_colors: Some(zterm_core::terminal::TerminalColorProfile::default().into()),
+
                 operation_id: Some(
                     OperationId {
                         lease: OperationLease {
@@ -1864,6 +1866,8 @@ mod tests {
             request_id,
             5_000,
             &v2::SessionCreateRequest {
+                base_colors: Some(zterm_core::terminal::TerminalColorProfile::default().into()),
+
                 operation_id: Some(operation_id.into()),
                 target: Some(wire_target(target)),
                 name: name.to_owned(),

@@ -340,7 +340,7 @@ fn embedded_controls_do_not_obscure_filtered_sequence_identity() {
 }
 
 #[test]
-fn underline_color_filter_uses_sgr_parameters_without_blocking_rgb_components() {
+fn underline_color_and_ordinary_rgb_components_are_supported() {
     let mut ordinary_rgb = TerminalModel::new(TerminalSize::new(2, 16), 0).expect("RGB model");
     let rgb_update = ordinary_rgb
         .ingest(b"\x1b[38;2;58;59;60mRGB")
@@ -361,12 +361,13 @@ fn underline_color_filter_uses_sgr_parameters_without_blocking_rgb_components() 
     let mut underline = TerminalModel::new(TerminalSize::new(2, 16), 0).expect("underline model");
     let underline_update = underline
         .ingest(b"\x1b[058;5;1mcontained")
-        .expect("leading-zero underline color is contained");
+        .expect("leading-zero underline color is supported");
+    assert!(underline_update.events.is_empty());
     assert_eq!(
-        underline_update.events,
-        vec![TerminalSideEvent::UnsupportedSequence(
-            UnsupportedSequenceKind::Csi,
-        )]
+        underline.snapshot().surface.rows[0].cells[0]
+            .style
+            .underline_color,
+        TerminalColor::Indexed(1)
     );
 }
 

@@ -29,10 +29,9 @@ impl ChromeLayout {
             .min(limits.max_viewport_rows)
             .max(1);
         let usable_columns = physical.columns.min(limits.max_viewport_columns).max(1);
-        let gutter_column = (physical.rows > 1
-            && screen == ActiveScreen::Main
-            && usable_columns > 4)
-            .then_some(usable_columns);
+        let gutter_column =
+            (physical.rows > 1 && screen == ActiveScreen::Main && usable_columns > 4)
+                .then_some(usable_columns);
         let child_columns = usable_columns.saturating_sub(u16::from(gutter_column.is_some()));
         Self {
             child: TerminalSize::new(usable_rows, child_columns.max(1)),
@@ -91,12 +90,7 @@ impl ScrollbarGeometry {
             .min(self.thumb_len.saturating_sub(1))
     }
 
-    pub(super) fn offset_for_pointer(
-        self,
-        row: u16,
-        grab_row: u16,
-        maximum_offset: u64,
-    ) -> u64 {
+    pub(super) fn offset_for_pointer(self, row: u16, grab_row: u16, maximum_offset: u64) -> u64 {
         if maximum_offset == 0 {
             return 0;
         }
@@ -113,9 +107,8 @@ impl ScrollbarGeometry {
             .saturating_mul(maximum)
             .saturating_add(u128::from(travel) / 2)
             / u128::from(travel);
-        maximum_offset.saturating_sub(
-            u64::try_from(newer_distance.min(maximum)).unwrap_or(maximum_offset),
-        )
+        maximum_offset
+            .saturating_sub(u64::try_from(newer_distance.min(maximum)).unwrap_or(maximum_offset))
     }
 }
 
@@ -142,6 +135,7 @@ pub(super) struct ComposedFrame {
     pub(super) rows: BTreeMap<u16, Vec<TerminalCell>>,
     pub(super) cursor: ComposedCursor,
     pub(super) modes: TerminalModes,
+    pub(super) colors: zterm_core::terminal::TerminalColorSnapshot,
 }
 
 impl ComposedFrame {
@@ -152,14 +146,7 @@ impl ComposedFrame {
         status: &StatusRenderer,
         transport_state: TerminalViewTransportState,
     ) -> Result<Self, CliError> {
-        Self::compose_inner(
-            surface,
-            previous,
-            viewport,
-            None,
-            status,
-            transport_state,
-        )
+        Self::compose_inner(surface, previous, viewport, None, status, transport_state)
     }
 
     pub(super) fn compose_live_candidate(
@@ -315,6 +302,7 @@ impl ComposedFrame {
             rows,
             cursor,
             modes: surface.modes,
+            colors: surface.colors.clone(),
         })
     }
 }

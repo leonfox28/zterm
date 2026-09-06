@@ -65,7 +65,9 @@ followed by a request carrying one exact `OperationId`.
 The terminal wire registry is canonical and non-negotiated:
 
 ```text
-300 TerminalAttachRequest
+209 SessionCreateRequest
+323 TerminalAttachRequest
+324 TerminalBaseColors                     controller observation
 301 TerminalSemanticSnapshot              content
 302 TerminalSemanticDelta                 content
 303 TerminalInput
@@ -108,6 +110,12 @@ the generated Rust module are exactly `proto/zterm/v2`, `zterm.v2`, and `v2`.
 
 ### Semantic terminal domain
 
+Color observations and snapshots follow [Terminal Colors](./terminal-colors.md):
+262 required values, 262 bounded inherited sources, valid enums/RGB/Dynamic
+roles, monotonic color stamps on Revision, explicit cursor provenance, and
+underline shape/color. Missing metadata is invalid, never an old-client default.
+
+
 - `zterm-core::terminal` owns size, screen, cell/style/cursor/modes, side
   events, exact `TerminalSurface`, revision-bound snapshot, full-row semantic
   delta patches, scroll metrics, history-window query/result, and redacted
@@ -133,7 +141,7 @@ the generated Rust module are exactly `proto/zterm/v2`, `zterm.v2`, and `v2`.
 - History-window requests contain an immutable epoch/revision/extent/viewport
   anchor, absolute target, and bounded margins. `response_shape` is the single
   authority for disposition, translated target, signed first row, and exact row
-  count. A Frame contains semantic rows only; Changed/Gap are content-free and
+  count. A Frame contains semantic rows and required colors; Changed/Gap are content-free and
   report `epoch <= revision` with `revision >= query.anchor.revision`.
 - `ViewportCache<TerminalSurfaceRow>` is renderer-neutral and contains no ANSI,
   async runtime, mouse pixels, platform type, or terminal parser. It retains one
@@ -158,7 +166,7 @@ the generated Rust module are exactly `proto/zterm/v2`, `zterm.v2`, and `v2`.
   Capabilities retains unknown bits, but no bit 17/19/20/21 presentation
   negotiation or fallback exists; `TERMINAL_SERVICE` is the only terminal
   service capability.
-- Kinds 312/313, 315/316, and 319/320/321 are retired and must not appear in the
+- Kinds 202/300, 312/313, 315/316, and 319/320/321 are retired and must not appear in the
   v2 registry. Kind 318 means only semantic history-window response; kind 322
   means only the structured transient clipboard write.
 - `proto/zterm/v2/*.proto` is the only compiled wire source. There is no v1

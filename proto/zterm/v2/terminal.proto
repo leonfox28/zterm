@@ -14,6 +14,7 @@ message TerminalAttachRequest {
   ResumeViewId resume_view_id = 7;
   optional uint64 known_revision = 8;
   reserved 9;
+  TerminalColorProfile base_colors = 10;
 }
 
 enum TerminalActiveScreen {
@@ -163,8 +164,9 @@ message TerminalStyle {
   bool bold = 3;
   bool dim = 4;
   bool italic = 5;
-  bool underline = 6;
+  uint32 underline = 6;
   bool inverse = 7;
+  TerminalColor underline_color = 8;
 }
 
 message TerminalCell {
@@ -187,6 +189,7 @@ message TerminalCursor {
 }
 
 message TerminalSurface {
+  TerminalColorSnapshot colors = 8;
   uint32 row_count = 1;
   uint32 column_count = 2;
   TerminalActiveScreen active_screen = 3;
@@ -209,6 +212,7 @@ message TerminalSemanticRowPatch {
 }
 
 message TerminalSemanticDelta {
+  TerminalColorSnapshot colors = 11;
   AttachmentId attachment_id = 1;
   uint64 from_revision = 2;
   uint64 to_revision = 3;
@@ -222,6 +226,7 @@ message TerminalSemanticDelta {
 }
 
 message TerminalSemanticHistoryWindowFrame {
+  TerminalColorSnapshot colors = 10;
   AttachmentId attachment_id = 1;
   TerminalHistoryWindowOutcome outcome = 2;
   TerminalViewportDisposition disposition = 3;
@@ -245,4 +250,27 @@ message TerminalConnectionStatusEvent {
   AttachmentId attachment_id = 1;
   TerminalConnectionPath path = 2;
   optional uint32 rtt_ms = 3;
+}
+
+message TerminalColorObservation {
+  oneof value {
+    bool unknown = 1;
+    TerminalRgbColor rgb = 2;
+    bool dynamic = 3;
+  }
+}
+message TerminalColorProfile {
+  repeated TerminalColorObservation values = 1;
+  uint32 appearance = 2;
+}
+message TerminalColorSnapshot {
+  TerminalColorProfile profile = 1;
+  uint64 changed_at = 2;
+  bool reverse = 3;
+  bool custom_cursor = 4; repeated uint32 inherited_sources = 5;
+}
+message TerminalBaseColors {
+  AttachmentId attachment_id = 1;
+  TerminalColorProfile profile = 2;
+  uint64 sequence = 3;
 }

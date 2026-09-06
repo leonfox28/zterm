@@ -91,6 +91,8 @@ async fn queued_delta_resize_case(trigger: ResizeTrigger) {
     let pty = openpty(None, None).expect("synchronization fixture operation succeeds");
     let input_epoch = InputEpoch::new();
     let mut ui = TerminalUiSession {
+        host_colors: Default::default(),
+
         session_id,
         events,
         writer,
@@ -144,6 +146,8 @@ async fn queued_delta_resize_case(trigger: ResizeTrigger) {
             // Here the real target supplies an Awaiting revision and the UI must
             // apply, present and ACK the explicit delta barrier, releasing resume.
             let delta = TerminalSurfaceDelta {
+                colors: Default::default(),
+
                 from_revision: ui.surface.revision(),
                 to_revision: snapshot.revision,
                 size: snapshot.surface.size,

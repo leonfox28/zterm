@@ -862,6 +862,8 @@ fn session_create_bytes(
         request_id,
         5_000,
         &v2::SessionCreateRequest {
+            base_colors: Some(zterm_core::terminal::TerminalColorProfile::default().into()),
+
             operation_id: Some(operation_id),
             target: Some(v2::TargetSelector {
                 target: Some(v2::target_selector::Target::Local(true)),

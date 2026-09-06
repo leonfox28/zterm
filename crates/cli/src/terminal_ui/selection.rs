@@ -66,10 +66,7 @@ impl SelectionPresentation {
         }
     }
 
-    pub(super) fn copy_ready_for(
-        self,
-        source: Option<SelectionSourceIdentity>,
-    ) -> bool {
+    pub(super) fn copy_ready_for(self, source: Option<SelectionSourceIdentity>) -> bool {
         source.is_some() && self.source == source && self.copy_ready
     }
 
@@ -165,10 +162,32 @@ impl SelectionController {
         };
     }
 
+    /// Safe only after the caller has compared the complete semantic rows and geometry.
+    pub(super) fn rebase_live_revision(&mut self, revision: Revision) {
+        match &mut self.state {
+            SelectionState::Dragging {
+                source:
+                    SelectionSourceIdentity::Live {
+                        revision: current, ..
+                    },
+                ..
+            }
+            | SelectionState::Finalized {
+                source:
+                    SelectionSourceIdentity::Live {
+                        revision: current, ..
+                    },
+                ..
+            } => *current = revision,
+            _ => {}
+        }
+    }
+
     pub(super) fn reconcile(&mut self, source: Option<SelectionSourceIdentity>) {
         let selected = match self.state {
-            SelectionState::Dragging { source, .. }
-            | SelectionState::Finalized { source, .. } => source,
+            SelectionState::Dragging { source, .. } | SelectionState::Finalized { source, .. } => {
+                source
+            }
             SelectionState::Idle | SelectionState::CancelledUntilRelease => return,
         };
         if Some(selected) != source {
@@ -184,11 +203,7 @@ impl SelectionController {
         &self,
         source: Option<SelectionSourceIdentity>,
     ) -> SelectionPresentation {
-        SelectionPresentation::from_parts(
-            source,
-            self.range_for(source),
-            self.is_finalized(),
-        )
+        SelectionPresentation::from_parts(source, self.range_for(source), self.is_finalized())
     }
 
     pub(super) fn cancel(&mut self) {

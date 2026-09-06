@@ -547,6 +547,22 @@ impl TerminalViewCommandWriter {
         }
     }
 
+    /// Publishes current controller color observations.
+    pub async fn update_colors(
+        &self,
+        profile: zterm_core::terminal::TerminalColorProfile,
+    ) -> Result<(), DaemonError> {
+        #[cfg(unix)]
+        {
+            self.submit(TerminalDriverCommand::Colors { profile }).await
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = profile;
+            Err(unsupported_command_platform())
+        }
+    }
+
     /// Requests a full replacement after a revision gap.
     pub async fn request_sync(&self, known_revision: Revision) -> Result<(), DaemonError> {
         #[cfg(unix)]
@@ -634,11 +650,24 @@ struct PendingTerminalCommand {
 
 #[cfg(unix)]
 enum TerminalDriverCommand {
-    SnapshotApplied { revision: Revision },
-    Input { bytes: Vec<u8> },
-    Resize { size: TerminalSize },
-    RequestSync { known_revision: Revision },
-    RequestHistoryWindow { query: TerminalHistoryWindowQuery },
+    Colors {
+        profile: zterm_core::terminal::TerminalColorProfile,
+    },
+    SnapshotApplied {
+        revision: Revision,
+    },
+    Input {
+        bytes: Vec<u8>,
+    },
+    Resize {
+        size: TerminalSize,
+    },
+    RequestSync {
+        known_revision: Revision,
+    },
+    RequestHistoryWindow {
+        query: TerminalHistoryWindowQuery,
+    },
     Detach,
 }
 
@@ -986,6 +1015,7 @@ async fn handle_terminal_driver_command(
             }
             TerminalDriverCommand::Input { bytes } => client.write_input(bytes).await,
             TerminalDriverCommand::Resize { size } => client.resize(size).await,
+            TerminalDriverCommand::Colors { profile } => client.update_colors(profile).await,
             TerminalDriverCommand::RequestSync { known_revision } => {
                 client.request_sync(known_revision).await
             }
@@ -1924,6 +1954,8 @@ mod tests {
         let (prepared, _peer, _, _) = terminal_test_view(false);
         let snapshot = prepared.initial_snapshot();
         let delta = TerminalViewDelta {
+            colors: Default::default(),
+
             from_revision: snapshot.revision,
             to_revision: Revision::new(snapshot.revision.get() + 1),
             size: snapshot.surface.size,

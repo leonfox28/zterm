@@ -163,6 +163,8 @@ impl CombiningBudget {
 }
 
 pub(crate) struct AlacrittyEngine {
+    pub(crate) colors: crate::colors::ZtermColorState,
+    pub(crate) grid_input: bool,
     processor: Processor,
     term: Term<BoundedEventSink>,
     sink: BoundedEventSink,
@@ -180,6 +182,8 @@ impl AlacrittyEngine {
             ..Config::default()
         };
         let mut engine = Self {
+            colors: crate::colors::ZtermColorState::default(),
+            grid_input: false,
             processor: Processor::new(),
             term: Term::new(config, &EngineSize::new(size), sink.clone()),
             sink,
@@ -195,6 +199,7 @@ impl AlacrittyEngine {
 
     pub(crate) fn feed_raw(&mut self, bytes: &[u8]) {
         let previous_screen = self.active_screen();
+        self.grid_input = true;
         self.processor.advance(&mut self.term, bytes);
         if self.active_screen() != previous_screen {
             self.reconcile_active_combining_budget();
@@ -203,11 +208,14 @@ impl AlacrittyEngine {
 
     pub(crate) fn feed_screen_transition(&mut self, bytes: &[u8]) {
         self.reconcile_active_combining_budget();
+        self.grid_input = true;
         self.processor.advance(&mut self.term, bytes);
         self.reconcile_active_combining_budget();
     }
 
     pub(crate) fn feed_reset(&mut self, bytes: &[u8]) {
+        self.colors.reset();
+        self.grid_input = true;
         self.processor.advance(&mut self.term, bytes);
         self.legacy_x10_mouse = false;
         self.combining = CombiningBudget::default();
@@ -254,6 +262,38 @@ impl AlacrittyEngine {
             | (u8::from(mode.contains(TermMode::REPORT_ALTERNATE_KEYS)) << 2)
             | (u8::from(mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC)) << 3)
             | (u8::from(mode.contains(TermMode::REPORT_ASSOCIATED_TEXT)) << 4)
+    }
+
+    pub(crate) fn report_mode(&self, mode: u16, private: bool) -> u8 {
+        let flags = self.term.mode();
+        let enabled = if private {
+            match mode {
+                5 => self.colors.reverse,
+                2031 => self.colors.subscribed,
+                9 => self.legacy_x10_mouse,
+                1 => flags.contains(TermMode::APP_CURSOR),
+                6 => flags.contains(TermMode::ORIGIN),
+                7 => flags.contains(TermMode::LINE_WRAP),
+                25 => flags.contains(TermMode::SHOW_CURSOR),
+                47 | 1047 | 1049 => flags.contains(TermMode::ALT_SCREEN),
+                1000 => flags.contains(TermMode::MOUSE_REPORT_CLICK),
+                1002 => flags.contains(TermMode::MOUSE_DRAG),
+                1003 => flags.contains(TermMode::MOUSE_MOTION),
+                1004 => flags.contains(TermMode::FOCUS_IN_OUT),
+                1005 => flags.contains(TermMode::UTF8_MOUSE),
+                1006 => flags.contains(TermMode::SGR_MOUSE),
+                1007 => flags.contains(TermMode::ALTERNATE_SCROLL),
+                2004 => flags.contains(TermMode::BRACKETED_PASTE),
+                _ => return 0,
+            }
+        } else {
+            match mode {
+                4 => flags.contains(TermMode::INSERT),
+                20 => flags.contains(TermMode::LINE_FEED_NEW_LINE),
+                _ => return 0,
+            }
+        };
+        if enabled { 1 } else { 2 }
     }
 
     pub(crate) fn cursor_report(&self, private: bool) -> Vec<u8> {

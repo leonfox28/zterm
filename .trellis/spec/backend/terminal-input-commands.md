@@ -33,10 +33,14 @@ do not add suffix checks to the decoder or another prefix parser.
 
 ## 3. Contracts
 
-- Flow: `HostInputCodec` -> existing selected-copy priority -> `CommandMode`
+- Flow: `HostInputCodec` -> typed physical reply dispatch -> existing
+  selected-copy priority -> `CommandMode`
   -> command executor or existing encoding/viewport/Active input gates.
   Inactive attach waits use the same command owner, with their existing
-  cancellation and input-admission rules.
+  cancellation and input-admission rules. Color/appearance/status replies
+  never cancel a prefix or selection, including across input epochs. Literal
+  bracketed paste retains ownership of apparent replies inside it; see
+  [Terminal Colors](./terminal-colors.md).
 - Legacy 0x1d and an enhanced Ctrl+] press enter a one-shot command mode for
   one second. Match exact modifiers after excluding lock bits, using reported
   primary/base-layout identity; associated text alone never selects a binding.

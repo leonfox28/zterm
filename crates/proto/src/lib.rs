@@ -7,12 +7,13 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use prost::Message;
 use zeroize::{Zeroize, Zeroizing};
 use zterm_core::terminal::{
-    ActiveScreen, TerminalCell, TerminalClipboardWrite, TerminalColor, TerminalCursor,
+    ActiveScreen, TerminalAppearance, TerminalCell, TerminalClipboardWrite, TerminalColor,
+    TerminalColorProfile, TerminalColorSnapshot, TerminalColorValue, TerminalCursor,
     TerminalHistoryWindowAnchor, TerminalHistoryWindowQuery, TerminalKeyboardFlags, TerminalModes,
     TerminalMouseEncoding, TerminalMouseMode, TerminalScrollMetrics, TerminalSize, TerminalStyle,
     TerminalSurface, TerminalSurfaceDelta, TerminalSurfaceError, TerminalSurfaceHistoryWindowFrame,
     TerminalSurfaceHistoryWindowResult, TerminalSurfaceRow, TerminalSurfaceRowPatch,
-    TerminalSurfaceSnapshot, TerminalViewportDisposition,
+    TerminalSurfaceSnapshot, TerminalUnderline, TerminalViewportDisposition,
 };
 use zterm_core::{
     AttachmentId, AuthGeneration, AuthorizationStatus, Capabilities, ConnectionAttemptId,
@@ -479,7 +480,7 @@ pub enum WireKind {
     /// Session list response.
     SessionListResponse = 201,
     /// Session creation request.
-    SessionCreateRequest = 202,
+    SessionCreateRequest = 209,
     /// Session mutation response.
     SessionMutateResponse = 203,
     /// Session rename request.
@@ -493,7 +494,7 @@ pub enum WireKind {
     /// Daemon-issued mutation replay lease.
     SessionOperationLeaseResponse = 208,
     /// Terminal attach request.
-    TerminalAttachRequest = 300,
+    TerminalAttachRequest = 323,
     /// Complete exact semantic terminal surface.
     TerminalSemanticSnapshot = 301,
     /// Merged exact semantic terminal row replacements.
@@ -524,6 +525,8 @@ pub enum WireKind {
     TerminalSemanticHistoryWindowFrame = 318,
     /// Decoded latest-only child clipboard write for the current controller.
     TerminalClipboardWrite = 322,
+    /// Current controller base-color observations.
+    TerminalBaseColors = 324,
 }
 
 impl WireKind {
@@ -611,14 +614,14 @@ impl TryFrom<u32> for WireKind {
             105 => Self::ConnectionWelcome,
             200 => Self::SessionListRequest,
             201 => Self::SessionListResponse,
-            202 => Self::SessionCreateRequest,
+            209 => Self::SessionCreateRequest,
             203 => Self::SessionMutateResponse,
             204 => Self::SessionRenameRequest,
             205 => Self::SessionCloseRequest,
             206 => Self::SessionTakeoverRequest,
             207 => Self::SessionOperationLeaseRequest,
             208 => Self::SessionOperationLeaseResponse,
-            300 => Self::TerminalAttachRequest,
+            323 => Self::TerminalAttachRequest,
             301 => Self::TerminalSemanticSnapshot,
             302 => Self::TerminalSemanticDelta,
             303 => Self::TerminalInput,
@@ -634,6 +637,7 @@ impl TryFrom<u32> for WireKind {
             317 => Self::TerminalHistoryWindowRequest,
             318 => Self::TerminalSemanticHistoryWindowFrame,
             322 => Self::TerminalClipboardWrite,
+            324 => Self::TerminalBaseColors,
             unknown => return Err(ProtocolError::UnknownKind(unknown)),
         };
         Ok(kind)
@@ -1221,6 +1225,98 @@ pub fn terminal_clipboard_write_from_message(
     Ok((attachment_id, write))
 }
 
+impl From<TerminalColorProfile> for v2::TerminalColorProfile {
+    fn from(profile: TerminalColorProfile) -> Self {
+        use v2::terminal_color_observation::Value;
+        Self {
+            appearance: profile.appearance as u32,
+            values: profile
+                .values
+                .into_iter()
+                .map(|value| v2::TerminalColorObservation {
+                    value: Some(match value {
+                        TerminalColorValue::Unknown => Value::Unknown(true),
+                        TerminalColorValue::Dynamic => Value::Dynamic(true),
+                        TerminalColorValue::Rgb(r, g, b) => Value::Rgb(v2::TerminalRgbColor {
+                            red: r.into(),
+                            green: g.into(),
+                            blue: b.into(),
+                        }),
+                    }),
+                })
+                .collect(),
+        }
+    }
+}
+impl TryFrom<v2::TerminalColorProfile> for TerminalColorProfile {
+    type Error = ProtocolError;
+    fn try_from(profile: v2::TerminalColorProfile) -> Result<Self, Self::Error> {
+        use v2::terminal_color_observation::Value;
+        let invalid = || ProtocolError::InvalidTerminalSemanticField("color_profile");
+        if profile.values.len() != zterm_core::terminal::TERMINAL_COLOR_SLOTS {
+            return Err(invalid());
+        }
+        let mut result = Self {
+            appearance: match profile.appearance {
+                0 => TerminalAppearance::Unknown,
+                1 => TerminalAppearance::Dark,
+                2 => TerminalAppearance::Light,
+                _ => return Err(invalid()),
+            },
+            ..Self::default()
+        };
+        for (slot, value) in profile.values.into_iter().enumerate() {
+            result.values[slot] = match value.value {
+                Some(Value::Unknown(true)) => TerminalColorValue::Unknown,
+                Some(Value::Dynamic(true)) => TerminalColorValue::Dynamic,
+                Some(Value::Rgb(c)) => TerminalColorValue::Rgb(
+                    c.red.try_into().map_err(|_| invalid())?,
+                    c.green.try_into().map_err(|_| invalid())?,
+                    c.blue.try_into().map_err(|_| invalid())?,
+                ),
+                _ => return Err(invalid()),
+            };
+        }
+        if !result.is_valid() {
+            return Err(invalid());
+        }
+        Ok(result)
+    }
+}
+impl From<TerminalColorSnapshot> for v2::TerminalColorSnapshot {
+    fn from(c: TerminalColorSnapshot) -> Self {
+        Self {
+            profile: Some(c.profile.into()),
+            changed_at: c.changed_at.get(),
+            reverse: c.reverse,
+            custom_cursor: c.custom_cursor,
+            inherited_sources: c.inherited_sources.into_iter().map(u32::from).collect(),
+        }
+    }
+}
+fn required_colors(
+    c: Option<v2::TerminalColorSnapshot>,
+) -> Result<TerminalColorSnapshot, ProtocolError> {
+    let invalid = || ProtocolError::InvalidTerminalSemanticField("colors");
+    let c = c.ok_or_else(invalid)?;
+    if c.inherited_sources.len() != zterm_core::terminal::TERMINAL_COLOR_SLOTS {
+        return Err(invalid());
+    }
+    Ok(TerminalColorSnapshot {
+        profile: c.profile.ok_or_else(invalid)?.try_into()?,
+        changed_at: zterm_core::Revision::new(c.changed_at),
+        reverse: c.reverse,
+        custom_cursor: c.custom_cursor,
+        inherited_sources: c
+            .inherited_sources
+            .into_iter()
+            .map(|source| u16::try_from(source).map_err(|_| invalid()))
+            .collect::<Result<Vec<_>, _>>()?
+            .try_into()
+            .map_err(|_| invalid())?,
+    })
+}
+
 impl From<TerminalColor> for v2::TerminalColor {
     fn from(value: TerminalColor) -> Self {
         use v2::terminal_color::Value;
@@ -1270,7 +1366,8 @@ impl From<TerminalStyle> for v2::TerminalStyle {
             bold: value.bold,
             dim: value.dim,
             italic: value.italic,
-            underline: value.underline,
+            underline: value.underline as u32,
+            underline_color: Some(value.underline_color.into()),
             inverse: value.inverse,
         }
     }
@@ -1292,7 +1389,21 @@ impl TryFrom<v2::TerminalStyle> for TerminalStyle {
             bold: value.bold,
             dim: value.dim,
             italic: value.italic,
-            underline: value.underline,
+            underline: match value.underline {
+                0 => TerminalUnderline::None,
+                1 => TerminalUnderline::Single,
+                2 => TerminalUnderline::Double,
+                3 => TerminalUnderline::Curly,
+                4 => TerminalUnderline::Dotted,
+                5 => TerminalUnderline::Dashed,
+                _ => return Err(ProtocolError::InvalidTerminalSemanticField("underline")),
+            },
+            underline_color: value
+                .underline_color
+                .ok_or(ProtocolError::InvalidTerminalSemanticField(
+                    "underline_color",
+                ))?
+                .try_into()?,
             inverse: value.inverse,
         })
     }
@@ -1428,6 +1539,7 @@ fn terminal_scroll_metrics(
 
 fn terminal_surface_message(surface: TerminalSurface) -> v2::TerminalSurface {
     v2::TerminalSurface {
+        colors: Some(surface.colors.into()),
         row_count: u32::from(surface.size.rows),
         column_count: u32::from(surface.size.columns),
         active_screen: v2::TerminalActiveScreen::from(surface.active_screen) as i32,
@@ -1447,6 +1559,7 @@ fn terminal_surface_from_message(
         columns: value.column_count,
     })?;
     let surface = TerminalSurface {
+        colors: required_colors(value.colors)?,
         size,
         active_screen: terminal_active_screen(value.active_screen)?,
         rows: value
@@ -1521,6 +1634,7 @@ pub fn terminal_surface_delta_message(
     delta: TerminalSurfaceDelta,
 ) -> v2::TerminalSemanticDelta {
     v2::TerminalSemanticDelta {
+        colors: Some(delta.colors.into()),
         attachment_id: Some(attachment_id.into()),
         from_revision: delta.from_revision.get(),
         to_revision: delta.to_revision.get(),
@@ -1550,6 +1664,7 @@ pub fn terminal_surface_delta_from_message(
         .ok_or(ProtocolError::InvalidTerminalSemanticField("attachment_id"))?
         .try_into()?;
     let delta = TerminalSurfaceDelta {
+        colors: required_colors(value.colors)?,
         from_revision: zterm_core::Revision::new(value.from_revision),
         to_revision: zterm_core::Revision::new(value.to_revision),
         size: TerminalSize::try_from(v2::TerminalViewport {
@@ -1601,12 +1716,14 @@ pub fn terminal_surface_history_window_frame_message(
 ) -> v2::TerminalSemanticHistoryWindowFrame {
     match result {
         TerminalSurfaceHistoryWindowResult::Frame(TerminalSurfaceHistoryWindowFrame {
+            colors,
             disposition,
             anchor,
             target_offset_from_bottom,
             first_row_from_live_top,
             rows,
         }) => v2::TerminalSemanticHistoryWindowFrame {
+            colors: Some(colors.into()),
             attachment_id: Some(attachment_id.into()),
             outcome: v2::TerminalHistoryWindowOutcome::Frame as i32,
             disposition: match disposition {
@@ -1624,6 +1741,7 @@ pub fn terminal_surface_history_window_frame_message(
         },
         TerminalSurfaceHistoryWindowResult::HistoryChanged { epoch, revision } => {
             v2::TerminalSemanticHistoryWindowFrame {
+                colors: None,
                 attachment_id: Some(attachment_id.into()),
                 outcome: v2::TerminalHistoryWindowOutcome::Changed as i32,
                 disposition: v2::TerminalViewportDisposition::Unspecified as i32,
@@ -1637,6 +1755,7 @@ pub fn terminal_surface_history_window_frame_message(
         }
         TerminalSurfaceHistoryWindowResult::HistoryGap { epoch, revision } => {
             v2::TerminalSemanticHistoryWindowFrame {
+                colors: None,
                 attachment_id: Some(attachment_id.into()),
                 outcome: v2::TerminalHistoryWindowOutcome::Gap as i32,
                 disposition: v2::TerminalViewportDisposition::Unspecified as i32,
@@ -1699,6 +1818,7 @@ pub fn terminal_surface_history_window_from_message(
                 ));
             }
             let frame = TerminalSurfaceHistoryWindowFrame {
+                colors: required_colors(value.colors)?,
                 disposition,
                 anchor,
                 target_offset_from_bottom: value.target_offset_from_bottom,
@@ -1716,6 +1836,7 @@ pub fn terminal_surface_history_window_from_message(
         }
         v2::TerminalHistoryWindowOutcome::Changed | v2::TerminalHistoryWindowOutcome::Gap => {
             if value.disposition != v2::TerminalViewportDisposition::Unspecified as i32
+                || value.colors.is_some()
                 || value.anchor.is_some()
                 || value.target_offset_from_bottom != 0
                 || value.first_row_from_live_top != 0
@@ -2887,6 +3008,8 @@ mod tests {
         assert_message_round_trip(
             WireKind::TerminalAttachRequest,
             v2::TerminalAttachRequest {
+                base_colors: Default::default(),
+
                 target: target.clone(),
                 session_id: session_id.clone(),
                 takeover: true,
@@ -3011,12 +3134,14 @@ mod tests {
                 .map(|_| TerminalCell {
                     contents: contents.to_owned(),
                     style: TerminalStyle {
+                        underline_color: Default::default(),
+
                         foreground: TerminalColor::Rgb(1, 2, 3),
                         background: TerminalColor::Rgb(4, 5, 6),
                         bold: true,
                         dim: true,
                         italic: true,
-                        underline: true,
+                        underline: TerminalUnderline::Single,
                         inverse: true,
                     },
                     ..TerminalCell::default()
@@ -3035,6 +3160,8 @@ mod tests {
         let snapshot = TerminalSurfaceSnapshot {
             revision,
             surface: TerminalSurface {
+                colors: Default::default(),
+
                 size: TerminalSize::new(2, 3),
                 active_screen: ActiveScreen::Main,
                 rows: vec![semantic_row(3, SENTINEL), semantic_row(3, "x")],
@@ -3066,6 +3193,8 @@ mod tests {
         assert_message_round_trip(WireKind::TerminalSemanticSnapshot, message);
 
         let delta = TerminalSurfaceDelta {
+            colors: Default::default(),
+
             from_revision: revision,
             to_revision: zterm_core::Revision::new(8),
             size: snapshot.surface.size,
@@ -3197,6 +3326,8 @@ mod tests {
         let size = TerminalSize::new(80, 240);
         let row = semantic_row(size.columns, "abcdefghijklmnopqrstuv");
         let surface = TerminalSurface {
+            colors: Default::default(),
+
             size,
             active_screen: ActiveScreen::Main,
             rows: vec![row.clone(); usize::from(size.rows)],
@@ -3236,6 +3367,8 @@ mod tests {
             newer_margin_rows: 80,
         };
         let frame = TerminalSurfaceHistoryWindowFrame {
+            colors: Default::default(),
+
             disposition: TerminalViewportDisposition::Exact,
             anchor: query.anchor,
             target_offset_from_bottom: 160,
@@ -3315,6 +3448,8 @@ mod tests {
         let message = terminal_surface_history_window_frame_message(
             AttachmentId::from_array([0x47; 16]),
             TerminalSurfaceHistoryWindowResult::Frame(TerminalSurfaceHistoryWindowFrame {
+                colors: Default::default(),
+
                 disposition: TerminalViewportDisposition::Exact,
                 anchor: query.anchor,
                 target_offset_from_bottom: 1,
@@ -3333,6 +3468,7 @@ mod tests {
 
         for (current_epoch, current_revision) in [(3, 2), (0, 0)] {
             let malformed = v2::TerminalSemanticHistoryWindowFrame {
+                colors: None,
                 attachment_id: Some(AttachmentId::from_array([0x48; 16]).into()),
                 outcome: v2::TerminalHistoryWindowOutcome::Gap as i32,
                 disposition: v2::TerminalViewportDisposition::Unspecified as i32,
@@ -3349,6 +3485,44 @@ mod tests {
                     TerminalSurfaceError::InvalidHistoryWindow
                 ))
             ));
+        }
+    }
+    #[test]
+    fn color_profiles_and_snapshot_metadata_are_required_and_bounded() {
+        let profile = TerminalColorProfile::default();
+        let wire: v2::TerminalColorProfile = profile.clone().into();
+        assert_eq!(
+            TerminalColorProfile::try_from(wire.clone()).expect("profile round trip"),
+            profile
+        );
+        let mut short = wire.clone();
+        short.values.pop();
+        assert!(TerminalColorProfile::try_from(short).is_err());
+        let mut long = wire.clone();
+        long.values.push(wire.values[0]);
+        assert!(TerminalColorProfile::try_from(long).is_err());
+        let mut invalid = wire.clone();
+        invalid.appearance = 3;
+        assert!(TerminalColorProfile::try_from(invalid).is_err());
+        let mut dynamic = wire.clone();
+        dynamic.values[0].value = Some(v2::terminal_color_observation::Value::Dynamic(true));
+        assert!(TerminalColorProfile::try_from(dynamic).is_err());
+        let mut invalid = wire;
+        invalid.values[0].value = None;
+        assert!(TerminalColorProfile::try_from(invalid).is_err());
+        assert!(required_colors(None).is_err());
+        let mut snapshot: v2::TerminalColorSnapshot = TerminalColorSnapshot::default().into();
+        snapshot.inherited_sources.pop();
+        assert!(required_colors(Some(snapshot)).is_err());
+    }
+    #[test]
+    fn color_capable_create_attach_kinds_retire_the_old_side_effecting_requests() {
+        assert_eq!(WireKind::SessionCreateRequest as u32, 209);
+        assert_eq!(WireKind::TerminalAttachRequest as u32, 323);
+        assert_eq!(WireKind::TerminalBaseColors as u32, 324);
+        for kind in [202, 300] {
+            assert!(WireKind::try_from(kind).is_err());
+            assert!(v2::MessageKind::try_from(kind as i32).is_err());
         }
     }
 }

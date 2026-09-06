@@ -4,21 +4,27 @@ use std::io::{self, Write};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use zterm_core::terminal::{
-    TerminalCell, TerminalClipboardWrite, TerminalKeyboardFlags, TerminalModes, TerminalStyle,
-    TerminalColor,
+    COLOR_BACKGROUND, COLOR_CURSOR, COLOR_CURSOR_TEXT, COLOR_FOREGROUND,
+    COLOR_SELECTION_BACKGROUND, COLOR_SELECTION_FOREGROUND, TerminalCell, TerminalClipboardWrite,
+    TerminalColor, TerminalColorSnapshot, TerminalColorValue, TerminalKeyboardFlags, TerminalModes,
+    TerminalStyle, TerminalUnderline,
 };
 use zterm_core::terminal_selection::{TerminalTextPoint, TerminalTextRange};
 
 use super::{
     CliError, ComposedFrame, HOST_INPUT_CAPTURE, HOST_SYNC_BEGIN, HOST_SYNC_END,
-    keyboard::desired_outer_keyboard_flags, normalize_composed_row, terminal_io,
+    keyboard::desired_outer_keyboard_flags,
+    normalize_composed_row,
     selection::{SelectionPresentation, SelectionSourceIdentity},
+    terminal_io,
 };
 
 /// Sole active desktop writer and owner of the last successfully flushed frame.
 #[derive(Clone, Default)]
 pub(super) struct DesktopPresenter {
     pub(super) baseline: Option<ComposedFrame>,
+    pub(super) semantic_baseline: Option<ComposedFrame>,
+    observed_colors: Option<TerminalColorSnapshot>,
     committed_input_modes: HostInputModes,
     selection: SelectionPresentation,
 }
@@ -59,6 +65,22 @@ impl HostInputModes {
 }
 
 impl DesktopPresenter {
+    pub(super) fn observe_history_colors(&mut self, colors: TerminalColorSnapshot) -> bool {
+        let current = self
+            .observed_colors
+            .as_ref()
+            .into_iter()
+            .chain(self.semantic_baseline.as_ref().map(|frame| &frame.colors))
+            .map(|c| c.changed_at)
+            .max();
+        if current.is_none_or(|revision| colors.changed_at > revision) {
+            self.observed_colors = Some(colors);
+            true
+        } else {
+            false
+        }
+    }
+
     pub(super) fn set_selection(
         &mut self,
         source: Option<SelectionSourceIdentity>,
@@ -133,28 +155,27 @@ impl DesktopPresenter {
         source: Option<SelectionSourceIdentity>,
         selection: SelectionPresentation,
     ) -> Result<bool, CliError> {
-        if let Some(selection) = selection.range_for(source) {
-            for (row, cells) in &mut desired.rows {
-                for (column, cell) in cells.iter_mut().enumerate() {
-                    let Ok(column) = u16::try_from(column) else {
-                        continue;
-                    };
-                    if selection.contains(TerminalTextPoint::new(*row, column)) {
-                        cell.style.inverse = !cell.style.inverse;
-                    }
-                }
+        for colors in self
+            .observed_colors
+            .as_ref()
+            .into_iter()
+            .chain(self.semantic_baseline.as_ref().map(|frame| &frame.colors))
+        {
+            if colors.changed_at > desired.colors.changed_at {
+                desired.colors = colors.clone();
             }
         }
-        let desired_input_modes = HostInputModes::desired(
-            desired.modes,
-            selection.copy_ready_for(source),
-        );
+        let semantic = desired.clone();
+        resolve_frame(&mut desired, selection.range_for(source));
+        let desired_input_modes =
+            HostInputModes::desired(desired.modes, selection.copy_ready_for(source));
         // A committed frame retains only modes represented in the physical
         // terminal. Routed child mouse/alternate-scroll state must not create
         // a false presentation difference later.
         desired.modes = desired_input_modes.terminal_modes();
         if self.baseline.as_ref() == Some(&desired) {
             self.selection = selection;
+            self.semantic_baseline = Some(semantic);
             return Ok(false);
         }
         let baseline = self.baseline.as_ref().filter(|baseline| {
@@ -231,8 +252,38 @@ impl DesktopPresenter {
         }
         self.committed_input_modes = desired_input_modes;
         self.selection = selection;
+        self.semantic_baseline = Some(semantic);
         self.baseline = Some(desired);
         Ok(true)
+    }
+
+    pub(super) fn write_color_command(
+        &mut self,
+        writer: &mut impl Write,
+        command: super::host_colors::HostColorCommand,
+    ) -> Result<(), CliError> {
+        use super::host_colors::HostColorCommand;
+        let mut bytes = Vec::new();
+        match command {
+            HostColorCommand::EnableAppearance => bytes.extend_from_slice(b"\x1b[?2031h"),
+            HostColorCommand::Probe => {
+                for start in (0..256).step_by(32) {
+                    bytes.extend_from_slice(b"\x1b]4");
+                    for index in start..start + 32 {
+                        write!(bytes, ";{index};?").expect("memory writer");
+                    }
+                    bytes.extend_from_slice(b"\x1b\\");
+                }
+                for role in [10, 11, 12, 17, 19] {
+                    write!(bytes, "\x1b]{role};?\x1b\\").expect("memory writer");
+                }
+                bytes.extend_from_slice(b"\x1b]21;foreground=?;background=?;cursor=?;cursor_text=?;selection_foreground=?;selection_background=?\x1b\\\x1b[?996n\x1b[?2031$p\x1b[5n");
+            }
+        }
+        writer
+            .write_all(&bytes)
+            .and_then(|()| writer.flush())
+            .map_err(|error| terminal_io("observe physical terminal colors", error))
     }
 
     pub(super) fn write_clipboard(
@@ -251,6 +302,119 @@ impl DesktopPresenter {
         writer
             .flush()
             .map_err(|error| terminal_io("flush terminal clipboard effect", error))
+    }
+}
+
+// Unknown defaults retain their physical source. Known effective colors have
+// already been mapped by the model and must never be reversed a second time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PaintColor {
+    Foreground,
+    Background,
+    Color(TerminalColor),
+}
+
+fn slot_color(colors: &TerminalColorSnapshot, slot: usize) -> PaintColor {
+    match colors.profile.values[slot] {
+        TerminalColorValue::Rgb(r, g, b) => PaintColor::Color(TerminalColor::Rgb(r, g, b)),
+        _ => match colors.source(slot) {
+            COLOR_FOREGROUND => PaintColor::Foreground,
+            COLOR_BACKGROUND => PaintColor::Background,
+            index => PaintColor::Color(TerminalColor::Indexed(u8::try_from(index).unwrap_or(0))),
+        },
+    }
+}
+fn cell_color(colors: &TerminalColorSnapshot, color: TerminalColor, default: usize) -> PaintColor {
+    match color {
+        TerminalColor::Default => slot_color(colors, default),
+        TerminalColor::Indexed(index) => slot_color(colors, usize::from(index)),
+        color => PaintColor::Color(color),
+    }
+}
+fn role_color(colors: &TerminalColorSnapshot, slot: usize, fallback: PaintColor) -> PaintColor {
+    match colors.profile.values[slot] {
+        TerminalColorValue::Rgb(r, g, b) => PaintColor::Color(TerminalColor::Rgb(r, g, b)),
+        TerminalColorValue::Dynamic | TerminalColorValue::Unknown => fallback,
+    }
+}
+fn paint_pair(style: &mut TerminalStyle, mut foreground: PaintColor, mut background: PaintColor) {
+    style.inverse = foreground == PaintColor::Background || background == PaintColor::Foreground;
+    if style.inverse {
+        std::mem::swap(&mut foreground, &mut background);
+    }
+    style.foreground = match foreground {
+        PaintColor::Color(c) => c,
+        _ => TerminalColor::Default,
+    };
+    style.background = match background {
+        PaintColor::Color(c) => c,
+        _ => TerminalColor::Default,
+    };
+}
+fn resolve_frame(frame: &mut ComposedFrame, selection: Option<TerminalTextRange>) {
+    let colors = &frame.colors;
+    let cursor = &frame.cursor;
+    let software = colors.custom_cursor && cursor.visible;
+    let cursor_span = frame.rows.get(&cursor.row).and_then(|row| {
+        let mut column = usize::from(cursor.column);
+        if row.get(column)?.wide_continuation {
+            column = column.saturating_sub(1);
+        }
+        Some((column, column + if row.get(column)?.wide { 2 } else { 1 }))
+    });
+    for (row_index, row) in &mut frame.rows {
+        if *row_index >= frame.layout.content_size.rows {
+            continue;
+        }
+        for (column, cell) in row
+            .iter_mut()
+            .enumerate()
+            .take(usize::from(frame.layout.content_size.columns))
+        {
+            let mut fg = cell_color(colors, cell.style.foreground, COLOR_FOREGROUND);
+            let mut bg = cell_color(colors, cell.style.background, COLOR_BACKGROUND);
+            if cell.style.inverse {
+                std::mem::swap(&mut fg, &mut bg);
+            }
+            if selection.is_some_and(|s| {
+                s.contains(TerminalTextPoint::new(
+                    *row_index,
+                    u16::try_from(column).unwrap_or(u16::MAX),
+                ))
+            }) {
+                (fg, bg) = (
+                    role_color(colors, COLOR_SELECTION_FOREGROUND, bg),
+                    role_color(colors, COLOR_SELECTION_BACKGROUND, fg),
+                );
+            }
+            if software
+                && *row_index == cursor.row
+                && cursor_span.is_some_and(|(start, end)| (start..end).contains(&column))
+            {
+                (fg, bg) = (
+                    role_color(colors, COLOR_CURSOR_TEXT, bg),
+                    role_color(colors, COLOR_CURSOR, fg),
+                );
+            }
+            if cell.style.underline_color != TerminalColor::Default
+                && let PaintColor::Color(color) =
+                    cell_color(colors, cell.style.underline_color, COLOR_FOREGROUND)
+            {
+                cell.style.underline_color = color;
+            }
+            paint_pair(&mut cell.style, fg, bg);
+        }
+    }
+    let fg = cell_color(colors, frame.cursor.style.foreground, COLOR_FOREGROUND);
+    let bg = cell_color(colors, frame.cursor.style.background, COLOR_BACKGROUND);
+    let (fg, bg) = if frame.cursor.style.inverse {
+        (bg, fg)
+    } else {
+        (fg, bg)
+    };
+    paint_pair(&mut frame.cursor.style, fg, bg);
+    if software {
+        frame.cursor.visible = false;
     }
 }
 
@@ -328,8 +492,21 @@ fn write_style(writer: &mut impl Write, style: TerminalStyle) -> io::Result<()> 
     if style.italic {
         parameters.push("3".to_owned());
     }
-    if style.underline {
-        parameters.push("4".to_owned());
+    if style.underline != TerminalUnderline::None {
+        let shape = match style.underline {
+            TerminalUnderline::None => 0,
+            TerminalUnderline::Single => 1,
+            TerminalUnderline::Double => 2,
+            TerminalUnderline::Curly => 3,
+            TerminalUnderline::Dotted => 4,
+            TerminalUnderline::Dashed => 5,
+        };
+        parameters.push(format!("4:{shape}"));
+    }
+    match style.underline_color {
+        TerminalColor::Default => {}
+        TerminalColor::Indexed(index) => parameters.push(format!("58;5;{index}")),
+        TerminalColor::Rgb(r, g, b) => parameters.push(format!("58;2;{r};{g};{b}")),
     }
     if style.inverse {
         parameters.push("7".to_owned());
@@ -413,9 +590,252 @@ fn write_changed_input_modes(
     Ok(())
 }
 
-fn write_keyboard_mode(
-    writer: &mut impl Write,
-    flags: TerminalKeyboardFlags,
-) -> io::Result<()> {
+fn write_keyboard_mode(writer: &mut impl Write, flags: TerminalKeyboardFlags) -> io::Result<()> {
     write!(writer, "\x1b[={}u", flags.bits())
+}
+
+#[cfg(test)]
+mod color_tests {
+    use super::super::composition::{ComposedCursor, LayoutIdentity};
+    use super::*;
+    use zterm_core::{Revision, terminal::TerminalSize};
+    fn frame() -> ComposedFrame {
+        let mut rows = BTreeMap::new();
+        rows.insert(
+            0,
+            vec![
+                TerminalCell {
+                    contents: "界\u{301}".into(),
+                    wide: true,
+                    ..Default::default()
+                },
+                TerminalCell {
+                    wide_continuation: true,
+                    ..Default::default()
+                },
+                TerminalCell {
+                    contents: "X".into(),
+                    ..Default::default()
+                },
+            ],
+        );
+        rows.insert(
+            1,
+            vec![TerminalCell {
+                contents: "status".into(),
+                style: TerminalStyle {
+                    inverse: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+        );
+        ComposedFrame {
+            physical_size: TerminalSize::new(2, 3),
+            layout: LayoutIdentity {
+                content_size: TerminalSize::new(1, 3),
+                gutter_column: None,
+                status_row: Some(1),
+            },
+            rows,
+            cursor: ComposedCursor {
+                row: 0,
+                column: 0,
+                visible: true,
+                style: TerminalStyle::default(),
+            },
+            modes: TerminalModes::default(),
+            colors: TerminalColorSnapshot::default(),
+        }
+    }
+    #[test]
+    fn palette_resolution_preserves_semantics_and_leaves_chrome_on_outer_colors() {
+        let mut desired = frame();
+        desired.colors.profile.values[COLOR_FOREGROUND] = TerminalColorValue::Rgb(1, 2, 3);
+        desired.colors.profile.values[COLOR_BACKGROUND] = TerminalColorValue::Rgb(4, 5, 6);
+        desired.colors.profile.values[2] = TerminalColorValue::Rgb(7, 8, 9);
+        desired
+            .rows
+            .get_mut(&0)
+            .expect("color fixture operation succeeds")[2]
+            .style
+            .foreground = TerminalColor::Indexed(2);
+        desired
+            .rows
+            .get_mut(&0)
+            .expect("color fixture operation succeeds")[2]
+            .style
+            .background = TerminalColor::Rgb(20, 30, 40);
+        let mut presenter = DesktopPresenter::default();
+        let mut output = Vec::new();
+        presenter
+            .present(&mut output, desired.clone(), None)
+            .expect("color fixture operation succeeds");
+        assert_eq!(presenter.semantic_baseline.as_ref(), Some(&desired));
+        let physical = presenter
+            .baseline
+            .as_ref()
+            .expect("color fixture operation succeeds");
+        assert_eq!(
+            physical.rows[&0][2].style.foreground,
+            TerminalColor::Rgb(7, 8, 9)
+        );
+        assert_eq!(
+            physical.rows[&0][2].style.background,
+            TerminalColor::Rgb(20, 30, 40)
+        );
+        assert_eq!(physical.rows[&1], desired.rows[&1]);
+        assert!(!output.windows(2).any(|w| w == b"\x1b]"));
+        let mut next = desired.clone();
+        next.colors.changed_at = Revision::new(1);
+        next.colors.profile.values[2] = TerminalColorValue::Rgb(70, 80, 90);
+        output.clear();
+        presenter
+            .present(&mut output, next, None)
+            .expect("color fixture operation succeeds");
+        assert!(
+            String::from_utf8(output)
+                .expect("color fixture operation succeeds")
+                .contains("38;2;70;80;90")
+        );
+        assert_eq!(
+            presenter
+                .semantic_baseline
+                .as_ref()
+                .expect("color fixture operation succeeds")
+                .rows,
+            desired.rows
+        );
+    }
+    #[test]
+    fn software_cursor_preserves_wide_combining_glyph_and_repairs_old_span() {
+        let mut desired = frame();
+        desired.colors.custom_cursor = true;
+        desired.colors.profile.values[COLOR_CURSOR] = TerminalColorValue::Rgb(200, 0, 0);
+        desired.colors.profile.values[COLOR_CURSOR_TEXT] = TerminalColorValue::Rgb(0, 200, 0);
+        let mut presenter = DesktopPresenter::default();
+        let mut bytes = Vec::new();
+        presenter
+            .present(&mut bytes, desired.clone(), None)
+            .expect("color fixture operation succeeds");
+        let physical = presenter
+            .baseline
+            .as_ref()
+            .expect("color fixture operation succeeds");
+        assert!(!physical.cursor.visible);
+        assert_eq!(physical.rows[&0][0].contents, "界\u{301}");
+        assert_eq!(
+            physical.rows[&0][0].style.background,
+            TerminalColor::Rgb(200, 0, 0)
+        );
+        assert_eq!(physical.rows[&0][0].style, physical.rows[&0][1].style);
+        desired.cursor.column = 2;
+        bytes.clear();
+        presenter
+            .present(&mut bytes, desired.clone(), None)
+            .expect("color fixture operation succeeds");
+        let encoded = String::from_utf8(bytes).expect("color fixture operation succeeds");
+        assert!(encoded.contains("界\u{301}"));
+        assert!(encoded.contains("X"));
+        assert!(encoded.contains("\x1b[1;3H"));
+        assert_eq!(
+            presenter
+                .baseline
+                .as_ref()
+                .expect("color fixture operation succeeds")
+                .rows[&0][0]
+                .style,
+            TerminalStyle::default()
+        );
+        desired.colors.custom_cursor = false;
+        desired.colors.changed_at = Revision::new(1);
+        presenter
+            .present(&mut Vec::new(), desired, None)
+            .expect("color fixture operation succeeds");
+        assert!(
+            presenter
+                .baseline
+                .as_ref()
+                .expect("color fixture operation succeeds")
+                .cursor
+                .visible
+        );
+    }
+    #[test]
+    fn observed_history_colors_never_roll_back_and_failed_frame_keeps_semantic_baseline() {
+        let mut presenter = DesktopPresenter::default();
+        let desired = frame();
+        presenter
+            .present(&mut Vec::new(), desired.clone(), None)
+            .expect("color fixture operation succeeds");
+        let mut colors = desired.colors.clone();
+        colors.changed_at = Revision::new(3);
+        colors.profile.values[COLOR_BACKGROUND] = TerminalColorValue::Rgb(9, 8, 7);
+        assert!(presenter.observe_history_colors(colors.clone()));
+        assert!(!presenter.observe_history_colors(TerminalColorSnapshot::default()));
+        struct Fails;
+        impl Write for Fails {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("fixture"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        assert!(
+            presenter
+                .present(&mut Fails, desired.clone(), None)
+                .is_err()
+        );
+        assert_eq!(presenter.semantic_baseline.as_ref(), Some(&desired));
+        assert!(presenter.baseline.is_none());
+        presenter
+            .present(&mut Vec::new(), desired, None)
+            .expect("color fixture operation succeeds");
+        assert_eq!(
+            presenter
+                .semantic_baseline
+                .expect("color fixture operation succeeds")
+                .colors,
+            colors
+        );
+    }
+    #[test]
+    fn unknown_default_sources_reverse_once_and_explicit_underline_stays_literal() {
+        let mut desired = frame();
+        desired.colors.reverse = true;
+        desired.colors.inherited_sources[COLOR_FOREGROUND] =
+            u16::try_from(COLOR_BACKGROUND).expect("color fixture operation succeeds");
+        desired.colors.inherited_sources[COLOR_BACKGROUND] =
+            u16::try_from(COLOR_FOREGROUND).expect("color fixture operation succeeds");
+        desired
+            .rows
+            .get_mut(&0)
+            .expect("color fixture operation succeeds")[2]
+            .style = TerminalStyle {
+            inverse: true,
+            underline: TerminalUnderline::Curly,
+            underline_color: TerminalColor::Rgb(8, 9, 10),
+            ..Default::default()
+        };
+        let mut presenter = DesktopPresenter::default();
+        let mut bytes = Vec::new();
+        presenter
+            .present(&mut bytes, desired, None)
+            .expect("color fixture operation succeeds");
+        let physical = presenter
+            .baseline
+            .expect("color fixture operation succeeds");
+        assert!(physical.rows[&0][0].style.inverse);
+        assert!(!physical.rows[&0][2].style.inverse);
+        assert_eq!(
+            physical.rows[&0][2].style.underline_color,
+            TerminalColor::Rgb(8, 9, 10)
+        );
+        assert!(
+            String::from_utf8(bytes)
+                .expect("color fixture operation succeeds")
+                .contains("4:3;58;2;8;9;10")
+        );
+    }
 }
