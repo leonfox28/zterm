@@ -4900,6 +4900,72 @@ mod unix {
         }
 
         #[test]
+        fn hidden_cursor_keeps_ime_position_and_moves_without_cell_changes() {
+            for screen in [ActiveScreen::Main, ActiveScreen::Alternate] {
+                let physical = TerminalSize::new(6, 24);
+                let layout = ChromeLayout::new(physical, screen);
+                let mut snapshot = test_snapshot(layout.child, screen, Revision::new(2));
+                let viewport =
+                    ViewportController::with_layout(layout, snapshot.surface.scroll_metrics);
+                let status = StatusRenderer::new(
+                    TerminalViewTarget::for_display("peer", TerminalViewRoute::Remote),
+                    physical,
+                );
+                let mut presenter = DesktopPresenter::default();
+
+                for (row, column, visible) in
+                    [(2, 3, true), (2, 3, false), (3, 5, false), (3, 5, true)]
+                {
+                    snapshot.surface.cursor = TerminalCursor {
+                        row,
+                        column,
+                        visible,
+                        style: TerminalStyle::default(),
+                    };
+                    let desired = ComposedFrame::compose(
+                        &snapshot.surface,
+                        presenter.semantic_baseline.as_ref(),
+                        &viewport,
+                        &status,
+                        TerminalViewTransportState::Active,
+                    )
+                    .expect("compose cursor-only update");
+                    if let Some(previous) = &presenter.semantic_baseline {
+                        assert_eq!(desired.rows, previous.rows, "only the cursor changed");
+                    }
+                    let mut output = ViewportFrameWriter::default();
+                    assert!(
+                        presenter
+                            .present(&mut output, desired.clone(), None)
+                            .expect("present cursor-only update"),
+                        "cursor position/visibility must reach the physical terminal"
+                    );
+                    let mut expected_tail =
+                        format!("\x1b[{};{}H", row + 1, column + 1).into_bytes();
+                    expected_tail.extend_from_slice(if visible {
+                        b"\x1b[?25h"
+                    } else {
+                        b"\x1b[?25l"
+                    });
+                    expected_tail.extend_from_slice(HOST_INPUT_CAPTURE);
+                    expected_tail.extend_from_slice(HOST_SYNC_END);
+                    assert!(
+                        output.bytes.ends_with(&expected_tail),
+                        "screen={screen:?} cursor=({row},{column},{visible}) output={:?}",
+                        String::from_utf8_lossy(&output.bytes)
+                    );
+                    assert_eq!((output.writes, output.flushes), (1, 1));
+                    assert!(
+                        !presenter
+                            .present(&mut output, desired, None)
+                            .expect("unchanged cursor is a no-op")
+                    );
+                    assert_eq!((output.writes, output.flushes), (1, 1));
+                }
+            }
+        }
+
+        #[test]
         fn desktop_presenter_is_the_single_atomic_commit_boundary() {
             let size = TerminalSize::new(2, 4);
             let snapshot = test_snapshot(size, ActiveScreen::Alternate, Revision::new(2));
