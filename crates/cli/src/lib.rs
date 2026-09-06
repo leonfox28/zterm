@@ -21,6 +21,8 @@ mod terminal_ui;
 
 pub use terminal_ui::run_terminal;
 
+const UPDATE_CONNECTION_GUIDANCE: &str = "Update will continue independently if this terminal disconnects. Existing sessions will end. Reconnect manually after the daemon starts; use zterm --version, zterm daemon status and zterm logs to check the result.";
+
 const SETUP_GUIDANCE: &str = "zterm is not configured. Run `zterm setup` first.\n";
 
 /// zterm's public command tree plus one hidden daemon entry flag.
@@ -29,21 +31,25 @@ const SETUP_GUIDANCE: &str = "zterm is not configured. Run `zterm setup` first.\
     name = "zterm",
     version,
     about = "Secure persistent terminal sessions across trusted devices",
-    disable_help_subcommand = true
+    disable_help_subcommand = true,
+    args_conflicts_with_subcommands = true
 )]
 pub struct Cli {
     /// Internal detached daemon entry; never accepted as a state-path override.
     #[arg(
         long,
         hide = true,
-        conflicts_with_all = ["internal_release_self_check", "internal_release_verify", "internal_release_install"]
+        conflicts_with_all = ["internal_update", "internal_release_self_check", "internal_release_verify", "internal_release_install"]
     )]
     internal_daemon: bool,
+    /// Internal one-shot updater entry with an inherited private channel.
+    #[arg(long, hide = true, conflicts_with_all = ["internal_daemon", "internal_release_self_check", "internal_release_verify", "internal_release_install"])]
+    internal_update: bool,
     /// Internal side-effect-free build identity used by the installer.
     #[arg(
         long,
         hide = true,
-        conflicts_with_all = ["internal_daemon", "internal_release_verify", "internal_release_install"]
+        conflicts_with_all = ["internal_update", "internal_daemon", "internal_release_verify", "internal_release_install"]
     )]
     internal_release_self_check: bool,
     /// Internal exact manifest/signature verification used by the installer.
@@ -52,7 +58,7 @@ pub struct Cli {
         hide = true,
         num_args = 2,
         value_names = ["MANIFEST", "SIGNATURE"],
-        conflicts_with_all = ["internal_daemon", "internal_release_self_check", "internal_release_install"]
+        conflicts_with_all = ["internal_update", "internal_daemon", "internal_release_self_check", "internal_release_install"]
     )]
     internal_release_verify: Option<Vec<PathBuf>>,
     /// Internal no-clobber installation of this already verified candidate.
@@ -60,7 +66,7 @@ pub struct Cli {
         long,
         hide = true,
         value_name = "DESTINATION",
-        conflicts_with_all = ["internal_daemon", "internal_release_self_check", "internal_release_verify"]
+        conflicts_with_all = ["internal_update", "internal_daemon", "internal_release_self_check", "internal_release_verify"]
     )]
     internal_release_install: Option<PathBuf>,
     /// Public operation to perform.
@@ -73,6 +79,7 @@ impl fmt::Debug for Cli {
         formatter
             .debug_struct("Cli")
             .field("internal_daemon", &self.internal_daemon)
+            .field("internal_update", &self.internal_update)
             .field(
                 "internal_release_self_check",
                 &self.internal_release_self_check,
@@ -91,6 +98,12 @@ impl fmt::Debug for Cli {
 }
 
 impl Cli {
+    /// Whether this invocation enters the detached one-shot updater.
+    #[must_use]
+    pub const fn internal_update(&self) -> bool {
+        self.internal_update
+    }
+
     /// Whether this parse selected the hidden pre-runtime daemon entry.
     #[must_use]
     pub const fn internal_daemon(&self) -> bool {
@@ -122,6 +135,7 @@ impl Cli {
     #[must_use]
     pub fn has_internal_entry(&self) -> bool {
         self.internal_daemon
+            || self.internal_update
             || self.internal_release_self_check
             || self.internal_release_verify.is_some()
             || self.internal_release_install.is_some()
@@ -869,16 +883,21 @@ async fn update(
         .update_with_callbacks(
             arguments.version.as_deref(),
             arguments.yes,
-            |impact| confirm_sessions("Updating zterm", impact, interaction),
+            |impact| {
+                eprintln!("{UPDATE_CONNECTION_GUIDANCE}");
+                confirm_sessions("Updating zterm", impact, interaction)
+            },
             |stage| {
                 eprintln!(
                     "{}",
                     match stage {
-                        UpdateStage::Preparing => "Downloading and verifying the release...",
-                        UpdateStage::Verified => "Release verified.",
-                        UpdateStage::Stopping => "Stopping the daemon...",
-                        UpdateStage::Activating => "Installing the verified release...",
-                        UpdateStage::Starting => "Starting the updated daemon...",
+                        UpdateStage::Preparing =>
+                            "Downloading and verifying the release...".to_owned(),
+                        UpdateStage::Verified { version } => format!("Release {version} verified."),
+                        UpdateStage::Continuing => UPDATE_CONNECTION_GUIDANCE.to_owned(),
+                        UpdateStage::Stopping => "Stopping the daemon...".to_owned(),
+                        UpdateStage::Activating => "Installing the verified release...".to_owned(),
+                        UpdateStage::Starting => "Starting the updated daemon...".to_owned(),
                     }
                 )
             },
@@ -1791,6 +1810,30 @@ mod tests {
         assert_eq!(padded("开发", 6), "开发  ");
         assert!(render_sessions(Vec::new(), "local").contains("zterm connect local"));
         assert!(render_devices(Vec::new()).contains("zterm pair"));
+    }
+
+    #[test]
+    fn independent_updater_is_hidden_and_exclusive() {
+        use clap::CommandFactory;
+        let parsed = Cli::try_parse_from(["zterm", "--internal-update"]).expect("internal updater");
+        assert!(parsed.internal_update() && parsed.has_internal_entry());
+        for args in [
+            vec!["zterm", "--internal-update", "status"],
+            vec!["zterm", "--internal-update", "--internal-daemon"],
+            vec![
+                "zterm",
+                "--internal-update",
+                "--internal-release-self-check",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        assert!(
+            !Cli::command()
+                .render_long_help()
+                .to_string()
+                .contains("--internal-update")
+        );
     }
 
     #[test]

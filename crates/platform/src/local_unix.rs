@@ -310,6 +310,52 @@ pub fn detach_current_process() -> Result<(), LocalPlatformError> {
     }
 }
 
+/// Launches a one-shot child with a private bidirectional channel on stdin.
+/// The child must detach before acknowledging readiness. No PTY stdio survives.
+#[cfg(unix)]
+pub fn spawn_isolated_command(
+    executable: &Path,
+    working_directory: &Path,
+    internal_argument: &str,
+) -> Result<(std::process::Child, std::os::unix::net::UnixStream), LocalPlatformError> {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+
+    let (parent, child) =
+        UnixStream::pair().map_err(|error| LocalPlatformError::Io(error.to_string()))?;
+    let mut command = Command::new(executable);
+    command
+        .arg(internal_argument)
+        .current_dir(working_directory)
+        .stdin(Stdio::from(OwnedFd::from(child)))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let process = command
+        .spawn()
+        .map_err(|error| LocalPlatformError::Io(error.to_string()))?;
+    // Drop Command too: its configured stdin still owns the child socket end.
+    drop(command);
+    Ok((process, parent))
+}
+
+/// Takes a private inherited socket from stdin and detaches the one-shot child.
+#[cfg(unix)]
+pub fn take_isolated_channel(
+    uid: u32,
+) -> Result<std::os::unix::net::UnixStream, LocalPlatformError> {
+    use std::os::fd::AsFd;
+    use std::os::unix::net::UnixStream;
+
+    let descriptor = std::io::stdin()
+        .as_fd()
+        .try_clone_to_owned()
+        .map_err(|error| LocalPlatformError::Io(error.to_string()))?;
+    let channel = UnixStream::from(descriptor);
+    authorize_stream_peer(&channel, uid)?;
+    detach_current_process()?;
+    Ok(channel)
+}
+
 #[cfg(target_os = "linux")]
 fn peer_uid<F: std::os::fd::AsFd>(stream: &F) -> Result<u32, LocalPlatformError> {
     nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials)

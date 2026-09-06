@@ -104,7 +104,7 @@ pub struct ValidatedSetupStatus {
 }
 
 /// Active-session impact returned by stop and update preflight.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SessionImpact {
     /// Live terminal sessions affected by the operation.
     pub active_session_count: u32,
@@ -251,6 +251,8 @@ impl DeviceManagement {
 /// Shared lifecycle and live-session service state for one daemon process.
 #[derive(Clone)]
 pub struct DaemonService {
+    #[cfg(all(test, unix))]
+    pub(crate) version_override: Option<String>,
     #[cfg(unix)]
     setup: BootstrapResult,
     #[cfg(unix)]
@@ -296,6 +298,8 @@ impl DaemonService {
             devices: None,
             pairing: None,
             remote_sessions: None,
+            #[cfg(test)]
+            version_override: None,
         }
     }
 
@@ -316,6 +320,8 @@ impl DaemonService {
             devices: None,
             pairing: None,
             remote_sessions: None,
+            #[cfg(test)]
+            version_override: None,
         }
     }
 
@@ -332,6 +338,8 @@ impl DaemonService {
             devices: None,
             pairing: None,
             remote_sessions: None,
+            #[cfg(test)]
+            version_override: None,
         }
     }
 
@@ -353,6 +361,8 @@ impl DaemonService {
             devices: None,
             pairing: None,
             remote_sessions: None,
+            #[cfg(test)]
+            version_override: None,
         }
     }
 
@@ -840,6 +850,15 @@ impl DaemonService {
     }
 
     #[cfg(unix)]
+    fn build_version(&self) -> String {
+        #[cfg(test)]
+        if let Some(version) = &self.version_override {
+            return version.clone();
+        }
+        env!("CARGO_PKG_VERSION").to_owned()
+    }
+
+    #[cfg(unix)]
     fn dispatch_inner(
         &self,
         frame: DecodedFrame,
@@ -854,7 +873,7 @@ impl DaemonService {
                     request_id,
                     &v2::LocalReadinessResponse {
                         protocol: Some(protocol_proto()),
-                        version: env!("CARGO_PKG_VERSION").to_owned(),
+                        version: self.build_version(),
                         started_at_unix: self.started_at_unix,
                     },
                     false,
@@ -870,7 +889,7 @@ impl DaemonService {
                     request_id,
                     &v2::LocalStatusResponse {
                         protocol: Some(protocol_proto()),
-                        version: env!("CARGO_PKG_VERSION").to_owned(),
+                        version: self.build_version(),
                         phase: zterm_core::PHASE_NAME.to_owned(),
                         device_id: Some(self.setup.device_id.into()),
                         endpoint_id: self.setup.endpoint_id.clone(),

@@ -324,6 +324,19 @@ pub(crate) fn verify_activated_candidate(
         .map_err(Into::into)
 }
 
+/// Refuses an invocation superseded by another executable activation.
+#[cfg(unix)]
+pub(crate) fn verify_updater_executable(executable: &Path) -> Result<(), DaemonError> {
+    let observed = run_candidate_self_check(executable).map_err(DaemonError::from)?;
+    if observed != ReleaseSelfCheck::current() {
+        return Err(DaemonError::new(
+            DomainErrorKind::UpdateRejected,
+            "installed executable changed while this update was waiting; run update again",
+        ));
+    }
+    Ok(())
+}
+
 /// Writes managed install metadata after setup or a successful activation.
 pub fn write_install_metadata(
     paths: &UserPaths,
@@ -622,7 +635,7 @@ fn map_release_error(error: ReleaseError) -> DistributionError {
 }
 
 #[cfg(all(test, unix))]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeMap;
 
     use ring::signature::{Ed25519KeyPair, KeyPair};
@@ -770,6 +783,50 @@ mod tests {
             current,
             temporary,
         )
+    }
+
+    pub(crate) fn prepare_update_fixture(script: &str) -> PreparedRelease {
+        let (mut fetcher, selection, key, current, _temporary) = fixture();
+        let manifest_url = selection.asset_url(MANIFEST_ASSET);
+        let mut manifest: ReleaseManifest =
+            serde_json::from_slice(&fetcher.0[&manifest_url]).expect("fixture manifest");
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        {
+            let mut archive = tar::Builder::new(&mut encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(script.len() as u64);
+            header.set_mode(0o700);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, "zterm", script.as_bytes())
+                .expect("fixture archive");
+            archive.finish().expect("archive finish");
+        }
+        let archive = encoder.finish().expect("gzip finish");
+        let artifact = &mut manifest.artifacts[0];
+        artifact.length = archive.len() as u64;
+        artifact.sha256 = sha256_hex(&archive);
+        fetcher.0.insert(artifact.url.clone(), archive);
+        let raw = serde_json::to_vec(&manifest).expect("manifest bytes");
+        let signer = Ed25519KeyPair::from_seed_unchecked(&[8; 32]).expect("fixture signer");
+        fetcher.0.insert(
+            selection.asset_url(SIGNATURE_ASSET),
+            signer.sign(&raw).as_ref().to_vec(),
+        );
+        fetcher.0.insert(manifest_url, raw);
+        prepare_with(&fetcher, &selection, &key, current).expect("authenticated update fixture")
+    }
+
+    pub(crate) fn update_fixture_self_check() -> ReleaseSelfCheck {
+        ReleaseSelfCheck {
+            schema: RELEASE_MANIFEST_SCHEMA,
+            product: "zterm".into(),
+            build: build_identity(
+                "9.1.0",
+                BuildIdentity::current().target,
+                "0123456789abcdef0123456789abcdef01234567",
+            ),
+        }
     }
 
     #[test]

@@ -34,6 +34,12 @@ For each arrow, ask:
 
 ### Step 2: Identify Boundaries
 
+For lifecycle operations that stop a daemon or PTY, also trace the lifetime of
+the caller and the process responsible for the remaining steps. If the operation
+can terminate its own caller, require an independent completion owner and test
+the real shutdown boundary. Keep execution handoff separate from authorization
+to interrupt work; see the backend distribution lifecycle contract.
+
 | Boundary              | Common Issues                     |
 | --------------------- | --------------------------------- |
 | API ↔ Service         | Type mismatches, missing fields   |

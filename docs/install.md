@@ -133,6 +133,24 @@ if it was previously stopped. The CLI shows actual update phases and reports
 success after local readiness, without waiting for Internet connectivity.
 PTYs ended for the update are not restored.
 
+You can run the same command inside a remote zterm Session or a local zterm
+self-attachment. A one-shot updater runs independently of that terminal. After
+you confirm and the updater accepts the operation, closing the Session or
+losing the connection does not cancel installation. Reconnect manually after
+the new daemon starts; the old Session's shell and programs have ended.
+
+An ordinary external terminal waits for the actual update result. On a
+configured server, update stages and the final outcome are also recorded in
+the existing daemon log. After reconnecting, check `zterm --version`,
+`zterm daemon status`, and `zterm logs`. If the daemon cannot start, use SSH or
+another independent terminal to inspect the same information and follow the
+restart guidance. Acceptance is not a claim that installation has succeeded.
+
+The first upgrade from an older updater that terminates with its own Session
+must still be run from an independent terminal, such as SSH. Downloading the
+fixed candidate cannot change the old updater process already executing.
+Subsequent upgrades can use the independent updater from within zterm.
+
 Before setup, update installs the binary and prints `Run zterm setup to
 configure and start the daemon.` It never creates an identity implicitly. If
 activation committed but startup fails, the new binary stays installed and

@@ -18,8 +18,10 @@ NetworkReporter::update(update)
 
 `init_lifecycle_logging` installs the daemon's text tracing subscriber. The
 existing detached launcher redirects stdout/stderr to the managed daemon log.
-CLI update reports typed `UpdateStage` progress to its own terminal; those
-messages do not claim to be captured by a stopped daemon's subscriber.
+CLI update renders typed `UpdateStage` progress from the independent updater.
+The one-shot update owner also appends bounded configured-update stage/outcome
+records to the existing daemon log; it does not depend on a stopped daemon's
+subscriber or on the PTY that update may terminate.
 
 ## 3. Contracts
 
@@ -48,7 +50,16 @@ messages do not claim to be captured by a stopped daemon's subscriber.
 - Keep the current managed files `daemon.log` and `daemon.log.1`. The launcher
   rotates at startup if the current file is at least 4 MiB, retaining one
   predecessor. This is not a runtime capacity limit. Do not add extra managed
-  files, a writer process, remote upload, transcript or retention engine.
+  files, a logging service, remote upload, transcript or retention engine.
+- The explicit one-shot updater is the sole additional writer exception. It
+  validates existing state/log directories and uses `open_append` for each
+  stage, so final completion after startup rotation reaches current daemon.log.
+  Records contain timestamp, updater PID, authenticated target, acceptance,
+  stage and outcome/category; no payload/error-tree dumps. `stage=committed`
+  distinguishes committed activation; `outcome=partial_completion` reports
+  subsequent startup failure while retaining the new executable. Known log
+  path errors fail before stop; later diagnostic failure must not roll back a
+  successful operation. Before setup, update creates no log or identity state.
 - `logs` reads once without creating paths or starting a daemon: default 100
   lines, maximum 1,000 lines and 1 MiB. `-n` aliases `--lines`. Missing/empty logs
   get an English explanation; explicitly selecting zero lines remains empty.
@@ -65,7 +76,9 @@ messages do not claim to be captured by a stopped daemon's subscriber.
 | Ordinary controller detach | INFO event; live Session remains available |
 | Prepared takeover attachment removed before acquiring control | No controller-detached event; actual controller unaffected |
 | Typed operation failure | Useful component/stage/category without payload text |
-| Update committed but daemon startup fails | CLI partial-completion error; no new file writer or false full success |
+| Update committed but daemon startup fails | CLI partial-completion error and updater partial-completion record; no false full success |
+| Configured updater's foreground PTY ends | existing log retains stages and final outcome independently |
+| Daemon startup rotates the log during update | final result reopens/appends current daemon.log |
 
 ## 5. Good / Base / Bad Cases
 
@@ -85,6 +98,9 @@ terminal/ticket/cwd content. The pair-create/replay fixture checks the actual
 returned ticket and one committed event. Do not modify the global subscriber for concurrent
 unrelated tests. Existing log-tail/no-autospawn tests own read limits and the
 empty output contract; no follow tests are needed.
+The updater's process tests own outcome persistence across frontend loss,
+post-commit failure and startup rotation; no separate retention subsystem tests
+are needed.
 
 ## 7. Wrong vs Correct
 

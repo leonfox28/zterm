@@ -83,6 +83,20 @@ zterm-release-tool validate-next-version <SEMVER>
 The text must be canonical SemVer and strictly newer than the compiled
 workspace version.
 
+The one-shot updater has a separate hidden entry, mutually exclusive with
+normal commands and all other internal entries:
+
+```text
+--internal-update
+```
+
+`update::run_internal_update()` takes an inherited same-UID Unix socket from
+stdin through `local_unix::take_isolated_channel(uid)`, detaches before readiness,
+and owns one `PreparedRelease` until `LocalRuntime::apply_prepared_update` ends.
+`update_with_callbacks` launches this owner through
+`local_unix::spawn_isolated_command(executable, cwd, internal_argument)` and
+acts only as its foreground confirmation/progress adapter.
+
 ### 3. Contracts
 
 - `zterm-release.json` authenticates schema/product/version/tag/classification,
@@ -158,8 +172,35 @@ workspace version.
   Before setup, report setup guidance without identity creation. Post-commit
   startup failure is a nonzero partial-completion error retaining the new
   binary; no second rollback engine. UpdateStage exposes actual preparation,
-  verified, stop, activation and startup phases to the CLI, without a new log
-  writer. An old installed updater retains its old behavior for the first upgrade.
+  verified target version, handoff, stop, activation and startup phases to the
+  CLI. The one-shot update owner records bounded configured-update outcomes
+  through the existing daemon log; see [Logging](./logging-guidelines.md).
+  An old installed updater retains its old behavior for the first upgrade.
+- All public update invocations use one detached execution path. The child
+  owns download and staging from the beginning; do not hand trusted candidate
+  metadata between processes or download it again after confirmation. The
+  private channel carries bounded, typed Begin(version, approved), Approve,
+  Cancel and Continue requests, plus Ready, Progress, Confirm(SessionImpact),
+  Handoff, Accepted and Complete(Result) responses. JSON bodies have a 64 KiB
+  ceiling and a four-byte big-endian length. Writes share a one-second absolute
+  deadline; after any partial/failed write close the channel rather than append
+  another frame. Child readiness has a five-second deadline. Human input holds
+  no lifecycle lock and has no artificial timeout.
+- Receiving Continue transfers execution responsibility. Frontend EOF before
+  handoff cancels; after acceptance it cannot stop activation or startup.
+  Handoff does not grant interruption permission: a newly admitted Session
+  after an idle preflight still requires foreground confirmation unless -y or
+  earlier action-wide approval applies. Foreground loss at that point leaves
+  unapproved work alive. A ready child unwinds cancellation and drops staging;
+  only a child that never became ready may be killed by launcher cleanup.
+- Preserve the existing configured lifecycle-lock activation owner. Under that
+  ownership, self-check the installed source executable against the updater's
+  embedded build identity before replacement; reject a superseded invocation.
+  The terminal awaits actual completion when it survives. Channel loss is an
+  `operation_outcome_unknown` after possible handoff, never success; before
+  handoff it is a cancellation without mutation. Session-ended updates require
+  manual reconnect and do not restore old shell processes. Initial migration
+  from an older foreground updater requires an independent terminal such as SSH.
 - Uninstall validates the running managed executable, reuses identity reset and
   managed-inventory deletion, then removes the executable last. One confirmation
   or -y/--yes approves deletion and Session impact, including zero-Session
@@ -240,6 +281,11 @@ workspace version.
 | a v1 or mixed-version peer reaches a v2 ALPN/wire boundary | explicit incompatibility; do not downgrade, translate terminal representation, or partially activate the attachment |
 | Live Sessions and no prior interruption approval | show names and request y/yes; cancel/EOF/noninteractive refusal leaves binary and Sessions intact |
 | Session admitted after an empty preflight | unapproved stop returns impact and confirms within this invocation before interrupting |
+| Updater launch/readiness or pre-handoff control fails | no daemon stop or executable replacement; prepared staging unwinds |
+| Originating PTY/foreground ends after accepted handoff | detached owner completes activation and startup; record actual outcome |
+| Foreground disappears while newly admitted work requires approval | preserve unapproved work and installed executable |
+| Progress peer stalls or closes after acceptance | bounded send fails and channel closes; mutation owner continues |
+| Source executable changed while this invocation waited | `update_rejected` under activation ownership; do not overwrite the new source |
 | Committed update with configured state | ensure activated executable and match authenticated manifest readiness |
 | Committed update before setup | success with setup guidance; no identity creation |
 | Activation committed but startup/readiness failed | nonzero partial-completion diagnostic; new binary remains installed |
@@ -256,6 +302,10 @@ workspace version.
 
 ### 5. Good/Base/Bad Cases
 
+- Good: confirm update inside a daemon-owned PTY, lose that terminal during
+  stop, then observe the detached owner install and start the signed target.
+- Bad: run activation in the same foreground process whose root PTY update
+  explicitly closes, or treat a successful helper spawn as update success.
 - Good: signed newer target archive verifies, zero Sessions are active, daemon
   stops, candidate activates/post-checks, metadata commits, lifecycle lock is
   released, new-version daemon becomes ready, and the rollback file is removed.
@@ -282,6 +332,15 @@ workspace version.
 
 ### 6. Tests Required
 
+- `cargo test -p zterm-daemon --lib update::tests` owns the real PTY regression:
+  authenticated fixture preparation, actual Session shutdown, executable
+  activation and target-version daemon readiness after the foreground ends.
+  It also covers cancellation/staging cleanup, pre-handoff EOF, late Session
+  admission, -y, bounded stalled writes, source replacement, rollback, startup
+  partial completion, pre-setup no-state creation and final log rotation.
+  Fixtures inject signing/build inputs only in cfg(test); production official
+  build checks remain intact. This is isolated process evidence, not a hosted
+  official-release or real-network acceptance run.
 - `cargo test -p zterm-core release::tests` asserts exact-byte authentication,
   common schema/classification boundaries, current-target uniqueness and
   artifact checks, one-target and unknown/more-than-four-target inventories,
@@ -332,6 +391,15 @@ workspace version.
   to validate this distribution contract.
 
 ### 7. Wrong vs Correct
+
+Wrong: the foreground updater requests daemon stop from inside an affected
+PTY, then expects that same process to activate the candidate after its own
+Session ends.
+
+Correct: a detached one-shot child owns the verified candidate and the complete
+stop/activate/start sequence. The foreground supplies explicit interruption
+approval and Continue; a later foreground disconnect cannot own cancellation.
+The surviving foreground and existing log consume the actual completion result.
 
 #### Wrong
 

@@ -657,6 +657,11 @@ No new crate, background owner, or second Session interpreter is introduced.
   --force is removed; the internal LocalStopRequest.force boolean remains the
   action-level interruption approval. CLI I/O stays outside LocalRuntime and
   outside lifecycle/registry locks.
+- Update's foreground I/O is forwarded over a private inherited updater
+  channel, not a remote control endpoint. The one-shot child owns candidate
+  preparation, stop, activation and startup so closing the invoking PTY cannot
+  terminate its updater. Continue/acceptance is distinct from interruption
+  approval, including late Session admission; see [Distribution](./distribution-lifecycle.md).
 - Session registry admission atomically rejects an unapproved stop with live,
   provisional, cleanup-only or Starting ownership. Return stopping=false with
   names/count without cancelling owners or closing admission; the same CLI
