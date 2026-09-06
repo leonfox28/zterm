@@ -118,7 +118,8 @@ fn run_terminal_child_if_requested() -> bool {
         DaemonLauncher::for_test("/does/not/exist".into(), "--must-not-run".to_owned()),
     );
     let arguments = match mode {
-        "connect" | "screen-switch" | "scroll" | "copy" | "enhanced-prefix" => {
+        "connect" | "screen-switch" | "scroll" | "copy" | "enhanced-prefix"
+        | "alternate-detach" | "alternate-reattach" | "alternate-wider" | "main-wider" => {
             vec!["zterm", "connect", "local"]
         }
         "bare-signal" => vec!["zterm"],
@@ -327,6 +328,25 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
     let copy_output = run_local_terminal_child(&runtime, &state.paths, "copy").await;
     assert_local_selection_copy(&copy_output);
     wait_for_detach(&runtime, "local", &ui_main_id.to_string()).await;
+
+    // Retain the application-neutral child's Alternate screen across real CLI
+    // invocations. Every invocation below also proves input reaches that child.
+    for mode in [
+        "alternate-detach",
+        "alternate-reattach",
+        "alternate-wider",
+        "main-wider",
+    ] {
+        let output = run_local_terminal_child(&runtime, &state.paths, mode).await;
+        assert!(contains_bytes(&output, TERMINAL_RESTORE_BYTES));
+        let retained = runtime
+            .session_list("local")
+            .await
+            .expect("retained Session");
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].session_id, ui_main_id);
+        wait_for_detach(&runtime, "local", &ui_main_id.to_string()).await;
+    }
 
     let enhanced_output = run_local_terminal_child(&runtime, &state.paths, "enhanced-prefix").await;
     assert!(contains_bytes(&enhanced_output, b"\x1b[=15u"));
@@ -617,10 +637,30 @@ async fn run_local_terminal_child(
     use nix::pty::{Winsize, openpty};
     use nix::sys::termios::tcgetattr;
 
+    let columns = match mode {
+        "alternate-wider" => 90,
+        "main-wider" => 100,
+        _ => 80,
+    };
+    let child_columns = match mode {
+        "alternate-reattach" | "alternate-wider" => columns,
+        _ => columns - 1,
+    };
+    let retained_revision = if mode == "alternate-reattach" {
+        Some(
+            runtime
+                .session_list("local")
+                .await
+                .expect("retained viewport")[0]
+                .revision,
+        )
+    } else {
+        None
+    };
     let pty = openpty(
         Some(&Winsize {
             ws_row: 24,
-            ws_col: 80,
+            ws_col: columns,
             ws_xpixel: 0,
             ws_ypixel: 0,
         }),
@@ -650,7 +690,10 @@ async fn run_local_terminal_child(
 
     let input_probe = match mode {
         "connect" => TERMINAL_CONNECT_MARKER,
-        "screen-switch" => b"ZTERM_TEST_DECSET_1049".as_slice(),
+        "screen-switch" | "alternate-detach" => b"ZTERM_TEST_DECSET_1049".as_slice(),
+        "alternate-reattach" => b"ZTERM_SAME_SIZE_INPUT".as_slice(),
+        "alternate-wider" => b"ZTERM_ALT_WIDER_INPUT".as_slice(),
+        "main-wider" => b"ZTERM_MAIN_WIDER_INPUT".as_slice(),
         "scroll" => b"ZTERM_SCROLL_PROBE".as_slice(),
         "copy" => TERMINAL_COPY_SCREEN,
         "enhanced-prefix" => b"ZTERM_TEST_KEYBOARD_15".as_slice(),
@@ -749,7 +792,40 @@ async fn run_local_terminal_child(
             &format!("local terminal {mode} did not commit its initial semantic presentation"),
         );
     }
-    let active_revision = wait_for_active_viewport(runtime, 23, 79).await;
+    let active_revision = wait_for_active_viewport(runtime, 23, child_columns).await;
+    if let Some(retained_revision) = retained_revision {
+        let settled = wait_for_terminal_quiescence(runtime, &presentation_count, mode).await;
+        assert_eq!(
+            settled, retained_revision,
+            "same-size Alternate reattach must not resize or mutate the retained model"
+        );
+    }
+    // This deterministic child keeps its cursor visible. The CLI presents it
+    // only after its own Active input fence opens; the daemon's controller
+    // lease alone does not prove the frontend consumed that event yet.
+    let input_deadline = std::time::Instant::now() + TERMINAL_TEST_TIMEOUT;
+    loop {
+        let ready = {
+            let bytes = captured.lock().expect("input-ready presentation");
+            bytes
+                .windows(TERMINAL_SYNC_END.len())
+                .rposition(|window| window == TERMINAL_SYNC_END)
+                .and_then(|end| {
+                    bytes[..end]
+                        .windows(TERMINAL_SYNC_BEGIN.len())
+                        .rposition(|window| window == TERMINAL_SYNC_BEGIN)
+                        .map(|begin| contains_bytes(&bytes[begin..end], b"\x1b[?25h"))
+                })
+                .unwrap_or(false)
+        };
+        if ready {
+            break;
+        }
+        if std::time::Instant::now() >= input_deadline {
+            terminate_failed_child(&mut child, "terminal input fence did not open");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
     // Validate the real input -> PTY -> model -> semantic presentation path
     // through protocol-visible progress. Raw presenter bytes are intentionally
     // not treated as a reconstruction of the final screen.
@@ -779,6 +855,28 @@ async fn run_local_terminal_child(
         "fixture input must advance the authoritative terminal model"
     );
     let quiescent_revision = wait_for_terminal_quiescence(runtime, &presentation_count, mode).await;
+    if matches!(
+        mode,
+        "alternate-reattach" | "alternate-wider" | "main-wider"
+    ) {
+        assert!(
+            contains_bytes(
+                &captured.lock().expect("reattach presentation"),
+                input_probe
+            ),
+            "reattached input must be echoed by the retained child"
+        );
+    }
+    if mode == "alternate-detach" {
+        wait_for_active_viewport(runtime, 23, columns).await;
+        wait_for_terminal_quiescence(runtime, &presentation_count, mode).await;
+    } else if mode == "alternate-wider" {
+        master_writer
+            .write_all(b"ZTERM_TEST_DECRST_1049\r")
+            .expect("return retained child to Main for changed-width reattach");
+        wait_for_active_viewport(runtime, 23, columns - 1).await;
+        wait_for_terminal_quiescence(runtime, &presentation_count, mode).await;
+    }
     if mode == "enhanced-prefix" {
         assert!(
             contains_bytes(

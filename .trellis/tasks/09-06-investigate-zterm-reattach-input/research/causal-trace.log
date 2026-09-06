@@ -1,0 +1,40 @@
+1788661098620000 10913 UI INITIAL provisional=TerminalSize { rows: 39, columns: 139 } snapshot=TerminalSize { rows: 39, columns: 139 } desired=TerminalSize { rows: 39, columns: 139 } screen=Main
+1788661098621578 10913 CLIENT SEND TerminalSnapshotApplied
+1788661098621911 10913 UI STATE previous=Synchronizing effective=Active resize=None
+1788661098622678 10913 UI DELTA from=0 to=2 size=TerminalSize { rows: 39, columns: 139 } state=Active barrier=false
+1788661098867994 10913 UI INPUT state=Active len=44
+1788661098868274 10913 CLIENT SEND TerminalInput
+1788661098870712 10913 UI DELTA from=2 to=10 size=TerminalSize { rows: 39, columns: 139 } state=Active barrier=false
+1788661098872850 10913 UI DELTA from=10 to=21 size=TerminalSize { rows: 39, columns: 139 } state=Active barrier=false
+1788661098875028 10913 UI INPUT state=Active len=70
+1788661098875147 10913 CLIENT SEND TerminalInput
+1788661098877685 10913 UI DELTA from=21 to=39 size=TerminalSize { rows: 39, columns: 139 } state=Active barrier=false
+1788661098879634 10913 UI DELTA from=39 to=50 size=TerminalSize { rows: 39, columns: 139 } state=Active barrier=false
+1788661098908562 10913 UI STATE previous=Active effective=Synchronizing resize=None
+1788661098913963 10913 UI SNAPSHOT revision=51 size=TerminalSize { rows: 39, columns: 139 } state=Synchronizing
+1788661098915389 10913 CLIENT SEND TerminalSnapshotApplied
+1788661098915580 10913 UI STATE previous=Synchronizing effective=Synchronizing resize=Some(TerminalSize { rows: 39, columns: 140 })
+1788661098915651 10913 CLIENT SEND TerminalResize
+1788661098915992 10912 SERVER RESIZE current=TerminalSize { rows: 39, columns: 139 } requested=TerminalSize { rows: 39, columns: 140 }
+1788661098921322 10913 UI STATE previous=Synchronizing effective=Synchronizing resize=None
+1788661098925122 10913 UI SNAPSHOT revision=52 size=TerminalSize { rows: 39, columns: 140 } state=Synchronizing
+1788661098925982 10913 CLIENT SEND TerminalSnapshotApplied
+1788661098926104 10913 UI STATE previous=Synchronizing effective=Active resize=None
+1788661099226097 10913 UI INPUT state=Active len=16
+1788661099226388 10913 CLIENT SEND TerminalInput
+1788661099226576 10913 CLIENT SEND TerminalInput
+1788661099226659 10913 CLIENT SEND TerminalInput
+1788661099226724 10913 CLIENT SEND TerminalInput
+1788661099228109 10913 UI DELTA from=52 to=55 size=TerminalSize { rows: 39, columns: 140 } state=Active barrier=false
+1788661099229036 10913 UI DELTA from=55 to=56 size=TerminalSize { rows: 39, columns: 140 } state=Active barrier=false
+1788661099534858 10913 UI INPUT state=Active len=17
+1788661099535060 10913 CLIENT SEND TerminalDetach
+1788661099602447 10979 UI INITIAL provisional=TerminalSize { rows: 39, columns: 139 } snapshot=TerminalSize { rows: 39, columns: 140 } desired=TerminalSize { rows: 39, columns: 140 } screen=Alternate
+1788661099603593 10979 CLIENT SEND TerminalSnapshotApplied
+1788661099603793 10979 UI STATE previous=Synchronizing effective=Synchronizing resize=Some(TerminalSize { rows: 39, columns: 140 })
+1788661099604118 10979 CLIENT SEND TerminalResize
+1788661099604182 10912 SERVER RESIZE current=TerminalSize { rows: 39, columns: 140 } requested=TerminalSize { rows: 39, columns: 140 }
+1788661099605007 10979 UI DELTA from=56 to=57 size=TerminalSize { rows: 39, columns: 140 } state=Synchronizing barrier=false
+1788661100603573 10979 UI INPUT state=Synchronizing len=16
+1788661101134767 10979 UI INPUT state=Synchronizing len=17
+1788661101135043 10979 CLIENT SEND TerminalDetach

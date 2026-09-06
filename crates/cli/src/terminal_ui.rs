@@ -246,8 +246,8 @@ mod unix {
         if let Some(cancellation) = current_terminal_cancellation(cancellation_receiver) {
             return Err(cancellation.error(None));
         }
-        let initial_physical_size = terminal_size(stdout)?;
-        let initial_layout = ChromeLayout::new(initial_physical_size, ActiveScreen::Main);
+        let mut physical_size = terminal_size(stdout)?;
+        let initial_layout = ChromeLayout::new(physical_size, ActiveScreen::Main);
         let initial_size = initial_layout.child;
         let stateful_prepare = matches!(
             &request.kind,
@@ -262,7 +262,6 @@ mod unix {
         let mut stdin_pump = StdinPump::start(stdin, input_epoch.clone())?;
         let mut prefix = CommandMode::new();
         let transport_state = TerminalViewTransportState::Synchronizing;
-        let mut resize_coalescer = ResizeCoalescer::new(initial_size);
         let prepared = match await_while_inactive(
             prepare(request, runtime, initial_size),
             InactiveWaitContext {
@@ -271,7 +270,7 @@ mod unix {
                 cancellation_receiver,
                 stdin_pump: &mut stdin_pump,
                 prefix: &mut prefix,
-                resize_coalescer: &mut resize_coalescer,
+                physical_size: &mut physical_size,
                 current_input_epoch,
                 preserve_submitted_result: stateful_prepare,
                 report_key_events: false,
@@ -295,23 +294,21 @@ mod unix {
             }
         };
         let session_id = prepared.session_id();
-        let physical_size = terminal_size(stdout)?;
+        physical_size = terminal_size(stdout)?;
         let latest_layout = ChromeLayout::new(
             physical_size,
             prepared.initial_snapshot().surface.active_screen,
         );
-        let latest_size = latest_layout.child;
-        if latest_size != initial_size || resize_coalescer.pending.is_some() {
-            let _ = resize_coalescer.observe(latest_size, transport_state);
-        }
-
         let view_target = prepared.target().clone();
         let surface = AttachmentSurface::from_snapshot(prepared.initial_snapshot())?;
+        // The creation hint does not resize a retained Session. Only the host
+        // snapshot establishes the actual geometry for resize deduplication.
+        let mut resize_coalescer = ResizeCoalescer::new(surface.surface.size);
         let mut presenter = DesktopPresenter::default();
         let mut selection = SelectionController::default();
         let initial_scroll_metrics = prepared.initial_snapshot().surface.scroll_metrics;
         let mut viewport = ViewportController::with_layout(latest_layout, initial_scroll_metrics);
-        let status_renderer = StatusRenderer::new(view_target, physical_size);
+        let mut status_renderer = StatusRenderer::new(view_target, physical_size);
         reconcile_presenter_selection(&mut selection, &viewport, &surface, &mut presenter);
         present_surface_stdout(
             &surface,
@@ -339,7 +336,7 @@ mod unix {
                 cancellation_receiver,
                 stdin_pump: &mut stdin_pump,
                 prefix: &mut prefix,
-                resize_coalescer: &mut resize_coalescer,
+                physical_size: &mut physical_size,
                 current_input_epoch,
                 preserve_submitted_result: false,
                 report_key_events: presenter
@@ -363,6 +360,14 @@ mod unix {
                 return inactive_cancellation_result(cancellation, Some(session_id));
             }
         };
+        // Both inactive waits retain physical sizes, without assuming Main.
+        // Sample again because a ready future may win over a pending SIGWINCH.
+        // Reconcile once, using the known screen, before the first Active event.
+        physical_size = terminal_size(stdout)?;
+        let layout = ChromeLayout::new(physical_size, surface.active_screen());
+        viewport.set_layout(layout);
+        status_renderer.resize(physical_size);
+        let _ = resize_coalescer.observe(layout.child, transport_state);
         let (events, writer) = view.split();
         if let Some(query) = viewport.prefetch_live()
             && writer.request_history_window(query).await.is_err()
@@ -402,13 +407,13 @@ mod unix {
         .await
     }
 
-    struct InactiveWaitContext<'a> {
-        stdout: &'a io::Stdout,
+    struct InactiveWaitContext<'a, Output> {
+        stdout: &'a Output,
         resize_signal: &'a mut Signal,
         cancellation_receiver: &'a mut watch::Receiver<Option<TerminalSignalCancellation>>,
         stdin_pump: &'a mut StdinPump,
         prefix: &'a mut CommandMode,
-        resize_coalescer: &'a mut ResizeCoalescer,
+        physical_size: &'a mut TerminalSize,
         current_input_epoch: u64,
         preserve_submitted_result: bool,
         report_key_events: bool,
@@ -416,7 +421,7 @@ mod unix {
 
     async fn await_while_inactive<T>(
         future: impl Future<Output = Result<T, CliError>>,
-        context: InactiveWaitContext<'_>,
+        context: InactiveWaitContext<'_, impl AsFd>,
     ) -> Result<InactiveWait<T>, CliError> {
         let InactiveWaitContext {
             stdout,
@@ -424,7 +429,7 @@ mod unix {
             cancellation_receiver,
             stdin_pump,
             prefix,
-            resize_coalescer,
+            physical_size,
             current_input_epoch,
             preserve_submitted_result,
             report_key_events,
@@ -457,11 +462,7 @@ mod unix {
                             "SIGWINCH handler closed",
                         ));
                     }
-                    let latest = child_terminal_size(terminal_size(stdout)?);
-                    let _ = resize_coalescer.observe(
-                        latest,
-                        TerminalViewTransportState::Synchronizing,
-                    );
+                    *physical_size = terminal_size(stdout)?;
                 }
                 () = wait_for_prefix_deadline(prefix_deadline), if prefix_deadline.is_some() => {
                     prefix.cancel();
@@ -653,10 +654,6 @@ mod unix {
                 )
             }
         }
-    }
-
-    fn child_terminal_size(physical: TerminalSize) -> TerminalSize {
-        ChromeLayout::new(physical, ActiveScreen::Main).child
     }
 
     fn preserve_created_session<T>(
@@ -3985,6 +3982,104 @@ mod unix {
                 coalescer.enter_transport_state(TerminalViewTransportState::Active),
                 (TerminalViewTransportState::Active, None)
             );
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn inactive_waits_retain_physical_resizes_and_discard_startup_input() {
+            // Count real terminal-size reads so each SIGWINCH is consumed
+            // before the next resize, without depending on a timing delay.
+            struct ResizeProbe<'a> {
+                terminal: &'a std::os::fd::OwnedFd,
+                reads: Arc<AtomicUsize>,
+            }
+            impl AsFd for ResizeProbe<'_> {
+                fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+                    self.reads.fetch_add(1, Ordering::SeqCst);
+                    self.terminal.as_fd()
+                }
+            }
+
+            for preserve_submitted_result in [true, false] {
+                let pty = openpty(None, None).expect("inactive resize PTY");
+                let reads = Arc::new(AtomicUsize::new(0));
+                let stdout = ResizeProbe {
+                    terminal: &pty.slave,
+                    reads: Arc::clone(&reads),
+                };
+                let mut resize_signal = signal(SignalKind::window_change()).expect("SIGWINCH");
+                let (_cancel_sender, mut cancellation_receiver) = watch::channel(None);
+                let input_epoch = InputEpoch::new();
+                let mut stdin_pump =
+                    StdinPump::start(&pty.slave, input_epoch.clone()).expect("inactive stdin pump");
+                let input_sender = stdin_pump.sender_for_test.clone();
+                let mut prefix = CommandMode::new();
+                let mut physical_size = TerminalSize::new(40, 140);
+                let (release, ready) = tokio::sync::oneshot::channel();
+                let wait = await_while_inactive(
+                    async {
+                        ready.await.expect("release initial operation");
+                        Ok(())
+                    },
+                    InactiveWaitContext {
+                        stdout: &stdout,
+                        resize_signal: &mut resize_signal,
+                        cancellation_receiver: &mut cancellation_receiver,
+                        stdin_pump: &mut stdin_pump,
+                        prefix: &mut prefix,
+                        physical_size: &mut physical_size,
+                        current_input_epoch: input_epoch.current(),
+                        preserve_submitted_result,
+                        report_key_events: false,
+                    },
+                );
+                let resize = async {
+                    for (index, (rows, columns)) in [(50, 160), (42, 152)].into_iter().enumerate() {
+                        rustix::termios::tcsetwinsize(
+                            &pty.master,
+                            rustix::termios::Winsize {
+                                ws_row: rows,
+                                ws_col: columns,
+                                ws_xpixel: 0,
+                                ws_ypixel: 0,
+                            },
+                        )
+                        .expect("resize inactive outer terminal");
+                        kill(Pid::this(), NixSignal::SIGWINCH).expect("notify inactive resize");
+                        input_sender
+                            .send(StdinEvent::Bytes {
+                                epoch: input_epoch.current(),
+                                bytes: b"startup input".to_vec(),
+                            })
+                            .await
+                            .expect("queue inactive input");
+                        while reads.load(Ordering::SeqCst) <= index
+                            || input_sender.capacity() != STDIN_CHANNEL_CAPACITY
+                        {
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                    release.send(()).expect("complete initial operation");
+                };
+                let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                    tokio::join!(wait, resize)
+                })
+                .await
+                .expect("inactive resize/input progress");
+                assert!(matches!(
+                    result.expect("inactive wait"),
+                    InactiveWait::Ready(())
+                ));
+                assert_eq!(physical_size, TerminalSize::new(42, 152));
+                assert!(
+                    stdin_pump
+                        .receiver
+                        .as_mut()
+                        .expect("live receiver")
+                        .try_recv()
+                        .is_err()
+                );
+                stdin_pump.shutdown().expect("stop inactive stdin pump");
+            }
         }
 
         #[test]
