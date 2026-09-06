@@ -35,6 +35,8 @@ mod session_wire;
 pub mod store;
 pub mod terminal_driver;
 pub mod transport;
+#[cfg(unix)]
+pub mod update;
 
 /// Static workspace build information.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -248,7 +248,7 @@ pub struct IdentityResetResult {
 }
 
 /// Result of one explicit authenticated binary update.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct UpdateResult {
     /// Version replaced by this invocation.
     pub previous_version: String,
@@ -261,12 +261,17 @@ pub struct UpdateResult {
 }
 
 /// Actual update transaction boundaries, rendered by the invoking frontend.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum UpdateStage {
     /// Candidate download and authentication are beginning.
     Preparing,
     /// All candidate authentication checks completed.
-    Verified,
+    Verified {
+        /// Authenticated target version.
+        version: String,
+    },
+    /// The foreground is handing off mutation ownership before its PTY may end.
+    Continuing,
     /// Stopping the current daemon after any required approval.
     Stopping,
     /// Replacing the installed executable.
@@ -458,126 +463,143 @@ impl LocalRuntime {
     pub async fn update_with_callbacks(
         &self,
         exact_tag: Option<&str>,
-        mut approved: bool,
-        mut confirm: impl FnMut(&SessionImpact) -> Result<(), DaemonError>,
-        mut progress: impl FnMut(UpdateStage),
+        approved: bool,
+        confirm: impl FnMut(&SessionImpact) -> Result<(), DaemonError>,
+        progress: impl FnMut(UpdateStage),
     ) -> Result<UpdateResult, DaemonError> {
         #[cfg(unix)]
         {
             let executable = self.launcher.executable();
             crate::distribution::validate_managed_executable(executable, self.paths.uid())?;
-            let selection = crate::distribution::ReleaseSelection::parse(exact_tag)?;
-            progress(UpdateStage::Preparing);
-            let prepared = crate::distribution::prepare_update(selection).await?;
-            progress(UpdateStage::Verified);
-
-            let client = LocalClient::new(self.paths.socket());
-            let (daemon_running, impact) = match client.status().await {
-                Ok(status) => {
-                    require_update_daemon_compatible(
-                        &status.version,
-                        status.protocol.wire_major,
-                        status.protocol.state_schema,
-                    )?;
-                    (true, client.update_preflight().await?)
-                }
-                Err(error) if error.kind() == DomainErrorKind::DaemonStopped => (
-                    false,
-                    SessionImpact {
-                        active_session_count: 0,
-                        active_session_names: Vec::new(),
-                        stopping: false,
-                        interruption_required: false,
-                    },
-                ),
-                Err(error) => return Err(error),
-            };
-            require_interruption_approval(&impact, &mut approved, &mut confirm)?;
-            let ended = if daemon_running {
-                progress(UpdateStage::Stopping);
-                self.stop_with_confirmation(approved, &mut confirm)
-                    .await?
-                    .map_or_else(Vec::new, |impact| impact.active_session_names)
-            } else {
-                Vec::new()
-            };
-
-            let state_present = managed_root_exists(&self.paths)?;
-            let lifecycle = if state_present {
-                let lock = acquire_lifecycle_lock(&self.paths, Instant::now()).await?;
-                if probe_readiness(&self.paths).await?.is_some() {
-                    return Err(DaemonError::new(
-                        DomainErrorKind::UpdateRejected,
-                        "daemon restarted while update was waiting for lifecycle ownership",
-                    ));
-                }
-                ensure_daemon_ownership_released(&self.paths)?;
-                Some(lock)
-            } else {
-                None
-            };
-
-            progress(UpdateStage::Activating);
-            let mut source = fs::File::open(prepared.candidate()).map_err(|_| {
-                DaemonError::new(
-                    DomainErrorKind::ReleaseArtifactInvalid,
-                    "verified update candidate became unavailable before activation",
-                )
-            })?;
-            let activation = zterm_platform::user_state::activate_executable(
+            crate::distribution::ReleaseSelection::parse(exact_tag)?;
+            crate::update::run_frontend(
                 executable,
-                self.paths.uid(),
-                |output| std::io::copy(&mut source, output).map(|_| ()),
+                &self.paths,
+                exact_tag,
+                approved,
+                confirm,
+                progress,
             )
-            .map_err(|error| DaemonError::new(DomainErrorKind::PathUnsafe, error.to_string()))?;
-
-            let post_activation =
-                crate::distribution::verify_activated_candidate(executable, prepared.manifest())
-                    .and_then(|()| {
-                        if state_present {
-                            crate::distribution::write_install_metadata(
-                                &self.paths,
-                                executable,
-                                Some(prepared.manifest()),
-                            )?;
-                        }
-                        Ok(())
-                    });
-            if let Err(error) = post_activation {
-                activation.rollback().map_err(|rollback| {
-                    DaemonError::new(
-                        DomainErrorKind::PathUnsafe,
-                        format!(
-                            "update activation failed and rollback could not complete: {rollback}"
-                        ),
-                    )
-                })?;
-                return Err(error);
-            }
-            activation.commit().map_err(|error| {
-                DaemonError::new(DomainErrorKind::PathUnsafe, error.to_string())
-            })?;
-            drop(lifecycle);
-
-            let daemon_started = finish_update_startup(
-                self.observe().await,
-                prepared.manifest(),
-                &mut progress,
-                || self.ensure(),
-            )
-            .await?;
-            Ok(UpdateResult {
-                previous_version: zterm_core::BuildIdentity::current().version.to_owned(),
-                installed_version: prepared.version().to_owned(),
-                ended_session_names: ended,
-                daemon_started,
-            })
         }
         #[cfg(not(unix))]
         {
             let _ = (exact_tag, approved, confirm, progress);
             Err(unsupported_command_platform())
         }
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn apply_prepared_update(
+        &self,
+        prepared: crate::distribution::PreparedRelease,
+        mut approved: bool,
+        interaction: &mut impl crate::update::UpdateInteraction,
+    ) -> Result<UpdateResult, DaemonError> {
+        let executable = self.launcher.executable();
+        let client = LocalClient::new(self.paths.socket());
+        let (daemon_running, impact) = match client.status().await {
+            Ok(status) => {
+                require_update_daemon_compatible(
+                    &status.version,
+                    status.protocol.wire_major,
+                    status.protocol.state_schema,
+                )?;
+                (true, client.update_preflight().await?)
+            }
+            Err(error) if error.kind() == DomainErrorKind::DaemonStopped => (
+                false,
+                SessionImpact {
+                    active_session_count: 0,
+                    active_session_names: Vec::new(),
+                    stopping: false,
+                    interruption_required: false,
+                },
+            ),
+            Err(error) => return Err(error),
+        };
+        require_interruption_approval(&impact, &mut approved, &mut |impact| {
+            interaction.confirm(impact)
+        })?;
+        interaction.handoff(&prepared)?;
+        let ended = if daemon_running {
+            interaction.progress(UpdateStage::Stopping);
+            self.stop_with_confirmation(approved, |impact| interaction.confirm(impact))
+                .await?
+                .map_or_else(Vec::new, |impact| impact.active_session_names)
+        } else {
+            Vec::new()
+        };
+
+        let state_present = managed_root_exists(&self.paths)?;
+        let lifecycle = if state_present {
+            let lock = acquire_lifecycle_lock(&self.paths, Instant::now()).await?;
+            if probe_readiness(&self.paths).await?.is_some() {
+                return Err(DaemonError::new(
+                    DomainErrorKind::UpdateRejected,
+                    "daemon restarted while update was waiting for lifecycle ownership",
+                ));
+            }
+            ensure_daemon_ownership_released(&self.paths)?;
+            Some(lock)
+        } else {
+            None
+        };
+
+        crate::distribution::verify_updater_executable(executable)?;
+        interaction.progress(UpdateStage::Activating);
+        let mut source = fs::File::open(prepared.candidate()).map_err(|_| {
+            DaemonError::new(
+                DomainErrorKind::ReleaseArtifactInvalid,
+                "verified update candidate became unavailable before activation",
+            )
+        })?;
+        let activation = zterm_platform::user_state::activate_executable(
+            executable,
+            self.paths.uid(),
+            |output| std::io::copy(&mut source, output).map(|_| ()),
+        )
+        .map_err(|error| DaemonError::new(DomainErrorKind::PathUnsafe, error.to_string()))?;
+
+        let post_activation =
+            crate::distribution::verify_activated_candidate(executable, prepared.manifest())
+                .and_then(|()| {
+                    if state_present {
+                        crate::distribution::write_install_metadata(
+                            &self.paths,
+                            executable,
+                            Some(prepared.manifest()),
+                        )?;
+                    }
+                    Ok(())
+                });
+        if let Err(error) = post_activation {
+            activation.rollback().map_err(|rollback| {
+                DaemonError::new(
+                    DomainErrorKind::PathUnsafe,
+                    format!("update activation failed and rollback could not complete: {rollback}"),
+                )
+            })?;
+            return Err(error);
+        }
+        activation
+            .commit()
+            .map_err(|error| DaemonError::new(DomainErrorKind::PathUnsafe, error.to_string()))?;
+        drop(lifecycle);
+        interaction.committed();
+
+        let daemon_started = finish_update_startup(
+            self.observe().await,
+            prepared.manifest(),
+            &mut |stage| interaction.progress(stage),
+            || self.ensure(),
+        )
+        .await?;
+        Ok(UpdateResult {
+            previous_version: zterm_core::BuildIdentity::current().version.to_owned(),
+            installed_version: prepared.version().to_owned(),
+            ended_session_names: ended,
+            daemon_started,
+        })
     }
 
     /// Observes uninstall impact without stopping, spawning, or deleting anything.

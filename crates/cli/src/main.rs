@@ -7,6 +7,15 @@ use clap::Parser;
 
 fn main() -> ExitCode {
     let cli = zterm_cli::Cli::parse();
+    if cli.internal_update() {
+        #[cfg(unix)]
+        return match zterm_daemon::update::run_internal_update() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::FAILURE,
+        };
+        #[cfg(not(unix))]
+        return ExitCode::FAILURE;
+    }
     if cli.internal_daemon() {
         return match zterm_daemon::lifecycle::run_internal_daemon() {
             Ok(()) => ExitCode::SUCCESS,
