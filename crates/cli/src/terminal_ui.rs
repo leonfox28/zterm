@@ -25,7 +25,6 @@ pub async fn run_terminal(
 #[cfg(unix)]
 mod unix {
     use std::collections::VecDeque;
-    use std::fmt;
     use std::future::Future;
     use std::io::{self, IsTerminal, Write};
     use std::os::fd::{AsFd, OwnedFd};
@@ -89,6 +88,11 @@ mod unix {
     mod keyboard {
         include!("terminal_ui/keyboard.rs");
     }
+    mod prefix {
+        include!("terminal_ui/prefix.rs");
+    }
+    use prefix::{CommandMode, LocalCommand, PrefixAction};
+
     mod selection {
         include!("terminal_ui/selection.rs");
     }
@@ -245,7 +249,6 @@ mod unix {
         let initial_physical_size = terminal_size(stdout)?;
         let initial_layout = ChromeLayout::new(initial_physical_size, ActiveScreen::Main);
         let initial_size = initial_layout.child;
-        let escape = request.escape;
         let stateful_prepare = matches!(
             &request.kind,
             TerminalRequestKind::Create { .. }
@@ -257,7 +260,7 @@ mod unix {
         let input_epoch = InputEpoch::new();
         let current_input_epoch = input_epoch.current();
         let mut stdin_pump = StdinPump::start(stdin, input_epoch.clone())?;
-        let mut prefix = PrefixParser::new(escape.0);
+        let mut prefix = CommandMode::new();
         let transport_state = TerminalViewTransportState::Synchronizing;
         let mut resize_coalescer = ResizeCoalescer::new(initial_size);
         let prepared = match await_while_inactive(
@@ -271,6 +274,7 @@ mod unix {
                 resize_coalescer: &mut resize_coalescer,
                 current_input_epoch,
                 preserve_submitted_result: stateful_prepare,
+                report_key_events: false,
             },
         )
         .await?
@@ -338,6 +342,9 @@ mod unix {
                 resize_coalescer: &mut resize_coalescer,
                 current_input_epoch,
                 preserve_submitted_result: false,
+                report_key_events: presenter
+                    .presented_keyboard_flags()
+                    .contains(zterm_core::terminal::TerminalKeyboardFlags::REPORT_EVENT_TYPES),
             },
         )
         .await?
@@ -400,10 +407,11 @@ mod unix {
         resize_signal: &'a mut Signal,
         cancellation_receiver: &'a mut watch::Receiver<Option<TerminalSignalCancellation>>,
         stdin_pump: &'a mut StdinPump,
-        prefix: &'a mut PrefixParser,
+        prefix: &'a mut CommandMode,
         resize_coalescer: &'a mut ResizeCoalescer,
         current_input_epoch: u64,
         preserve_submitted_result: bool,
+        report_key_events: bool,
     }
 
     async fn await_while_inactive<T>(
@@ -419,14 +427,16 @@ mod unix {
             resize_coalescer,
             current_input_epoch,
             preserve_submitted_result,
+            report_key_events,
         } = context;
         tokio::pin!(future);
+        let mut input_codec = HostInputCodec::new();
         loop {
             if prefix
                 .deadline()
                 .is_some_and(|deadline| Instant::now() >= deadline)
             {
-                let _ = prefix.flush_pending();
+                prefix.cancel();
                 continue;
             }
             let prefix_deadline = prefix.deadline();
@@ -454,24 +464,26 @@ mod unix {
                     );
                 }
                 () = wait_for_prefix_deadline(prefix_deadline), if prefix_deadline.is_some() => {
-                    let _ = prefix.flush_pending();
+                    prefix.cancel();
                 }
                 input = stdin_pump.recv() => {
                     match input {
                         Some(StdinEvent::Bytes { epoch, bytes })
                             if input_epoch_is_current(epoch, current_input_epoch) =>
                         {
-                            for action in prefix.feed(&bytes, Instant::now()) {
-                                if action == PrefixAction::Detach {
-                                    let cancellation = InactiveCancellation::LocalDetach;
-                                    if preserve_submitted_result {
-                                        return finish_submitted_after_cancellation(
-                                            &mut future,
-                                            cancellation,
-                                        )
-                                        .await;
+                            for event in input_codec.feed(&bytes)? {
+                                for action in prefix.route(event, Instant::now(), report_key_events)? {
+                                    if let PrefixAction::Command(command) = action {
+                                        let cancellation = match command {
+                                            LocalCommand::Detach => InactiveCancellation::LocalDetach,
+                                        };
+                                        if preserve_submitted_result {
+                                            return finish_submitted_after_cancellation(
+                                                &mut future, cancellation,
+                                            ).await;
+                                        }
+                                        return Ok(InactiveWait::Cancelled(cancellation));
                                     }
-                                    return Ok(InactiveWait::Cancelled(cancellation));
                                 }
                             }
                         }
@@ -516,7 +528,7 @@ mod unix {
         input_epoch: &InputEpoch,
         current_input_epoch: &mut u64,
         stdin_pump: &mut StdinPump,
-        prefix: &mut PrefixParser,
+        prefix: &mut CommandMode,
         next: TerminalViewTransportState,
     ) -> Result<(), CliError> {
         if next == TerminalViewTransportState::Active {
@@ -538,7 +550,7 @@ mod unix {
         input_epoch: &InputEpoch,
         current_input_epoch: &mut u64,
         stdin_pump: &mut StdinPump,
-        prefix: &mut PrefixParser,
+        prefix: &mut CommandMode,
         previous: TerminalViewTransportState,
         next: TerminalViewTransportState,
         viewport: &mut ViewportController,
@@ -1142,7 +1154,7 @@ mod unix {
             input: &impl AsFd,
             input_epoch: &InputEpoch,
             current_input_epoch: &mut u64,
-            prefix: &mut PrefixParser,
+            prefix: &mut CommandMode,
         ) -> Result<(), CliError> {
             #[cfg(test)]
             let reader_test_seam = self.reader_test_seam.clone();
@@ -1281,114 +1293,6 @@ mod unix {
                     return Err(format!("read terminal stdin: {detail}"));
                 }
             }
-        }
-    }
-
-    #[derive(Clone, Eq, PartialEq)]
-    enum PrefixAction {
-        Input(Vec<u8>),
-        Detach,
-    }
-
-    impl fmt::Debug for PrefixAction {
-        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            match self {
-                Self::Input(bytes) => formatter
-                    .debug_struct("Input")
-                    .field("byte_len", &bytes.len())
-                    .finish(),
-                Self::Detach => formatter.write_str("Detach"),
-            }
-        }
-    }
-
-    struct PrefixParser {
-        prefix: Option<u8>,
-        pending_deadline: Option<Instant>,
-        detached: bool,
-    }
-
-    impl PrefixParser {
-        const fn new(prefix: Option<u8>) -> Self {
-            Self {
-                prefix,
-                pending_deadline: None,
-                detached: false,
-            }
-        }
-
-        fn feed(&mut self, bytes: &[u8], now: Instant) -> Vec<PrefixAction> {
-            if self.detached || bytes.is_empty() {
-                return Vec::new();
-            }
-            let Some(prefix) = self.prefix else {
-                return vec![PrefixAction::Input(bytes.to_vec())];
-            };
-            let mut actions = Vec::new();
-            let mut ordinary =
-                Vec::with_capacity(bytes.len() + usize::from(self.pending_deadline.is_some()));
-            if self
-                .pending_deadline
-                .is_some_and(|deadline| now >= deadline)
-            {
-                self.pending_deadline = None;
-                ordinary.push(prefix);
-            }
-            for &byte in bytes {
-                if self.pending_deadline.take().is_some() {
-                    if byte == b'.' {
-                        if !ordinary.is_empty() {
-                            actions.push(PrefixAction::Input(std::mem::take(&mut ordinary)));
-                        }
-                        actions.push(PrefixAction::Detach);
-                        self.detached = true;
-                        break;
-                    }
-                    ordinary.push(prefix);
-                    if byte != prefix {
-                        ordinary.push(byte);
-                    }
-                } else if byte == prefix {
-                    self.pending_deadline = Some(now + CONTROL_PREFIX_TIMEOUT);
-                } else {
-                    ordinary.push(byte);
-                }
-            }
-            if !ordinary.is_empty() {
-                actions.push(PrefixAction::Input(ordinary));
-            }
-            actions
-        }
-
-        const fn deadline(&self) -> Option<Instant> {
-            self.pending_deadline
-        }
-
-        fn flush_pending(&mut self) -> Option<Vec<u8>> {
-            self.pending_deadline
-                .take()
-                .and(self.prefix)
-                .map(|prefix| vec![prefix])
-        }
-
-        fn clear_pending(&mut self) {
-            self.pending_deadline = None;
-        }
-
-        const fn detached(&self) -> bool {
-            self.detached
-        }
-    }
-
-    fn take_pending_active_input(
-        prefix: &mut PrefixParser,
-        state: TerminalViewTransportState,
-    ) -> Option<Vec<u8>> {
-        let pending = prefix.flush_pending();
-        if state == TerminalViewTransportState::Active {
-            pending
-        } else {
-            None
         }
     }
 
@@ -2339,6 +2243,8 @@ mod unix {
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum HostInputEvent {
         Bytes(Vec<u8>),
+        Opaque(Vec<u8>),
+        ForwardedBytes(Vec<u8>),
         LegacyCtrlC,
         EnhancedKey(EnhancedKey),
         Paste(Vec<u8>),
@@ -2407,7 +2313,7 @@ mod unix {
                         if let Some(mouse) = SgrMouse::parse(raw.clone()) {
                             events.push(HostInputEvent::Mouse(mouse));
                         } else {
-                            push_raw_host_bytes(&mut events, raw);
+                            events.push(HostInputEvent::Opaque(raw));
                         }
                         continue;
                     }
@@ -2415,7 +2321,7 @@ mod unix {
                         break;
                     }
                 }
-                if self.pending.starts_with(b"\x1b[") {
+                if self.pending.starts_with(b"\x1b[") || self.pending.starts_with(b"\x1bO") {
                     if let Some(end) = self
                         .pending
                         .iter()
@@ -2427,7 +2333,7 @@ mod unix {
                         if let Some(key) = EnhancedKey::parse(raw.clone()) {
                             events.push(HostInputEvent::EnhancedKey(key));
                         } else {
-                            push_raw_host_bytes(&mut events, raw);
+                            events.push(HostInputEvent::Opaque(raw));
                         }
                         continue;
                     }
@@ -2437,6 +2343,25 @@ mod unix {
                 }
                 if known_host_prefix(&self.pending) {
                     break;
+                }
+                // Keep legacy Alt and SS3 keys opaque as one input unit. In
+                // command mode, cancelling such a key must not leak its suffix
+                // or mistake an embedded control byte for a new prefix.
+                if self.pending[0] == 0x1b && self.pending.get(1) != Some(&b'[') {
+                    let second = self.pending[1];
+                    let length = match second {
+                        b'O' | 0xc2..=0xdf => 3,
+                        0xe0..=0xef => 4,
+                        0xf0..=0xf4 => 5,
+                        _ => 2,
+                    };
+                    if self.pending.len() < length {
+                        break;
+                    }
+                    events.push(HostInputEvent::Opaque(
+                        self.pending.drain(..length).collect(),
+                    ));
+                    continue;
                 }
                 push_host_bytes(&mut events, vec![self.pending.remove(0)]);
             }
@@ -3352,73 +3277,6 @@ mod unix {
             }
         }
 
-        #[test]
-        fn prefix_parser_detaches_escapes_and_preserves_unknown_sequences() {
-            let mut parser = PrefixParser::new(Some(0x1d));
-            let now = Instant::now();
-            assert_eq!(
-                parser.feed(b"a\x1d\x1db\x1dx", now),
-                vec![PrefixAction::Input(b"a\x1db\x1dx".to_vec())]
-            );
-            assert_eq!(parser.feed(b"\x1d.", now), vec![PrefixAction::Detach]);
-            assert!(parser.detached());
-            assert!(parser.feed(b"ignored", now).is_empty());
-
-            let mut transparent = PrefixParser::new(None);
-            assert_eq!(
-                transparent.feed(b"\x1d.", now),
-                vec![PrefixAction::Input(b"\x1d.".to_vec())]
-            );
-        }
-
-        #[test]
-        fn prefix_deadline_flushes_once_and_state_changes_clear_pending_input() {
-            let now = Instant::now();
-            let mut parser = PrefixParser::new(Some(0x1d));
-            assert!(parser.feed(b"\x1d", now).is_empty());
-            assert_eq!(parser.deadline(), Some(now + CONTROL_PREFIX_TIMEOUT));
-            assert_eq!(parser.flush_pending(), Some(vec![0x1d]));
-            assert_eq!(parser.deadline(), None);
-            assert_eq!(parser.flush_pending(), None);
-
-            assert!(parser.feed(b"\x1d", now).is_empty());
-            parser.clear_pending();
-            assert_eq!(parser.deadline(), None);
-            assert_eq!(
-                parser.feed(b"x", now),
-                vec![PrefixAction::Input(b"x".to_vec())]
-            );
-
-            assert!(parser.feed(b"\x1d", now).is_empty());
-            assert_eq!(
-                parser.feed(b"x", now + CONTROL_PREFIX_TIMEOUT),
-                vec![PrefixAction::Input(b"\x1dx".to_vec())]
-            );
-        }
-
-        #[test]
-        fn stdin_eof_flushes_a_lone_prefix_only_for_an_active_view() {
-            let now = Instant::now();
-            let mut active = PrefixParser::new(Some(0x1d));
-            assert!(active.feed(b"\x1d", now).is_empty());
-            assert_eq!(
-                take_pending_active_input(&mut active, TerminalViewTransportState::Active),
-                Some(vec![0x1d])
-            );
-            assert_eq!(active.deadline(), None);
-
-            let mut reconnecting = PrefixParser::new(Some(0x1d));
-            assert!(reconnecting.feed(b"\x1d", now).is_empty());
-            assert_eq!(
-                take_pending_active_input(
-                    &mut reconnecting,
-                    TerminalViewTransportState::Reconnecting,
-                ),
-                None
-            );
-            assert_eq!(reconnecting.deadline(), None);
-        }
-
         #[tokio::test(flavor = "current_thread")]
         async fn stdin_queue_is_exactly_bounded_and_recovers_after_one_receive() {
             let pty = openpty(None, None).expect("open stdin-capacity PTY");
@@ -3497,7 +3355,7 @@ mod unix {
 
             let input_epoch = InputEpoch::new();
             let mut current_epoch = input_epoch.current();
-            let mut prefix = PrefixParser::new(Some(0x1d));
+            let mut prefix = CommandMode::new();
             let (reader_test_seam, controls) = StdinReaderTestSeam::with_gates(4);
             let mut controls = VecDeque::from(controls);
             let mut stdin_pump = Some(
@@ -3514,7 +3372,12 @@ mod unix {
                     .recv_timeout(Duration::from_secs(2))
                     .expect("reader reached the deterministic poll/read seam");
 
-                assert!(prefix.feed(b"\x1d", Instant::now()).is_empty());
+                assert!(
+                    prefix
+                        .feed(b"\x1d", Instant::now(), false)
+                        .expect("prefix input")
+                        .is_empty()
+                );
                 let stale_epoch = current_epoch;
                 let old_pump = stdin_pump.take().expect("live stdin pump");
                 let cancellation_probe = duplicate_cloexec(
@@ -5571,14 +5434,14 @@ mod unix {
                 .expect("malformed CSI-u input is preserved");
             assert_eq!(
                 malformed,
-                vec![HostInputEvent::Bytes(b"\x1b[99;0u".to_vec())]
+                vec![HostInputEvent::Opaque(b"\x1b[99;0u".to_vec())]
             );
             let malformed_with_etx = codec
                 .feed(b"\x1b[99;\x03u")
                 .expect("malformed CSI-u containing ETX is preserved");
             assert_eq!(
                 malformed_with_etx,
-                vec![HostInputEvent::Bytes(b"\x1b[99;\x03u".to_vec())],
+                vec![HostInputEvent::Opaque(b"\x1b[99;\x03u".to_vec())],
                 "an ETX inside a malformed framed sequence must not be guessed as a copy key"
             );
             assert_eq!(

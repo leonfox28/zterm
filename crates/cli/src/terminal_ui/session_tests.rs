@@ -98,7 +98,7 @@ async fn queued_delta_resize_case(trigger: ResizeTrigger) {
         stdin_pump: StdinPump::start(&pty.slave, input_epoch.clone())
             .expect("synchronization fixture operation succeeds"),
         input_epoch,
-        prefix: PrefixParser::new(None),
+        prefix: CommandMode::new(),
         transport_state: TerminalViewTransportState::Active,
         resize_coalescer: ResizeCoalescer::new(layout.child),
         physical_size,

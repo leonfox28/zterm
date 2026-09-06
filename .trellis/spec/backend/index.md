@@ -30,6 +30,7 @@ explicit future task requests them; see [Distribution](./distribution-lifecycle.
 | [Core and Wire Domain Contract](./core-wire-domain.md) | Shared IDs, revisions, operation replay, semantic wire-v2 DTOs, framing, and protocol limits | Active |
 | [Effective-User State Contract](./effective-user-state.md) | Per-user paths, configuration, identity, SQLite, and safe file operations | Active |
 | [Local Daemon and IPC Contract](./local-daemon-ipc.md) | Same-UID Unix IPC, opaque remote Session tunneling, frontend attachment state, and sole desktop presentation | Active |
+| [Terminal Input Command Contract](./terminal-input-commands.md) | Fixed Ctrl+] command ownership before child encoding, local cancellation, lifecycle and shortcut extension | Active |
 | [Persistent Session Service Contract](./session-service.md) | Daemon-lifetime sessions, attachments, controller leases, and count/dimension admission | Active |
 | [Iroh Transport, Pairing, and Device Authorization Contract](./transport-auth.md) | Endpoint ownership, route fallback, pairing, directional authorization, revoke, security, and platform evidence boundaries | Active |
 | [Signed Distribution and Executable Lifecycle Contract](./distribution-lifecycle.md) | Native Release trust, installer, explicit update/rollback, uninstall, and protected draft workflow | Active |

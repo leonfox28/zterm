@@ -372,3 +372,25 @@ Implemented human-readable CLI commands, English y/yes and -y confirmation, atom
 ### Next Steps
 
 - Prepare and publish v0.1.19 through the repository PR/CI/signing workflow.
+
+
+## Session 15: Unify Ctrl+] command mode and prepare release
+<!-- trellis-session: v=2 fp=bbb1a4bafae0fdb7 -->
+
+**Date**: 2026-09-06
+**Task**: Unify Ctrl+] command mode and prepare release
+**Branch**: `investigate-zterm-herdr-ctrl-close-exit`
+
+### Summary
+
+Implemented a shared fixed Ctrl+] command dispatcher for legacy and enhanced input; local cancellation, release ownership, quoting and --escape removal. Preserved clipboard and keyboard-reporting policy; retained Ghostty/Doubao diagnosis without IME adaptation. Direct implementation and review, no sub-agents. Final just check and generic outer-PTY detach/reattach tests passed. User authorized v0.1.20 release through the repository operator.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `a686f6f` | fix(cli): unify Ctrl+] command handling |
+
+### Status
+
+[OK] **Completed**

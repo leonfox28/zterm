@@ -150,6 +150,8 @@ enum Command {
         command: DeviceCommand,
     },
     /// Attach the default or selected persistent Session.
+    ///
+    /// Use Ctrl+] then . to detach. Unknown prefix commands cancel locally.
     Connect(ConnectArgs),
     /// Inspect or manage persistent Sessions.
     Session {
@@ -275,9 +277,6 @@ struct ConnectArgs {
     /// Explicitly replace an existing controller after synchronization.
     #[arg(long)]
     takeover: bool,
-    /// Local detach prefix: ctrl-@ through ctrl-_, ctrl-?, or none.
-    #[arg(long, default_value = "ctrl-]", value_parser = parse_escape_prefix)]
-    escape: EscapePrefix,
 }
 
 #[derive(Debug, Subcommand)]
@@ -285,8 +284,12 @@ enum SessionCommand {
     /// List live Sessions on one exact target.
     List(SessionListArgs),
     /// Create a named Session, then attach that exact created identity.
+    ///
+    /// Use Ctrl+] then . to detach. Unknown prefix commands cancel locally.
     New(SessionNewArgs),
     /// Attach one exact existing Session.
+    ///
+    /// Use Ctrl+] then . to detach. Unknown prefix commands cancel locally.
     Attach(SessionAttachArgs),
     /// Rename one exact existing Session.
     Rename(SessionRenameArgs),
@@ -310,9 +313,6 @@ struct SessionNewArgs {
     /// Working directory interpreted by the selected host.
     #[arg(long)]
     cwd: Option<PathBuf>,
-    /// Local detach prefix: ctrl-@ through ctrl-_, ctrl-?, or none.
-    #[arg(long, default_value = "ctrl-]", value_parser = parse_escape_prefix)]
-    escape: EscapePrefix,
 }
 
 impl fmt::Debug for SessionNewArgs {
@@ -323,7 +323,6 @@ impl fmt::Debug for SessionNewArgs {
             .field("name", &self.name)
             .field("cwd", &"[REDACTED]")
             .field("cwd_present", &self.cwd.is_some())
-            .field("escape", &self.escape)
             .finish()
     }
 }
@@ -337,9 +336,6 @@ struct SessionAttachArgs {
     /// Explicitly replace an existing controller after synchronization.
     #[arg(long)]
     takeover: bool,
-    /// Local detach prefix: ctrl-@ through ctrl-_, ctrl-?, or none.
-    #[arg(long, default_value = "ctrl-]", value_parser = parse_escape_prefix)]
-    escape: EscapePrefix,
 }
 
 #[derive(Debug, clap::Args)]
@@ -506,26 +502,6 @@ impl From<DaemonError> for CliError {
     }
 }
 
-/// Per-invocation local control-prefix selection.
-#[derive(Clone, Copy, Eq, PartialEq)]
-struct EscapePrefix(Option<u8>);
-
-impl EscapePrefix {
-    const DEFAULT: Self = Self(Some(0x1d));
-}
-
-impl fmt::Debug for EscapePrefix {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.0 {
-            Some(byte) => formatter
-                .debug_tuple("EscapePrefix")
-                .field(&format_args!("control-{byte:#04x}"))
-                .finish(),
-            None => formatter.write_str("EscapePrefix(None)"),
-        }
-    }
-}
-
 #[cfg(unix)]
 enum TerminalRequestKind {
     Attach {
@@ -550,7 +526,6 @@ enum TerminalRequestKind {
 /// Deferred terminal operation. It owns no attachment, socket, frame, or route.
 pub struct TerminalRequest {
     kind: TerminalRequestKind,
-    escape: EscapePrefix,
 }
 
 impl fmt::Debug for TerminalRequest {
@@ -568,7 +543,6 @@ impl fmt::Debug for TerminalRequest {
         formatter
             .debug_struct("TerminalRequest")
             .field("operation", &operation)
-            .field("escape", &self.escape)
             .finish_non_exhaustive()
     }
 }
@@ -660,7 +634,6 @@ async fn bare(runtime: &LocalRuntime) -> Result<CommandOutcome, CliError> {
                     target: "local".to_owned(),
                     session: "main".to_owned(),
                     takeover: false,
-                    escape: EscapePrefix::DEFAULT,
                 },
             )
             .await
@@ -755,7 +728,6 @@ async fn connect(
     _runtime: &LocalRuntime,
     arguments: ConnectArgs,
 ) -> Result<CommandOutcome, CliError> {
-    let escape = arguments.escape;
     #[cfg(unix)]
     let kind = {
         let create_main = arguments.session == "main";
@@ -772,7 +744,7 @@ async fn connect(
         let _ = arguments;
         TerminalRequestKind::Attach
     };
-    Ok(CommandOutcome::Terminal(TerminalRequest { kind, escape }))
+    Ok(CommandOutcome::Terminal(TerminalRequest { kind }))
 }
 
 async fn session(
@@ -788,7 +760,6 @@ async fn session(
             .map(|sessions| render_sessions(sessions, &arguments.target))
             .map(CommandOutcome::Text),
         SessionCommand::New(arguments) => {
-            let escape = arguments.escape;
             #[cfg(unix)]
             let kind = TerminalRequestKind::Create {
                 target: arguments.target,
@@ -800,10 +771,9 @@ async fn session(
                 let _ = arguments;
                 TerminalRequestKind::Create
             };
-            Ok(CommandOutcome::Terminal(TerminalRequest { kind, escape }))
+            Ok(CommandOutcome::Terminal(TerminalRequest { kind }))
         }
         SessionCommand::Attach(arguments) => {
-            let escape = arguments.escape;
             #[cfg(unix)]
             let kind = TerminalRequestKind::Attach {
                 target: arguments.target,
@@ -816,7 +786,7 @@ async fn session(
                 let _ = arguments;
                 TerminalRequestKind::Attach
             };
-            Ok(CommandOutcome::Terminal(TerminalRequest { kind, escape }))
+            Ok(CommandOutcome::Terminal(TerminalRequest { kind }))
         }
         SessionCommand::Rename(arguments) => {
             let renamed = runtime
@@ -982,31 +952,6 @@ fn parse_pair_ttl(value: &str) -> Result<u32, String> {
         .ok_or_else(|| "TTL value is too large".to_owned())?;
     validate_pair_ttl(seconds).map_err(|error| error.to_string())?;
     u32::try_from(seconds).map_err(|_| "TTL value is too large".to_owned())
-}
-
-fn parse_escape_prefix(value: &str) -> Result<EscapePrefix, String> {
-    if value == "none" {
-        return Ok(EscapePrefix(None));
-    }
-    let suffix = value
-        .strip_prefix("ctrl-")
-        .ok_or_else(|| "escape must be ctrl-@ through ctrl-_, ctrl-?, or none".to_owned())?;
-    let mut characters = suffix.chars();
-    let character = characters
-        .next()
-        .ok_or_else(|| "escape must be ctrl-@ through ctrl-_, ctrl-?, or none".to_owned())?;
-    if characters.next().is_some() || !character.is_ascii() {
-        return Err("escape must name exactly one ASCII control".to_owned());
-    }
-    let upper = character.to_ascii_uppercase() as u8;
-    let byte = match upper {
-        b'@'..=b'_' => upper & 0x1f,
-        b'?' => 0x7f,
-        _ => {
-            return Err("escape must be ctrl-@ through ctrl-_, ctrl-?, or none".to_owned());
-        }
-    };
-    Ok(EscapePrefix(Some(byte)))
 }
 
 fn read_pair_ticket(
@@ -1893,14 +1838,25 @@ mod tests {
     }
 
     #[test]
-    fn escape_parser_supports_default_custom_delete_and_disabled_controls() {
-        assert_eq!(parse_escape_prefix("ctrl-]"), Ok(EscapePrefix(Some(0x1d))));
-        assert_eq!(parse_escape_prefix("ctrl-@"), Ok(EscapePrefix(Some(0x00))));
-        assert_eq!(parse_escape_prefix("ctrl-a"), Ok(EscapePrefix(Some(0x01))));
-        assert_eq!(parse_escape_prefix("ctrl-?"), Ok(EscapePrefix(Some(0x7f))));
-        assert_eq!(parse_escape_prefix("none"), Ok(EscapePrefix(None)));
-        for invalid in ["ctrl-a-b", "a", "CTRL-A", "ctrl-é"] {
-            assert!(parse_escape_prefix(invalid).is_err(), "accepted {invalid}");
+    fn removed_escape_option_is_rejected_on_all_terminal_entry_points() {
+        for command in [
+            vec!["zterm", "connect", "local"],
+            vec!["zterm", "session", "new", "local", "test"],
+            vec!["zterm", "session", "attach", "local", "main"],
+        ] {
+            assert!(Cli::try_parse_from(command.clone()).is_ok());
+            for value in ["none", "ctrl-]", "ctrl-a"] {
+                let mut arguments = command.clone();
+                arguments.extend(["--escape", value]);
+                let error = Cli::try_parse_from(arguments).expect_err("removed option");
+                assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+            }
+            let mut help = command;
+            help.push("--help");
+            let error = Cli::try_parse_from(help).expect_err("help response");
+            assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+            assert!(!error.to_string().contains("--escape"));
+            assert!(error.to_string().contains("Ctrl+]"));
         }
     }
 

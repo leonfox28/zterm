@@ -1,0 +1,74 @@
+[
+  {
+    "case": "legacy-shell",
+    "presented_flags": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "legacy_exit": 0,
+    "daemon_cleanup_exit": 0
+  },
+  {
+    "case": "generic-flags-3",
+    "presented_flags": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      3
+    ],
+    "enhanced_payload_hex": "1b5b39333b35751b5b39333b353a33752e",
+    "enhanced_exit": null,
+    "child_received_hex": "1b5b39333b35751b5b39333b353a33752e",
+    "legacy_fallback_exit": 0,
+    "daemon_cleanup_exit": 0
+  },
+  {
+    "case": "generic-flags-9",
+    "presented_flags": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      9
+    ],
+    "enhanced_payload_hex": "1b5b39333b35751b5b343675",
+    "enhanced_exit": null,
+    "child_received_hex": "1b5b39333b35751b5b343675",
+    "legacy_fallback_exit": 0,
+    "daemon_cleanup_exit": 0
+  },
+  {
+    "case": "herdr-persistent",
+    "herdr_visible": true,
+    "presented_flags": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      7,
+      7,
+      7,
+      7,
+      7
+    ],
+    "enhanced_payload_hex": "1b5b39333b35751b5b39333b353a33752e",
+    "enhanced_exit": null,
+    "legacy_fallback_exit": 0,
+    "herdr_cleanup_exit": 0,
+    "daemon_cleanup_exit": 0
+  }
+]
