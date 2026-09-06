@@ -1,0 +1,22 @@
+{
+  "name": "zterm-causal-5789d0be88",
+  "target": "dev",
+  "rows": 50,
+  "columns": 180,
+  "observed": false,
+  "startup_exit": null,
+  "not_synchronized": false,
+  "script_started": true,
+  "herdr_visible": true,
+  "server_warmup": 0,
+  "primed_server": false,
+  "installed_cli": null,
+  "inspection_complete": false,
+  "reattach_exit": null,
+  "reattach_not_synchronized": false,
+  "reattach_herdr_visible": true,
+  "reattach_input_roundtrip": true,
+  "post_quit_not_synchronized": false,
+  "cleanup": "close outcome unknown; read-only list exited 0 and confirmed exact Session absent",
+  "build": "current fixed CLI; existing paired dev daemon unchanged"
+}

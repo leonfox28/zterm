@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/backend/local-daemon-ipc.md", "reason": "Existing layout/resize owner, input admission and explicit snapshot/resume barrier contracts; read relevant sections directly."}
+{"file": ".trellis/tasks/09-06-investigate-zterm-reattach-input/research/findings.md", "reason": "Confirmed generic and Herdr reproduction, geometry causal chain and bounded local defect classification; no sub-agents."}
+{"file": ".trellis/tasks/09-06-investigate-zterm-reattach-input/design.md", "reason": "Proposed authoritative initial geometry reconciliation and preserved synchronization contracts."}

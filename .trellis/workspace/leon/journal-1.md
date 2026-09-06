@@ -394,3 +394,25 @@ Implemented a shared fixed Ctrl+] command dispatcher for legacy and enhanced inp
 ### Status
 
 [OK] **Completed**
+
+
+## Session 16: Fix retained terminal reattach input and geometry
+<!-- trellis-session: v=2 fp=04e0b25de70151b9 -->
+
+**Date**: 2026-09-06
+**Task**: Fix retained terminal reattach input and geometry
+**Branch**: `investigate-zterm-reattach-input`
+
+### Summary
+
+Initialized CLI resize deduplication from the authoritative snapshot and reconciled physical sizes after initial acknowledgement. Added real Main/Alternate reattach and inactive SIGWINCH/input regressions. Final just check and eight private local probes passed; disposable paired dev Herdr reattach accepted input and cleanup was verified. Direct implementation/review without sub-agents. User authorized formal v0.1.21 release.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `dd7f385` | fix(cli): reconcile reattach geometry from host snapshot |
+
+### Status
+
+[OK] **Completed**

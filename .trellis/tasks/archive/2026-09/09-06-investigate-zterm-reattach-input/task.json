@@ -1,0 +1,30 @@
+{
+  "id": "investigate-zterm-reattach-input",
+  "name": "investigate-zterm-reattach-input",
+  "title": "修复 zterm 重连后的输入冻结与尺寸协调",
+  "description": "从权威快照初始化 CLI resize 基准，保留初始化期间的物理尺寸变化，覆盖真实重连输入与 Main/Alternate 尺寸变化；全程不使用子代理。",
+  "status": "completed",
+  "dev_type": "backend",
+  "scope": "cli",
+  "package": null,
+  "priority": "P2",
+  "creator": "leon",
+  "assignee": "leon",
+  "createdAt": "2026-09-06",
+  "completedAt": "2026-09-06",
+  "branch": "investigate-zterm-reattach-input",
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [
+    "crates/cli/src/terminal_ui.rs",
+    "crates/cli/tests/daemon_autospawn.rs",
+    ".trellis/spec/backend/local-daemon-ipc.md"
+  ],
+  "notes": "User approved implementation on 2026-09-06. Shared CLI initializer now seeds resize deduplication from validated snapshot size and reconciles latest physical layout after initial ACK. Real initializer regression failed on baseline and passes after fix; startup wait test covers SIGWINCH/input fencing. Eight private local raw-child/Herdr cases pass, plus disposable paired dev Herdr reattach input roundtrip. Paired close returned outcome unknown; successful read-only list confirmed exact test Session absent. Final just check exit 0. No sub-agents; no existing user Session changed, no installed binary update, commit or release. Awaiting workflow Phase 3.4 one-shot commit confirmation. See verification.md. User subsequently authorized work commit, archive/journal and formal release with “走发布流程吧” on 2026-09-06. Preparing version 0.1.21 through the existing release operator.",
+  "meta": {}
+}

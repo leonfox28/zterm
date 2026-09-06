@@ -368,6 +368,18 @@ No new crate, background owner, or second Session interpreter is introduced.
   not resized or overwritten until return-to-live. Main/alternate transitions
   submit at most one geometry change, and `ResizeCoalescer::last_submitted`
   suppresses the resize-produced same-screen replacement.
+- Initial CLI resize deduplication starts from the validated host snapshot's
+  `surface.size`, never the provisional Main-screen creation hint passed to
+  `prepare`. Attaching a retained Session does not apply that hint. Both
+  `await_while_inactive` waits retain physical dimensions; after the initial
+  acknowledgement, `run_view` samples the terminal again (a ready future can
+  win over SIGWINCH), projects through `ChromeLayout` with the snapshot's
+  `active_screen`, and updates the viewport/status before queuing the desired
+  child size. Equal geometry leaves the first Active unmodified; different
+  geometry submits one resize and retains the existing snapshot/Active fence.
+  A redundant same-size resize can yield an ordinary delta, which provides no
+  authority to reopen that fence. Do not repair initialization by ACKing such
+  deltas, forcing Active, or assuming an application-specific screen width.
 - Gutter ownership follows the effective layout, not the prior desired layout.
   `ViewportController` retains the last successfully presented gutter column
   and advances it only after the complete outer transaction succeeds. While
@@ -676,6 +688,12 @@ No new crate, background owner, or second Session interpreter is introduced.
 
 ## 4. Validation & Error Matrix
 
+| Initial attachment geometry | Required behavior |
+| --- | --- |
+| actual snapshot Main 139 / desired Main 139, or Alternate 140 / Alternate 140 | no resize, no model revision change, useful input after initial Active |
+| retained Main 139 / desired Main 149, or Alternate 140 / Alternate 150 | one real resize; replacement snapshot/Active before ordinary input |
+| SIGWINCH during prepare or initial acknowledgement | retain latest physical dimensions; project only with the known screen; resample before first Active |
+
 | Condition | Required result |
 | --- | --- |
 | peer effective UID differs from daemon owner | close with zero response bytes before frame decode |
@@ -753,6 +771,10 @@ No new crate, background owner, or second Session interpreter is introduced.
 
 ## 5. Good / Base / Bad Cases
 
+- **Good:** reattach a retained Alternate-screen child at the same outer size,
+  restore its keyboard flags, and accept subsequent input without a resize.
+- **Bad:** seed resize state from a Main creation hint: equal Alternate geometry
+  creates a spurious fence, while changed Main geometry can miss a real resize.
 - **Good:** authenticate peer credentials, decode one shared frame, dispatch to
   `SessionService` through `spawn_blocking`, and flush a terminal error before
   closing only the offending attachment.
@@ -831,6 +853,16 @@ No new crate, background owner, or second Session interpreter is introduced.
 
 ## 6. Tests Required
 
+- `daemon_autospawn` must run the real `run_terminal` initializer through an
+  outer PTY: enter Alternate, detach, reattach at equal and changed sizes, then
+  return to Main and reattach at a changed width. Assert retained SessionId,
+  actual child echo/model/presentation progress, terminal restoration, and no
+  revision change on quiescent same-size Alternate reattach. A manually built
+  `TerminalUiSession` bypasses this initializer and cannot own this regression.
+- `inactive_waits_retain_physical_resizes_and_discard_startup_input` exercises
+  prepare/ack wait policies with controlled completion, real PTY size reads,
+  SIGWINCH and queued input. Assert latest physical rows/columns are retained
+  without applying Main chrome, and ordinary startup input is consumed locally.
 - Real same-UID unary and duplex tests run on macOS/Linux; Linux CI includes a reachable
   cross-UID rejection harness. A helper executed as the foreign UID must live
   below one test-private directory whose parents are searchable by that UID;
@@ -999,6 +1031,20 @@ their owning client modules; platform/runtime coverage must not be inferred from
 module extraction alone.
 
 ## 7. Wrong vs Correct
+
+```rust
+// Wrong: a creation hint is treated as the size of an existing Session.
+let mut resizes = ResizeCoalescer::new(initial_main_layout.child);
+if desired.child != initial_main_layout.child {
+    resizes.observe(desired.child, Synchronizing);
+}
+
+// Correct: the validated snapshot is actual; the latest layout is desired.
+let mut resizes = ResizeCoalescer::new(snapshot.surface.size);
+let desired = ChromeLayout::new(latest_physical_size, snapshot.surface.active_screen);
+resizes.observe(desired.child, Synchronizing);
+// Only a real difference causes the first Active event to submit a resize.
+```
 
 ### Wrong
 

@@ -1,0 +1,152 @@
+[
+  {
+    "build": "unmodified",
+    "case": "generic-flags-7",
+    "same_outer_pty": true,
+    "initial_flags": 7,
+    "initial_herdr_visible": null,
+    "first_received_hex": "611b5b411b5b3133751b5b39393b3575",
+    "first_detach_exit": 0,
+    "termios_restored": false,
+    "session_list_detached": "Name  Controller  Viewport\nmain  Detached    139x39\n  ID: 91fe380d751cf67c4d929518f36237d1\n",
+    "reattach_flags": 7,
+    "reattach_visible": 1823,
+    "reattach_received_hex": "621b5b421b5b3133751b5b39393b3575",
+    "second_detach_exit": 0,
+    "errors_visible": false,
+    "daemon_cleanup": 0
+  },
+  {
+    "build": "unmodified",
+    "case": "generic-flags-15",
+    "same_outer_pty": true,
+    "initial_flags": 15,
+    "initial_herdr_visible": null,
+    "first_received_hex": "611b5b411b5b3133751b5b39393b3575",
+    "first_detach_exit": 0,
+    "termios_restored": false,
+    "session_list_detached": "Name  Controller  Viewport\nmain  Detached    139x39\n  ID: 98717584338a309737184c526a5c31c6\n",
+    "reattach_flags": 15,
+    "reattach_visible": 1825,
+    "reattach_received_hex": "621b5b421b5b3133751b5b39393b3575",
+    "second_detach_exit": 0,
+    "errors_visible": false,
+    "daemon_cleanup": 0
+  },
+  {
+    "build": "unmodified",
+    "case": "herdr-reattach",
+    "same_outer_pty": true,
+    "initial_flags": 7,
+    "initial_herdr_visible": true,
+    "first_input_effect": true,
+    "first_detach_exit": 0,
+    "termios_restored": false,
+    "session_list_detached": "Name  Controller  Viewport\nmain  Detached    140x39\n  ID: e7c7135a83f82c6402da45fd6f51148b\n",
+    "reattach_flags": 7,
+    "reattach_visible": 2582,
+    "reattach_input_effect": false,
+    "after_herdr_quit_flags": 7,
+    "post_quit_shell_effect": false,
+    "second_detach_exit": 0,
+    "errors_visible": false,
+    "herdr_cleanup": 0,
+    "daemon_cleanup": 0
+  },
+  {
+    "build": "unmodified",
+    "case": "generic-alternate-flags-7",
+    "same_outer_pty": true,
+    "alternate": true,
+    "initial_flags": 7,
+    "initial_herdr_visible": null,
+    "first_received_hex": "611b5b411b5b3133751b5b39393b3575",
+    "first_detach_exit": 0,
+    "termios_restored": false,
+    "session_list_detached": "Name  Controller  Viewport\nmain  Detached    140x39\n  ID: 13b7aaeb4f2ce5e369b3d30576c42747\n",
+    "reattach_flags": 7,
+    "reattach_visible": 487,
+    "reattach_received_hex": "",
+    "second_detach_exit": 0,
+    "errors_visible": false,
+    "daemon_cleanup": 0
+  },
+  {
+    "build": "observation-only",
+    "case": "generic-alternate-flags-7",
+    "same_outer_pty": true,
+    "alternate": true,
+    "initial_flags": 7,
+    "initial_herdr_visible": null,
+    "first_received_hex": "611b5b411b5b3133751b5b39393b3575",
+    "first_detach_exit": 0,
+    "termios_restored": false,
+    "termios_flag_changes": {
+      "3": [
+        1483,
+        536872395
+      ]
+    },
+    "session_list_detached": "Name  Controller  Viewport\nmain  Detached    140x39\n  ID: 7b5c5f2771fd7fb0aa0bfe605537f652\n",
+    "reattach_flags": 7,
+    "reattach_visible": 487,
+    "reattach_received_hex": "",
+    "second_detach_exit": 0,
+    "errors_visible": false,
+    "daemon_cleanup": 0
+  },
+  {
+    "build": "unmodified",
+    "case": "generic-alternate-legacy",
+    "same_outer_pty": true,
+    "alternate": true,
+    "reattach_columns": 140,
+    "initial_flags": 0,
+    "initial_herdr_visible": null,
+    "first_received_hex": "611b5b411b5b3133751b5b39393b3575",
+    "first_detach_exit": 0,
+    "termios_restored": false,
+    "termios_flag_changes": {
+      "3": [
+        1483,
+        536872395
+      ]
+    },
+    "termios_restored_except_kernel_pendin": true,
+    "session_list_detached": "Name  Controller  Viewport\nmain  Detached    140x39\n  ID: 1e1f772a337a2acb3859d53b0cec83d7\n",
+    "reattach_flags": 0,
+    "reattach_visible": 487,
+    "reattach_received_hex": "",
+    "session_list_reattached": "Name  Controller  Viewport\nmain  Attached    140x39\n  ID: 1e1f772a337a2acb3859d53b0cec83d7\n",
+    "second_detach_exit": 0,
+    "errors_visible": false,
+    "daemon_cleanup": 0
+  },
+  {
+    "build": "unmodified",
+    "case": "generic-main-new-width",
+    "same_outer_pty": true,
+    "alternate": false,
+    "reattach_columns": 150,
+    "initial_flags": 7,
+    "initial_herdr_visible": null,
+    "first_received_hex": "611b5b411b5b3133751b5b39393b3575",
+    "first_detach_exit": 0,
+    "termios_restored": false,
+    "termios_flag_changes": {
+      "3": [
+        1483,
+        536872395
+      ]
+    },
+    "termios_restored_except_kernel_pendin": true,
+    "session_list_detached": "Name  Controller  Viewport\nmain  Detached    139x39\n  ID: f50115c53112b39775cca9e2a9ad9240\n",
+    "reattach_flags": 7,
+    "reattach_visible": 1833,
+    "reattach_received_hex": "621b5b421b5b3133751b5b39393b3575",
+    "session_list_reattached": "Name  Controller  Viewport\nmain  Attached    139x39\n  ID: f50115c53112b39775cca9e2a9ad9240\n",
+    "second_detach_exit": 0,
+    "errors_visible": false,
+    "daemon_cleanup": 0
+  }
+]
