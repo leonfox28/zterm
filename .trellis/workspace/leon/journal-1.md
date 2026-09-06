@@ -451,3 +451,38 @@ Implemented the complete color protocol scope inline without subagents; native j
 ### Next Steps
 
 - Prepare v0.1.22 in this feature PR, wait for exact PR/main CI, then publish through the protected signed-release operator.
+
+
+## Session 18: Preserve hidden cursor position for Chinese IME
+<!-- trellis-session: v=2 fp=6d1f0896f0a9872d -->
+
+**Date**: 2026-09-06
+**Task**: Preserve hidden cursor position for Chinese IME
+**Branch**: `wicked-spider`
+
+### Summary
+
+Fixed the CLI compositor resetting hidden cursor coordinates to the origin. Native Herdr/Pi IME smoke passed by user confirmation. Preparing v0.1.23 through the formal release workflow.
+
+### Main Changes
+
+- Preserve active live cursor coordinates independently of visibility; document the contract.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `8416f4d` | fix(cli): preserve hidden cursor position for IME |
+
+### Testing
+
+- [OK] Regression failed before correction and passed after; CLI tests, Clippy, ci-policy, candidate build passed.
+- [OK] User confirmed Chinese IME placement is correct in Herdr/Pi with the candidate.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- Publish v0.1.23 with the existing protected release operator.
