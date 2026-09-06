@@ -11,7 +11,7 @@ pub(super) struct TerminalUiSession {
     pub(super) input_epoch: InputEpoch,
     pub(super) current_input_epoch: u64,
     pub(super) stdin_pump: StdinPump,
-    pub(super) prefix: PrefixParser,
+    pub(super) prefix: CommandMode,
     pub(super) transport_state: TerminalViewTransportState,
     pub(super) resize_coalescer: ResizeCoalescer,
     pub(super) physical_size: TerminalSize,
@@ -69,7 +69,7 @@ impl TerminalUiSession {
                 .deadline()
                 .is_some_and(|deadline| Instant::now() >= deadline)
             {
-                self.flush_prefix().await?;
+                self.prefix.cancel();
                 continue;
             }
             let prefix_deadline = self.prefix.deadline();
@@ -129,7 +129,7 @@ impl TerminalUiSession {
                 // The explicit expired-deadline check above makes this local
                 // timeout independent of continuously ready terminal output.
                 () = wait_for_prefix_deadline(prefix_deadline), if prefix_deadline.is_some() => {
-                    self.flush_prefix().await?;
+                    self.prefix.cancel();
                 }
                 () = wait_for_viewport_deadline(viewport_deadline), if viewport_deadline.is_some() => {
                     let now = Instant::now();
@@ -183,225 +183,240 @@ impl TerminalUiSession {
                             };
                             let mut force_viewport_presentation = false;
                             while let Some(host_event) = host_events.pop_front() {
-                                match host_event {
-                                    HostInputEvent::Bytes(bytes) => {
-                                        if let Err(error) = invalidate_selection_stdout(
-                                            &mut self.selection,
-                                            &mut self.viewport,
-                                            &self.surface,
-                                            &mut self.presenter,
-                                            &self.status_renderer,
-                                            self.transport_state,
-                                            &mut self.viewport_pacer,
-                                        ) {
-                                            break 'terminal Err(error);
+                                let copy_owned = match &host_event {
+                                    HostInputEvent::EnhancedKey(key) => self.copy_key_lease.owns(
+                                        key, self.selection.is_finalized(),
+                                    ),
+                                    HostInputEvent::LegacyCtrlC => self.selection.is_finalized(),
+                                    _ => false,
+                                };
+                                let actions = if copy_owned {
+                                    self.prefix.cancel();
+                                    vec![PrefixAction::Input(host_event)]
+                                } else {
+                                    self.prefix.route(
+                                        host_event, Instant::now(),
+                                        self.presenter.presented_keyboard_flags().contains(
+                                            zterm_core::terminal::TerminalKeyboardFlags::REPORT_EVENT_TYPES,
+                                        ),
+                                    )?
+                                };
+                                for action in actions {
+                                    let host_event = match action {
+                                        PrefixAction::Input(event) => event,
+                                        PrefixAction::Command(command) => {
+                                            self.viewport_pacer.cancel();
+                                            break 'terminal Ok(match command {
+                                                LocalCommand::Detach => TerminalCompletion::Detached,
+                                            });
                                         }
-                                        for action in self.prefix.feed(&bytes, Instant::now()) {
-                                            match action {
-                                                PrefixAction::Input(bytes) if self.viewport.is_live()
-                                                    && self.transport_state
-                                                        == TerminalViewTransportState::Active =>
+                                    };
+                                    match host_event {
+                                        HostInputEvent::Bytes(bytes) | HostInputEvent::ForwardedBytes(bytes) | HostInputEvent::Opaque(bytes) => {
+                                            if let Err(error) = invalidate_selection_stdout(
+                                                &mut self.selection,
+                                                &mut self.viewport,
+                                                &self.surface,
+                                                &mut self.presenter,
+                                                &self.status_renderer,
+                                                self.transport_state,
+                                                &mut self.viewport_pacer,
+                                            ) {
+                                                break 'terminal Err(error);
+                                            }
+                                            if self.viewport.is_live()
+                                                && self.transport_state == TerminalViewTransportState::Active
+                                            {
+                                                self.writer.write_input(bytes).await?;
+                                            } else if !self.viewport.is_live() {
+                                                let effect = self.viewport.retain_or_resume(bytes)?;
+                                                self.apply_viewport(effect, true).await?;
+                                            }
+                                        }
+                                        HostInputEvent::LegacyCtrlC => {
+                                            if self.selection.is_finalized() {
+                                                if let Err(error) = write_selection_clipboard_stdout(
+                                                    &self.selection,
+                                                    &self.viewport,
+                                                    &self.surface,
+                                                    &mut self.presenter,
+                                                ) {
+                                                    break 'terminal Err(error);
+                                                }
+                                            } else {
+                                                host_events
+                                                    .push_front(HostInputEvent::ForwardedBytes(vec![0x03]));
+                                            }
+                                        }
+                                        HostInputEvent::EnhancedKey(key) => {
+                                            let outer_flags = self.presenter.presented_keyboard_flags();
+                                            match route_enhanced_input(
+                                                &key,
+                                                self.surface.modes(),
+                                                outer_flags,
+                                                self.selection.is_finalized(),
+                                                &mut self.copy_key_lease,
+                                            ) {
+                                                KeyboardRoute::Copy => {
+                                                    if let Err(error) =
+                                                        write_selection_clipboard_stdout(
+                                                            &self.selection,
+                                                            &self.viewport,
+                                                            &self.surface,
+                                                            &mut self.presenter,
+                                                        )
+                                                    {
+                                                        break 'terminal Err(error);
+                                                    }
+                                                }
+                                                KeyboardRoute::Consume => {}
+                                                KeyboardRoute::Forward {
+                                                    bytes,
+                                                    clear_selection,
+                                                    reinterpret_legacy,
+                                                } => {
+                                                    if clear_selection
+                                                        && let Err(error) =
+                                                            invalidate_selection_stdout(
+                                                                &mut self.selection,
+                                                                &mut self.viewport,
+                                                                &self.surface,
+                                                                &mut self.presenter,
+                                                                &self.status_renderer,
+                                                                self.transport_state,
+                                                                &mut self.viewport_pacer,
+                                                            )
+                                                    {
+                                                        break 'terminal Err(error);
+                                                    }
+                                                    let forwarded = if reinterpret_legacy {
+                                                        host_events_from_legacy_bytes(bytes)
+                                                    } else if bytes.is_empty() {
+                                                        Vec::new()
+                                                    } else {
+                                                        vec![HostInputEvent::ForwardedBytes(bytes)]
+                                                    };
+                                                    for event in forwarded.into_iter().rev() {
+                                                        host_events.push_front(match event {
+                                                            HostInputEvent::Bytes(bytes) => HostInputEvent::ForwardedBytes(bytes),
+                                                            event => event,
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        HostInputEvent::Paste(bytes) => {
+                                            if let Err(error) = invalidate_selection_stdout(
+                                                &mut self.selection,
+                                                &mut self.viewport,
+                                                &self.surface,
+                                                &mut self.presenter,
+                                                &self.status_renderer,
+                                                self.transport_state,
+                                                &mut self.viewport_pacer,
+                                            ) {
+                                                break 'terminal Err(error);
+                                            }
+                                            if self.viewport.is_live()
+                                                && self.transport_state
+                                                    == TerminalViewTransportState::Active
+                                            {
+                                                if let Err(error) = self.writer.write_input(bytes).await {
+                                                    break 'terminal Err(error.into());
+                                                }
+                                            } else if !self.viewport.is_live() {
+                                                let effect = self.viewport.retain_or_resume(bytes)?;
+                                                self.apply_viewport(effect, true).await?;
+                                            }
+                                        }
+                                        HostInputEvent::PageUp | HostInputEvent::PageDown => {
+                                            if let Err(error) = invalidate_selection_stdout(
+                                                &mut self.selection,
+                                                &mut self.viewport,
+                                                &self.surface,
+                                                &mut self.presenter,
+                                                &self.status_renderer,
+                                                self.transport_state,
+                                                &mut self.viewport_pacer,
+                                            ) {
+                                                break 'terminal Err(error);
+                                            }
+                                            let older = matches!(host_event, HostInputEvent::PageUp);
+                                            let raw = if older { PAGE_UP } else { PAGE_DOWN };
+                                            if self.viewport.is_resume_pending() {
+                                                self.viewport.retain_resume_input(raw)?;
+                                            } else if self.viewport.is_history()
+                                                || live_history_navigation_allowed(self.transport_state)
+                                                    && history_owns_gestures(
+                                                        self.surface.active_screen(),
+                                                        self.surface.modes(),
+                                                    )
+                                            {
+                                                let effect = self.viewport.navigate(
+                                                    older,
+                                                    usize::from(self.viewport.content_size().rows)
+                                                        .saturating_sub(1)
+                                                        .max(1),
+                                                );
+                                                self.apply_viewport(effect, true).await?;
+                                            } else if self.transport_state
+                                                == TerminalViewTransportState::Active
+                                                && let Err(error) = self.writer.write_input(raw.to_vec()).await
+                                            {
+                                                break 'terminal Err(error.into());
+                                            }
+                                        }
+                                        HostInputEvent::Mouse(mouse) => {
+                                            let routed = match route_pointer(
+                                                &mouse,
+                                                &mut self.viewport,
+                                                &self.surface,
+                                                &mut self.selection,
+                                                live_history_navigation_allowed(self.transport_state),
+                                            ) {
+                                                Ok(routed) => routed,
+                                                Err(error) => break 'terminal Err(error),
+                                            };
+                                            reconcile_presenter_selection(
+                                                &mut self.selection,
+                                                &self.viewport,
+                                                &self.surface,
+                                                &mut self.presenter,
+                                            );
+                                            match routed {
+                                                PointerRoute::Viewport(effect) => {
+                                                    force_viewport_presentation |= mouse.release;
+                                                    self.apply_viewport(effect, true).await?;
+                                                }
+                                                PointerRoute::Child(bytes)
+                                                    if self.viewport.is_resume_pending() =>
+                                                {
+                                                    self.viewport.retain_resume_input(&bytes)?;
+                                                }
+                                                PointerRoute::Child(bytes)
+                                                    if self.viewport.is_live()
+                                                        && self.transport_state
+                                                            == TerminalViewTransportState::Active =>
                                                 {
                                                     if let Err(error) = self.writer.write_input(bytes).await {
                                                         break 'terminal Err(error.into());
                                                     }
                                                 }
-                                                PrefixAction::Input(bytes) if !self.viewport.is_live() => {
-                                                    let effect = self.viewport.retain_or_resume(bytes)?;
-                                                    self.apply_viewport(effect, true).await?;
-                                                }
-                                                PrefixAction::Input(_) => {}
-                                                PrefixAction::Detach => break,
-                                            }
-                                        }
-                                    }
-                                    HostInputEvent::LegacyCtrlC => {
-                                        if self.selection.is_finalized() {
-                                            if let Err(error) = write_selection_clipboard_stdout(
-                                                &self.selection,
-                                                &self.viewport,
-                                                &self.surface,
-                                                &mut self.presenter,
-                                            ) {
-                                                break 'terminal Err(error);
-                                            }
-                                        } else {
-                                            host_events
-                                                .push_front(HostInputEvent::Bytes(vec![0x03]));
-                                        }
-                                    }
-                                    HostInputEvent::EnhancedKey(key) => {
-                                        let outer_flags = self.presenter.presented_keyboard_flags();
-                                        match route_enhanced_input(
-                                            &key,
-                                            self.surface.modes(),
-                                            outer_flags,
-                                            self.selection.is_finalized(),
-                                            &mut self.copy_key_lease,
-                                        ) {
-                                            KeyboardRoute::Copy => {
-                                                if let Err(error) =
-                                                    write_selection_clipboard_stdout(
-                                                        &self.selection,
+                                                PointerRoute::Child(_) | PointerRoute::Ignore => {}
+                                                PointerRoute::SelectionChanged => {
+                                                    let now = Instant::now();
+                                                    if mark_cached_viewport_dirty(
                                                         &self.viewport,
-                                                        &self.surface,
-                                                        &mut self.presenter,
-                                                    )
-                                                {
-                                                    break 'terminal Err(error);
-                                                }
-                                            }
-                                            KeyboardRoute::Consume => {}
-                                            KeyboardRoute::Forward {
-                                                bytes,
-                                                clear_selection,
-                                                reinterpret_legacy,
-                                            } => {
-                                                if clear_selection
-                                                    && let Err(error) =
-                                                        invalidate_selection_stdout(
-                                                            &mut self.selection,
-                                                            &mut self.viewport,
-                                                            &self.surface,
-                                                            &mut self.presenter,
-                                                            &self.status_renderer,
-                                                            self.transport_state,
-                                                            &mut self.viewport_pacer,
-                                                        )
-                                                {
-                                                    break 'terminal Err(error);
-                                                }
-                                                let forwarded = if reinterpret_legacy {
-                                                    host_events_from_legacy_bytes(bytes)
-                                                } else if bytes.is_empty() {
-                                                    Vec::new()
-                                                } else {
-                                                    vec![HostInputEvent::Bytes(bytes)]
-                                                };
-                                                for event in forwarded.into_iter().rev() {
-                                                    host_events.push_front(event);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    HostInputEvent::Paste(bytes) => {
-                                        if let Err(error) = invalidate_selection_stdout(
-                                            &mut self.selection,
-                                            &mut self.viewport,
-                                            &self.surface,
-                                            &mut self.presenter,
-                                            &self.status_renderer,
-                                            self.transport_state,
-                                            &mut self.viewport_pacer,
-                                        ) {
-                                            break 'terminal Err(error);
-                                        }
-                                        if self.viewport.is_live()
-                                            && self.transport_state
-                                                == TerminalViewTransportState::Active
-                                        {
-                                            if let Err(error) = self.writer.write_input(bytes).await {
-                                                break 'terminal Err(error.into());
-                                            }
-                                        } else if !self.viewport.is_live() {
-                                            let effect = self.viewport.retain_or_resume(bytes)?;
-                                            self.apply_viewport(effect, true).await?;
-                                        }
-                                    }
-                                    HostInputEvent::PageUp | HostInputEvent::PageDown => {
-                                        if let Err(error) = invalidate_selection_stdout(
-                                            &mut self.selection,
-                                            &mut self.viewport,
-                                            &self.surface,
-                                            &mut self.presenter,
-                                            &self.status_renderer,
-                                            self.transport_state,
-                                            &mut self.viewport_pacer,
-                                        ) {
-                                            break 'terminal Err(error);
-                                        }
-                                        let older = matches!(host_event, HostInputEvent::PageUp);
-                                        let raw = if older { PAGE_UP } else { PAGE_DOWN };
-                                        if self.viewport.is_resume_pending() {
-                                            self.viewport.retain_resume_input(raw)?;
-                                        } else if self.viewport.is_history()
-                                            || live_history_navigation_allowed(self.transport_state)
-                                                && history_owns_gestures(
-                                                    self.surface.active_screen(),
-                                                    self.surface.modes(),
-                                                )
-                                        {
-                                            let effect = self.viewport.navigate(
-                                                older,
-                                                usize::from(self.viewport.content_size().rows)
-                                                    .saturating_sub(1)
-                                                    .max(1),
-                                            );
-                                            self.apply_viewport(effect, true).await?;
-                                        } else if self.transport_state
-                                            == TerminalViewTransportState::Active
-                                            && let Err(error) = self.writer.write_input(raw.to_vec()).await
-                                        {
-                                            break 'terminal Err(error.into());
-                                        }
-                                    }
-                                    HostInputEvent::Mouse(mouse) => {
-                                        let routed = match route_pointer(
-                                            &mouse,
-                                            &mut self.viewport,
-                                            &self.surface,
-                                            &mut self.selection,
-                                            live_history_navigation_allowed(self.transport_state),
-                                        ) {
-                                            Ok(routed) => routed,
-                                            Err(error) => break 'terminal Err(error),
-                                        };
-                                        reconcile_presenter_selection(
-                                            &mut self.selection,
-                                            &self.viewport,
-                                            &self.surface,
-                                            &mut self.presenter,
-                                        );
-                                        match routed {
-                                            PointerRoute::Viewport(effect) => {
-                                                force_viewport_presentation |= mouse.release;
-                                                self.apply_viewport(effect, true).await?;
-                                            }
-                                            PointerRoute::Child(bytes)
-                                                if self.viewport.is_resume_pending() =>
-                                            {
-                                                self.viewport.retain_resume_input(&bytes)?;
-                                            }
-                                            PointerRoute::Child(bytes)
-                                                if self.viewport.is_live()
-                                                    && self.transport_state
-                                                        == TerminalViewTransportState::Active =>
-                                            {
-                                                if let Err(error) = self.writer.write_input(bytes).await {
-                                                    break 'terminal Err(error.into());
-                                                }
-                                            }
-                                            PointerRoute::Child(_) | PointerRoute::Ignore => {}
-                                            PointerRoute::SelectionChanged => {
-                                                let now = Instant::now();
-                                                if mark_cached_viewport_dirty(
-                                                    &self.viewport,
-                                                    &mut self.viewport_pacer,
-                                                    now,
-                                                ) {
-                                                    force_viewport_presentation |= mouse.release;
+                                                        &mut self.viewport_pacer,
+                                                        now,
+                                                    ) {
+                                                        force_viewport_presentation |= mouse.release;
+                                                    }
                                                 }
                                             }
                                         }
                                     }
                                 }
-                                if self.prefix.detached() {
-                                    break;
-                                }
-                            }
-                            if self.prefix.detached() {
-                                self.viewport_pacer.cancel();
-                                break Ok(TerminalCompletion::Detached);
                             }
                             if self.deferred_active && !self.input_codec.paste_in_progress() {
                                 if let Err(error) = self.transition_transport(stdin, TerminalViewTransportState::Active).await {
@@ -427,14 +442,7 @@ impl TerminalUiSession {
                         Some(StdinEvent::Bytes { .. }) => {}
                         Some(StdinEvent::Eof) | None => {
                             self.viewport_pacer.cancel();
-                            if let Some(bytes) = take_pending_active_input(
-                                &mut self.prefix,
-                                self.transport_state,
-                            ) && self.viewport.is_live()
-                                && let Err(error) = self.writer.write_input(bytes).await
-                            {
-                                break Err(error.into());
-                            }
+                            self.prefix.clear_pending();
                             break Ok(TerminalCompletion::Detached);
                         }
                         Some(StdinEvent::Error(detail)) => {
@@ -653,19 +661,6 @@ impl TerminalUiSession {
             }
         }
         Ok(None)
-    }
-
-    async fn flush_prefix(&mut self) -> Result<(), CliError> {
-        if let Some(bytes) = self.prefix.flush_pending() {
-            if self.viewport.is_live() && self.transport_state == TerminalViewTransportState::Active
-            {
-                self.writer.write_input(bytes).await?;
-            } else if !self.viewport.is_live() {
-                let effect = self.viewport.retain_or_resume(bytes)?;
-                self.apply_viewport(effect, false).await?;
-            }
-        }
-        Ok(())
     }
 
     async fn apply_viewport(

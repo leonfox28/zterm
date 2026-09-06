@@ -63,6 +63,56 @@ enum KeyCode {
     Functional(FunctionalKey),
 }
 
+/// A binding is a key and exact modifiers, independent of its wire encoding.
+#[derive(Clone, Copy)]
+pub(super) struct Shortcut {
+    character: char,
+    modifiers: u8,
+}
+
+impl Shortcut {
+    pub(super) const fn plain(character: char) -> Self {
+        Self {
+            character,
+            modifiers: 0,
+        }
+    }
+
+    pub(super) const fn control(character: char) -> Self {
+        Self {
+            character,
+            modifiers: MOD_CONTROL,
+        }
+    }
+
+    pub(super) fn matches_legacy(self, byte: u8) -> bool {
+        match self.modifiers {
+            0 => self.character == char::from(byte),
+            MOD_CONTROL => legacy_control(self.character) == Some(byte),
+            _ => false,
+        }
+    }
+}
+
+/// Reported key identity for owning releases even if Ctrl was released first.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) struct KeyIdentity(KeyCode);
+
+impl KeyIdentity {
+    pub(super) fn from_legacy(byte: u8) -> Option<Self> {
+        if matches!(byte, b'\t' | b'\r' | 0x7f) {
+            return Some(Self(key_code_from_number(u32::from(byte))));
+        }
+        let code = match byte {
+            0x1d => u32::from(']'),
+            1..=26 => u32::from(b'a' + byte - 1),
+            b' '..=b'~' => u32::from(byte.to_ascii_lowercase()),
+            _ => return None,
+        };
+        Some(Self(KeyCode::Unicode(code)))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct EnhancedKey {
     code: KeyCode,
@@ -75,6 +125,27 @@ pub(super) struct EnhancedKey {
 }
 
 impl EnhancedKey {
+    pub(super) fn matches_shortcut(&self, shortcut: Shortcut) -> bool {
+        let modifiers = self.modifiers & !(MOD_CAPS_LOCK | MOD_NUM_LOCK);
+        modifiers == shortcut.modifiers
+            && (self.code == KeyCode::Unicode(u32::from(shortcut.character))
+                || self.base_layout == Some(shortcut.character)
+                || modifiers & MOD_SHIFT != 0 && self.shifted == Some(shortcut.character))
+    }
+
+    pub(super) fn identity(&self) -> KeyIdentity {
+        KeyIdentity(
+            self.base_layout
+                .map_or(self.code, |key| KeyCode::Unicode(u32::from(key))),
+        )
+    }
+
+    pub(super) fn is_modifier(&self) -> bool {
+        matches!(
+            self.code,
+            KeyCode::Functional(FunctionalKey::Other(57441..=57452))
+        )
+    }
     pub(super) fn parse(raw: Vec<u8>) -> Option<Self> {
         if !raw.starts_with(b"\x1b[") || raw.len() < 3 {
             return None;
@@ -179,12 +250,7 @@ impl EnhancedKey {
         Some(Self::functional(raw, code, modifiers, kind))
     }
 
-    fn functional(
-        raw: Vec<u8>,
-        code: FunctionalKey,
-        modifiers: u8,
-        kind: KeyEventKind,
-    ) -> Self {
+    fn functional(raw: Vec<u8>, code: FunctionalKey, modifiers: u8, kind: KeyEventKind) -> Self {
         Self {
             code: KeyCode::Functional(code),
             shifted: None,
@@ -201,9 +267,7 @@ impl EnhancedKey {
             KeyCode::Unicode(code) => matches!(code, 99 | 67),
             KeyCode::Functional(_) => false,
         } || self.shifted.is_some_and(|key| matches!(key, 'c' | 'C'))
-            || self
-                .base_layout
-                .is_some_and(|key| matches!(key, 'c' | 'C'));
+            || self.base_layout.is_some_and(|key| matches!(key, 'c' | 'C'));
         let required = self.modifiers & (MOD_CONTROL | MOD_SUPER) != 0;
         let forbidden = self.modifiers & (MOD_ALT | MOD_HYPER | MOD_META) != 0;
         is_c && required && !forbidden
@@ -258,9 +322,8 @@ impl EnhancedKey {
             return text.into_bytes();
         }
 
-        let control_shift_space = primary == ' '
-            && modifiers & MOD_CONTROL != 0
-            && modifiers & MOD_SHIFT != 0;
+        let control_shift_space =
+            primary == ' ' && modifiers & MOD_CONTROL != 0 && modifiers & MOD_SHIFT != 0;
         let legacy_combo = modifiers & !(MOD_SHIFT | MOD_ALT | MOD_CONTROL) == 0
             && (control_shift_space
                 || !(modifiers & MOD_CONTROL != 0 && modifiers & MOD_SHIFT != 0));
@@ -300,7 +363,11 @@ impl EnhancedKey {
             FunctionalKey::Escape => c0_bytes(0x1b, modifiers, false),
             FunctionalKey::Enter => c0_bytes(b'\r', modifiers, false),
             FunctionalKey::Backspace => c0_bytes(
-                if modifiers & MOD_CONTROL != 0 { 0x08 } else { 0x7f },
+                if modifiers & MOD_CONTROL != 0 {
+                    0x08
+                } else {
+                    0x7f
+                },
                 modifiers,
                 false,
             ),
@@ -372,9 +439,7 @@ impl EnhancedKey {
             FunctionalKey::KeypadUp => self.legacy_functional(FunctionalKey::Up, modes),
             FunctionalKey::KeypadDown => self.legacy_functional(FunctionalKey::Down, modes),
             FunctionalKey::KeypadPageUp => self.legacy_functional(FunctionalKey::PageUp, modes),
-            FunctionalKey::KeypadPageDown => {
-                self.legacy_functional(FunctionalKey::PageDown, modes)
-            }
+            FunctionalKey::KeypadPageDown => self.legacy_functional(FunctionalKey::PageDown, modes),
             FunctionalKey::KeypadHome => self.legacy_functional(FunctionalKey::Home, modes),
             FunctionalKey::KeypadEnd => self.legacy_functional(FunctionalKey::End, modes),
             FunctionalKey::KeypadInsert => self.legacy_functional(FunctionalKey::Insert, modes),
@@ -414,6 +479,10 @@ pub(super) struct CopyKeyLease {
 }
 
 impl CopyKeyLease {
+    pub(super) fn owns(&self, key: &EnhancedKey, selection_finalized: bool) -> bool {
+        (self.active == Some(key.lease_key()) && key.kind != KeyEventKind::Press)
+            || (selection_finalized && key.kind == KeyEventKind::Press && key.is_copy_shortcut())
+    }
     pub(super) fn consume(&mut self, key: &EnhancedKey) -> bool {
         let Some(active) = self.active else {
             return false;
@@ -501,9 +570,7 @@ fn parse_u32(bytes: &[u8]) -> Option<u32> {
         return None;
     }
     bytes.iter().try_fold(0_u32, |value, byte| {
-        value
-            .checked_mul(10)?
-            .checked_add(u32::from(*byte - b'0'))
+        value.checked_mul(10)?.checked_add(u32::from(*byte - b'0'))
     })
 }
 
@@ -689,7 +756,10 @@ mod tests {
             b"\x1b[99;5;55296u",
             b"\x1b[99;5;67;68u",
         ] {
-            assert!(EnhancedKey::parse(invalid.to_vec()).is_none(), "{invalid:?}");
+            assert!(
+                EnhancedKey::parse(invalid.to_vec()).is_none(),
+                "{invalid:?}"
+            );
         }
     }
 

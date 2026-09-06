@@ -164,12 +164,9 @@ The public commands are:
 
 ```text
 zterm connect <target> [--session <name-or-id>] [--takeover]
-              [--escape <ctrl-@..ctrl-_|ctrl-?|none>]
 zterm session list [<target>]
 zterm session new <target> <name> [--cwd <host-path>]
-                   [--escape <ctrl-@..ctrl-_|ctrl-?|none>]
 zterm session attach <target> <session> [--takeover]
-                      [--escape <ctrl-@..ctrl-_|ctrl-?|none>]
 zterm session rename <target> <session> <new-name>
 zterm session close <target> <session> [-y|--yes]
 ```
@@ -239,14 +236,18 @@ acknowledged; input and resize become effective only in the active state. A
 revision gap requests an authoritative full synchronization rather than
 guessing missing output. SIGWINCH updates are coalesced.
 
-The default local prefix is `Ctrl+]`:
+The fixed local command prefix is `Ctrl+]`:
 
 - `Ctrl+] .` detaches only this view. It does not close or signal the Session.
-- `Ctrl+] Ctrl+]` sends one literal `Ctrl+]` byte to the active PTY.
-- Any other second byte, or a one-second prefix timeout, sends the pending
-  prefix as ordinary input while active.
-- `--escape ctrl-@` through `--escape ctrl-_`, or `--escape ctrl-?`, selects
-  one other ASCII control byte. `--escape none` disables the prefix.
+- `Ctrl+] Ctrl+]` sends one literal Ctrl+] key using the existing child encoding.
+- An unknown command or a one-second timeout cancels locally. The attempted
+  command is not replayed to the Session.
+- Legacy and already-reported enhanced keys use the same command dispatcher.
+  Prefix handling does not change the terminal's keyboard-reporting mode.
+- Input-method text is not remapped to a physical key: a Chinese `。` does not
+  trigger the period command. Clipboard and normal input behavior are unchanged.
+
+The former `--escape` customization/disable option has been removed.
 
 Because the terminal is raw, ordinary keyboard `Ctrl-C`, `Ctrl-Z`, and similar
 control bytes go to the active host PTY. A separately delivered process signal

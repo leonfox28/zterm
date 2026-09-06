@@ -118,7 +118,7 @@ fn run_terminal_child_if_requested() -> bool {
         DaemonLauncher::for_test("/does/not/exist".into(), "--must-not-run".to_owned()),
     );
     let arguments = match mode {
-        "connect" | "screen-switch" | "scroll" | "copy" => {
+        "connect" | "screen-switch" | "scroll" | "copy" | "enhanced-prefix" => {
             vec!["zterm", "connect", "local"]
         }
         "bare-signal" => vec!["zterm"],
@@ -328,8 +328,17 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
     assert_local_selection_copy(&copy_output);
     wait_for_detach(&runtime, "local", &ui_main_id.to_string()).await;
 
+    let enhanced_output = run_local_terminal_child(&runtime, &state.paths, "enhanced-prefix").await;
+    assert!(contains_bytes(&enhanced_output, b"\x1b[=15u"));
+    assert!(contains_bytes(&enhanced_output, TERMINAL_RESTORE_BYTES));
+    wait_for_detach(&runtime, "local", &ui_main_id.to_string()).await;
+
     let bare_output = run_local_terminal_child(&runtime, &state.paths, "bare-signal").await;
     assert!(contains_bytes(&bare_output, TERMINAL_RESTORE_BYTES));
+    assert!(
+        contains_bytes(&bare_output, b"\x1b[=15u"),
+        "reattaching must preserve the same live child and its keyboard mode"
+    );
     let bare_sessions = runtime
         .session_list("local")
         .await
@@ -644,6 +653,7 @@ async fn run_local_terminal_child(
         "screen-switch" => b"ZTERM_TEST_DECSET_1049".as_slice(),
         "scroll" => b"ZTERM_SCROLL_PROBE".as_slice(),
         "copy" => TERMINAL_COPY_SCREEN,
+        "enhanced-prefix" => b"ZTERM_TEST_KEYBOARD_15".as_slice(),
         "bare-signal" => TERMINAL_BARE_MARKER,
         "stop-confirm" => b"".as_slice(),
         _ => panic!("unsupported terminal PTY fixture mode"),
@@ -769,6 +779,30 @@ async fn run_local_terminal_child(
         "fixture input must advance the authoritative terminal model"
     );
     let quiescent_revision = wait_for_terminal_quiescence(runtime, &presentation_count, mode).await;
+    if mode == "enhanced-prefix" {
+        assert!(
+            contains_bytes(
+                &captured.lock().expect("captured keyboard mode"),
+                b"\x1b[=15u"
+            ),
+            "the application-neutral child must enable enhanced keyboard reporting"
+        );
+        master_writer
+            .write_all(b"\x1b[93;5u\x1b[93;5:2u\x1b[93;5:3u\x1b[120u\x1b[120;1:2u\x1b[120;1:3u")
+            .expect("unknown command lifecycle");
+        // A deliberate pending command must expire without ever reaching the
+        // child. This covers the actual event loop's timeout owner, not only
+        // the pure command state machine.
+        master_writer
+            .write_all(b"\x1b[93;5u\x1b[93;5:3u")
+            .expect("prefix timeout");
+        tokio::time::sleep(std::time::Duration::from_millis(1_150)).await;
+        assert_eq!(
+            current_controller_revision(runtime).await,
+            quiescent_revision,
+            "unknown commands and timeout must not replay input to the child PTY"
+        );
+    }
     if mode == "scroll" {
         let live_rows = project_outer_child_rows(
             &captured
@@ -934,6 +968,10 @@ async fn run_local_terminal_child(
         );
         kill(Pid::from_raw(child.id() as i32), Signal::SIGTERM)
             .expect("cancel resized terminal child");
+    } else if mode == "enhanced-prefix" {
+        master_writer
+            .write_all(b"\x1b[93;5u\x1b[93;5:3u\x1b[46u")
+            .expect("enhanced prefix and encoded command key");
     } else {
         master_writer
             .write_all(b"\x1d.")

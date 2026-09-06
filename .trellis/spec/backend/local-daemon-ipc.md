@@ -414,12 +414,18 @@ No new crate, background owner, or second Session interpreter is introduced.
   disabled value on entry, mirrors nonzero child flags, temporarily requests
   flags 7 (disambiguation, event types, and alternate keys) only while a
   finalized local selection overlays a zero-flag child, and pops on every exit.
-  The sole host-input codec preserves raw bytes when outer and child modes
-  agree; during that temporary elevation it consumes one Ctrl/Super+C press and
+  After local command ownership, unconsumed input preserves raw bytes when outer
+  and child modes agree; during that temporary elevation it consumes one Ctrl/Super+C press and
   its matching repeat/release lease or performs the complete legacy downgrade
   for other valid keys. Any other outer/child mismatch remains byte-preserving;
   it is not treated as recoverable through legacy reinterpretation. No timer,
   terminal brand, process name, or screen-text heuristic participates.
+- Fixed Ctrl+] enters one local command owner after decoding and before child
+  encoding, in both active sessions and inactive attach waits. Only period is
+  currently bound to Detach; unknown commands and timeout cancel locally with
+  no replay. Command mode adds no keyboard-reporting request or input-method
+  mapping. See [Terminal Input Commands](./terminal-input-commands.md) for the
+  executable lifecycle, forwarding, CLI and regression contracts.
 - Physical input encoding is a presenter-owned host effect, not a
   visual-history property. Its projection contains exactly application cursor,
   application keypad, bracketed paste, focus reporting, and derived outer Kitty

@@ -37,12 +37,9 @@ zterm device list
 zterm device rename <device> <alias>
 zterm device revoke <device> [-y|--yes]
 zterm connect <device|local> [--session <name-or-id>] [--takeover]
-              [--escape <ctrl-@..ctrl-_|ctrl-?|none>]
 zterm session list [<device|local>]
 zterm session new <device|local> <name> [--cwd <host-path>]
-                   [--escape <ctrl-@..ctrl-_|ctrl-?|none>]
 zterm session attach <device|local> <session> [--takeover]
-                      [--escape <ctrl-@..ctrl-_|ctrl-?|none>]
 zterm session rename <device|local> <session> <new-name>
 zterm session close <device|local> <session> [-y|--yes]
 zterm daemon status
