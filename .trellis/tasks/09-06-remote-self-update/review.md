@@ -35,8 +35,9 @@ research, and this review). Keep real signed remote acceptance marked pending.
 See `research/verification.md`. The updater regression has failed before and
 passed after the fix. Existing cancellation, signatures, rollback, daemon
 readiness, no-setup and identity boundaries are retained. No real server or
-production installation was changed. Linux runtime and an official signed
-remote update remain hosted/release acceptance items.
+production installation was changed. Linux runtime verification subsequently
+passed in hosted CI; an official signed remote update remains a separate
+acceptance item. See `research/release.md` for publication evidence.
 
 ## Approval boundary
 

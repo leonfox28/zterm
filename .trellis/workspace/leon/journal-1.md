@@ -486,3 +486,39 @@ Fixed the CLI compositor resetting hidden cursor coordinates to the origin. Nati
 ### Next Steps
 
 - Publish v0.1.23 with the existing protected release operator.
+
+
+## Session 19: Remote self-update fix and v0.1.24 release
+<!-- trellis-session: v=2 fp=a73b33dbfe0df924 -->
+
+**Date**: 2026-09-06
+**Task**: Remote self-update fix and v0.1.24 release
+**Branch**: `short-toad`
+
+### Summary
+
+Detached updater survives originating PTY termination. PR #30 merged and v0.1.24 published immutable with eight assets; real remote signed-upgrade acceptance remains pending.
+
+### Main Changes
+
+- Added detached update ownership, bounded approval/control protocol, durable outcome logging and migration guidance.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `ca7eb7e` | fix(update): complete upgrades after the originating session ends |
+| `4048885` | chore: prepare v0.1.24 release |
+
+### Testing
+
+- [OK] Local just check passed; all 14 update tests passed on macOS arm64, Linux arm64 and Linux x64 in PR CI 34035113162.
+- [OK] Main CI 34035436342 and signed release workflow 34035804008 passed, including all three installer proofs and immutable publication.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- Bootstrap v0.1.24 via SSH, then validate a subsequent signed upgrade from a real remote zterm Session; keep remote-self-update task active.
