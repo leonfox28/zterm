@@ -45,18 +45,22 @@
   filesystem activation and daemon startup, with isolated signed fixture inputs.
   It does not exercise a real remote Iroh connection or an official signed
   Release on a user's server.
-- Linux arm64/x64 runtime evidence remains assigned to the existing hosted
-  native jobs. macOS execution is not a claim of Linux execution.
+- Linux arm64/x64 runtime evidence is now supplied by the successful hosted
+  PR and main jobs. All 14 updater tests passed on all three native platforms;
+  see `release.md` for exact runs.
 - Real-server acceptance needs an installed published updater containing this
   fix plus a newer signed compatible target. Bootstrap the first fixed updater
   via SSH; then invoke the subsequent update inside a remote zterm Session,
   approve interruption, reconnect manually, and check executable/daemon versions,
   identity/pairing retention and the final `zterm logs` outcome.
-- No server, production daemon, identity, installed executable, signing material,
-  release or remote repository was mutated by this implementation session.
+- No user server, production daemon, identity or installed executable was
+  modified. The subsequent authorized release workflow committed/pushed the
+  changes, merged PR #30 and published signed v0.1.24 through the protected
+  Environment; signing material remained within the hosted workflow.
 
 ## Commit status
 
-Work commit approval and task archival are pending. Keep the task active until
-the user approves the commit and remaining real-release acceptance is handled
-or assigned to the release verification task.
+Work commit `ca7eb7e` and version commit `4048885` were approved and merged in
+PR #30. v0.1.24 publication is complete. Keep the task active while real signed
+remote acceptance remains pending; it has not been replaced by fixture or
+installer evidence.

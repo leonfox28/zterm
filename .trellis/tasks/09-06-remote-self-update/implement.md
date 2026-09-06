@@ -1,7 +1,7 @@
 # Remote self-update implementation plan
 
 Status: implementation, isolated regression coverage and final quality review
-complete; release execution and real-release acceptance remain pending. The user approved the final plan and implementation on
+complete; v0.1.24 is published and real-server acceptance remains pending. The user approved the final plan and implementation on
 2026-09-06 and subsequently authorized the work commit and release workflow.
 Task start used `--allow-empty-context` for the authorized inline mode.
 
@@ -119,7 +119,7 @@ Linux x64 owns `true true`, and Linux arm64 owns `false false`.
   manually reconnect and verify version, identity and pairing.
 - [x] Keep isolated-test evidence separate from a real signed/server run. Do
   not claim full remote release acceptance until that run occurs.
-- [ ] Follow the authorized repository commit/release workflow for v0.1.24.
+- [x] Follow the authorized repository commit/release workflow for v0.1.24.
   Record PR, exact main CI, tag and immutable publication evidence; keep real
   server acceptance separate from publication.
 
@@ -146,10 +146,12 @@ Linux x64 owns `true true`, and Linux arm64 owns `false false`.
 - The full `just check` gate passed on this macOS host. A later local correction
   changes lost-after-handoff control errors to `operation_outcome_unknown` rather
   than `cancelled`; focused tests, final Clippy and a final serial `just check` verify that correction.
-- No production installation, server, signing authority, release, identity or
-  session was modified. Full real-server acceptance remains pending a published
-  fixed updater and a newer signed compatible target, as planned. No claim of
-  Linux runtime or hosted signing evidence is made from macOS tests.
+- PR #30 merged and v0.1.24 was published through the authorized release
+  workflow. Three-platform hosted tests, protected signing, final installer
+  verification and immutable publication all passed; see `research/release.md`.
+  No user server, production installation, identity or Session was modified.
+  Full real-server acceptance remains pending an installed fixed updater and
+  a newer signed compatible target, as planned.
 - The user authorized the proposed work commit and release workflow. Keep the
   task active while the outstanding real signed remote acceptance remains
   pending; publication alone does not establish that acceptance.

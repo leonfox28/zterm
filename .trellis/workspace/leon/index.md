@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 18
+- **Total Sessions**: 19
 - **Last Active**: 2026-09-06
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~488 | Active |
+| `journal-1.md` | ~524 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 19 | 2026-09-06 | Remote self-update fix and v0.1.24 release | `ca7eb7e`, `4048885` | `short-toad` |
 | 18 | 2026-09-06 | Preserve hidden cursor position for Chinese IME | `8416f4d` | `wicked-spider` |
 | 17 | 2026-09-06 | Terminal color and appearance compatibility | `139d097` | `mundane-moth` |
 | 16 | 2026-09-06 | Fix retained terminal reattach input and geometry | `dd7f385` | `investigate-zterm-reattach-input` |

@@ -15,8 +15,8 @@
   "branch": "short-toad",
   "base_branch": "main",
   "worktree_path": null,
-  "commit": null,
-  "pr_url": null,
+  "commit": "ca7eb7e",
+  "pr_url": "https://github.com/leonfox28/zterm/pull/30",
   "subtasks": [],
   "children": [],
   "parent": null,
@@ -31,6 +31,6 @@
     "crates/cli/src/main.rs",
     "docs/install.md"
   ],
-  "notes": "Implementation and release workflow approved 2026-09-06. Allows ending Sessions; independent updater, manual reconnect. Isolated PTY regression reproduced the old failure and passes with detached ownership. User authorized the proposed work commit and v0.1.24 release preparation, PR merge and publication. Real signed remote upgrade remains release-dependent and is not claimed by isolated tests.",
+  "notes": "Implementation and release workflow approved 2026-09-06. Allows ending Sessions; independent updater, manual reconnect. PR #30 merged as 1ded7f93a356f97346512a58812960594e6e1902. v0.1.24 published immutable with eight assets; PR/main CI, all 14 updater tests on three platforms, protected signing and final installer matrix passed. Real signed remote upgrade remains pending an installed fixed updater and newer target; keep task active. See research/release.md.",
   "meta": {}
 }
