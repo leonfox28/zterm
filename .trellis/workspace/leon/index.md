@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 16
+- **Total Sessions**: 17
 - **Last Active**: 2026-09-06
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~418 | Active |
+| `journal-1.md` | ~453 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 17 | 2026-09-06 | Terminal color and appearance compatibility | `139d097` | `mundane-moth` |
 | 16 | 2026-09-06 | Fix retained terminal reattach input and geometry | `dd7f385` | `investigate-zterm-reattach-input` |
 | 15 | 2026-09-06 | Unify Ctrl+] command mode and prepare release | `a686f6f` | `investigate-zterm-herdr-ctrl-close-exit` |
 | 14 | 2026-09-05 | Simplify CLI workflows and daemon diagnostics | `b4941e0` | `zterm-cli-commands-execution` |

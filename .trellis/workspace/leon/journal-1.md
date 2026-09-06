@@ -416,3 +416,38 @@ Initialized CLI resize deduplication from the authoritative snapshot and reconci
 ### Status
 
 [OK] **Completed**
+
+
+## Session 17: Terminal color and appearance compatibility
+<!-- trellis-session: v=2 fp=8e165d9423ebf81f -->
+
+**Date**: 2026-09-06
+**Task**: Terminal color and appearance compatibility
+**Branch**: `mundane-moth`
+
+### Summary
+
+Implemented the complete color protocol scope inline without subagents; native just check passed (560 tests, 0 failures). User authorized v0.1.22 release workflow.
+
+### Main Changes
+
+- Added host observations, required color metadata, OSC color protocols, appearance notifications, underline compatibility, history repaint and software cursor.
+- Fixed controller takeover ACK and stale-notification races; matching new CLI and daemon builds are required.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `139d097` | feat(terminal): support color and appearance protocols |
+
+### Testing
+
+- [OK] Native just check passed; isolated PTY color swatch fixture passed. Physical GUI/Herdr smoke and Linux hosted evidence remain separate.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- Prepare v0.1.22 in this feature PR, wait for exact PR/main CI, then publish through the protected signed-release operator.
