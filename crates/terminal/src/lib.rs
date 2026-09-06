@@ -3,6 +3,8 @@
 //! This crate is the only zterm-owned dependency boundary around Alacritty's
 //! terminal state engine. PTY ownership remains in `zterm-platform`.
 
+mod color_names;
+mod colors;
 mod engine;
 mod ingress;
 mod model;

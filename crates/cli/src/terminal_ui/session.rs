@@ -23,6 +23,7 @@ pub(super) struct TerminalUiSession {
     pub(super) viewport_pacer: ViewportPresentationPacer,
     pub(super) sync_requested: bool,
     pub(super) input_codec: HostInputCodec,
+    pub(super) host_colors: HostColors,
     pub(super) copy_key_lease: CopyKeyLease,
     pub(super) deferred_active: bool,
 }
@@ -49,6 +50,16 @@ impl TerminalUiSession {
         cancellation_receiver: &mut watch::Receiver<Option<TerminalSignalCancellation>>,
     ) -> Result<TerminalCompletion, CliError> {
         'terminal: loop {
+            self.host_colors
+                .flush_commands(&mut self.presenter, &mut stdout.lock())?;
+            if matches!(
+                self.transport_state,
+                TerminalViewTransportState::Active | TerminalViewTransportState::Reconnecting
+            ) && let Some(profile) = self.host_colors.take_update()
+            {
+                self.writer.update_colors(profile).await?;
+            }
+            let color_deadline = self.host_colors.deadline();
             let now = Instant::now();
             if self.viewport_pacer.due(now) {
                 if let Err(error) = present_cached_viewport_stdout(
@@ -162,10 +173,10 @@ impl TerminalUiSession {
                         Err(error) => break Err(error),
                     }
                 }
+                () = wait_for_prefix_deadline(color_deadline), if color_deadline.is_some() => { self.host_colors.expire(Instant::now()); }
                 input = self.stdin_pump.recv() => {
                     match input {
-                        Some(StdinEvent::Bytes { epoch, bytes })
-                            if input_epoch_is_current(epoch, self.current_input_epoch) =>
+                        Some(StdinEvent::Bytes { epoch, bytes }) =>
                         {
                             // A paced history frame may have committed a new
                             // source since the preceding pointer event. Retire
@@ -177,12 +188,13 @@ impl TerminalUiSession {
                                 &self.surface,
                                 &mut self.presenter,
                             );
-                            let mut host_events = match self.input_codec.feed(&bytes) {
+                            let mut host_events = match self.input_codec.feed_for_epoch(&bytes, epoch, self.current_input_epoch) {
                                 Ok(events) => VecDeque::from(events),
                                 Err(error) => break 'terminal Err(error),
                             };
                             let mut force_viewport_presentation = false;
                             while let Some(host_event) = host_events.pop_front() {
+                                if let HostInputEvent::TerminalReply { reply, bytes } = host_event { self.host_colors.observe(reply, bytes, Instant::now()); continue; }
                                 let copy_owned = match &host_event {
                                     HostInputEvent::EnhancedKey(key) => self.copy_key_lease.owns(
                                         key, self.selection.is_finalized(),
@@ -212,6 +224,7 @@ impl TerminalUiSession {
                                         }
                                     };
                                     match host_event {
+                                        HostInputEvent::TerminalReply { .. } => {},
                                         HostInputEvent::Bytes(bytes) | HostInputEvent::ForwardedBytes(bytes) | HostInputEvent::Opaque(bytes) => {
                                             if let Err(error) = invalidate_selection_stdout(
                                                 &mut self.selection,
@@ -439,7 +452,6 @@ impl TerminalUiSession {
                                 break 'terminal Err(error);
                             }
                         }
-                        Some(StdinEvent::Bytes { .. }) => {}
                         Some(StdinEvent::Eof) | None => {
                             self.viewport_pacer.cancel();
                             self.prefix.clear_pending();
@@ -608,7 +620,13 @@ impl TerminalUiSession {
                 }
             }
             TerminalViewEvent::HistoryWindow(result) => {
+                let colors = match &result {
+                    TerminalSurfaceHistoryWindowResult::Frame(frame) => Some(frame.colors.clone()),
+                    _ => None,
+                };
                 let effect = self.viewport.apply_view_history_window(result)?;
+                let colors_changed =
+                    colors.is_some_and(|colors| self.presenter.observe_history_colors(colors));
                 reconcile_presenter_selection_for_next_frame(
                     &mut self.selection,
                     &self.viewport,
@@ -616,6 +634,15 @@ impl TerminalUiSession {
                     &mut self.presenter,
                 );
                 self.apply_viewport(effect, false).await?;
+                if colors_changed {
+                    present_surface_stdout(
+                        &self.surface,
+                        &mut self.presenter,
+                        &self.viewport,
+                        &self.status_renderer,
+                        self.transport_state,
+                    )?;
+                }
                 reconcile_presenter_selection(
                     &mut self.selection,
                     &self.viewport,
@@ -695,6 +722,7 @@ impl TerminalUiSession {
         self.viewport_pacer.cancel();
         let (next, pending_resize) = self.resize_coalescer.enter_transport_state(next);
         if next == TerminalViewTransportState::Reconnecting {
+            self.host_colors.request_refresh();
             self.viewport.reset_presentation_for_reconnect();
             self.status_renderer.reset_for_reconnect();
         }

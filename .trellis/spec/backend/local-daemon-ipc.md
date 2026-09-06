@@ -250,7 +250,8 @@ No new crate, background owner, or second Session interpreter is introduced.
   request correlation plus mutation ambiguity. On retryable remote loss it
   resolves an outstanding history query once as a content-free Gap, emits
   `Reconnecting`, opens a fresh tunnel/service stream, and attaches with the
-  same ResumeViewId and SessionId plus the latest applied revision/viewport.
+  same ResumeViewId and SessionId plus the latest applied revision/viewport
+  and observed color profile. Color observation sequence resets per attachment.
   Every successful replacement epoch projects `Synchronizing` and then an
   explicit frontend-owned `Unknown` path before any collected Direct/Relay
   samples or target state. Consecutive identical path samples are suppressed.
@@ -314,10 +315,13 @@ No new crate, background owner, or second Session interpreter is introduced.
   view; create-then-attach failure preserves `CreatedSessionAttach`; an
   unprovable post-submit result remains `operation_outcome_unknown`.
 - Each non-`Active` terminal transition advances the input epoch and clears the
-  prefix. Returning to `Active` first joins the old stdin reader, flushes queued
-  kernel input, advances the epoch, installs the replacement reader, and only
-  then accepts input. `SIGWINCH` has one CLI owner: after successfully
-  submitting a changed size it immediately treats the view as
+  prefix. Returning to `Active` first joins the old stdin reader, retains queued
+  bytes and drains at most 64 KiB kernel input under the old epoch, advances the
+  epoch, installs the replacement reader, and only
+  then accepts input. The persistent codec retains physical-reply framing and
+  discards old keyboard units; aggregate retained events use the resume-input
+  bound. Never tcflush away color replies. `SIGWINCH` has one CLI owner:
+  after successfully submitting a changed size it immediately treats the view as
   `Synchronizing`, coalesces only the latest observation, and sends no further
   resize until an authoritative `Active` event. If that event finds a different
   pending size, the owner submits it and remains `Synchronizing`; only an
@@ -447,8 +451,8 @@ No new crate, background owner, or second Session interpreter is introduced.
   compact post-delta viewport/cache-anchor metadata plus a reconciled selection
   candidate. That post-delta selection identity, not the pre-delta viewport,
   determines any flags-7 elevation. The preview does not clone cached rows.
-  For a pinned history view, the sole `DesktopPresenter` emits only controls
-  for changed projected fields in one buffered `write_all + flush`; it emits no
+  When colors are unchanged in a pinned history view, the sole
+  `DesktopPresenter` emits only controls for changed projected fields in one buffered `write_all + flush`; it emits no
   rows, chrome, cursor, mouse reset/capture, or visual transaction. An unchanged
   projection does no I/O. Only after successful output (or a proven no-I/O
   projection) may the caller commit the surface, live metrics, cache-anchor
@@ -456,7 +460,9 @@ No new crate, background owner, or second Session interpreter is introduced.
   write/flush failure commits none of those candidates and invalidates the
   presenter baseline so the next presentation is a complete recovery frame.
   Live full-frame delta presentation uses the same staged selection/viewport
-  ordering rather than mutating them before the outer write.
+  ordering rather than mutating them before the outer write. Color-only
+  changes repaint semantic pinned rows without moving history or invalidating
+  a valid selection; the newest color stamp wins over delayed history replies.
 - Snapshot, applied delta, resync replacement, history, status, and scrollbar
   changes first converge as one semantic `ComposedFrame`. The sole
   `DesktopPresenter` then emits one buffered outer transaction: DEC 2026 begin,
@@ -464,7 +470,8 @@ No new crate, background owner, or second Session interpreter is introduced.
   DEC 2026 end, one `write_all`, and exactly one flush. No daemon/model/tunnel
   path constructs presentation ANSI. Child modes may change semantic input
   routing but cannot leave physical outer capture disabled. A partial write or
-  flush failure clears the presenter's committed baseline, makes a best-effort
+  flush failure clears the presenter's physical baseline while preserving its
+  semantic fallback, makes a best-effort
   DEC 2026 end while preserving the original error, and forces the next retry
   to perform a full clear plus complete repaint. Raw-mode cleanup begins by
   ending DEC 2026, then disables capture/restores the user's terminal on normal
@@ -543,7 +550,7 @@ No new crate, background owner, or second Session interpreter is introduced.
   oversized unterminated or complete paste fails with a typed resource error
   without forwarding a partial prefix. If `Active` arrives while a resume paste
   is incomplete, the UI keeps consuming that paste under the old input epoch,
-  then performs the authoritative reader join/flush/new-epoch fence before
+  then performs the authoritative reader join/bounded-drain/new-epoch fence before
   forwarding the complete retained unit exactly once.
 - `TerminalSyncRequired`/replacement snapshot is a background visual sync, not
   a transport reconnect: an already-pinned complete semantic history frame,
@@ -615,7 +622,7 @@ No new crate, background owner, or second Session interpreter is introduced.
   removes the exact socket only after all ownership is released.
 - M4 session list/create/rename/close remain strict unary calls. The attachment
   reader accepts only snapshot acknowledgement, sync, input, resize, detach,
-  and takeover for the bound attachment. A protocol error flushes one typed
+  history-window, base-color observation, and takeover for the bound attachment. A protocol error flushes one typed
   error before closing only that stream.
 - Attachment output uses one fixed-capacity control queue plus latest-only
   revision/lifecycle watches. A slow socket writer cannot backpressure the PTY
@@ -1263,3 +1270,20 @@ assert_eq!(error.kind(), DomainErrorKind::DeadlineExceeded);
   device/inode/change-time ownership token.
 - Reporting successful stop before every registry-owned child/thread/reservation
   is released.
+
+## Physical colors and software cursor
+
+[Terminal Colors](./terminal-colors.md) owns the bounded startup probe, typed
+reply framing across all UI phases, controller profile propagation, owned-2031
+cleanup and semantic/physical presenter separation. Explicit cursor colors use a
+steady software block over the real glyph while preserving CUP; inherited
+cursor behavior stays native. All child global color mutations are semantic
+state only, never physical OSC setters. Initial color observations precede
+interactive create and attach; matching create209/attach323 peers are required.
+
+A queued Active/Awaiting/revision notification may race controller takeover.
+The internal `attachment_next_update` maps LeaseLost to no update so the writer
+can deliver the authoritative lifecycle LeaseLost event; it must not close the
+stream first. Request/input authorization still rejects the old controller.
+`stale_color_sync_notification_cannot_hide_takeover_lease_loss` proves this
+ordering without timing sleeps. An unchanged base publishes no revision wake.

@@ -368,9 +368,30 @@ impl LocalClient {
         working_directory: Option<&Path>,
         viewport: Option<zterm_core::terminal::TerminalSize>,
     ) -> Result<crate::session::SessionSummary, DaemonError> {
+        self.create_session_at_with_colors(
+            target,
+            name,
+            working_directory,
+            viewport,
+            zterm_core::terminal::TerminalColorProfile::default(),
+        )
+        .await
+    }
+
+    /// Creates a Session with observations available before PTY startup.
+    #[cfg(unix)]
+    pub async fn create_session_at_with_colors(
+        &self,
+        target: ResolvedSessionTarget,
+        name: &SessionName,
+        working_directory: Option<&Path>,
+        viewport: Option<zterm_core::terminal::TerminalSize>,
+        base_colors: zterm_core::terminal::TerminalColorProfile,
+    ) -> Result<crate::session::SessionSummary, DaemonError> {
         let frame = self
             .mutation_request(target, WireKind::SessionCreateRequest, |operation_id| {
                 v2::SessionCreateRequest {
+                    base_colors: Some(base_colors.clone().into()),
                     operation_id: Some(operation_id.into()),
                     target: Some(resolved_target_wire(target)),
                     name: name.to_string(),
@@ -1710,6 +1731,8 @@ mod tests {
             request_id,
             1_000,
             &v2::SessionCreateRequest {
+                base_colors: Some(zterm_core::terminal::TerminalColorProfile::default().into()),
+
                 operation_id: Some(
                     OperationId {
                         lease: OperationLease {

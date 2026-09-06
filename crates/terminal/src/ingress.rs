@@ -280,11 +280,21 @@ impl TerminalIngressPolicy {
                 if matches!(byte, 0x18 | 0x1a) {
                     PolicyState::Ground
                 } else if byte == 0x9c || (matches!(string.kind, StringKind::Osc) && byte == 0x07) {
-                    self.dispatch_string(string, output);
+                    self.dispatch_string(
+                        string,
+                        engine,
+                        output,
+                        if byte == 7 { "\x07" } else { "\x1b\\" },
+                    )?;
                     PolicyState::Ground
                 } else if string.saw_escape && byte == b'\\' {
                     string.saw_escape = false;
-                    self.dispatch_string(string, output);
+                    self.dispatch_string(
+                        string,
+                        engine,
+                        output,
+                        if byte == 7 { "\x07" } else { "\x1b\\" },
+                    )?;
                     PolicyState::Ground
                 } else {
                     if string.saw_escape {
@@ -411,6 +421,46 @@ impl TerminalIngressPolicy {
         let final_byte = *sequence.bytes.last().unwrap_or(&0);
         let body = &sequence.bytes[2..sequence.bytes.len() - 1];
         let (marker, parameters) = parse_parameters(body);
+        if body == b"?996" && final_byte == b'n' {
+            return output.push_reply(&engine.colors.appearance_reply());
+        }
+        if final_byte == b'p' && body.ends_with(b"$") {
+            let (private, values) = parse_parameters(&body[..body.len() - 1]);
+            if !matches!(private, None | Some(b'?')) {
+                return Ok(());
+            }
+            if let Some(values) = values {
+                for value in values {
+                    let state = engine.report_mode(value, private == Some(b'?'));
+                    let prefix = if private == Some(b'?') { "?" } else { "" };
+                    output.push_reply(format!("\x1b[{prefix}{value};{state}$y").as_bytes())?;
+                }
+            }
+            return Ok(());
+        }
+        if body.ends_with(b"#") && matches!(final_byte, b'P' | b'Q' | b'R') {
+            if final_byte == b'R' {
+                return if body == b"#" {
+                    output.push_reply(&engine.colors.stack_report())
+                } else {
+                    Ok(())
+                };
+            }
+            let (marker, values) = parse_parameters(&body[..body.len() - 1]);
+            if marker.is_some() {
+                return Ok(());
+            }
+            if let Some(values) = values {
+                if values.is_empty() {
+                    engine.colors.stack(final_byte == b'P', 0);
+                } else {
+                    for v in values {
+                        engine.colors.stack(final_byte == b'P', usize::from(v));
+                    }
+                }
+            }
+            return Ok(());
+        }
 
         if final_byte == b'c' && marker.is_none() && matches!(parameters.as_deref(), Some([] | [0]))
         {
@@ -459,6 +509,8 @@ impl TerminalIngressPolicy {
             let mut forwarded = Vec::new();
             for parameter in parameters {
                 match parameter {
+                    5 => engine.colors.reverse = enabled,
+                    2031 => engine.colors.subscribed = enabled,
                     9 => engine.set_legacy_x10_mouse(enabled),
                     2026 => output.push_event(TerminalSideEvent::UnsupportedSequence(
                         UnsupportedSequenceKind::Csi,
@@ -484,8 +536,7 @@ impl TerminalIngressPolicy {
             }
             return Ok(());
         }
-        let sgr_extra = final_byte == b'm' && sgr_contains_underline_color(body);
-        let unsupported = matches!(final_byte, b'b' | b'c') || body.contains(&b'$') || sgr_extra;
+        let unsupported = matches!(final_byte, b'b' | b'c') || body.contains(&b'$');
         if unsupported {
             output.push_event(TerminalSideEvent::UnsupportedSequence(
                 UnsupportedSequenceKind::Csi,
@@ -496,7 +547,13 @@ impl TerminalIngressPolicy {
         Ok(())
     }
 
-    fn dispatch_string(&self, string: ControlString, output: &mut UpdateCollector) {
+    fn dispatch_string(
+        &self,
+        string: ControlString,
+        engine: &mut AlacrittyEngine,
+        output: &mut UpdateCollector,
+        end: &str,
+    ) -> Result<(), IngressError> {
         if string.overflowed {
             if string.clipboard {
                 output.push_event(TerminalSideEvent::EffectRejected(
@@ -510,13 +567,40 @@ impl TerminalIngressPolicy {
                 };
                 output.push_event(TerminalSideEvent::UnsupportedSequence(kind));
             }
-            return;
+            return Ok(());
+        }
+        if let Ok(text) = std::str::from_utf8(&string.bytes) {
+            if matches!(string.kind, StringKind::Dcs) {
+                if let Some(payload) = text.strip_prefix("+q") {
+                    return output.push_reply(&crate::colors::capabilities(payload));
+                }
+                if let Some(request) = text.strip_prefix("$q") {
+                    let reply = if request == "m" {
+                        format!(
+                            "\x1bP1$r{}\x1b\\",
+                            crate::colors::sgr(crate::projection::terminal_style(
+                                &engine.term().grid().cursor.template
+                            ))
+                        )
+                    } else {
+                        "\x1bP0$r\x1b\\".to_owned()
+                    };
+                    return output.push_reply(reply.as_bytes());
+                }
+            } else if matches!(string.kind, StringKind::Osc) {
+                let (command, payload) = text.split_once(';').unwrap_or((text, ""));
+                if let Ok(command) = command.parse::<u16>()
+                    && let Some(reply) = engine.colors.osc(command, payload, end)
+                {
+                    return output.push_reply(&reply);
+                }
+            }
         }
         if !matches!(string.kind, StringKind::Osc) {
             output.push_event(TerminalSideEvent::UnsupportedSequence(
                 UnsupportedSequenceKind::Control,
             ));
-            return;
+            return Ok(());
         }
         let mut fields = string.bytes.splitn(2, |byte| *byte == b';');
         let command = fields.next().unwrap_or_default();
@@ -540,6 +624,7 @@ impl TerminalIngressPolicy {
                 UnsupportedSequenceKind::Osc,
             )),
         }
+        Ok(())
     }
 }
 
@@ -654,52 +739,6 @@ fn parse_parameters(body: &[u8]) -> (Option<u8>, Option<Vec<u16>>) {
     (marker, Some(parsed))
 }
 
-fn sgr_contains_underline_color(body: &[u8]) -> bool {
-    let parameters = body.split(|byte| *byte == b';').collect::<Vec<_>>();
-    let mut index = 0;
-    while index < parameters.len() {
-        let parameter = parameters[index];
-        let value = decimal_parameter(
-            parameter
-                .split(|byte| *byte == b':')
-                .next()
-                .unwrap_or_default(),
-        );
-        if matches!(value, Some(58 | 59)) {
-            return true;
-        }
-
-        // Semicolon-form foreground/background colors consume their mode and
-        // color components as SGR parameters. Do not mistake an RGB component
-        // or palette index of 58/59 for a top-level underline-color attribute.
-        if !parameter.contains(&b':') && matches!(value, Some(38 | 48)) {
-            let color_mode = parameters.get(index + 1).and_then(|parameter| {
-                decimal_parameter(
-                    parameter
-                        .split(|byte| *byte == b':')
-                        .next()
-                        .unwrap_or_default(),
-                )
-            });
-            index = index.saturating_add(match color_mode {
-                Some(2) => 5,
-                Some(5) => 3,
-                _ => 2,
-            });
-        } else {
-            index += 1;
-        }
-    }
-    false
-}
-
-fn decimal_parameter(bytes: &[u8]) -> Option<u16> {
-    if bytes.is_empty() {
-        return Some(0);
-    }
-    std::str::from_utf8(bytes).ok()?.parse().ok()
-}
-
 fn bounded_text(bytes: &[u8]) -> (String, bool) {
     let truncated = bytes.len() > MAX_TITLE_BYTES;
     let retained = bytes.get(..MAX_TITLE_BYTES).unwrap_or(bytes);
@@ -715,14 +754,5 @@ mod tests {
         assert_eq!(parse_parameters(b"?6"), (Some(b'?'), Some(vec![6])));
         assert_eq!(parse_parameters(b"8;24;80"), (None, Some(vec![8, 24, 80])));
         assert_eq!(parse_parameters(b"38:2:1:2:3"), (None, None));
-    }
-
-    #[test]
-    fn underline_color_detection_observes_sgr_parameter_boundaries() {
-        assert!(sgr_contains_underline_color(b"058;5;1"));
-        assert!(sgr_contains_underline_color(b"1;58:2::1:2:3"));
-        assert!(sgr_contains_underline_color(b"38;5;58;59"));
-        assert!(!sgr_contains_underline_color(b"38;2;58;59;60"));
-        assert!(!sgr_contains_underline_color(b"48:2::58:59:60"));
     }
 }

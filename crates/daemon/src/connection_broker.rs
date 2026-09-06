@@ -2845,6 +2845,7 @@ fn is_remote_service_kind(kind: WireKind) -> bool {
             | WireKind::TerminalAttachRequest
             | WireKind::TerminalInput
             | WireKind::TerminalResize
+            | WireKind::TerminalBaseColors
             | WireKind::TerminalDetach
             | WireKind::TerminalSnapshotApplied
             | WireKind::TerminalSyncRequest

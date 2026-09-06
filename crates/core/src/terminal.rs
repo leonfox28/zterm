@@ -4,6 +4,9 @@
 //! free of terminal-engine dependencies so protocol and future client crates
 //! can share these values without compiling a host PTY stack.
 
+mod colors;
+pub use colors::*;
+
 use std::fmt;
 
 use crate::{ResourceLimits, Revision};
@@ -158,7 +161,9 @@ pub struct TerminalStyle {
     /// Italic rendering is active.
     pub italic: bool,
     /// Underline rendering is active.
-    pub underline: bool,
+    pub underline: TerminalUnderline,
+    /// Explicit underline color; Default follows displayed foreground.
+    pub underline_color: TerminalColor,
     /// Foreground and background are inverted.
     pub inverse: bool,
 }
@@ -335,6 +340,8 @@ impl fmt::Debug for TerminalSurfaceRow {
 /// Complete semantic state of one active terminal screen.
 #[derive(Clone, Eq, PartialEq)]
 pub struct TerminalSurface {
+    /// Effective Session color state.
+    pub colors: TerminalColorSnapshot,
     /// Exact rectangular viewport size.
     pub size: TerminalSize,
     /// Currently active child screen.
@@ -404,6 +411,8 @@ impl fmt::Debug for TerminalSurfaceRowPatch {
 /// Merged semantic update from one attachment checkpoint to the latest revision.
 #[derive(Clone, Eq, PartialEq)]
 pub struct TerminalSurfaceDelta {
+    /// Effective Session color state.
+    pub colors: TerminalColorSnapshot,
     /// Checkpoint revision used as the baseline.
     pub from_revision: Revision,
     /// Latest model revision represented by this update.
@@ -502,6 +511,9 @@ impl std::error::Error for TerminalSurfaceError {}
 impl TerminalSurface {
     /// Validates a complete surface against its authoritative revision.
     pub fn validate(&self, revision: Revision) -> Result<(), TerminalSurfaceError> {
+        if !self.colors.is_valid_at(revision) {
+            return Err(TerminalSurfaceError::InvalidRevision);
+        }
         validate_surface_size(self.size)?;
         if self.rows.len() != usize::from(self.size.rows) {
             return Err(TerminalSurfaceError::InvalidRowCount);
@@ -527,6 +539,9 @@ impl TerminalSurfaceDelta {
     /// Validates metadata and every complete row replacement.
     pub fn validate(&self) -> Result<(), TerminalSurfaceError> {
         if self.from_revision >= self.to_revision {
+            return Err(TerminalSurfaceError::InvalidRevision);
+        }
+        if !self.colors.is_valid_at(self.to_revision) {
             return Err(TerminalSurfaceError::InvalidRevision);
         }
         validate_surface_size(self.size)?;
@@ -569,6 +584,9 @@ impl TerminalSurfaceDelta {
         self.validate()?;
         if baseline_revision != self.from_revision
             || baseline.size != self.size
+            || baseline.colors.changed_at > self.colors.changed_at
+            || (baseline.colors.changed_at == self.colors.changed_at
+                && baseline.colors != self.colors)
             || baseline.active_screen != self.active_screen
         {
             return Err(TerminalSurfaceError::IncompatibleBaseline);
@@ -578,6 +596,7 @@ impl TerminalSurfaceDelta {
         for patch in &self.row_patches {
             candidate.rows[usize::from(patch.row)] = patch.replacement.clone();
         }
+        candidate.colors = self.colors.clone();
         candidate.cursor = self.cursor;
         candidate.modes = self.modes;
         candidate.scroll_metrics = self.scroll_metrics;
@@ -822,6 +841,8 @@ pub struct TerminalHistoryWindowResponseShape {
 /// One complete semantic history window produced from a single model revision.
 #[derive(Clone, Eq, PartialEq)]
 pub struct TerminalSurfaceHistoryWindowFrame {
+    /// Effective Session color state.
+    pub colors: TerminalColorSnapshot,
     /// Whether the request retained or replaced its supplied row identity.
     pub disposition: TerminalViewportDisposition,
     /// Current authoritative coordinate-space anchor.
@@ -840,6 +861,9 @@ impl TerminalSurfaceHistoryWindowFrame {
         &self,
         query: TerminalHistoryWindowQuery,
     ) -> Result<(), TerminalSurfaceError> {
+        if !self.colors.is_valid_at(self.anchor.revision) {
+            return Err(TerminalSurfaceError::InvalidRevision);
+        }
         validate_surface_size(self.anchor.viewport)?;
         let Some(shape) = query.response_shape(self.anchor) else {
             return Err(TerminalSurfaceError::InvalidHistoryWindow);
@@ -1023,6 +1047,8 @@ mod tests {
 
     fn semantic_surface(revision: Revision) -> TerminalSurface {
         TerminalSurface {
+            colors: Default::default(),
+
             size: TerminalSize::new(2, 3),
             active_screen: ActiveScreen::Main,
             rows: vec![
@@ -1079,6 +1105,8 @@ mod tests {
 
         let mut applied = surface.clone();
         let delta = TerminalSurfaceDelta {
+            colors: Default::default(),
+
             from_revision: revision,
             to_revision: Revision::new(4),
             size: surface.size,
@@ -1176,6 +1204,8 @@ mod tests {
             newer_margin_rows: 0,
         };
         let frame = TerminalSurfaceHistoryWindowFrame {
+            colors: Default::default(),
+
             disposition: TerminalViewportDisposition::Exact,
             anchor: query.anchor,
             target_offset_from_bottom: 1,
@@ -1247,6 +1277,8 @@ mod tests {
             surface,
         };
         let delta = TerminalSurfaceDelta {
+            colors: Default::default(),
+
             from_revision: Revision::new(47),
             to_revision: Revision::new(53),
             size: TerminalSize::new(2, 3),

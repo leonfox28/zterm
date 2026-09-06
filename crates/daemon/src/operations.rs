@@ -814,10 +814,29 @@ impl LocalRuntime {
         working_directory: Option<&Path>,
         viewport: Option<TerminalSize>,
     ) -> Result<CreatedSession, DaemonError> {
+        self.session_create_for_attach_with_colors(
+            target,
+            name,
+            working_directory,
+            viewport,
+            zterm_core::terminal::TerminalColorProfile::default(),
+        )
+        .await
+    }
+
+    /// Color-aware interactive terminal entry.
+    pub async fn session_create_for_attach_with_colors(
+        &self,
+        target: &str,
+        name: &str,
+        working_directory: Option<&Path>,
+        viewport: Option<TerminalSize>,
+        base_colors: zterm_core::terminal::TerminalColorProfile,
+    ) -> Result<CreatedSession, DaemonError> {
         let name = parse_session_name(name)?;
         let (client, target) = self.configured_session_target(target).await?;
         let summary = client
-            .create_session_at(target, &name, working_directory, viewport)
+            .create_session_at_with_colors(target, &name, working_directory, viewport, base_colors)
             .await?
             .into();
         Ok(CreatedSession { target, summary })
@@ -829,6 +848,21 @@ impl LocalRuntime {
         created: &CreatedSession,
         viewport: Option<TerminalSize>,
     ) -> Result<PreparedTerminalView, DaemonError> {
+        self.attach_created_with_colors(
+            created,
+            viewport,
+            zterm_core::terminal::TerminalColorProfile::default(),
+        )
+        .await
+    }
+
+    /// Color-aware interactive terminal entry.
+    pub async fn attach_created_with_colors(
+        &self,
+        created: &CreatedSession,
+        viewport: Option<TerminalSize>,
+        base_colors: zterm_core::terminal::TerminalColorProfile,
+    ) -> Result<PreparedTerminalView, DaemonError> {
         self.ensure_configured_daemon().await?;
         self.attach_resolved(
             created.target,
@@ -836,6 +870,7 @@ impl LocalRuntime {
             false,
             false,
             viewport,
+            base_colors,
         )
         .await
     }
@@ -877,10 +912,38 @@ impl LocalRuntime {
         takeover: bool,
         viewport: Option<TerminalSize>,
     ) -> Result<PreparedTerminalView, DaemonError> {
+        self.attach_with_colors(
+            target,
+            selector,
+            create_main,
+            takeover,
+            viewport,
+            zterm_core::terminal::TerminalColorProfile::default(),
+        )
+        .await
+    }
+
+    /// Color-aware interactive terminal entry.
+    pub async fn attach_with_colors(
+        &self,
+        target: &str,
+        selector: Option<&str>,
+        create_main: bool,
+        takeover: bool,
+        viewport: Option<TerminalSize>,
+        base_colors: zterm_core::terminal::TerminalColorProfile,
+    ) -> Result<PreparedTerminalView, DaemonError> {
         let (_, target) = self.configured_session_target(target).await?;
         let selector = selector.map(parse_session_selector).transpose()?;
-        self.attach_resolved(target, selector, create_main, takeover, viewport)
-            .await
+        self.attach_resolved(
+            target,
+            selector,
+            create_main,
+            takeover,
+            viewport,
+            base_colors,
+        )
+        .await
     }
 
     /// Observes reset impact without spawning, stopping, or creating files.
@@ -1039,6 +1102,7 @@ impl LocalRuntime {
         create_main: bool,
         takeover: bool,
         viewport: Option<TerminalSize>,
+        base_colors: zterm_core::terminal::TerminalColorProfile,
     ) -> Result<PreparedTerminalView, DaemonError> {
         #[cfg(unix)]
         {
@@ -1067,13 +1131,14 @@ impl LocalRuntime {
                     route: TerminalViewRoute::Local,
                 }
             };
-            let mut client = SessionClient::connect_resolved(
+            let mut client = SessionClient::connect_resolved_with_colors(
                 self.paths.socket(),
                 target,
                 selector,
                 create_main,
                 takeover,
                 viewport,
+                base_colors,
             )
             .await?;
             if target.device_id().is_some() {

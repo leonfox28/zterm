@@ -39,7 +39,7 @@ mod unix {
     use std::time::{Duration, Instant};
 
     use futures_util::FutureExt;
-    use nix::sys::termios::{FlushArg, SetArg, Termios, cfmakeraw, tcflush, tcgetattr, tcsetattr};
+    use nix::sys::termios::{SetArg, Termios, cfmakeraw, tcgetattr, tcsetattr};
     use rustix::event::{PollFd, PollFlags, poll};
     use tokio::signal::unix::{Signal, SignalKind, signal};
     use tokio::sync::{mpsc, watch};
@@ -70,6 +70,11 @@ mod unix {
     use zterm_daemon::operations::LocalRuntime;
 
     use super::super::{CliError, TerminalRequest, TerminalRequestKind};
+
+    mod host_colors {
+        include!("terminal_ui/host_colors.rs");
+    }
+    use host_colors::{HostColors, HostReply};
 
     mod ui_session {
         include!("terminal_ui/session.rs");
@@ -201,6 +206,7 @@ mod unix {
                 &stdout,
                 &mut resize,
                 &mut cancellation_receiver,
+                Arc::clone(&guard.appearance_owned),
             ),
             &mut interrupt,
             &mut terminate,
@@ -242,6 +248,7 @@ mod unix {
         stdout: &io::Stdout,
         resize_signal: &mut Signal,
         cancellation_receiver: &mut watch::Receiver<Option<TerminalSignalCancellation>>,
+        appearance_owned: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<TerminalCompletion, CliError> {
         if let Some(cancellation) = current_terminal_cancellation(cancellation_receiver) {
             return Err(cancellation.error(None));
@@ -261,14 +268,58 @@ mod unix {
         let current_input_epoch = input_epoch.current();
         let mut stdin_pump = StdinPump::start(stdin, input_epoch.clone())?;
         let mut prefix = CommandMode::new();
+        let mut input_codec = HostInputCodec::new();
+        let mut presenter = DesktopPresenter::default();
+        let mut host_colors = HostColors::default();
+        host_colors.owned_subscription = appearance_owned;
+        host_colors.flush_commands(&mut presenter, &mut stdout.lock())?;
+        let initial_color_deadline = Instant::now() + Duration::from_millis(250);
+        // Collect before any create/attach side effect, so a child's first query
+        // observes this controller's base. Unsupported hosts cost at most 250 ms.
+        loop {
+            host_colors.expire(Instant::now());
+            if host_colors.initial_complete() || Instant::now() >= initial_color_deadline {
+                break;
+            }
+            let deadline = Some(
+                host_colors
+                    .deadline()
+                    .unwrap_or(initial_color_deadline)
+                    .min(initial_color_deadline),
+            );
+            tokio::select! {
+                cancellation = receive_terminal_cancellation(cancellation_receiver) => return Err(cancellation.error(None)),
+                () = wait_for_prefix_deadline(deadline) => {},
+                input = stdin_pump.recv() => match input {
+                    Some(StdinEvent::Bytes { epoch, bytes }) => {
+                        for event in input_codec.feed_for_epoch(&bytes, epoch, current_input_epoch)? {
+                            if let HostInputEvent::TerminalReply { reply, bytes } = event {
+                                host_colors.observe(reply, bytes, Instant::now());
+                            } else {
+                                for action in prefix.route(event, Instant::now(), false)? {
+                                    if matches!(action, PrefixAction::Command(LocalCommand::Detach)) { return Ok(TerminalCompletion::Detached); }
+                                }
+                            }
+                        }
+                    },
+                    Some(StdinEvent::Error(error)) => return Err(CliError::Io(error)),
+                    Some(StdinEvent::Eof) | None => return Ok(TerminalCompletion::Detached),
+                }
+            }
+            host_colors.flush_commands(&mut presenter, &mut stdout.lock())?;
+        }
+
         let transport_state = TerminalViewTransportState::Synchronizing;
         let prepared = match await_while_inactive(
-            prepare(request, runtime, initial_size),
+            prepare(request, runtime, initial_size, host_colors.profile.clone()),
             InactiveWaitContext {
                 stdout,
                 resize_signal,
                 cancellation_receiver,
                 stdin_pump: &mut stdin_pump,
+                input_codec: &mut input_codec,
+                host_colors: &mut host_colors,
+                presenter: &mut presenter,
                 prefix: &mut prefix,
                 physical_size: &mut physical_size,
                 current_input_epoch,
@@ -304,7 +355,6 @@ mod unix {
         // The creation hint does not resize a retained Session. Only the host
         // snapshot establishes the actual geometry for resize deduplication.
         let mut resize_coalescer = ResizeCoalescer::new(surface.surface.size);
-        let mut presenter = DesktopPresenter::default();
         let mut selection = SelectionController::default();
         let initial_scroll_metrics = prepared.initial_snapshot().surface.scroll_metrics;
         let mut viewport = ViewportController::with_layout(latest_layout, initial_scroll_metrics);
@@ -328,6 +378,9 @@ mod unix {
                 Some(session_id),
             );
         }
+        let report_key_events = presenter
+            .presented_keyboard_flags()
+            .contains(zterm_core::terminal::TerminalKeyboardFlags::REPORT_EVENT_TYPES);
         let view = match await_while_inactive(
             async move { prepared.acknowledge_initial().await.map_err(Into::into) },
             InactiveWaitContext {
@@ -335,13 +388,14 @@ mod unix {
                 resize_signal,
                 cancellation_receiver,
                 stdin_pump: &mut stdin_pump,
+                input_codec: &mut input_codec,
+                host_colors: &mut host_colors,
+                presenter: &mut presenter,
                 prefix: &mut prefix,
                 physical_size: &mut physical_size,
                 current_input_epoch,
                 preserve_submitted_result: false,
-                report_key_events: presenter
-                    .presented_keyboard_flags()
-                    .contains(zterm_core::terminal::TerminalKeyboardFlags::REPORT_EVENT_TYPES),
+                report_key_events,
             },
         )
         .await?
@@ -377,7 +431,6 @@ mod unix {
             viewport.window_cache.defer_pending_request();
         }
         let sync_requested = false;
-        let input_codec = HostInputCodec::new();
         let copy_key_lease = CopyKeyLease::default();
         let deferred_active = false;
 
@@ -400,6 +453,7 @@ mod unix {
             viewport_pacer,
             sync_requested,
             input_codec,
+            host_colors,
             copy_key_lease,
             deferred_active,
         }
@@ -412,6 +466,9 @@ mod unix {
         resize_signal: &'a mut Signal,
         cancellation_receiver: &'a mut watch::Receiver<Option<TerminalSignalCancellation>>,
         stdin_pump: &'a mut StdinPump,
+        input_codec: &'a mut HostInputCodec,
+        host_colors: &'a mut HostColors,
+        presenter: &'a mut DesktopPresenter,
         prefix: &'a mut CommandMode,
         physical_size: &'a mut TerminalSize,
         current_input_epoch: u64,
@@ -428,6 +485,9 @@ mod unix {
             resize_signal,
             cancellation_receiver,
             stdin_pump,
+            input_codec,
+            host_colors,
+            presenter,
             prefix,
             physical_size,
             current_input_epoch,
@@ -435,8 +495,9 @@ mod unix {
             report_key_events,
         } = context;
         tokio::pin!(future);
-        let mut input_codec = HostInputCodec::new();
         loop {
+            host_colors.flush_commands(presenter, &mut io::stdout().lock())?;
+            let color_deadline = host_colors.deadline();
             if prefix
                 .deadline()
                 .is_some_and(|deadline| Instant::now() >= deadline)
@@ -467,12 +528,13 @@ mod unix {
                 () = wait_for_prefix_deadline(prefix_deadline), if prefix_deadline.is_some() => {
                     prefix.cancel();
                 }
+                () = wait_for_prefix_deadline(color_deadline), if color_deadline.is_some() => { host_colors.expire(Instant::now()); }
                 input = stdin_pump.recv() => {
                     match input {
-                        Some(StdinEvent::Bytes { epoch, bytes })
-                            if input_epoch_is_current(epoch, current_input_epoch) =>
+                        Some(StdinEvent::Bytes { epoch, bytes }) =>
                         {
-                            for event in input_codec.feed(&bytes)? {
+                            for event in input_codec.feed_for_epoch(&bytes, epoch, current_input_epoch)? {
+                                if let HostInputEvent::TerminalReply { reply, bytes } = event { host_colors.observe(reply, bytes, Instant::now()); continue; }
                                 for action in prefix.route(event, Instant::now(), report_key_events)? {
                                     if let PrefixAction::Command(command) = action {
                                         let cancellation = match command {
@@ -488,7 +550,6 @@ mod unix {
                                 }
                             }
                         }
-                        Some(StdinEvent::Bytes { .. }) => {}
                         Some(StdinEvent::Eof) | None => {
                             prefix.clear_pending();
                             let cancellation = InactiveCancellation::LocalDetach;
@@ -583,6 +644,7 @@ mod unix {
             && input_codec.paste_in_progress()
     }
 
+    #[cfg(test)]
     const fn input_epoch_is_current(observed: u64, current: u64) -> bool {
         observed == current
     }
@@ -617,6 +679,7 @@ mod unix {
         request: TerminalRequest,
         runtime: &LocalRuntime,
         viewport: TerminalSize,
+        base_colors: zterm_core::terminal::TerminalColorProfile,
     ) -> Result<PreparedTerminalView, CliError> {
         match request.kind {
             TerminalRequestKind::Attach {
@@ -625,12 +688,13 @@ mod unix {
                 create_main,
                 takeover,
             } => runtime
-                .attach(
+                .attach_with_colors(
                     &target,
                     selector.as_deref(),
                     create_main,
                     takeover,
                     Some(viewport),
+                    base_colors.clone(),
                 )
                 .await
                 .map_err(Into::into),
@@ -640,17 +704,20 @@ mod unix {
                 working_directory,
             } => {
                 let created = runtime
-                    .session_create_for_attach(
+                    .session_create_for_attach_with_colors(
                         &target,
                         &name,
                         working_directory.as_deref(),
                         Some(viewport),
+                        base_colors.clone(),
                     )
                     .await?;
                 let session_id = created.summary().session_id;
                 preserve_created_session(
                     session_id,
-                    runtime.attach_created(&created, Some(viewport)).await,
+                    runtime
+                        .attach_created_with_colors(&created, Some(viewport), base_colors)
+                        .await,
                 )
             }
         }
@@ -862,6 +929,7 @@ mod unix {
         output: OwnedFd,
         original: Termios,
         restored: bool,
+        appearance_owned: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl TerminalGuard {
@@ -879,6 +947,7 @@ mod unix {
                 output,
                 original,
                 restored: false,
+                appearance_owned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             };
             if let Err(error) = write_all_fd(&guard.output, ENTER_TERMINAL_UI) {
                 let _ = guard.restore();
@@ -891,7 +960,13 @@ mod unix {
             if self.restored {
                 return Ok(());
             }
-            let output = write_all_fd(&self.output, RESTORE_TERMINAL_UI)
+            let appearance = if self.appearance_owned.load(Ordering::Acquire) {
+                write_all_fd(&self.output, b"\x1b[?2031l")
+            } else {
+                Ok(())
+            };
+            let output = appearance
+                .and_then(|()| write_all_fd(&self.output, RESTORE_TERMINAL_UI))
                 .map_err(|error| terminal_io("restore terminal display", error));
             let attributes = tcsetattr_retry(&self.input, SetArg::TCSANOW, &self.original)
                 .map_err(|error| terminal_io("restore terminal attributes", error.into()));
@@ -1069,11 +1144,12 @@ mod unix {
 
     struct StdinPump {
         receiver: Option<mpsc::Receiver<StdinEvent>>,
+        retained: VecDeque<StdinEvent>,
         #[cfg(test)]
         sender_for_test: mpsc::Sender<StdinEvent>,
         _cancellation_read_guard: OwnedFd,
         cancellation_write: Option<OwnedFd>,
-        handle: Option<JoinHandle<Result<(), String>>>,
+        handle: Option<JoinHandle<Result<Option<StdinEvent>, String>>>,
         #[cfg(test)]
         reader_test_seam: Option<StdinReaderTestSeam>,
     }
@@ -1119,6 +1195,7 @@ mod unix {
                 .map_err(|error| terminal_io("start terminal stdin reader", error))?;
             Ok(Self {
                 receiver: Some(receiver),
+                retained: VecDeque::new(),
                 #[cfg(test)]
                 sender_for_test,
                 _cancellation_read_guard: cancellation_read_guard,
@@ -1139,6 +1216,9 @@ mod unix {
         }
 
         async fn recv(&mut self) -> Option<StdinEvent> {
+            if let Some(event) = self.retained.pop_front() {
+                return Some(event);
+            }
             self.receiver
                 .as_mut()
                 .expect("terminal stdin receiver exists while its pump is live")
@@ -1156,42 +1236,95 @@ mod unix {
             #[cfg(test)]
             let reader_test_seam = self.reader_test_seam.clone();
 
-            // This ordering is the input-safety boundary. The old receiver is
-            // discarded before its reader is woken and joined; no reader exists
-            // while the kernel queue is flushed, and the replacement reader is
-            // not created until the new epoch and prefix state are installed.
-            self.shutdown()?;
+            let mut retained = self.stop_reader()?;
+            // No concurrent reader exists here. Consume complete bounded chunks
+            // under the old epoch; the persistent codec later retains replies
+            // and discards keyboard events, including split escape sequences.
+            let mut drained = 0usize;
             loop {
-                match tcflush(input, FlushArg::TCIFLUSH) {
-                    Ok(()) => break,
-                    Err(nix::errno::Errno::EINTR) => {}
+                let mut descriptors = [PollFd::new(input, PollFlags::IN)];
+                match poll(
+                    &mut descriptors,
+                    Some(&rustix::event::Timespec {
+                        tv_sec: 0,
+                        tv_nsec: 0,
+                    }),
+                ) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error) if error == rustix::io::Errno::INTR => continue,
                     Err(error) => {
-                        return Err(terminal_io(
-                            "discard unsynchronized terminal input",
-                            error.into(),
-                        ));
+                        return Err(terminal_io("drain inactive terminal input", error.into()));
+                    }
+                }
+                if !descriptors[0].revents().contains(PollFlags::IN) {
+                    break;
+                }
+                if drained >= 64 * 1024 {
+                    return Err(terminal_daemon_error(
+                        DomainErrorKind::ResourceExhausted,
+                        "inactive terminal input exceeded drain bound",
+                    ));
+                }
+                let mut buffer = [0; STDIN_CHUNK_BYTES];
+                match rustix::io::read(input, &mut buffer) {
+                    Ok(0) => break,
+                    Ok(length) => {
+                        drained += length;
+                        retained.push_back(StdinEvent::Bytes {
+                            epoch: *current_input_epoch,
+                            bytes: buffer[..length].to_vec(),
+                        });
+                    }
+                    Err(rustix::io::Errno::INTR | rustix::io::Errno::AGAIN) => {
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(terminal_io("drain inactive terminal input", error.into()));
                     }
                 }
             }
+            // Repeated ACK fences may occur before the consumer drains retained
+            // events. Bound the aggregate, not just each kernel read round.
+            let retained_bytes = retained.iter().try_fold(0usize, |total, event| {
+                let length = match event {
+                    StdinEvent::Bytes { bytes, .. } => bytes.len().max(1),
+                    StdinEvent::Error(detail) => detail.len().max(1),
+                    StdinEvent::Eof => 1,
+                };
+                total.checked_add(length)
+            });
+            if retained_bytes.is_none_or(|length| length > RESUME_INPUT_BOUND) {
+                return Err(terminal_daemon_error(
+                    DomainErrorKind::ResourceExhausted,
+                    "inactive terminal input exceeded retained bound",
+                ));
+            }
             *current_input_epoch = input_epoch.advance();
             prefix.clear_pending();
-            let replacement = Self::start_inner(
+            let mut replacement = Self::start_inner(
                 input,
                 input_epoch.clone(),
                 #[cfg(test)]
                 reader_test_seam,
             )?;
+            replacement.retained = retained;
             *self = replacement;
             Ok(())
         }
 
         fn shutdown(&mut self) -> Result<(), CliError> {
-            if let Some(mut receiver) = self.receiver.take() {
+            self.stop_reader().map(drop)
+        }
+
+        fn stop_reader(&mut self) -> Result<VecDeque<StdinEvent>, CliError> {
+            let mut receiver = self.receiver.take();
+            if let Some(receiver) = &mut receiver {
                 receiver.close();
-                drop(receiver);
             }
+            let mut retained = std::mem::take(&mut self.retained);
             let Some(handle) = self.handle.take() else {
-                return Ok(());
+                return Ok(retained);
             };
             let wake = self
                 .cancellation_write
@@ -1204,7 +1337,7 @@ mod unix {
                 })
                 .unwrap_or(Ok(()));
             let joined = match handle.join() {
-                Ok(Ok(())) => Ok(()),
+                Ok(Ok(tail)) => Ok(tail),
                 Ok(Err(detail)) => Err(CliError::Io(detail)),
                 Err(payload) => {
                     drop(payload);
@@ -1213,10 +1346,17 @@ mod unix {
                     ))
                 }
             };
+            if let Some(receiver) = &mut receiver {
+                while let Ok(event) = receiver.try_recv() {
+                    retained.push_back(event);
+                }
+            }
             match (wake, joined) {
-                (_, Err(error)) => Err(error),
-                (Err(error), Ok(())) => Err(error),
-                (Ok(()), Ok(())) => Ok(()),
+                (_, Err(error)) | (Err(error), Ok(_)) => Err(error),
+                (Ok(()), Ok(tail)) => {
+                    retained.extend(tail);
+                    Ok(retained)
+                }
             }
         }
     }
@@ -1233,7 +1373,7 @@ mod unix {
         sender: mpsc::Sender<StdinEvent>,
         input_epoch: InputEpoch,
         #[cfg(test)] reader_test_seam: Option<StdinReaderTestSeam>,
-    ) -> Result<(), String> {
+    ) -> Result<Option<StdinEvent>, String> {
         loop {
             let mut descriptors = [
                 PollFd::new(&cancellation, PollFlags::IN),
@@ -1245,7 +1385,7 @@ mod unix {
                 Err(error) => return Err(format!("poll terminal stdin: {error}")),
             }
             if !descriptors[0].revents().is_empty() {
-                return Ok(());
+                return Ok(None);
             }
 
             let input_events = descriptors[1].revents();
@@ -1264,17 +1404,14 @@ mod unix {
             match rustix::io::read(&input, &mut buffer) {
                 Ok(0) => {
                     let _ = sender.blocking_send(StdinEvent::Eof);
-                    return Ok(());
+                    return Ok(None);
                 }
                 Ok(read) => {
-                    if sender
-                        .blocking_send(StdinEvent::Bytes {
-                            epoch,
-                            bytes: buffer[..read].to_vec(),
-                        })
-                        .is_err()
-                    {
-                        return Ok(());
+                    if let Err(error) = sender.blocking_send(StdinEvent::Bytes {
+                        epoch,
+                        bytes: buffer[..read].to_vec(),
+                    }) {
+                        return Ok(Some(error.0));
                     }
                 }
                 Err(error) if error == rustix::io::Errno::INTR => {}
@@ -1285,7 +1422,7 @@ mod unix {
                         .blocking_send(StdinEvent::Error(detail.clone()))
                         .is_err()
                     {
-                        return Ok(());
+                        return Ok(None);
                     }
                     return Err(format!("read terminal stdin: {detail}"));
                 }
@@ -2248,11 +2385,17 @@ mod unix {
         PageUp,
         PageDown,
         Mouse(SgrMouse),
+        TerminalReply { reply: HostReply, bytes: usize },
     }
 
     struct HostInputCodec {
         pending: Vec<u8>,
         in_paste: bool,
+        discarding_osc: bool,
+        osc_utf8_tail: u8,
+        discarding_csi: bool,
+        utf8_tail: u8,
+        pending_epoch: Option<u64>,
     }
 
     impl HostInputCodec {
@@ -2260,7 +2403,34 @@ mod unix {
             Self {
                 pending: Vec::new(),
                 in_paste: false,
+                discarding_osc: false,
+                osc_utf8_tail: 0,
+                discarding_csi: false,
+                utf8_tail: 0,
+                pending_epoch: None,
             }
+        }
+
+        fn feed_for_epoch(
+            &mut self,
+            bytes: &[u8],
+            epoch: u64,
+            current: u64,
+        ) -> Result<Vec<HostInputEvent>, CliError> {
+            let source_epoch = self.pending_epoch.unwrap_or(epoch);
+            let events = self.feed(bytes)?;
+            self.pending_epoch = (!self.pending.is_empty()
+                || self.utf8_tail != 0
+                || self.discarding_osc
+                || self.discarding_csi)
+                .then_some(source_epoch);
+            Ok(events
+                .into_iter()
+                .filter(|event| {
+                    matches!(event, HostInputEvent::TerminalReply { .. })
+                        || (epoch == current && source_epoch == current)
+                })
+                .collect())
         }
 
         fn feed(&mut self, bytes: &[u8]) -> Result<Vec<HostInputEvent>, CliError> {
@@ -2285,9 +2455,106 @@ mod unix {
                     }
                     break;
                 }
-                if self.pending.starts_with(PASTE_START) {
+                if !self.discarding_osc
+                    && !self.discarding_csi
+                    && self.pending.starts_with(PASTE_START)
+                {
                     self.in_paste = true;
                     continue;
+                }
+                if self.discarding_csi {
+                    let end = self
+                        .pending
+                        .iter()
+                        .position(|byte| (0x40..=0x7e).contains(byte));
+                    let count = end.map_or(self.pending.len(), |index| index + 1);
+                    self.pending.drain(..count);
+                    self.discarding_csi = end.is_none();
+                    events.push(HostInputEvent::TerminalReply {
+                        reply: HostReply::Ignored,
+                        bytes: count,
+                    });
+                    continue;
+                }
+                // C1 introducers are controls only outside UTF-8 continuation bytes.
+                if self.utf8_tail != 0 {
+                    let byte = self.pending[0];
+                    if byte & 0xc0 == 0x80 {
+                        self.utf8_tail -= 1;
+                        push_host_bytes(&mut events, vec![self.pending.remove(0)]);
+                        continue;
+                    }
+                    self.utf8_tail = 0;
+                }
+                let osc_prefix = if self.pending.starts_with(b"\x1b]") {
+                    2
+                } else if self.pending[0] == 0x9d {
+                    1
+                } else {
+                    0
+                };
+                if osc_prefix != 0 || self.discarding_osc {
+                    let start = if self.discarding_osc { 0 } else { osc_prefix };
+                    let mut tail = if self.discarding_osc {
+                        self.osc_utf8_tail
+                    } else {
+                        0
+                    };
+                    let mut end = None;
+                    for index in start..self.pending.len() {
+                        let byte = self.pending[index];
+                        if tail != 0 && byte & 0xc0 == 0x80 {
+                            tail -= 1;
+                            continue;
+                        }
+                        tail = match byte {
+                            0xc2..=0xdf => 1,
+                            0xe0..=0xef => 2,
+                            0xf0..=0xf4 => 3,
+                            _ => 0,
+                        };
+                        if matches!(byte, 7 | 0x9c | 0x18 | 0x1a) {
+                            end = Some((index, 1));
+                            break;
+                        }
+                        if byte == 0x1b && self.pending.get(index + 1) == Some(&b'\\') {
+                            end = Some((index, 2));
+                            break;
+                        }
+                    }
+                    if let Some((end, length)) = end {
+                        let count = end + length;
+                        let replies = if self.discarding_osc
+                            || count > 1024
+                            || matches!(self.pending[end], 0x18 | 0x1a)
+                        {
+                            vec![HostReply::Ignored]
+                        } else {
+                            host_colors::osc_replies(&self.pending[start..end])
+                        };
+                        for (index, reply) in replies.into_iter().enumerate() {
+                            events.push(HostInputEvent::TerminalReply {
+                                reply,
+                                bytes: if index == 0 { count } else { 0 },
+                            });
+                        }
+                        self.pending.drain(..count);
+                        self.discarding_osc = false;
+                        self.osc_utf8_tail = 0;
+                        continue;
+                    }
+                    if self.pending.len() > 1024 {
+                        let keep = usize::from(self.pending.last() == Some(&0x1b));
+                        let count = self.pending.len() - keep;
+                        self.pending.drain(..count);
+                        self.discarding_osc = true;
+                        self.osc_utf8_tail = tail;
+                        events.push(HostInputEvent::TerminalReply {
+                            reply: HostReply::Ignored,
+                            bytes: count,
+                        });
+                    }
+                    break;
                 }
                 if self.pending.starts_with(PAGE_UP) {
                     self.pending.drain(..PAGE_UP.len());
@@ -2318,16 +2585,25 @@ mod unix {
                         break;
                     }
                 }
-                if self.pending.starts_with(b"\x1b[") || self.pending.starts_with(b"\x1bO") {
+                if self.pending.starts_with(b"\x1b[")
+                    || self.pending.starts_with(b"\x1bO")
+                    || self.pending[0] == 0x9b
+                {
+                    let prefix_len = if self.pending[0] == 0x9b { 1 } else { 2 };
                     if let Some(end) = self
                         .pending
                         .iter()
                         .enumerate()
-                        .skip(2)
+                        .skip(prefix_len)
                         .find_map(|(index, byte)| (0x40..=0x7e).contains(byte).then_some(index))
                     {
                         let raw: Vec<u8> = self.pending.drain(..=end).collect();
-                        if let Some(key) = EnhancedKey::parse(raw.clone()) {
+                        if let Some(reply) = host_colors::csi_reply(&raw) {
+                            events.push(HostInputEvent::TerminalReply {
+                                reply,
+                                bytes: raw.len(),
+                            });
+                        } else if let Some(key) = EnhancedKey::parse(raw.clone()) {
                             events.push(HostInputEvent::EnhancedKey(key));
                         } else {
                             events.push(HostInputEvent::Opaque(raw));
@@ -2335,6 +2611,16 @@ mod unix {
                         continue;
                     }
                     if self.pending.len() < HOST_SEQUENCE_BOUND {
+                        break;
+                    }
+                    if host_colors::is_color_csi(&self.pending) {
+                        let count = self.pending.len();
+                        self.pending.clear();
+                        self.discarding_csi = true;
+                        events.push(HostInputEvent::TerminalReply {
+                            reply: HostReply::Ignored,
+                            bytes: count,
+                        });
                         break;
                     }
                 }
@@ -2360,6 +2646,12 @@ mod unix {
                     ));
                     continue;
                 }
+                self.utf8_tail = match self.pending[0] {
+                    0xc2..=0xdf => 1,
+                    0xe0..=0xef => 2,
+                    0xf0..=0xf4 => 3,
+                    _ => 0,
+                };
                 push_host_bytes(&mut events, vec![self.pending.remove(0)]);
             }
             Ok(events)
@@ -2873,7 +3165,7 @@ mod unix {
     ) -> Result<bool, CliError> {
         let desired = ComposedFrame::compose(
             &surface.surface,
-            presenter.baseline.as_ref(),
+            presenter.semantic_baseline.as_ref(),
             viewport,
             status,
             transport_state,
@@ -2944,7 +3236,7 @@ mod unix {
         let desired = if viewport.is_history() {
             ComposedFrame::compose(
                 &candidate.surface,
-                presenter.baseline.as_ref(),
+                presenter.semantic_baseline.as_ref(),
                 viewport,
                 status,
                 transport_state,
@@ -2952,7 +3244,7 @@ mod unix {
         } else {
             ComposedFrame::compose_live_candidate(
                 &candidate.surface,
-                presenter.baseline.as_ref(),
+                presenter.semantic_baseline.as_ref(),
                 viewport,
                 LiveViewportProjection::new(
                     layout.child,
@@ -3022,7 +3314,15 @@ mod unix {
         let viewport_plan = viewport.preview_delta(&candidate, delta.scroll_metrics, live_layout);
         let mut candidate_selection = *selection;
         if render_live {
-            candidate_selection.cancel();
+            if surface.surface.colors != candidate.surface.colors
+                && surface.surface.rows == candidate.surface.rows
+                && surface.surface.size == candidate.surface.size
+                && surface.active_screen() == candidate.active_screen()
+            {
+                candidate_selection.rebase_live_revision(candidate.revision());
+            } else {
+                candidate_selection.cancel();
+            }
         }
         candidate_selection.reconcile(viewport_plan.selection_source);
         let selection_presentation =
@@ -3031,7 +3331,7 @@ mod unix {
         if render_live {
             let desired = ComposedFrame::compose_live_candidate(
                 &candidate.surface,
-                presenter.baseline.as_ref(),
+                presenter.semantic_baseline.as_ref(),
                 viewport,
                 LiveViewportProjection::new(
                     viewport_plan.content_size,
@@ -3040,6 +3340,20 @@ mod unix {
                         .live_metrics
                         .filter(|metrics| metrics.is_valid()),
                 ),
+                status,
+                transport_state,
+            )?;
+            presenter.present_candidate(
+                writer,
+                desired,
+                viewport_plan.selection_source,
+                selection_presentation,
+            )?;
+        } else if candidate.surface.colors != surface.surface.colors {
+            let desired = ComposedFrame::compose(
+                &candidate.surface,
+                presenter.semantic_baseline.as_ref(),
+                viewport,
                 status,
                 transport_state,
             )?;
@@ -3511,18 +3825,31 @@ mod unix {
                     .release
                     .send(())
                     .expect("release replacement reader");
-                let event = tokio::time::timeout(
-                    Duration::from_secs(2),
-                    stdin_pump.as_mut().expect("replacement pump").recv(),
-                )
-                .await
-                .expect("post-fence delivery completed within its bound")
-                .expect("replacement pump remained live");
-                assert!(matches!(
-                    event,
-                    StdinEvent::Bytes { epoch, bytes }
-                        if epoch == current_epoch && bytes == fresh
-                ));
+                let mut codec = HostInputCodec::new();
+                loop {
+                    let event = tokio::time::timeout(
+                        Duration::from_secs(2),
+                        stdin_pump.as_mut().expect("replacement pump").recv(),
+                    )
+                    .await
+                    .expect("bounded delivery")
+                    .expect("live pump");
+                    let StdinEvent::Bytes { epoch, bytes } = event else {
+                        panic!("expected input");
+                    };
+                    let decoded = codec
+                        .feed_for_epoch(&bytes, epoch, current_epoch)
+                        .expect("decode epoch");
+                    if epoch != current_epoch {
+                        assert!(
+                            decoded.is_empty(),
+                            "stale keys are discarded after preserving reply framing"
+                        );
+                        continue;
+                    }
+                    assert_eq!(decoded, vec![HostInputEvent::Bytes(fresh.clone())]);
+                    break;
+                }
             }
 
             stdin_pump
@@ -3564,6 +3891,8 @@ mod unix {
             TerminalSurfaceSnapshot {
                 revision,
                 surface: TerminalSurface {
+                    colors: Default::default(),
+
                     size,
                     active_screen,
                     rows,
@@ -3598,6 +3927,8 @@ mod unix {
             let effect = viewport
                 .apply_view_history_window(TerminalSurfaceHistoryWindowResult::Frame(
                     TerminalSurfaceHistoryWindowFrame {
+                        colors: Default::default(),
+
                         disposition: shape.disposition,
                         anchor: query.anchor,
                         target_offset_from_bottom: shape.target_offset_from_bottom,
@@ -3959,6 +4290,118 @@ mod unix {
         }
 
         #[test]
+        fn palette_only_delta_recolors_live_and_pinned_history_without_losing_selection() {
+            use zterm_core::terminal::{
+                COLOR_BACKGROUND, COLOR_SELECTION_BACKGROUND, COLOR_SELECTION_FOREGROUND,
+                TerminalColorValue,
+            };
+            for history in [false, true] {
+                let physical = TerminalSize::new(5, 24);
+                let layout = ChromeLayout::new(physical, ActiveScreen::Main);
+                let snapshot = test_snapshot(layout.child, ActiveScreen::Main, Revision::new(2));
+                let mut surface =
+                    AttachmentSurface::from_snapshot(&snapshot).expect("color baseline");
+                let mut viewport =
+                    ViewportController::with_layout(layout, snapshot.surface.scroll_metrics);
+                if history {
+                    install_test_history_window(&mut viewport);
+                }
+                let status = StatusRenderer::new(
+                    TerminalViewTarget::for_display("local", TerminalViewRoute::Local),
+                    physical,
+                );
+                let mut presenter = DesktopPresenter::default();
+                let mut output = ViewportFrameWriter::default();
+                present_surface_with_writer(
+                    &mut output,
+                    &surface,
+                    &mut presenter,
+                    &viewport,
+                    &status,
+                    TerminalViewTransportState::Active,
+                )
+                .expect("initial frame");
+                viewport.observe_presentation();
+                let mut selection = finalize_test_selection(
+                    &surface,
+                    &mut viewport,
+                    &mut presenter,
+                    &status,
+                    &mut output,
+                );
+                let semantic = presenter
+                    .semantic_baseline
+                    .as_ref()
+                    .expect("semantic baseline")
+                    .rows
+                    .clone();
+                let offset = viewport.scroll_metrics().map(|m| m.offset_from_bottom);
+                let mut colors = snapshot.surface.colors.clone();
+                colors.changed_at = Revision::new(3);
+                colors.profile.values[COLOR_BACKGROUND] = TerminalColorValue::Rgb(4, 5, 6);
+                colors.profile.values[COLOR_SELECTION_FOREGROUND] =
+                    TerminalColorValue::Rgb(11, 12, 13);
+                colors.profile.values[COLOR_SELECTION_BACKGROUND] =
+                    TerminalColorValue::Rgb(14, 15, 16);
+                let delta = TerminalSurfaceDelta {
+                    colors,
+                    from_revision: Revision::new(2),
+                    to_revision: Revision::new(3),
+                    size: layout.child,
+                    active_screen: ActiveScreen::Main,
+                    row_patches: Vec::new(),
+                    cursor: snapshot.surface.cursor,
+                    modes: snapshot.surface.modes,
+                    scroll_metrics: snapshot.surface.scroll_metrics.map(|m| {
+                        TerminalScrollMetrics {
+                            revision: Revision::new(3),
+                            ..m
+                        }
+                    }),
+                };
+                output = ViewportFrameWriter::default();
+                assert!(matches!(
+                    apply_delta_with_writer(
+                        &mut output,
+                        &mut surface,
+                        &mut presenter,
+                        &delta,
+                        &mut viewport,
+                        &mut selection,
+                        &status,
+                        TerminalViewTransportState::Active,
+                        false
+                    )
+                    .expect("color delta"),
+                    DeltaRender::Applied
+                ));
+                assert!(selection.is_finalized());
+                assert_eq!(viewport.is_history(), history);
+                assert_eq!(
+                    viewport.scroll_metrics().map(|m| m.offset_from_bottom),
+                    offset
+                );
+                assert_eq!(
+                    presenter
+                        .semantic_baseline
+                        .as_ref()
+                        .expect("semantic colors")
+                        .rows,
+                    semantic
+                );
+                let physical = presenter.baseline.as_ref().expect("painted colors");
+                assert_eq!(
+                    physical.rows[&0][0].style.foreground,
+                    TerminalColor::Rgb(11, 12, 13)
+                );
+                assert_eq!(
+                    physical.rows[&0][2].style.background,
+                    TerminalColor::Rgb(4, 5, 6)
+                );
+                assert_eq!((output.writes, output.flushes), (1, 1));
+            }
+        }
+        #[test]
         fn resize_coalescer_retains_only_the_latest_non_active_viewport() {
             let initial = TerminalSize::new(24, 80);
             let latest = TerminalSize::new(40, 120);
@@ -4015,12 +4458,18 @@ mod unix {
                 let mut prefix = CommandMode::new();
                 let mut physical_size = TerminalSize::new(40, 140);
                 let (release, ready) = tokio::sync::oneshot::channel();
+                let mut input_codec = HostInputCodec::new();
+                let mut host_colors = HostColors::default();
+                let mut presenter = DesktopPresenter::default();
                 let wait = await_while_inactive(
                     async {
                         ready.await.expect("release initial operation");
                         Ok(())
                     },
                     InactiveWaitContext {
+                        input_codec: &mut input_codec,
+                        host_colors: &mut host_colors,
+                        presenter: &mut presenter,
                         stdout: &stdout,
                         resize_signal: &mut resize_signal,
                         cancellation_receiver: &mut cancellation_receiver,
@@ -4093,6 +4542,8 @@ mod unix {
                 ..TerminalStyle::default()
             };
             let delta = TerminalSurfaceDelta {
+                colors: Default::default(),
+
                 from_revision: Revision::new(4),
                 to_revision: Revision::new(5),
                 size,
@@ -4186,6 +4637,8 @@ mod unix {
             let effect = viewport
                 .apply_view_history_window(TerminalSurfaceHistoryWindowResult::Frame(
                     TerminalSurfaceHistoryWindowFrame {
+                        colors: Default::default(),
+
                         disposition: shape.disposition,
                         anchor: query.anchor,
                         target_offset_from_bottom: shape.target_offset_from_bottom,
@@ -4373,7 +4826,7 @@ mod unix {
             let viewport = ViewportController::with_layout(layout, None);
             let style = TerminalStyle {
                 background: TerminalColor::Rgb(1, 2, 3),
-                underline: true,
+                underline: zterm_core::terminal::TerminalUnderline::Single,
                 ..TerminalStyle::default()
             };
             let mut snapshot = test_snapshot(size, ActiveScreen::Alternate, Revision::new(2));
@@ -4718,6 +5171,8 @@ mod unix {
             let child_flags = zterm_core::terminal::TerminalKeyboardFlags::from_bits(9)
                 .expect("valid child keyboard flags");
             let delta = TerminalSurfaceDelta {
+                colors: Default::default(),
+
                 from_revision: Revision::new(2),
                 to_revision: Revision::new(3),
                 size: layout.child,
@@ -4797,6 +5252,8 @@ mod unix {
 
             output = ViewportFrameWriter::default();
             let delta = TerminalSurfaceDelta {
+                colors: Default::default(),
+
                 from_revision: Revision::new(3),
                 to_revision: Revision::new(4),
                 size: layout.child,
@@ -4848,6 +5305,8 @@ mod unix {
                 ..TerminalModes::default()
             };
             let delta = TerminalSurfaceDelta {
+                colors: Default::default(),
+
                 from_revision: Revision::new(4),
                 to_revision: Revision::new(5),
                 size: layout.child,
@@ -4968,6 +5427,8 @@ mod unix {
                     .clone();
 
                 let delta = TerminalSurfaceDelta {
+                    colors: Default::default(),
+
                     from_revision: Revision::new(2),
                     to_revision: Revision::new(3),
                     size: layout.child,
@@ -5126,6 +5587,8 @@ mod unix {
                 let metrics_before = viewport.live_metrics;
 
                 let delta = TerminalSurfaceDelta {
+                    colors: Default::default(),
+
                     from_revision: Revision::new(2),
                     to_revision: Revision::new(3),
                     size: layout.child,
@@ -5260,6 +5723,8 @@ mod unix {
             let source_before = viewport.selection_source_identity(&surface);
 
             let delta = TerminalSurfaceDelta {
+                colors: Default::default(),
+
                 from_revision: Revision::new(2),
                 to_revision: Revision::new(3),
                 size: layout.child,
@@ -5878,6 +6343,8 @@ mod unix {
                 viewport
                     .apply_view_history_window(TerminalSurfaceHistoryWindowResult::Frame(
                         TerminalSurfaceHistoryWindowFrame {
+                            colors: Default::default(),
+
                             disposition: shape.disposition,
                             anchor: query.anchor,
                             target_offset_from_bottom: shape.target_offset_from_bottom,
@@ -6188,6 +6655,28 @@ mod unix {
             .await;
         }
 
+        #[test]
+        fn terminal_guard_restores_only_owned_appearance_subscription() {
+            for owned in [false, true] {
+                let pty = openpty(None, None).expect("appearance guard PTY");
+                let mut guard = TerminalGuard::enter(&pty.slave, &pty.slave).expect("enter guard");
+                guard.appearance_owned.store(owned, Ordering::Release);
+                guard.restore().expect("restore guard");
+                fcntl(pty.master.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
+                    .expect("nonblocking capture");
+                let mut bytes = Vec::new();
+                let mut buffer = [0; 4096];
+                loop {
+                    match rustix::io::read(&pty.master, &mut buffer) {
+                        Ok(0) | Err(rustix::io::Errno::AGAIN) => break,
+                        Ok(n) => bytes.extend_from_slice(&buffer[..n]),
+                        Err(error) => panic!("read guard output: {error}"),
+                    }
+                }
+                assert_eq!(find_bytes(&bytes, b"\x1b[?2031l").is_some(), owned);
+                assert!(find_bytes(&bytes, b"\x1b]").is_none());
+            }
+        }
         #[test]
         fn terminal_guard_restores_attributes_on_success_error_cancel_and_panic() {
             for path in [

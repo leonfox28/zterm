@@ -686,6 +686,8 @@ fn generated_session_terminal_and_route_debug_is_redacted_without_wire_changes()
         }),
     };
     let create = v2::SessionCreateRequest {
+        base_colors: Some(zterm_core::terminal::TerminalColorProfile::default().into()),
+
         operation_id: None,
         target: None,
         name: "build".to_owned(),
@@ -705,6 +707,8 @@ fn generated_session_terminal_and_route_debug_is_redacted_without_wire_changes()
         }),
         revision: 41,
         surface: Some(v2::TerminalSurface {
+            colors: Some(zterm_core::terminal::TerminalColorSnapshot::default().into()),
+
             row_count: 43,
             column_count: 151,
             active_screen: v2::TerminalActiveScreen::Main as i32,
@@ -718,6 +722,8 @@ fn generated_session_terminal_and_route_debug_is_redacted_without_wire_changes()
         }),
     };
     let delta = v2::TerminalSemanticDelta {
+        colors: Some(zterm_core::terminal::TerminalColorSnapshot::default().into()),
+
         attachment_id: snapshot.attachment_id.clone(),
         from_revision: 41,
         to_revision: 47,
@@ -739,6 +745,8 @@ fn generated_session_terminal_and_route_debug_is_redacted_without_wire_changes()
         scroll_metrics: None,
     };
     let history = v2::TerminalSemanticHistoryWindowFrame {
+        colors: Some(zterm_core::terminal::TerminalColorSnapshot::default().into()),
+
         attachment_id: snapshot.attachment_id.clone(),
         outcome: v2::TerminalHistoryWindowOutcome::Frame as i32,
         disposition: v2::TerminalViewportDisposition::Exact as i32,
@@ -774,6 +782,8 @@ fn generated_session_terminal_and_route_debug_is_redacted_without_wire_changes()
         value: RESUME_SENTINEL.to_vec(),
     };
     let attach = v2::TerminalAttachRequest {
+        base_colors: Some(zterm_core::terminal::TerminalColorProfile::default().into()),
+
         target: None,
         session_id: summary.session_id.clone(),
         takeover: false,

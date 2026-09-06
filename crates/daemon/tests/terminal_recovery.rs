@@ -86,6 +86,8 @@ async fn future_snapshot_ack_recovers_and_wrong_kind_is_stream_local() -> Result
         90,
         0,
         &v2::TerminalAttachRequest {
+            base_colors: Some(zterm_core::terminal::TerminalColorProfile::default().into()),
+
             target: Some(v2::TargetSelector {
                 target: Some(v2::target_selector::Target::Local(true)),
             }),

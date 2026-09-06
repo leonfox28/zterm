@@ -752,12 +752,21 @@ impl SessionWireServer {
             .transpose()
             .map_err(protocol_error)?;
         let resume = terminal_resume_request(context, &request)?;
+        let base_colors = request
+            .base_colors
+            .clone()
+            .ok_or_else(|| {
+                DaemonError::new(DomainErrorKind::MalformedFrame, "missing base colors")
+            })?
+            .try_into()
+            .map_err(protocol_error)?;
         context
             .run_effect(&self.sessions, deadline, move |sessions, principal| {
                 if let Some(resume) = resume {
                     sessions.prepare_remote_attach_until(
                         principal,
                         RemoteAttachmentRequest {
+                            base_colors,
                             selector,
                             create_main,
                             takeover: request.takeover,
@@ -767,12 +776,15 @@ impl SessionWireServer {
                         deadline,
                     )
                 } else {
-                    sessions.prepare_attach_until(
+                    sessions.prepare_attach_with_colors_until(
                         principal,
                         selector,
                         create_main,
                         request.takeover,
-                        viewport,
+                        crate::session::InitialTerminal {
+                            viewport,
+                            colors: base_colors,
+                        },
                         deadline,
                     )
                 }
@@ -826,6 +838,13 @@ impl SessionWireServer {
                 }
                 WireKind::SessionCreateRequest => {
                     let request: v2::SessionCreateRequest = decode_request(frame)?;
+                    let base_colors = request
+                        .base_colors
+                        .ok_or_else(|| {
+                            DaemonError::new(DomainErrorKind::MalformedFrame, "missing base colors")
+                        })?
+                        .try_into()
+                        .map_err(protocol_error)?;
                     context.require_target(request.target)?;
                     let operation_id = required_operation_id(request.operation_id)?;
                     let name = session_name(&request.name)?;
@@ -838,12 +857,15 @@ impl SessionWireServer {
                         .map_err(protocol_error)?;
                     let summary = context
                         .run_effect(&self.sessions, deadline, move |sessions, principal| {
-                            sessions.create_until(
+                            sessions.create_with_colors_until(
                                 principal,
                                 operation_id,
                                 name,
                                 working_directory,
-                                viewport,
+                                crate::session::InitialTerminal {
+                                    viewport,
+                                    colors: base_colors,
+                                },
                                 deadline,
                             )
                         })
@@ -1236,6 +1258,26 @@ async fn process_attachment_frame(
                 .await?;
             Ok(false)
         }
+        WireKind::TerminalBaseColors => {
+            let request: v2::TerminalBaseColors = frame
+                .decode_message(WireKind::TerminalBaseColors)
+                .map_err(protocol_error)?;
+            require_attachment_id(request.attachment_id, attachment)?;
+            let base = request
+                .profile
+                .ok_or_else(|| {
+                    DaemonError::new(DomainErrorKind::MalformedFrame, "missing base colors")
+                })?
+                .try_into()
+                .map_err(protocol_error)?;
+            let worker = Arc::clone(attachment);
+            request_context
+                .run_effect(&server.sessions, deadline, move |_, _| {
+                    worker.update_colors_until(request.sequence, base, deadline)
+                })
+                .await?;
+            Ok(false)
+        }
         WireKind::TerminalResize => {
             let request: v2::TerminalResize = frame
                 .decode_message(WireKind::TerminalResize)
@@ -1499,8 +1541,9 @@ where
     Writer: AsyncWrite + Unpin,
 {
     match event {
-        AttachmentLifecycle::AwaitingSnapshot { .. } => Ok(false),
-        AttachmentLifecycle::Active { .. } | AttachmentLifecycle::PreparedTakeover => {
+        AttachmentLifecycle::AwaitingSnapshot { .. }
+        | AttachmentLifecycle::Active { .. }
+        | AttachmentLifecycle::PreparedTakeover => {
             if let Some(update) =
                 attachment_next_update(server, Arc::clone(attachment), request_context, deadline)
                     .await?
@@ -1559,11 +1602,18 @@ async fn attachment_next_update(
     request_context: &SessionRequestContext,
     deadline: Instant,
 ) -> Result<Option<AttachmentUpdate>, DaemonError> {
-    request_context
+    let result = request_context
         .run_effect(&server.sessions, deadline, move |_sessions, _principal| {
             attachment.next_update_until(deadline)
         })
-        .await
+        .await;
+    match result {
+        // A queued Active/Awaiting/revision notification may race takeover.
+        // The lifecycle watch owns the structured LeaseLost event; do not
+        // close this writer before it can deliver that terminal notification.
+        Err(error) if error.kind() == DomainErrorKind::LeaseLost => Ok(None),
+        result => result,
+    }
 }
 
 #[cfg(unix)]
@@ -2394,6 +2444,8 @@ mod tests {
         known_revision: Option<Revision>,
     ) -> v2::TerminalAttachRequest {
         v2::TerminalAttachRequest {
+            base_colors: Some(zterm_core::terminal::TerminalColorProfile::default().into()),
+
             target: Some(remote_target(own)),
             session_id: Some(session_id.into()),
             takeover: false,
@@ -2981,6 +3033,8 @@ mod tests {
             83,
             0,
             &v2::TerminalAttachRequest {
+                base_colors: Some(zterm_core::terminal::TerminalColorProfile::default().into()),
+
                 target: Some(remote_target(own)),
                 session_id: None,
                 takeover: false,
@@ -3881,5 +3935,150 @@ mod tests {
         let (healthy, response) = run_remote_bytes(server, context, request).await;
         healthy.expect("independent healthy stream remains usable");
         assert_eq!(decode_one(&response).kind, WireKind::SessionListResponse);
+    }
+    #[tokio::test]
+    async fn stale_color_sync_notification_cannot_hide_takeover_lease_loss() {
+        let temporary = tempfile::tempdir().expect("takeover notification fixture");
+        let sessions = unix_wire_service(device(0xe1), temporary.path().to_path_buf());
+        let view = AttachmentId::from_array([0xe2; 16]);
+        let principal = sessions.local_principal(view);
+        let first = sessions
+            .prepare_attach(principal, None, true, false, None)
+            .expect("first controller");
+        first
+            .attachment
+            .snapshot_applied(first.snapshot.revision)
+            .expect("first ACK");
+        let lifecycle = first.attachment.lifecycle_watch().expect("old lifecycle");
+        let pending = sessions
+            .prepare_attach(
+                principal,
+                Some(SessionSelector::Id(first.attachment.session_id())),
+                false,
+                true,
+                None,
+            )
+            .expect("prepared takeover");
+        pending
+            .attachment
+            .snapshot_applied(pending.snapshot.revision)
+            .expect("prepared ACK");
+        let lease = sessions
+            .issue_operation_lease(principal)
+            .expect("takeover lease");
+        sessions
+            .takeover(
+                principal,
+                OperationId { lease, sequence: 1 },
+                &pending.attachment,
+            )
+            .expect("takeover");
+        let server = SessionWireServer::new(sessions.clone());
+        let context = SessionRequestContext::local(view);
+        let attachment = Arc::new(first.attachment);
+        let mut bytes = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        for stale in [
+            AttachmentLifecycle::Active { generation: 1 },
+            AttachmentLifecycle::AwaitingSnapshot {
+                revision: first.snapshot.revision,
+            },
+        ] {
+            assert!(
+                !write_lifecycle_event(&mut bytes, &server, &attachment, &context, stale, deadline)
+                    .await
+                    .expect("stale sync defers to lease loss")
+            );
+            assert!(bytes.is_empty());
+        }
+        let event = lifecycle.borrow().clone();
+        assert!(matches!(event, AttachmentLifecycle::LeaseLost { .. }));
+        assert!(
+            write_lifecycle_event(&mut bytes, &server, &attachment, &context, event, deadline)
+                .await
+                .expect("deliver lease loss")
+        );
+        assert_eq!(decode_one(&bytes).kind, WireKind::TerminalLeaseLost);
+        sessions.shutdown().expect("notification fixture cleanup");
+    }
+
+    #[tokio::test]
+    async fn authenticated_remote_color_profile_reaches_initial_snapshot_and_live_delta() {
+        use zterm_core::terminal::{COLOR_BACKGROUND, TerminalColorProfile, TerminalColorValue};
+        let temporary = tempfile::tempdir().expect("remote color fixture");
+        let own = device(0xd1);
+        let remote = device(0xd2);
+        let accepted = generation(2);
+        let authorization = authorized_registry(remote, accepted);
+        let sessions = unix_wire_service(own, temporary.path().to_path_buf());
+        let mut profile = TerminalColorProfile::default();
+        profile.values[COLOR_BACKGROUND] = TerminalColorValue::Rgb(200, 201, 202);
+        let request = v2::TerminalAttachRequest {
+            target: Some(remote_target(own)),
+            session_id: None,
+            takeover: false,
+            session_name: String::new(),
+            create_main: true,
+            viewport: None,
+            resume_view_id: Some(ResumeViewId::from_array([0xd3; 16]).into()),
+            known_revision: None,
+            base_colors: Some(profile.clone().into()),
+        };
+        let (mut peer, task) = start_remote_attachment(
+            SessionWireServer::new(sessions.clone()),
+            remote_context(own, remote, accepted, authorization),
+            request,
+        )
+        .await;
+        let (attachment, revision) = loop {
+            let frame = peer.next().await;
+            if frame.kind != WireKind::TerminalSemanticSnapshot {
+                assert_eq!(frame.kind, WireKind::TerminalTransportStateEvent);
+                continue;
+            }
+            let message = frame
+                .decode_message(WireKind::TerminalSemanticSnapshot)
+                .expect("remote snapshot DTO");
+            let (_, attachment, snapshot) =
+                zterm_proto::terminal_surface_snapshot_from_message(message)
+                    .expect("remote snapshot");
+            assert_eq!(snapshot.surface.colors.profile, profile);
+            break (attachment, snapshot.revision);
+        };
+        acknowledge_and_observe_semantic_state(&mut peer, attachment, revision).await;
+        profile.values[COLOR_BACKGROUND] = TerminalColorValue::Rgb(10, 11, 12);
+        peer.send(
+            WireKind::TerminalBaseColors,
+            20,
+            &v2::TerminalBaseColors {
+                attachment_id: Some(attachment.into()),
+                profile: Some(profile.clone().into()),
+                sequence: 1,
+            },
+        )
+        .await;
+        let frame = peer.next().await;
+        assert_eq!(frame.kind, WireKind::TerminalSemanticDelta);
+        let message = frame
+            .decode_message(WireKind::TerminalSemanticDelta)
+            .expect("remote color delta DTO");
+        let (_, delta) =
+            zterm_proto::terminal_surface_delta_from_message(message).expect("remote color delta");
+        assert!(delta.row_patches.is_empty());
+        assert_eq!(delta.colors.profile, profile);
+        peer.send(
+            WireKind::TerminalBaseColors,
+            21,
+            &v2::TerminalBaseColors {
+                attachment_id: Some(AttachmentId::from_array([0xd4; 16]).into()),
+                profile: Some(profile.into()),
+                sequence: 2,
+            },
+        )
+        .await;
+        assert_eq!(peer.next().await.kind, WireKind::ServiceErrorResponse);
+        drop(peer);
+        let _ = task.await.expect("remote color server joins");
+        sessions.shutdown().expect("remote color cleanup");
     }
 }

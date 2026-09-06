@@ -617,6 +617,8 @@ mod tests {
             1,
             0,
             &v2::TerminalAttachRequest {
+                base_colors: Some(zterm_core::terminal::TerminalColorProfile::default().into()),
+
                 target: Some(target),
                 session_id: None,
                 takeover: false,

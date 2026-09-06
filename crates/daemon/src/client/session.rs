@@ -20,7 +20,7 @@ use std::{
     time::Duration,
 };
 use zterm_core::terminal::{
-    TerminalClipboardWrite, TerminalHistoryWindowQuery, TerminalSurfaceDelta,
+    TerminalClipboardWrite, TerminalColorProfile, TerminalHistoryWindowQuery, TerminalSurfaceDelta,
     TerminalSurfaceHistoryWindowResult, TerminalSurfaceSnapshot,
 };
 use zterm_core::{
@@ -154,6 +154,8 @@ struct ReconnectedAttachment {
 /// Real same-UID duplex socket adapter for one frontend-owned terminal attachment.
 #[doc(hidden)]
 pub struct SessionClient {
+    latest_colors: TerminalColorProfile,
+    color_sequence: u64,
     transport: AttachmentTransport,
     write_error: Option<DaemonError>,
     takeover_deadline: Option<tokio::time::Instant>,
@@ -207,6 +209,7 @@ impl fmt::Debug for SessionClient {
 impl SessionClient {
     /// Opens one already-resolved local or remote view for the high-level
     /// command runtime without exposing the socket or target token to the CLI.
+    #[cfg(test)]
     pub(crate) async fn connect_resolved(
         socket: impl AsRef<Path>,
         target: ResolvedSessionTarget,
@@ -222,6 +225,7 @@ impl SessionClient {
             create_main,
             takeover,
             viewport,
+            TerminalColorProfile::default(),
         )
         .await
     }
@@ -238,6 +242,7 @@ impl SessionClient {
             true,
             false,
             viewport,
+            TerminalColorProfile::default(),
         )
         .await
     }
@@ -256,6 +261,7 @@ impl SessionClient {
             false,
             takeover,
             viewport,
+            TerminalColorProfile::default(),
         )
         .await
     }
@@ -274,6 +280,7 @@ impl SessionClient {
             true,
             false,
             viewport,
+            TerminalColorProfile::default(),
         )
         .await
     }
@@ -294,6 +301,28 @@ impl SessionClient {
             false,
             takeover,
             viewport,
+            TerminalColorProfile::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn connect_resolved_with_colors(
+        socket: impl AsRef<Path>,
+        target: ResolvedSessionTarget,
+        selector: Option<SessionSelector>,
+        create_main: bool,
+        takeover: bool,
+        viewport: Option<zterm_core::terminal::TerminalSize>,
+        base_colors: TerminalColorProfile,
+    ) -> Result<Self, DaemonError> {
+        Self::connect_inner(
+            socket.as_ref(),
+            target,
+            selector,
+            create_main,
+            takeover,
+            viewport,
+            base_colors,
         )
         .await
     }
@@ -305,6 +334,7 @@ impl SessionClient {
         create_main: bool,
         takeover: bool,
         viewport: Option<zterm_core::terminal::TerminalSize>,
+        base_colors: TerminalColorProfile,
     ) -> Result<Self, DaemonError> {
         let deadline = super::control_deadline();
         let socket = socket.to_path_buf();
@@ -324,6 +354,7 @@ impl SessionClient {
             request_id,
             u32::try_from(DEFAULT_DEADLINE.as_millis()).unwrap_or(u32::MAX),
             &v2::TerminalAttachRequest {
+                base_colors: Some(base_colors.clone().into()),
                 target: Some(resolved_target_wire(target)),
                 session_id,
                 takeover,
@@ -426,6 +457,8 @@ impl SessionClient {
                 latest_viewport: initial_snapshot.surface.size,
                 reconnect_pending: false,
                 force_full_sync: false,
+                latest_colors: base_colors,
+                color_sequence: 0,
                 initial_snapshot: Some(initial_snapshot),
                 terminal_rows,
                 next_request_id: request_id + 1,
@@ -517,7 +550,9 @@ impl SessionClient {
             .next_request_id
             .checked_add(1)
             .ok_or_else(|| resource_error("terminal reconnect request ID exhausted"))?;
+        self.color_sequence = 0;
         let request = v2::TerminalAttachRequest {
+            base_colors: Some(self.latest_colors.clone().into()),
             target: Some(resolved_target_wire(self.target)),
             session_id: Some(self.session_id.into()),
             takeover: false,
@@ -714,6 +749,9 @@ impl SessionClient {
             tokio::net::UnixStream::pair().expect("test-private terminal driver Unix stream pair");
         (
             Self {
+                color_sequence: Default::default(),
+                latest_colors: Default::default(),
+
                 transport: AttachmentTransport::Direct {
                     stream,
                     decoder: FrameDecoder::new(),
@@ -735,6 +773,8 @@ impl SessionClient {
                 initial_snapshot: Some(TerminalSurfaceSnapshot {
                     revision: Revision::new(1),
                     surface: zterm_core::terminal::TerminalSurface {
+                        colors: Default::default(),
+
                         size: zterm_core::terminal::TerminalSize::new(24, 80),
                         active_screen: zterm_core::terminal::ActiveScreen::Main,
                         rows: (0..24)
@@ -797,6 +837,28 @@ impl SessionClient {
                 operation_id: None,
                 attachment_id: Some(self.attachment_id.into()),
                 bytes,
+            },
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Sends observations from the current physical terminal; never child input.
+    pub async fn update_colors(
+        &mut self,
+        profile: TerminalColorProfile,
+    ) -> Result<(), DaemonError> {
+        self.latest_colors = profile.clone();
+        self.color_sequence = self
+            .color_sequence
+            .checked_add(1)
+            .ok_or_else(|| resource_error("color observation sequence exhausted"))?;
+        self.send(
+            WireKind::TerminalBaseColors,
+            &v2::TerminalBaseColors {
+                attachment_id: Some(self.attachment_id.into()),
+                profile: Some(profile.into()),
+                sequence: self.color_sequence,
             },
         )
         .await
@@ -1253,6 +1315,7 @@ impl SessionClient {
                     // best-effort, matching an interrupted terminal stream.
                     WireKind::TerminalInput
                     | WireKind::TerminalResize
+                    | WireKind::TerminalBaseColors
                     | WireKind::TerminalSnapshotApplied
                     | WireKind::TerminalSyncRequest
                     | WireKind::TerminalHistoryWindowRequest
@@ -1777,6 +1840,8 @@ mod tests {
             TerminalSurfaceSnapshot {
                 revision: Revision::new(1),
                 surface: zterm_core::terminal::TerminalSurface {
+                    colors: Default::default(),
+
                     size: zterm_core::terminal::TerminalSize::new(24, 80),
                     active_screen: zterm_core::terminal::ActiveScreen::Main,
                     rows: (0..24)
@@ -1922,6 +1987,8 @@ mod tests {
             .known_revision
             .expect("replacement resume advertises an applied revision");
         let delta = TerminalSurfaceDelta {
+            colors: Default::default(),
+
             from_revision: Revision::new(known_revision),
             to_revision: Revision::new(
                 known_revision
@@ -2185,6 +2252,8 @@ mod tests {
         assert_eq!(direct.attachment_id(), tunneled.attachment_id());
 
         let delta = TerminalSurfaceDelta {
+            colors: Default::default(),
+
             from_revision: Revision::new(1),
             to_revision: Revision::new(2),
             size: zterm_core::terminal::TerminalSize::new(24, 80),
@@ -2644,6 +2713,10 @@ mod tests {
         let resume_view_id = ResumeViewId::from_array([0x55; ResumeViewId::LENGTH]);
         let viewport = zterm_core::terminal::TerminalSize::new(31, 97);
 
+        let mut colors = TerminalColorProfile::default();
+        colors.values[1] = zterm_core::terminal::TerminalColorValue::Rgb(17, 18, 19);
+        colors.appearance = zterm_core::terminal::TerminalAppearance::Dark;
+        let expected_colors = colors.clone();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept reconnect tunnel");
             let first = read_first(&mut stream).await.expect("read tunnel Open");
@@ -2718,6 +2791,16 @@ mod tests {
             let attach: v2::TerminalAttachRequest = attach
                 .decode_message(WireKind::TerminalAttachRequest)
                 .expect("decode inner resume request");
+            assert_eq!(
+                TerminalColorProfile::try_from(
+                    attach
+                        .base_colors
+                        .clone()
+                        .expect("resume retains observations")
+                )
+                .expect("valid resume observations"),
+                expected_colors
+            );
             let attached_session: SessionId = attach
                 .session_id
                 .expect("resume request keeps the Session ID")
@@ -2742,6 +2825,8 @@ mod tests {
             assert_eq!(attached_target.device_id(), Some(target_device));
 
             let delta = zterm_core::terminal::TerminalSurfaceDelta {
+                colors: Default::default(),
+
                 from_revision: Revision::new(11),
                 to_revision: Revision::new(12),
                 size: viewport,
@@ -2792,6 +2877,10 @@ mod tests {
         client.latest_viewport = viewport;
         client.reconnect_pending = true;
         client
+            .update_colors(colors.clone())
+            .await
+            .expect("colors remain retained across a closed transport");
+        client
             .reconnect_remote()
             .await
             .expect("frontend resumes through a replacement tunnel");
@@ -2799,6 +2888,11 @@ mod tests {
         assert_eq!(client.resume_view_id, Some(resume_view_id));
         assert_eq!(client.attachment_id, new_attachment);
         assert_eq!(client.latest_viewport, viewport);
+        assert_eq!(client.latest_colors, colors);
+        assert_eq!(
+            client.color_sequence, 0,
+            "new attachment begins a fresh observation sequence"
+        );
         assert_eq!(
             client
                 .applied_revision

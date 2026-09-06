@@ -27,6 +27,8 @@ TerminalModel::new(size: TerminalSize, scrollback_rows: usize)
     -> Result<TerminalModel, TerminalError>
 TerminalModel::ingest(&mut self, bytes: &[u8])
     -> Result<TerminalUpdate, TerminalError>
+TerminalModel::update_base_colors(&mut self, profile: TerminalColorProfile)
+    -> Result<TerminalUpdate, TerminalError>
 TerminalModel::preflight_resize(&self, size: TerminalSize)
     -> Result<Revision, TerminalError>
 TerminalModel::resize(&mut self, size: TerminalSize)
@@ -54,8 +56,9 @@ Debug implementation exposes an `alacritty_terminal` or `vte` type.
   CLI has no direct engine dependency; it includes the engine only transitively
   because the host binary also contains the daemon.
 - `Term<BoundedEventSink>` and the re-exported `vte::ansi::Processor` are the
-  sole terminal state engine. The Zterm ingress policy frames controls and
-  applies product policy but never stores a grid or history.
+  sole grid and SGR engine. The engine-owned `ZtermColorState` owns the
+  controller base, app overrides and color stack. The Zterm ingress policy
+  frames controls and applies product policy but never stores a grid or history.
 - Engine configuration uses the requested bounded scrollback, keeps Alacritty
   OSC 52 callbacks disabled as defense in depth, enables Alacritty's Kitty
   keyboard state machine, and normalizes initial alternate-scroll to off.
@@ -75,9 +78,11 @@ Debug implementation exposes an `alacritty_terminal` or `vte` type.
   unknown child-reply stream.
 - Whole-input, one-byte, fixed-size, and deterministic-random chunking must
   produce identical semantic state, replies, and allowed side events.
-- Query replies are exactly primary DA `CSI ?1;2c`, DSR status `CSI 0n`,
-  standard CPR, and private `CSI ?row;columnR`. Secondary DA, window/color/mode
-  queries, and other private markers receive no reply.
+- Query replies include primary DA `CSI ?1;2c`, DSR status `CSI 0n`,
+  standard/private CPR, supported input-mode DECRQM, and the exact color,
+  appearance, stack, SGR and capability queries in
+  [Terminal Colors](./terminal-colors.md). Replies execute at their stream
+  position. Secondary DA and unsupported window/private queries stay rejected.
 
 ## 5. Ingress and Side-Effect Policy
 
@@ -118,12 +123,13 @@ these hard caps:
   bounded reply. Ingress
   does not independently track or cap the engine's keyboard-stack depth;
   admitted controls use the pinned Alacritty engine's stack semantics directly.
-  Unrelated CSI-u remains rejected. OSC 8, other OSC, DCS/APC/PM/SOS,
-  synchronized-update 2026, REP, and underline-color controls remain consumed
-  or rejected before the engine.
-- Underline-color filtering follows top-level SGR parameter boundaries: numeric
-  aliases such as leading-zero `058` are contained, while `58`/`59` used as an
-  indexed or RGB foreground/background color component remain ordinary color.
+  Unrelated CSI-u remains rejected. Exact color OSC, color stack/appearance
+  CSI, SGR DECRQSS and XTGETTCAP are handled by the Zterm color owner.
+  OSC 8, other OSC/DCS, APC/PM/SOS, synchronized-update 2026 and REP remain
+  consumed or rejected before the engine.
+- SGR 58/59 and all six underline shapes pass through the pinned SGR parser.
+  Never discard sibling 0/31/38/48 parameters because an SGR contains underline
+  color. Indexed/RGB components equal to 58/59 remain ordinary components.
 - Engine callbacks are themselves bounded before model collection. They never
   forward upstream `PtyWrite`, clipboard/title/color payloads, closures,
   lifecycle events, or Debug output.
@@ -146,8 +152,8 @@ these hard caps:
 - A scalar crossing the cell, cell-count, or byte cap is discarded before
   Alacritty can grow `CellExtra` and produces a bounded
   `UnsupportedSequence(Character)` classification.
-- OSC 8 and underline-color inputs never reach the engine, so hyperlinks and
-  unsupported underline-color extras cannot create unmetered cell heap state.
+- OSC 8 never reaches the engine. Underline color is a fixed optional value
+  in cell extras; count combining scalars separately from that fixed field.
 - Eight live Sessions, a maximum 240x80 viewport, 2,000 history rows, and wire
   frame bounds remain separate service limits.
 
@@ -161,8 +167,9 @@ released when the Session model is dropped.
 - Projection reads the active grid at display offset zero and maps only the
   current Zterm subset: indexed/RGB/default colors, bold/dim/italic/underline/
   inverse, wide head/spacer, cursor, supported input modes, and the validated
-  five Kitty keyboard flags. Hyperlinks, strike, hidden, underline color/style
-  detail, palette state, and graphics are not advertised.
+  five Kitty keyboard flags, six underline shapes and underline color. Each
+  projection carries a required effective color snapshot. Hyperlinks, strike,
+  hidden and graphics are not advertised.
 - Projection produces only exact semantic rows/cells, cursor, modes, active
   screen, and optional main-screen scroll metrics. Model, driver, Session,
   protobuf, and the frontend Session adapter construct no presentation ANSI;
@@ -170,7 +177,8 @@ released when the Session model is dropped.
 - A full snapshot contains the complete latest active screen only. Retained
   main history is fetched separately through the bounded stateless semantic
   history-window contract; it is never replayed as snapshot bytes.
-- A checkpoint retains format, revision, size, active-screen identity, and one
+- A checkpoint uses internal format 3 and retains effective colors, revision,
+  size, active-screen identity, and one
   fixed projected active viewport. It retains neither Alacritty state, inactive
   screen, nor history; capacity is exactly `rows * columns` cells.
 - `capture` projects the visible screen exactly once, derives the Delta/Resync
@@ -189,7 +197,8 @@ released when the Session model is dropped.
   `sync_changed` suppresses the exact-equal no-op before calling this method.
   A newer revision whose visible rows are unchanged remains a valid semantic
   delta with zero row patches because revision/cursor/modes/metrics are still
-  part of the attachment contract.
+  part of the attachment contract. Colors carry their own changed_at on the
+  same Revision clock; zero-row palette deltas repaint retained semantic rows.
 - A valid `TerminalScrollMetrics` has nonzero `viewport_rows`,
   `epoch <= revision`, and `offset_from_bottom <= max_offset_from_bottom`.
   Snapshot and delta expose live main-screen metrics with offset zero; the
@@ -208,7 +217,8 @@ released when the Session model is dropped.
 
 - Main history is read oldest-to-newest through Alacritty negative-line
   indexing without changing display offset, revision, checkpoint, or viewport.
-- Monotonic append below capacity preserves epoch. Resize, clear/decrease,
+- Monotonic append below capacity preserves epoch. Palette-only changes do not
+  churn epochs even at history capacity. Resize, clear/decrease,
   capacity eviction, or identity ambiguity advances epoch and returns Changed
   or Gap instead of splicing unverifiable rows.
 - History while the alternate screen is active returns Changed; alternate

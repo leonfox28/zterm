@@ -112,8 +112,12 @@ blocking PtyReader
   explicitly kills/reaps the already-spawned child, aborts the queue, and
   joins every thread which did start; no child or detached partial runtime
   remains.
-- Resize holds the model owner only long enough to preflight, resize the native
-  PTY, mutate the model, and publish one revision. The checked model preflight
+- Ingest, resize and base-color updates share one commit mutex through model
+  mutation, generated PTY replies and revision publication. The model mutex is
+  released before any PTY I/O; independent child control remains available.
+  See [Terminal Colors](./terminal-colors.md) for stream-order evidence.
+- Resize preflights under a short model lock, releases it for native PTY resize,
+  then mutates the model and publishes under the commit mutex. Model preflight
   owns size/allocation/revision validation, while the Session service owns its
   independent viewport ceiling. Native/model dimensions therefore cannot
   diverge on a predictable validation failure. There is no terminal-memory
