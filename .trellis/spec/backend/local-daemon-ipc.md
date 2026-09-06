@@ -476,6 +476,14 @@ No new crate, background owner, or second Session interpreter is introduced.
   to perform a full clear plus complete repaint. Raw-mode cleanup begins by
   ending DEC 2026, then disables capture/restores the user's terminal on normal
   exit, signal, error, and panic.
+- An Active live `ComposedFrame` preserves in-bounds child cursor row, column,
+  style, and visibility independently. `visible == false` must not reset valid
+  coordinates: TUIs can hide the native glyph while positioning it for IME.
+  The presenter restores that position after cells/chrome and then emits
+  `?25h` or `?25l`. Hidden cursor-only movement must affect frame equality and
+  reach the outer terminal. History, inactive transport, and out-of-bounds
+  coordinates retain the hidden fallback; a hidden child cursor never gains a
+  software overlay. See [Terminal Colors](./terminal-colors.md).
 - The same sole presenter is the desktop clipboard sink. Both a finalized local
   selection copy action and a validated remote kind-322 effect become exactly
   one canonical `OSC 52;c;<standard padded Base64>BEL` write and one flush.
@@ -977,7 +985,12 @@ No new crate, background owner, or second Session interpreter is introduced.
   painted thumb, the snapshot frame contains validated offset-zero chrome in
   the same DEC-2026 transaction, and the Active transition does not repair a
   blank intermediate or emit an unchanged repaint. It must still restore a
-  hidden live cursor. Snapshot write/flush failure leaves the surface, layout,
+  hidden live cursor. A main/alternate-screen cursor regression composes and
+  presents visible → hidden → hidden-moved → visible with unchanged cells,
+  asserting the final CUP and `?25h`/`?25l` before capture/sync-end, one
+  write/flush for each change, and no output for identical frames. Hidden
+  coordinates must never be substituted with the origin.
+  Snapshot write/flush failure leaves the surface, layout,
   metrics and retained input uncommitted. The real outer-PTY scroll test must
   return to live and compare all child cells; frame counts alone are insufficient. For remote views, the same
   regression asserts the exact transaction count and requires every emitted

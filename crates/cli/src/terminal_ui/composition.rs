@@ -270,16 +270,16 @@ impl ComposedFrame {
             );
         }
 
+        // A hidden cursor still anchors the outer terminal's IME candidate window.
         let cursor = if transport_state == TerminalViewTransportState::Active
             && is_live
-            && surface.cursor.visible
             && surface.cursor.row < content_size.rows
             && surface.cursor.column < content_size.columns
         {
             ComposedCursor {
                 row: surface.cursor.row,
                 column: surface.cursor.column,
-                visible: true,
+                visible: surface.cursor.visible,
                 style: surface.cursor.style,
             }
         } else {
