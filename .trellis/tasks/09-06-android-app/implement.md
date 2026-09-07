@@ -406,3 +406,15 @@ compound acceptance matrices. Runtime evidence is in
 physical Xiaomi acceptance row. Remaining unchecked compound rows include
 fault injection / uncommon device permutations not established by build success;
 do not retroactively mark them passed from adjacent successful tests.
+
+
+## Public release extension — completed 2026-09-07
+
+- [x] Publish v0.1.26 through the canonical prepare/PR/merge/main/tag/sign flow.
+- [x] Add the retained ARM64 Android APK to the exact-main candidate and protected
+  signed inventory while preserving the existing native targets and installer.
+- [x] Verify the public APK's signer, versionCode, source, 16 KB packaging, and
+  emulator upgrade with identity/install history retained.
+
+See `research/android-public-release.md` for release/CI/artifact provenance. This
+completes public distribution, not the separately pending physical acceptance rows.
