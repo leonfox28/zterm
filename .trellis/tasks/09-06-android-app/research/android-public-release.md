@@ -33,7 +33,15 @@ candidates; publication must finish with verified immutable release assets.
 Local validation before PR: `just check` passed (613 Rust tests, seven intentional
 platform ignores across 53 suites; Clippy/docs/dependency/source/secret/release
 policy gates passed). Android debug and release APK builds/lint plus the
-authoritative debug JVM suite passed. The real APK signing helper passed with
+debug JVM task completed with NO-SOURCE (runtime tests are Android instrumentation,
+not a separate JVM suite). The real APK signing helper passed with
 the retained certificate and exact ZIP-payload equality; all six native libraries
 and APK ZIP alignment pass 16 KB checks. Formal GitHub signing secrets were
 provisioned in the existing protected release environment without exposing values.
+
+The dedicated Zterm_PublicRelease API 36 emulator accepted an update from the
+existing signed 1016 APK to the candidate (versionCode 102499 for the pre-version-
+bump local test). Identity SHA-256 and firstInstallTime were unchanged; the
+updated App launches. The formal v0.1.26 asset will be checked separately after
+publication. Daily emulator-5554's release fixture has a debug certificate and
+was deliberately preserved.

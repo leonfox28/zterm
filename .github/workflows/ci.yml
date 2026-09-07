@@ -301,7 +301,7 @@ jobs:
         run: echo "Reproduce on Docker-capable Linux with just ci-relay." >> "$GITHUB_STEP_SUMMARY"
 
   android:
-    name: arm64 APK build, lint and unit tests
+    name: Android arm64 APK and lint
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -351,7 +351,7 @@ jobs:
           overwrite: true
           retention-days: 7
       - name: Evidence boundary
-        run: echo 'Build, lint and JVM checks only. Native runtime and touch acceptance run on the local arm64 emulator and Xiaomi device.' >> "$GITHUB_STEP_SUMMARY"
+        run: echo 'Build, lint and packaging checks only. The JVM test task currently has no separate test sources; native runtime and touch acceptance run on the local arm64 emulator and Xiaomi device.' >> "$GITHUB_STEP_SUMMARY"
 
   candidate:
     name: Assemble the exact release candidate
@@ -476,7 +476,7 @@ jobs:
           fi
           {
             echo '## CI ownership summary'
-            echo "- Android: $ANDROID_RESULT (APK, lint, JVM, identity and 16 KB)"
+            echo "- Android: $ANDROID_RESULT (APK, lint, identity and 16 KB)"
             echo "- policy: $POLICY_RESULT (just ci-policy)"
             echo "- Rust matrix: $RUST_RESULT (just ci-unix)"
             echo "- dependencies: $DEPENDENCY_RESULT (just ci-dependencies)"
