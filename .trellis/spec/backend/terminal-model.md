@@ -170,6 +170,16 @@ released when the Session model is dropped.
   five Kitty keyboard flags, six underline shapes and underline color. Each
   projection carries a required effective color snapshot. Hyperlinks, strike,
   hidden and graphics are not advertised.
+- A projected wide head must have an adjacent spacer in the same row, and a
+  spacer must have its adjacent head. The pinned engine can leave an orphan
+  after non-reflow alternate-screen shrink; growth before child repaint does
+  not repair it. Project such fragments as ordinary blanks, preserving style
+  and the default/styled blank convention. Use the same row projection for
+  snapshots, checkpoints, deltas and history; never relax semantic/wire
+  validation or require a child repaint to make a resize snapshot valid.
+  Regression: `alternate_resize_clipping_a_wide_cell_keeps_the_snapshot_valid`
+  in `crates/terminal/tests/terminal_snapshot_delta.rs` covers clipping,
+  grow-before-repaint, retained complete pairs, and the repaint delta.
 - Projection produces only exact semantic rows/cells, cursor, modes, active
   screen, and optional main-screen scroll metrics. Model, driver, Session,
   protobuf, and the frontend Session adapter construct no presentation ANSI;

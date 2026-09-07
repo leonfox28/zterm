@@ -152,7 +152,20 @@ pub(crate) fn project(engine: &AlacrittyEngine) -> ProjectedScreen {
 pub(crate) fn project_row(engine: &AlacrittyEngine, line: Line) -> ProjectedRow {
     let grid = engine.term().grid();
     let cells = (0..grid.columns())
-        .map(|column| projected_cell(&grid[line][Column(column)]))
+        .map(|column| {
+            let cell = &grid[line][Column(column)];
+            let wide_flags = Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER;
+            let flags = cell.flags & wide_flags;
+            let paired = if flags == Flags::WIDE_CHAR {
+                column + 1 < grid.columns()
+                    && grid[line][Column(column + 1)].flags & wide_flags == Flags::WIDE_CHAR_SPACER
+            } else if flags == Flags::WIDE_CHAR_SPACER {
+                column > 0 && grid[line][Column(column - 1)].flags & wide_flags == Flags::WIDE_CHAR
+            } else {
+                flags.is_empty()
+            };
+            projected_cell(cell, paired)
+        })
         .collect::<Vec<_>>()
         .into_boxed_slice();
     let wrapped = grid[line]
@@ -161,8 +174,22 @@ pub(crate) fn project_row(engine: &AlacrittyEngine, line: Line) -> ProjectedRow 
     ProjectedRow { cells, wrapped }
 }
 
-fn projected_cell(cell: &Cell) -> ProjectedCell {
+fn projected_cell(cell: &Cell, paired: bool) -> ProjectedCell {
     let style = terminal_style(cell);
+    // Non-reflow grid clipping can retain a wide head without its spacer,
+    // including after the grid grows again. A fragment is a styled blank at
+    // the semantic boundary, never an invalid pair sent to every controller.
+    if !paired {
+        let mut text = InlineCellText::default();
+        if style != TerminalStyle::default() {
+            let _ = text.push(' ');
+        }
+        return ProjectedCell {
+            text,
+            style,
+            ..ProjectedCell::default()
+        };
+    }
     let wide = cell.flags.contains(Flags::WIDE_CHAR);
     let wide_continuation = cell.flags.contains(Flags::WIDE_CHAR_SPACER);
     let zerowidth = cell.zerowidth().unwrap_or_default();
