@@ -492,7 +492,7 @@ watch_release() {
         return 1
     fi
     phase=complete
-    printf '%s\n' "Immutable three-platform native release completed: $run_url"
+    printf '%s\n' "Immutable native and Android release completed: $run_url"
 }
 
 publish_release() {

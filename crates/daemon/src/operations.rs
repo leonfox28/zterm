@@ -20,7 +20,9 @@ use crate::bootstrap::BootstrapResult;
 use crate::bootstrap::bootstrap_with_lock_held;
 use crate::client::{LocalClient, LocalDeviceClient};
 #[cfg(unix)]
-use crate::client::{LocalPairingClient, RemoteDaemonRestarter, SessionClient};
+use crate::client::{
+    LocalPairingClient, RemoteDaemonRestarter, SessionClient, UnixAttachmentConnector,
+};
 use crate::config::ValidatedConfig;
 use crate::device_directory::ResolvedSessionTarget;
 use crate::error::DaemonError;
@@ -1142,19 +1144,20 @@ impl LocalRuntime {
                             "the exact remote target no longer has a local alias",
                         )
                     })?;
-                TerminalViewTarget {
-                    display_name: alias.as_str().to_owned(),
-                    route: TerminalViewRoute::Remote,
-                }
+                TerminalViewTarget::for_display(alias.as_str(), TerminalViewRoute::Remote)
             } else {
                 let status = LocalClient::new(self.paths.socket()).status().await?;
-                TerminalViewTarget {
-                    display_name: status.device_name,
-                    route: TerminalViewRoute::Local,
-                }
+                TerminalViewTarget::for_display(status.device_name, TerminalViewRoute::Local)
             };
-            let mut client = SessionClient::connect_resolved_with_colors(
-                self.paths.socket(),
+            let mut connector = UnixAttachmentConnector::new(self.paths.socket());
+            if target.device_id().is_some() {
+                connector = connector.with_remote_restarter(Arc::new(RuntimeDaemonRestarter {
+                    paths: self.paths.clone(),
+                    launcher: self.launcher.clone(),
+                }));
+            }
+            let client = SessionClient::connect_resolved_with_colors(
+                connector,
                 target,
                 selector,
                 create_main,
@@ -1163,13 +1166,7 @@ impl LocalRuntime {
                 base_colors,
             )
             .await?;
-            if target.device_id().is_some() {
-                client.set_remote_daemon_restarter(Arc::new(RuntimeDaemonRestarter {
-                    paths: self.paths.clone(),
-                    launcher: self.launcher.clone(),
-                }));
-            }
-            PreparedTerminalView::new(client, takeover, view_target)
+            PreparedTerminalView::new(client.into_inner(), takeover, view_target)
         }
         #[cfg(not(unix))]
         {

@@ -85,7 +85,7 @@ update. Reset/uninstall still confirm actual deletion even with no Sessions.
 Pairing commands are:
 
 ```text
-zterm pair create [--ttl <duration-with-s|m|h-suffix>]
+zterm pair create [--ttl <duration-with-s|m|h-suffix>] [--qr | --qr-image <new.png>]
 zterm pair accept [--stdin] [--alias <alias>]
 ```
 
@@ -94,6 +94,14 @@ validity and receiving instructions on standard error. The default validity is
 10 minutes; valid values range from `60s` to `1h`. Keep the ticket out of command
 arguments, environment variables, shell history, logs, and
 error reports.
+
+Use `--qr` to display that same ticket as a monochrome QR on interactive stdout,
+or `--qr-image <new.png>` to save a private PNG without overwriting an existing
+file. PNG mode still prints the original ticket on stdout. The two flags are
+mutually exclusive. If the committed ticket is too large for a QR, the terminal
+is too narrow, or image writing fails, the command explains the presentation
+failure and prints the same valid ticket for manual entry. It does not create a
+second offer. QR images carry the ticket's bearer authority and expiry.
 
 By default, `pair accept` reads one bounded line from an interactive TTY while
 echo is disabled. It has no ticket positional argument and no `--ticket` flag.

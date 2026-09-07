@@ -1,0 +1,22 @@
+[package]
+name = "zterm-android"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+iroh.workspace = true
+zeroize.workspace = true
+zterm-client.workspace = true
+zterm-core.workspace = true
+zterm-proto.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uniffi = { workspace = true, features = ["tokio"] }
+
+[lints]
+workspace = true

@@ -57,6 +57,22 @@ fi
 environment_gates=$(grep -Fc 'environment: release' "$workflow" || true)
 [ "$environment_gates" -eq 1 ] \
     || fail "only the signing job may use the protected release Environment"
+android_job=$(sed -n '/^  android:/,/^  candidate:/p' "$ci_workflow")
+printf '%s\n' "$android_job" | grep -Fq 'tools/android/release.py prepare' \
+    || fail "Android CI must inspect the exact release candidate"
+grep -Fq "ANDROID_RESULT: \${{ needs.android.result }}" "$ci_workflow" \
+    || fail "Android must participate in the stable CI gate"
+for android_asset in SHA256SUMS.sig zterm-android-arm64.apk zterm-android.json; do
+    grep -Fq "release-output/$android_asset" "$workflow" \
+        || fail "publication is missing $android_asset"
+done
+sign_job=$(sed -n '/^  sign:/,/^  installer:/p' "$workflow")
+for signing_secret in ZTERM_ANDROID_KEYSTORE_BASE64 ZTERM_ANDROID_KEYSTORE_PASSWORD; do
+    [ "$(grep -Fc "secrets.$signing_secret" "$workflow")" -eq 1 ] \
+        || fail "Android secret must have one signing owner"
+    printf '%s\n' "$sign_job" | grep -Fq "secrets.$signing_secret" \
+        || fail "Android secrets must remain in the protected signing job"
+done
 if grep -Eq 'immutable_release_checkpoint|enabled-and-reviewed' "$workflow"; then
     fail "release workflow must not use a self-asserted checkpoint input"
 fi
@@ -261,7 +277,7 @@ grep -Fq 'name: CI gate' "$ci_workflow" \
     || fail "CI lacks the stable branch-protection gate"
 grep -Fq 'if: always()' "$ci_workflow" \
     || fail "CI gate must aggregate failed, cancelled, and skipped owners"
-[ "$(grep -Fc 'timeout-minutes:' "$ci_workflow")" -eq 8 ] \
+[ "$(grep -Fc 'timeout-minutes:' "$ci_workflow")" -eq 9 ] \
     || fail "every CI job must have an explicit timeout"
 grep -Fq 'actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7' "$ci_workflow" \
     || fail "CI must use the pinned cache owner"

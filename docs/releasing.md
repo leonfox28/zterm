@@ -1,6 +1,6 @@
 # Release operations
 
-The default publication scope is **macOS arm64, Linux arm64, and Linux x64**.
+The default publication scope is **macOS arm64, Linux arm64, Linux x64, and Android arm64**.
 macOS Intel, Windows CI/distribution, and relay image publication are paused.
 Restore any of them only when a future task explicitly requests it. Existing
 immutable Releases and already published relay images remain historical assets.
@@ -11,7 +11,7 @@ do not enforce the presence, number, or support policy of other platforms.
 ```text
 reviewed feature branch + version commit in one PR
   -> PR CI -> merge the exact reviewed head
-  -> exact-SHA main CI + three native builds + verified unsigned candidate
+  -> exact-SHA main CI + three native builds + Android APK + verified unsigned candidate
   -> annotated vVERSION tag -> select that main candidate by artifact ID
   -> protected signing -> three final installer proofs -> immutable Release
 ```
@@ -85,12 +85,12 @@ source; remote tags and Release assets are never replaced.
 
 ## Build once, publish the verified bytes
 
-Main CI runs the normal test/policy graph and builds only the three shipped
-native binaries. Linux uses the pinned glibc 2.28 builder; macOS declares the
+Main CI runs the normal test/policy graph and builds the three shipped
+native binaries plus the unsigned Android release APK. Linux uses the pinned glibc 2.28 builder; macOS declares the
 13.0 deployment floor. The candidate jobs explicitly embed the exact source SHA.
 Ordinary PR and development builds retain their development identity.
 
-One Ubuntu job creates deterministic archives, the manifest, installer and SBOM,
+One Ubuntu job creates deterministic archives, the manifest, installer and Rust/Android SBOM,
 verifies the unsigned inventory, and ShellChecks the generated installer. The
 candidate uses the source commit timestamp and is uploaded as
 `release-candidate-SHA-ATTEMPT`, retained for seven days. The main `CI gate`
@@ -105,15 +105,42 @@ and the downloader treats digest mismatches as errors.
 
 The tag workflow does not rebuild `zterm` or rerun ordinary CI. It rebuilds the
 small reviewed signing tool before exposing the key, re-verifies the candidate
-and source SHA, signs the exact manifest, and tests the final signed installers
+and source SHA, platform-signs the retained APK, signs the exact native manifest and complete
+SHA256SUMS inventory, and tests the final signed installers
 on all three targets. It then creates one late draft, downloads and verifies its
 assets, attests those exact bytes, publishes, and requires `immutable: true`.
-There are eight native assets and no companion relay image publication.
+The eleven assets include the existing eight native assets, `zterm-android-arm64.apk`,
+`zterm-android.json`, and `SHA256SUMS.sig`. No relay image is published.
+The native schema-v1 manifest/installer stays unchanged; the signed checksum
+inventory authenticates all assets, including Android and its build metadata.
 
-Only **Approve and sign exact manifest bytes** uses the protected `release`
+Only the signing job uses the protected `release`
 Environment. Confirm immutable Releases remain enabled, inspect the exact green
 main/candidate status, and approve access to the signing key. No second signing
 approval or extra full test suite is introduced.
+
+## Android package and signing
+
+Android is a directly installable APK for API 26+, arm64-v8a, targeting API 36.
+The formal package is `io.github.leonfox28.zterm`; `.dev` remains the separate
+local development package. No store or Android automatic updater is introduced.
+`release/android-certificate.sha256` pins the existing acceptance certificate,
+so public releases install over that package without deleting its data.
+
+The protected `release` environment holds `ZTERM_ANDROID_KEYSTORE_BASE64`
+(PKCS12, alias `zterm`) and `ZTERM_ANDROID_KEYSTORE_PASSWORD`, independently of
+`ZTERM_RELEASE_SIGNING_KEY`. Provision them through `gh secret set --env release`
+using stdin; never commit the keystore/password or expose them in command arguments.
+The signing helper deletes temporary credentials and verifies that signing changed
+no ZIP payload entry. It checks the package, source identity, certificate, ABI,
+SDK floors, and every packaged native library's 16 KB alignment.
+
+`tools/android/release.py` derives formal versionCode from Cargo SemVer:
+`major * 10000000 + minor * 100000 + patch * 100 + stage`. Minor is at most 99;
+patch at most 999. Stable stage is 99; `alpha.1..29`, `beta.1..29`, and `rc.1..38`
+occupy stages 1..29, 31..59, and 61..98. The result must fit Android's maximum
+2100000000. Thus v0.1.26 is 102699, newer than the prior acceptance build 1016.
+Local `-PztermVersionCode` overrides are for acceptance builds, not formal CI.
 
 ## Failure and recovery
 

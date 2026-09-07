@@ -255,3 +255,14 @@ through a manifest signed by the current key. If the current private key may be
 compromised, freeze publication and use an independently reviewed recovery
 release process; do not silently add another signature format or replace
 immutable assets.
+
+
+## Android APK
+
+Download `zterm-android-arm64.apk` from the selected GitHub Release and allow your
+browser/file manager to install it. Android 8.0+ and arm64 are required. The
+package is `io.github.leonfox28.zterm`; updates preserve its pairing/settings data
+using the existing certificate. `zterm-android.json` records source, versionCode,
+certificate and digest. The detached `SHA256SUMS.sig` authenticates the complete
+Release inventory with the same reviewed Ed25519 key as the native manifest.
+The shell installer and `zterm update` remain native CLI commands.

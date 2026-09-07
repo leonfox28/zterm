@@ -54,43 +54,7 @@ struct ReservationEntry {
     count: usize,
 }
 
-/// Opaque exact Session target returned by the daemon-side resolver.
-///
-/// The value contains no alias. Holding it across lease allocation and retry
-/// therefore cannot be retargeted by a concurrent alias rename.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ResolvedSessionTarget(ResolvedSessionTargetKind);
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-enum ResolvedSessionTargetKind {
-    Local,
-    Device(DeviceId),
-}
-
-impl ResolvedSessionTarget {
-    /// Returns whether this exact target is the current local daemon.
-    #[must_use]
-    pub const fn is_local(self) -> bool {
-        matches!(self.0, ResolvedSessionTargetKind::Local)
-    }
-
-    /// Returns the frozen full device identity for a remote target.
-    #[must_use]
-    pub const fn device_id(self) -> Option<DeviceId> {
-        match self.0 {
-            ResolvedSessionTargetKind::Local => None,
-            ResolvedSessionTargetKind::Device(device_id) => Some(device_id),
-        }
-    }
-
-    pub(crate) const fn local() -> Self {
-        Self(ResolvedSessionTargetKind::Local)
-    }
-
-    pub(crate) const fn device(device_id: DeviceId) -> Self {
-        Self(ResolvedSessionTargetKind::Device(device_id))
-    }
-}
+pub use zterm_client::model::ResolvedSessionTarget;
 
 /// The single owner of the directional device merge and alias reservations.
 #[derive(Clone)]

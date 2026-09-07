@@ -23,8 +23,16 @@ allow = [
 ]
 confidence-threshold = 0.8
 # Keep non-baseline licenses scoped to the exact transitive crates introduced by
-# pinned Iroh 1.0.3 instead of allowing them for future dependencies globally.
+# pinned Iroh and UniFFI instead of allowing them for future dependencies globally.
 exceptions = [
+    { crate = "uniffi@0.32.0", allow = ["MPL-2.0"] },
+    { crate = "uniffi_bindgen@0.32.0", allow = ["MPL-2.0"] },
+    { crate = "uniffi_core@0.32.0", allow = ["MPL-2.0"] },
+    { crate = "uniffi_internal_macros@0.32.0", allow = ["MPL-2.0"] },
+    { crate = "uniffi_macros@0.32.0", allow = ["MPL-2.0"] },
+    { crate = "uniffi_meta@0.32.0", allow = ["MPL-2.0"] },
+    { crate = "uniffi_pipeline@0.32.0", allow = ["MPL-2.0"] },
+    { crate = "uniffi_udl@0.32.0", allow = ["MPL-2.0"] },
     { crate = "async_io_stream@0.3.3", allow = ["Unlicense"] },
     { crate = "attohttpc@0.30.1", allow = ["MPL-2.0"] },
     { crate = "pharos@0.5.3", allow = ["Unlicense"] },

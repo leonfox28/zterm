@@ -516,8 +516,8 @@ fn malformed(detail: impl Into<String>) -> DaemonError {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::client::resolved_target_wire;
     use crate::device_directory::ResolvedSessionTarget;
+    use zterm_client::protocol::resolved_target_wire;
     use zterm_proto::{FrameDecoder, encode_message};
     #[tokio::test]
     async fn completed_handlers_are_reaped_before_subsequent_connection_churn() {

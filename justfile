@@ -3,6 +3,23 @@ set shell := ["sh", "-eu", "-c"]
 default:
     @just --list
 
+# Generate Kotlin/native outputs and assemble the local Android APK.
+android-build:
+    sh tools/android/build.sh :app:assembleDebug
+
+# Android static/unit checks (device tests use the explicitly selected emulator).
+android-check:
+    sh tools/android/build.sh :app:lintDebug :app:testDebugUnitTest
+
+# Stable local signing identity stays outside the checkout.
+android-apk version_code:
+    python3 tools/android/apk.py {{ quote(version_code) }}
+
+# Install the debug build using adb's explicit serial selection.
+android-install serial:
+    sh tools/android/build.sh :app:assembleDebug
+    adb -s {{ quote(serial) }} install -r apps/android/app/build/outputs/apk/debug/app-debug.apk
+
 # Report required local tools and the hosted-only evidence boundary.
 doctor:
     sh tools/ci/doctor.sh
@@ -37,8 +54,9 @@ ci-policy:
     sh tests/release/static.sh
     sh tests/release/operator-fixture.sh
     sh tests/release/candidate-fixture.sh
+    PYTHONDONTWRITEBYTECODE=1 python3 tests/release/android_test.py
     shellcheck -s sh install/install.sh tests/release/*.sh tests/secret-scan*.sh tests/terminal-dependency-policy.sh $(find tools/ci tools/release -type f -name '*.sh' -print)
-    sh tools/ci/check-python-syntax.sh tests/release/https_fixture.py tests/release/https_fixture_bind_test.py
+    sh tools/ci/check-python-syntax.sh tests/release/https_fixture.py tests/release/https_fixture_bind_test.py tools/android/*.py tests/release/android_test.py
 
 # Full Unix runtime evidence; CI assigns docs/smoke to their canonical hosts.
 ci-unix docs='false' smoke='false':

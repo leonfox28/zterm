@@ -1,8 +1,8 @@
 //! Same-UID unary clients; daemon lifecycle remains with the command runtime.
 #[cfg(unix)]
 use super::{
-    DEFAULT_DEADLINE, connect_error, daemon_io, decode_response, malformed, resolved_target_wire,
-    resource_error, service_error,
+    DEFAULT_DEADLINE, connect_error, daemon_io, decode_response, malformed, resource_error,
+    service_error,
 };
 use crate::{
     config::ValidatedConfig,
@@ -14,44 +14,35 @@ use crate::{
 use crate::{
     network::{AddressServiceState, NetworkDiagnostic, NetworkObservation, NetworkState},
     pairing::PairTicketText,
-    remote_session::{
-        SessionUnaryResponseStatus, session_summary_from_wire, validate_session_unary_response,
-    },
+    remote_session::{SessionUnaryResponseStatus, validate_session_unary_response},
     service::{ProtocolStatus, protocol_error},
 };
 #[cfg(unix)]
 use ring::rand::{SecureRandom, SystemRandom};
-#[cfg(unix)]
-use std::{
-    collections::BTreeMap,
-    sync::{
-        Arc, Mutex as StdMutex,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::{Duration, Instant},
-};
 use std::{
     fmt,
     path::{Path, PathBuf},
 };
 #[cfg(unix)]
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    sync::Mutex as AsyncMutex,
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant},
 };
+#[cfg(unix)]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(unix)]
 use zeroize::{Zeroize, Zeroizing};
 #[cfg(unix)]
-use zterm_core::{
-    DEFAULT_PAIR_TTL_SECONDS, EphemeralOperationId, OperationId, OperationLease, PairFingerprint,
-};
+use zterm_client::unary::{SessionUnaryClient, SessionUnaryRequest, SessionUnaryTransport};
+#[cfg(unix)]
+use zterm_core::{DEFAULT_PAIR_TTL_SECONDS, EphemeralOperationId, PairFingerprint};
 use zterm_core::{DeviceAlias, DeviceId, DeviceSummary, DomainErrorKind, SessionId, SessionName};
+#[cfg(test)]
+use zterm_core::{OperationId, OperationLease};
 #[cfg(unix)]
 use zterm_proto::{DecodedFrame, FrameDecoder, WireKind, encode_message, v2};
 #[cfg(unix)]
 const PAIRING_DEADLINE: Duration = Duration::from_secs(15);
-#[cfg(unix)]
-const MAX_MUTATION_TARGETS_PER_CLIENT: usize = 64;
 
 /// Same-UID local daemon unary client. It never starts a daemon.
 pub struct LocalClient {
@@ -59,8 +50,7 @@ pub struct LocalClient {
     #[cfg(unix)]
     next_request_id: AtomicU64,
     #[cfg(unix)]
-    mutation_targets:
-        StdMutex<BTreeMap<ResolvedSessionTarget, Arc<AsyncMutex<LocalMutationState>>>>,
+    sessions: SessionUnaryClient,
 }
 
 impl fmt::Debug for LocalClient {
@@ -69,11 +59,7 @@ impl fmt::Debug for LocalClient {
         debug.field("socket", &"[REDACTED]");
         #[cfg(unix)]
         {
-            let mutation_target_count = self
-                .mutation_targets
-                .try_lock()
-                .ok()
-                .map(|targets| targets.len());
+            let mutation_target_count = self.sessions.cached_target_count();
             debug
                 .field(
                     "next_request_id",
@@ -82,22 +68,6 @@ impl fmt::Debug for LocalClient {
                 .field("mutation_target_count", &mutation_target_count);
         }
         debug.finish_non_exhaustive()
-    }
-}
-
-#[cfg(unix)]
-struct LocalMutationState {
-    lease: Option<OperationLease>,
-    next_sequence: u64,
-}
-
-#[cfg(unix)]
-impl fmt::Debug for LocalMutationState {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("LocalMutationState")
-            .field("has_lease", &self.lease.is_some())
-            .finish_non_exhaustive()
     }
 }
 
@@ -137,20 +107,12 @@ impl LocalClient {
     /// Creates a non-spawning client for one effective user's daemon socket.
     #[must_use]
     pub fn new(socket: impl Into<PathBuf>) -> Self {
-        #[cfg(unix)]
-        let mutation_targets = BTreeMap::from([(
-            ResolvedSessionTarget::local(),
-            Arc::new(AsyncMutex::new(LocalMutationState {
-                lease: None,
-                next_sequence: 1,
-            })),
-        )]);
         Self {
             socket: socket.into(),
             #[cfg(unix)]
             next_request_id: AtomicU64::new(1),
             #[cfg(unix)]
-            mutation_targets: StdMutex::new(mutation_targets),
+            sessions: SessionUnaryClient::default(),
         }
     }
 
@@ -313,7 +275,7 @@ impl LocalClient {
     /// Lists live sessions on the local daemon through one strict unary request.
     #[cfg(unix)]
     pub async fn list_sessions(&self) -> Result<Vec<crate::session::SessionSummary>, DaemonError> {
-        self.list_sessions_at(ResolvedSessionTarget::local()).await
+        self.sessions.list_sessions(self).await
     }
 
     /// Lists live sessions on one already-resolved exact target.
@@ -322,24 +284,7 @@ impl LocalClient {
         &self,
         target: ResolvedSessionTarget,
     ) -> Result<Vec<crate::session::SessionSummary>, DaemonError> {
-        let frame = self
-            .session_request(
-                target,
-                WireKind::SessionListRequest,
-                WireKind::SessionListResponse,
-                &v2::SessionListRequest {
-                    target: Some(resolved_target_wire(target)),
-                },
-                DEFAULT_DEADLINE,
-                false,
-            )
-            .await?;
-        let response: v2::SessionListResponse = decode_response(&frame)?;
-        response
-            .sessions
-            .into_iter()
-            .map(session_summary_from_wire)
-            .collect()
+        self.sessions.list_sessions_at(self, target).await
     }
 
     /// Creates a named account-login-shell session.
@@ -350,13 +295,9 @@ impl LocalClient {
         working_directory: Option<&Path>,
         viewport: Option<zterm_core::terminal::TerminalSize>,
     ) -> Result<crate::session::SessionSummary, DaemonError> {
-        self.create_session_at(
-            ResolvedSessionTarget::local(),
-            name,
-            working_directory,
-            viewport,
-        )
-        .await
+        self.sessions
+            .create_session(self, name, working_directory, viewport)
+            .await
     }
 
     /// Creates a named account-login-shell session on one exact target.
@@ -368,14 +309,9 @@ impl LocalClient {
         working_directory: Option<&Path>,
         viewport: Option<zterm_core::terminal::TerminalSize>,
     ) -> Result<crate::session::SessionSummary, DaemonError> {
-        self.create_session_at_with_colors(
-            target,
-            name,
-            working_directory,
-            viewport,
-            zterm_core::terminal::TerminalColorProfile::default(),
-        )
-        .await
+        self.sessions
+            .create_session_at(self, target, name, working_directory, viewport)
+            .await
     }
 
     /// Creates a Session with observations available before PTY startup.
@@ -388,20 +324,16 @@ impl LocalClient {
         viewport: Option<zterm_core::terminal::TerminalSize>,
         base_colors: zterm_core::terminal::TerminalColorProfile,
     ) -> Result<crate::session::SessionSummary, DaemonError> {
-        let frame = self
-            .mutation_request(target, WireKind::SessionCreateRequest, |operation_id| {
-                v2::SessionCreateRequest {
-                    base_colors: Some(base_colors.clone().into()),
-                    operation_id: Some(operation_id.into()),
-                    target: Some(resolved_target_wire(target)),
-                    name: name.to_string(),
-                    working_directory: working_directory
-                        .map_or_else(String::new, |path| path.to_string_lossy().into_owned()),
-                    viewport: viewport.map(Into::into),
-                }
-            })
-            .await?;
-        mutate_response(frame)
+        self.sessions
+            .create_session_at_with_colors(
+                self,
+                target,
+                name,
+                working_directory,
+                viewport,
+                base_colors,
+            )
+            .await
     }
 
     /// Renames a live session without changing its identity.
@@ -411,8 +343,7 @@ impl LocalClient {
         session_id: SessionId,
         name: &SessionName,
     ) -> Result<crate::session::SessionSummary, DaemonError> {
-        self.rename_session_at(ResolvedSessionTarget::local(), session_id, name)
-            .await
+        self.sessions.rename_session(self, session_id, name).await
     }
 
     /// Renames a live session on one exact target without changing its identity.
@@ -423,17 +354,9 @@ impl LocalClient {
         session_id: SessionId,
         name: &SessionName,
     ) -> Result<crate::session::SessionSummary, DaemonError> {
-        let frame = self
-            .mutation_request(target, WireKind::SessionRenameRequest, |operation_id| {
-                v2::SessionRenameRequest {
-                    operation_id: Some(operation_id.into()),
-                    target: Some(resolved_target_wire(target)),
-                    session_id: Some(session_id.into()),
-                    name: name.to_string(),
-                }
-            })
-            .await?;
-        mutate_response(frame)
+        self.sessions
+            .rename_session_at(self, target, session_id, name)
+            .await
     }
 
     /// Explicitly closes one live session.
@@ -442,8 +365,7 @@ impl LocalClient {
         &self,
         session_id: SessionId,
     ) -> Result<crate::session::SessionSummary, DaemonError> {
-        self.close_session_at(ResolvedSessionTarget::local(), session_id)
-            .await
+        self.sessions.close_session(self, session_id).await
     }
 
     /// Explicitly closes one live session on an exact target.
@@ -453,176 +375,9 @@ impl LocalClient {
         target: ResolvedSessionTarget,
         session_id: SessionId,
     ) -> Result<crate::session::SessionSummary, DaemonError> {
-        let frame = self
-            .mutation_request(target, WireKind::SessionCloseRequest, |operation_id| {
-                v2::SessionCloseRequest {
-                    operation_id: Some(operation_id.into()),
-                    target: Some(resolved_target_wire(target)),
-                    session_id: Some(session_id.into()),
-                }
-            })
-            .await?;
-        mutate_response(frame)
-    }
-
-    #[cfg(unix)]
-    async fn mutation_request<Message, Build>(
-        &self,
-        target: ResolvedSessionTarget,
-        request_kind: WireKind,
-        build: Build,
-    ) -> Result<DecodedFrame, DaemonError>
-    where
-        Message: prost::Message,
-        Build: FnOnce(OperationId) -> Message,
-    {
-        // Only one exact target is serialized. No remote await holds the map
-        // mutex or blocks local/other-device lease streams.
-        let state = self.mutation_target_state(target)?;
-        let mut mutation = state.lock().await;
-        if mutation.lease.is_none() {
-            mutation.lease = Some(self.issue_operation_lease(target).await?);
-            mutation.next_sequence = 1;
-        }
-        let sequence = mutation.next_sequence;
-        mutation.next_sequence = match sequence.checked_add(1) {
-            Some(next) => next,
-            None => {
-                mutation.lease = None;
-                mutation.next_sequence = 1;
-                return Err(resource_error("local operation sequence exhausted"));
-            }
-        };
-        let operation_id = OperationId {
-            lease: mutation.lease.expect("lease was allocated above"),
-            sequence,
-        };
-        let result = self
-            .session_request(
-                target,
-                request_kind,
-                WireKind::SessionMutateResponse,
-                &build(operation_id),
-                DEFAULT_DEADLINE,
-                true,
-            )
-            .await;
-        if result
-            .as_ref()
-            .err()
-            .is_some_and(|error| error.kind() == DomainErrorKind::OperationOutcomeUnknown)
-        {
-            mutation.lease = None;
-            mutation.next_sequence = 1;
-        }
-        result
-    }
-
-    #[cfg(unix)]
-    async fn issue_operation_lease(
-        &self,
-        target: ResolvedSessionTarget,
-    ) -> Result<OperationLease, DaemonError> {
-        let frame = self
-            .session_request(
-                target,
-                WireKind::SessionOperationLeaseRequest,
-                WireKind::SessionOperationLeaseResponse,
-                &v2::SessionOperationLeaseRequest {
-                    target: Some(resolved_target_wire(target)),
-                },
-                DEFAULT_DEADLINE,
-                true,
-            )
-            .await?;
-        let response: v2::SessionOperationLeaseResponse = decode_response(&frame)?;
-        response
-            .lease
-            .ok_or_else(|| malformed("operation lease response omitted lease"))?
-            .try_into()
-            .map_err(protocol_error)
-    }
-
-    #[cfg(unix)]
-    fn mutation_target_state(
-        &self,
-        target: ResolvedSessionTarget,
-    ) -> Result<Arc<AsyncMutex<LocalMutationState>>, DaemonError> {
-        let mut states = self
-            .mutation_targets
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(state) = states.get(&target) {
-            return Ok(Arc::clone(state));
-        }
-        if states.len() >= MAX_MUTATION_TARGETS_PER_CLIENT {
-            // The map is the only source of new Arcs while this mutex is held.
-            // A strong count of one therefore proves that no logical mutation
-            // or waiter can still use this target state; cached inactive leases
-            // may be discarded, but in-flight operation identity is never evicted.
-            let inactive = states
-                .iter()
-                .find_map(|(target, state)| (Arc::strong_count(state) == 1).then_some(*target));
-            let Some(inactive) = inactive else {
-                return Err(resource_error(
-                    "local client mutation-target capacity is exhausted by active operations",
-                ));
-            };
-            states.remove(&inactive);
-        }
-        let state = Arc::new(AsyncMutex::new(LocalMutationState {
-            lease: None,
-            next_sequence: 1,
-        }));
-        states.insert(target, Arc::clone(&state));
-        Ok(state)
-    }
-
-    #[cfg(unix)]
-    async fn session_request<Message: prost::Message>(
-        &self,
-        target: ResolvedSessionTarget,
-        request_kind: WireKind,
-        response_kind: WireKind,
-        message: &Message,
-        deadline: Duration,
-        mutation_or_lease_retry: bool,
-    ) -> Result<DecodedFrame, DaemonError> {
-        let request_id = self
-            .next_request_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
-            .map_err(|_| resource_error("local request ID exhausted"))?;
-        let deadline_ms = u32::try_from(deadline.as_millis()).unwrap_or(u32::MAX);
-        let bytes = Zeroizing::new(
-            encode_message(request_kind, request_id, deadline_ms, message)
-                .map_err(protocol_error)?,
-        );
-        match target.device_id() {
-            None => {
-                self.request_preencoded(
-                    &bytes,
-                    request_id,
-                    response_kind,
-                    deadline,
-                    mutation_or_lease_retry,
-                )
-                .await
-            }
-            Some(device_id) => {
-                let request_class = LocalRemoteRequestClass::for_kind(request_kind)?;
-                self.request_remote_preencoded(
-                    device_id,
-                    &bytes,
-                    request_id,
-                    response_kind,
-                    deadline,
-                    request_class,
-                )
-                .await
-            }
-        }
+        self.sessions
+            .close_session_at(self, target, session_id)
+            .await
     }
 
     #[cfg(unix)]
@@ -1341,32 +1096,9 @@ fn address_service_state(value: &str) -> Result<AddressServiceState, DaemonError
 }
 
 #[cfg(unix)]
-pub(super) fn mutate_response(
-    frame: DecodedFrame,
-) -> Result<crate::session::SessionSummary, DaemonError> {
-    let response: v2::SessionMutateResponse = decode_response(&frame)?;
-    session_summary_from_wire(
-        response
-            .session
-            .ok_or_else(|| malformed("session mutation response omitted session"))?,
-    )
-}
-
-#[cfg(unix)]
-pub(super) fn resolved_target_from_wire(
-    target: Option<v2::TargetSelector>,
-) -> Result<ResolvedSessionTarget, DaemonError> {
-    match target.and_then(|target| target.target) {
-        Some(v2::target_selector::Target::Local(true)) => Ok(ResolvedSessionTarget::local()),
-        Some(v2::target_selector::Target::Device(device_id)) => {
-            let device_id = device_id.try_into().map_err(protocol_error)?;
-            Ok(ResolvedSessionTarget::device(device_id))
-        }
-        _ => Err(malformed(
-            "target resolution response omitted a valid frozen target",
-        )),
-    }
-}
+use zterm_client::protocol::resolved_target_from_wire;
+#[cfg(test)]
+use zterm_client::protocol::resolved_target_wire;
 
 #[cfg(not(unix))]
 fn unsupported() -> DaemonError {
@@ -1408,6 +1140,60 @@ async fn read_one(stream: &mut tokio::net::UnixStream) -> Result<DecodedFrame, D
     }
 }
 
+#[cfg(unix)]
+impl SessionUnaryTransport for LocalClient {
+    fn request(
+        &self,
+        request: SessionUnaryRequest,
+    ) -> zterm_client::transport::TransportFuture<'_, Result<DecodedFrame, DaemonError>> {
+        Box::pin(async move {
+            let SessionUnaryRequest {
+                target,
+                request_kind,
+                response_kind,
+                payload,
+                deadline,
+                mutation_or_lease_retry,
+            } = request;
+            let request_id = self
+                .next_request_id
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    current.checked_add(1)
+                })
+                .map_err(|_| resource_error("local request ID exhausted"))?;
+            let deadline_ms = u32::try_from(deadline.as_millis()).unwrap_or(u32::MAX);
+            let bytes = Zeroizing::new(
+                zterm_proto::encode_payload(request_kind, request_id, deadline_ms, payload)
+                    .map_err(protocol_error)?,
+            );
+            match target.device_id() {
+                None => {
+                    self.request_preencoded(
+                        &bytes,
+                        request_id,
+                        response_kind,
+                        deadline,
+                        mutation_or_lease_retry,
+                    )
+                    .await
+                }
+                Some(device_id) => {
+                    let request_class = LocalRemoteRequestClass::for_kind(request_kind)?;
+                    self.request_remote_preencoded(
+                        device_id,
+                        &bytes,
+                        request_id,
+                        response_kind,
+                        deadline,
+                        request_class,
+                    )
+                    .await
+                }
+            }
+        })
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -1415,19 +1201,11 @@ mod tests {
     #[test]
     fn local_client_and_mutation_state_debug_redact_private_owners() {
         let client = LocalClient::new("/private/tmp/SOCKET_SENTINEL");
-        let mutation = LocalMutationState {
-            lease: Some(OperationLease {
-                daemon_incarnation: DaemonIncarnation::from_array(*b"LEASE_SENTINEL__"),
-                ordinal: 8_675_309,
-            }),
-            next_sequence: 2_434_117,
-        };
-        let debug = format!("{client:?} {mutation:?}");
+        let debug = format!("{client:?}");
         for sentinel in ["SOCKET_SENTINEL", "LEASE_SENTINEL__", "8675309", "2434117"] {
             assert!(!debug.contains(sentinel));
         }
         assert!(debug.contains("mutation_target_count: Some(1)"));
-        assert!(debug.contains("has_lease: true"));
     }
 
     #[tokio::test]
@@ -1766,127 +1544,5 @@ mod tests {
                 columns: 80,
             }),
         }
-    }
-
-    #[tokio::test]
-    async fn mutation_lease_state_is_isolated_and_serialized_only_per_exact_target() {
-        let client = LocalClient::new("/unused/test.sock");
-        let target_a = ResolvedSessionTarget::device(DeviceId::from_array([0xe1; 32]));
-        let target_b = ResolvedSessionTarget::device(DeviceId::from_array([0xe2; 32]));
-        let state_a = client
-            .mutation_target_state(target_a)
-            .expect("target A state");
-        let state_b = client
-            .mutation_target_state(target_b)
-            .expect("target B state");
-        {
-            let mut a = state_a.lock().await;
-            a.lease = Some(OperationLease {
-                daemon_incarnation: DaemonIncarnation::from_array([1; 16]),
-                ordinal: 11,
-            });
-            let mut b = state_b.lock().await;
-            b.lease = Some(OperationLease {
-                daemon_incarnation: DaemonIncarnation::from_array([2; 16]),
-                ordinal: 22,
-            });
-        }
-
-        let mut held_a = state_a.lock().await;
-        held_a.lease = None;
-        held_a.next_sequence = 1;
-        let b = tokio::time::timeout(Duration::from_millis(100), state_b.lock())
-            .await
-            .expect("target B does not wait for target A's mutation lock");
-        assert_eq!(b.lease.expect("target B lease retained").ordinal, 22);
-        drop(b);
-        drop(held_a);
-
-        assert!(state_a.lock().await.lease.is_none());
-        assert_eq!(
-            state_b
-                .lock()
-                .await
-                .lease
-                .expect("target B remains unpoisoned")
-                .ordinal,
-            22
-        );
-    }
-
-    #[test]
-    fn mutation_target_cache_evicts_only_inactive_state_and_stays_hard_bounded() {
-        let client = LocalClient::new("/unused/test.sock");
-        let active_target =
-            ResolvedSessionTarget::device(DeviceId::from_array([0xe1; DeviceId::LENGTH]));
-        let active = client
-            .mutation_target_state(active_target)
-            .expect("active target state");
-
-        for byte in 1_u8..=61 {
-            client
-                .mutation_target_state(ResolvedSessionTarget::device(DeviceId::from_array(
-                    [byte; 32],
-                )))
-                .expect("bounded target slot");
-        }
-        client
-            .mutation_target_state(ResolvedSessionTarget::device(DeviceId::from_array(
-                [62; DeviceId::LENGTH],
-            )))
-            .expect("last bounded target slot");
-
-        let replacement =
-            ResolvedSessionTarget::device(DeviceId::from_array([0xfe; DeviceId::LENGTH]));
-        client
-            .mutation_target_state(replacement)
-            .expect("inactive cached lease state is safely evicted");
-        let states = client
-            .mutation_targets
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert_eq!(states.len(), MAX_MUTATION_TARGETS_PER_CLIENT);
-        assert!(Arc::ptr_eq(
-            states
-                .get(&active_target)
-                .expect("externally retained state is never evicted"),
-            &active
-        ));
-        drop(states);
-
-        let saturated = LocalClient::new("/unused/saturated.sock");
-        let mut active_states = vec![
-            saturated
-                .mutation_target_state(ResolvedSessionTarget::local())
-                .expect("retain local target"),
-        ];
-        for index in 1..MAX_MUTATION_TARGETS_PER_CLIENT {
-            let byte = u8::try_from(index).expect("test target index fits one byte");
-            active_states.push(
-                saturated
-                    .mutation_target_state(ResolvedSessionTarget::device(DeviceId::from_array(
-                        [byte; DeviceId::LENGTH],
-                    )))
-                    .expect("retain every bounded target slot"),
-            );
-        }
-        assert_eq!(
-            saturated
-                .mutation_target_state(ResolvedSessionTarget::device(DeviceId::from_array(
-                    [0xfe; DeviceId::LENGTH]
-                )))
-                .expect_err("in-flight target states cannot be evicted")
-                .kind(),
-            DomainErrorKind::ResourceExhausted
-        );
-        assert_eq!(
-            saturated
-                .mutation_targets
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .len(),
-            MAX_MUTATION_TARGETS_PER_CLIENT
-        );
-        drop(active_states);
     }
 }

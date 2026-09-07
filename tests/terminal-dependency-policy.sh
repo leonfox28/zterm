@@ -20,6 +20,19 @@ reject_host_engine() {
 reject_host_engine zterm-core
 reject_host_engine zterm-proto
 
+# Only production/build edges define the distributable mobile boundary. Desktop
+# tests may exercise the canonical Unix adapter; no host crate is shipped.
+for package in zterm-client zterm-android; do
+    for target in aarch64-apple-darwin aarch64-linux-android; do
+        tree=$(cargo +1.98.0 tree --locked -p "$package" --target "$target" --edges normal,build --charset ascii)
+        if printf '%s\n' "$tree" | grep -E '(^|[[:space:]])(zterm-daemon|zterm-platform|zterm-cli|zterm-terminal|alacritty_terminal|vte|portable-pty|portmapper) v' >/dev/null; then
+            echo "$package ($target) imports a desktop/host dependency" >&2
+            printf '%s\n' "$tree" >&2
+            exit 1
+        fi
+    done
+done
+
 vte_tree=$(
     cargo +1.98.0 tree --locked --workspace --invert vte@0.15.0 --charset ascii \
         | sed -E 's/ v[0-9][^ ]* \([^)]*\)$//'

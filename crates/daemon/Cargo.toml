@@ -8,7 +8,7 @@ publish.workspace = true
 [dependencies]
 flate2.workspace = true
 futures-util.workspace = true
-iroh.workspace = true
+iroh = { workspace = true, features = ["portmapper"] }
 prost.workspace = true
 ring.workspace = true
 reqwest.workspace = true
@@ -25,6 +25,7 @@ tar.workspace = true
 tempfile.workspace = true
 zeroize.workspace = true
 zterm-core.workspace = true
+zterm-client.workspace = true
 zterm-platform.workspace = true
 zterm-proto.workspace = true
 zterm-terminal.workspace = true

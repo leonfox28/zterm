@@ -208,6 +208,11 @@ outbound-known and inbound-authorization directions explicit.
   registration is followed by an exact-generation recheck so a queued revoke
   cannot publish stale access. Each business side effect holds an
   `AuthorizedCommitContext` read permit through its blocking commit.
+- Desktop/mobile outbound Hello/Welcome use the shared `controller_handshake`.
+  Only the authenticated peer's explicit application close code `0x100` maps a
+  failed handshake to Unauthorized. Keep timeout, connection failure and framing
+  errors distinct, and inspect closure before local candidate cleanup. Neither
+  a missing Welcome nor a textual close reason proves revoked authorization.
 - The broker hands an installed `RemoteServiceHandler` owned, unread stream
   halves plus the mutually authenticated remote ID, receiver-owned accepted
   generation, and one absolute first-frame deadline. Only the shared

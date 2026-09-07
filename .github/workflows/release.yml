@@ -1,4 +1,4 @@
-name: signed native release
+name: signed release
 
 on:
   push:
@@ -129,6 +129,17 @@ jobs:
           target/release/zterm-release-tool verify-unsigned release-output
           jq -e --arg commit "$SOURCE_COMMIT" '.source_commit == $commit' \
             release-output/zterm-release.json >/dev/null
+
+      - name: Prepare APK signing tools before secret exposure
+        run: |
+          echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" 'build-tools;36.0.0' 'ndk;28.2.13676358'
+
+      - name: Sign and verify the retained APK payload
+        env:
+          ZTERM_ANDROID_KEYSTORE_BASE64: ${{ secrets.ZTERM_ANDROID_KEYSTORE_BASE64 }}
+          ZTERM_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ZTERM_ANDROID_KEYSTORE_PASSWORD }}
+        run: python3 tools/android/release.py sign release-output --sdk "$ANDROID_HOME"
 
       - name: Sign and self-verify with the protected release key
         env:
@@ -287,6 +298,9 @@ jobs:
           gh release create "$RELEASE_TAG" "${flags[@]}"
           gh release upload "$RELEASE_TAG" \
             release-output/SHA256SUMS \
+            release-output/SHA256SUMS.sig \
+            release-output/zterm-android-arm64.apk \
+            release-output/zterm-android.json \
             release-output/zterm-release.json \
             release-output/zterm-release.json.sig \
             release-output/zterm-install.sh \
@@ -348,5 +362,5 @@ jobs:
           {
             echo '## Formal release summary'
             echo "- exact green main CI and candidate: $CI_RUN_URL"
-            echo "- immutable three-platform Release: $NATIVE_RESULT $NATIVE_URL"
+            echo "- immutable native and Android Release: $NATIVE_RESULT $NATIVE_URL"
           } >> "$GITHUB_STEP_SUMMARY"

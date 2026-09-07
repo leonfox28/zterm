@@ -6,3 +6,15 @@
 # Private key and certificate material must never enter Git.
 *.key
 *.pem
+
+# Project-local MCP credentials (never commit server URLs containing tokens).
+/.codex/penpot-mcp.url
+
+# Android generated outputs and per-machine SDK configuration.
+/apps/android/.gradle/
+/apps/android/.kotlin/
+/apps/android/**/build/
+/apps/android/local.properties
+*.jks
+*.keystore
+*.p12

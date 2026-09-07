@@ -1,5 +1,7 @@
 [workspace]
 members = [
+    "crates/android",
+    "crates/client",
     "crates/cli",
     "crates/core",
     "crates/daemon",
@@ -7,11 +9,12 @@ members = [
     "crates/proto",
     "crates/terminal",
     "tools/release",
+    "tools/uniffi-bindgen",
 ]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.25"
+version = "0.1.26"
 edition = "2024"
 rust-version = "1.98"
 publish = false
@@ -23,7 +26,7 @@ base64 = "=0.22.1"
 clap = { version = "=4.6.6", default-features = false, features = ["std", "help", "usage", "error-context", "suggestions", "derive"] }
 futures-util = "0.3"
 flate2 = "=1.1.9"
-iroh = { version = "=1.0.3", default-features = false, features = ["portmapper", "tls-ring"] }
+iroh = { version = "=1.0.3", default-features = false, features = ["tls-ring"] }
 iroh-relay = { version = "=1.0.3", default-features = false, features = ["server", "test-utils", "tls-ring"] }
 nix = { version = "=0.28.0", default-features = false, features = ["fs", "process", "socket", "user"] }
 patchbay = { version = "=0.6.0" }
@@ -31,6 +34,8 @@ portable-pty = "=0.9.0"
 prost = "=0.14.4"
 prost-build = "=0.14.4"
 protoc-bin-vendored = "=3.2.0"
+qrcode = { version = "=0.14.1", default-features = false }
+png = "=0.18.1"
 ring = "=0.17.14"
 reqwest = { version = "=0.13.4", default-features = false, features = ["blocking", "rustls-no-provider"] }
 rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std"] }
@@ -42,12 +47,15 @@ tar = "=0.4.46"
 tempfile = "=3.27.0"
 rustix = { version = "1.1.4", features = ["event", "pipe", "termios"] }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 toml = "=1.1.4"
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.20", default-features = false, features = ["fmt", "registry"] }
 unicode-width = "=0.2.2"
+uniffi = { version = "=0.32.0", default-features = false }
 zeroize = "=1.9.0"
 zterm-core = { path = "crates/core" }
+zterm-client = { path = "crates/client" }
 zterm-daemon = { path = "crates/daemon" }
 zterm-platform = { path = "crates/platform" }
 zterm-proto = { path = "crates/proto" }

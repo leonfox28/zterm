@@ -179,7 +179,7 @@ gh pr create
 CI runs for the pull request, not a duplicate branch-push workflow. Updating
 the branch cancels the older PR-head run. Merge only after the stable `CI gate`
 is green; the resulting `main` push runs the full integration graph plus all
-three exact-SHA candidate builds and one unsigned assembly. Tag publication
+three exact-SHA native candidate builds, the Android APK job, and one unsigned assembly. Tag publication
 reuses that candidate instead of compiling the product again.
 
 The deterministic two-file release-version commit is the narrow exception to

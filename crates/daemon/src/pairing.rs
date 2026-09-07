@@ -15,11 +15,11 @@ use ring::digest::{SHA256, digest};
 use ring::rand::{SecureRandom, SystemRandom};
 use zeroize::Zeroizing;
 use zterm_core::{
-    AuthGeneration, DeviceDisplayName, DeviceId, DomainErrorKind, EphemeralOperationId,
-    PAIR_NONCE_BYTES, PAIR_OFFER_ID_BYTES, PAIR_PROTOCOL_VERSION, PAIR_SECRET_BYTES,
-    PAIR_TICKET_FORMAT_VERSION, PairAccepted, PairBegin, PairChallenge, PairFingerprint, PairNonce,
-    PairOfferId, PairProof, PairSecret, PairTicketError, PairTicketFields, PairTranscript,
-    RelayHint, TransportLimits, TransportLimitsError, validate_pair_ttl,
+    AuthGeneration, DeviceDisplayName, DeviceId, EphemeralOperationId, PAIR_NONCE_BYTES,
+    PAIR_OFFER_ID_BYTES, PAIR_PROTOCOL_VERSION, PAIR_SECRET_BYTES, PAIR_TICKET_FORMAT_VERSION,
+    PairAccepted, PairBegin, PairChallenge, PairFingerprint, PairNonce, PairOfferId, PairProof,
+    PairSecret, PairTicketError, PairTicketFields, PairTranscript, RelayHint, TransportLimits,
+    validate_pair_ttl,
 };
 
 use crate::error::DaemonError;
@@ -141,121 +141,7 @@ impl PairingEntropy for SystemPairingEntropy {
     }
 }
 
-/// Typed local pairing failure with a separate generic peer projection.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PairingError {
-    /// The configured transport limits were internally inconsistent.
-    InvalidLimits(TransportLimitsError),
-    /// Public ticket or transcript fields failed the shared core contract.
-    InvalidTicket(PairTicketError),
-    /// Ticket fields did not bind the authenticated endpoint or handshake.
-    InvalidBinding,
-    /// The wall/monotonic clock could not be observed.
-    ClockUnavailable,
-    /// Expiry or deadline arithmetic could not be represented.
-    TimeOverflow,
-    /// The operating-system entropy source failed.
-    EntropyUnavailable,
-    /// The configured live-offer or operation-cell bound was reached.
-    ResourceExhausted,
-    /// The caller's absolute deadline elapsed.
-    DeadlineExceeded,
-    /// No live or retained terminal offer matched the identifier.
-    OfferNotFound,
-    /// The offer expired by either wall clock or monotonic time.
-    TicketExpired,
-    /// The offer was already committed and consumed.
-    TicketConsumed,
-    /// Another valid consumer currently owns the pre-commit CAS.
-    OfferConsuming,
-    /// The controller proof did not authenticate the exact transcript.
-    InvalidProof,
-    /// An operation ID was reused for another semantic fingerprint.
-    OutcomeUnknown,
-    /// An opaque challenge or consumption permit did not belong to this state.
-    StateConflict,
-}
-
-impl PairingError {
-    /// Stable, detailed category exposed only to the same-UID local caller.
-    #[must_use]
-    pub const fn local_kind(self) -> DomainErrorKind {
-        match self {
-            Self::InvalidLimits(_) | Self::ResourceExhausted => DomainErrorKind::ResourceExhausted,
-            Self::ClockUnavailable | Self::EntropyUnavailable => {
-                DomainErrorKind::TransportUnavailable
-            }
-            Self::DeadlineExceeded => DomainErrorKind::DeadlineExceeded,
-            Self::TicketExpired => DomainErrorKind::PairTicketExpired,
-            Self::TicketConsumed => DomainErrorKind::PairTicketConsumed,
-            Self::OfferConsuming | Self::OutcomeUnknown | Self::StateConflict => {
-                DomainErrorKind::PairOutcomeUnknown
-            }
-            Self::InvalidTicket(_)
-            | Self::InvalidBinding
-            | Self::TimeOverflow
-            | Self::OfferNotFound
-            | Self::InvalidProof => DomainErrorKind::PairTicketInvalid,
-        }
-    }
-
-    /// Generic category safe to expose to an unauthenticated pair peer.
-    #[must_use]
-    pub const fn peer_kind(self) -> DomainErrorKind {
-        match self {
-            Self::InvalidLimits(_) | Self::ResourceExhausted => DomainErrorKind::ResourceExhausted,
-            Self::ClockUnavailable | Self::EntropyUnavailable => {
-                DomainErrorKind::TransportUnavailable
-            }
-            Self::DeadlineExceeded => DomainErrorKind::DeadlineExceeded,
-            _ => DomainErrorKind::PairTicketInvalid,
-        }
-    }
-
-    /// Generic daemon error which does not distinguish offer state or proof failure.
-    #[must_use]
-    pub fn peer_error(self) -> DaemonError {
-        let detail = match self.peer_kind() {
-            DomainErrorKind::ResourceExhausted => "pairing service is overloaded",
-            DomainErrorKind::TransportUnavailable => "pairing service is unavailable",
-            DomainErrorKind::DeadlineExceeded => "pairing handshake deadline elapsed",
-            _ => "pairing request was rejected",
-        };
-        DaemonError::new(self.peer_kind(), detail)
-    }
-}
-
-impl fmt::Display for PairingError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidLimits(error) => error.fmt(formatter),
-            Self::InvalidTicket(error) => error.fmt(formatter),
-            Self::InvalidBinding => formatter.write_str("pairing handshake binding is invalid"),
-            Self::ClockUnavailable => formatter.write_str("pairing clock is unavailable"),
-            Self::TimeOverflow => formatter.write_str("pairing time arithmetic overflowed"),
-            Self::EntropyUnavailable => formatter.write_str("pairing entropy is unavailable"),
-            Self::ResourceExhausted => formatter.write_str("pairing offer capacity is exhausted"),
-            Self::DeadlineExceeded => formatter.write_str("pairing operation deadline elapsed"),
-            Self::OfferNotFound => formatter.write_str("pairing offer is unavailable"),
-            Self::TicketExpired => formatter.write_str("pairing ticket has expired"),
-            Self::TicketConsumed => formatter.write_str("pairing ticket was already consumed"),
-            Self::OfferConsuming => {
-                formatter.write_str("pairing ticket already has a pre-commit consumer")
-            }
-            Self::InvalidProof => formatter.write_str("pairing proof was rejected"),
-            Self::OutcomeUnknown => formatter.write_str("pairing operation outcome is unknown"),
-            Self::StateConflict => formatter.write_str("pairing state changed unexpectedly"),
-        }
-    }
-}
-
-impl std::error::Error for PairingError {}
-
-impl From<PairingError> for DaemonError {
-    fn from(error: PairingError) -> Self {
-        Self::new(error.local_kind(), error.to_string())
-    }
-}
+pub use zterm_client::pairing::{PairingError, controller_transcript};
 
 /// Validated semantic input for one local pair-create mutation.
 #[derive(Clone, Debug)]
@@ -555,32 +441,6 @@ impl fmt::Debug for PairCommitResult {
             .field("host_diagnostic_version", &self.host_diagnostic_version)
             .finish()
     }
-}
-
-/// Builds the exact controller-side transcript after checking TLS/ticket bindings.
-pub fn controller_transcript(
-    ticket: &PairTicketFields,
-    authenticated_host: DeviceId,
-    controller_device_id: DeviceId,
-    begin: &PairBegin,
-    challenge: &PairChallenge,
-) -> Result<PairTranscript, PairingError> {
-    if ticket.host_device_id() != authenticated_host
-        || ticket.offer_id() != begin.offer_id()
-        || ticket.expires_at_unix() != challenge.ticket_expiry_unix()
-        || begin.pair_protocol_version() != challenge.selected_version()
-    {
-        return Err(PairingError::InvalidBinding);
-    }
-    PairTranscript::new(
-        ticket,
-        controller_device_id,
-        begin.controller_name(),
-        begin.controller_nonce(),
-        challenge.host_nonce(),
-        challenge.selected_version(),
-    )
-    .map_err(PairingError::InvalidTicket)
 }
 
 /// Cloneable bounded owner for pairing offers and local create replay cells.
