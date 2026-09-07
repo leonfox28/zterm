@@ -37,3 +37,10 @@ project_doc_fallback_filenames = ["AGENTS.md"]
 # (this file) takes precedence over user-level `~/.codex/config.toml`.
 [agents]
 max_depth = 1
+
+# Penpot is configured only for this project. Its token stays in an ignored file.
+[mcp_servers.penpot]
+command = "uv"
+args = ["run", "--script", ".codex/penpot-mcp.py"]
+startup_timeout_sec = 60
+tool_timeout_sec = 180

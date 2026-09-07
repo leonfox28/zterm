@@ -1347,6 +1347,16 @@ deferred, and no performance/RSS claim was measured.
 
 ### Step 15.2 — Cross-platform and real-terminal acceptance
 
+Android handoff addendum, 2026-09-07: the user explicitly reported that Zterm's
+macOS/Linux basic functionality has been verified and supplied local `zterm`
+and remote `zterm connect dev` for development. Android accepts that user report
+as its existing-host prerequisite; do not repeat the whole host campaign as an
+App-start blocker. The report does not provide per-route fixture logs or exact
+tested host revisions, so the historical detailed checkboxes below are not
+converted into independently observed passes. See
+`../09-06-android-app/research/mainline-refresh.md` for the new source baseline,
+successful read-only local/remote access checks, and evidence boundaries.
+
 - [ ] On macOS, verify local/direct/relay with the reviewed binary in Ghostty and at least one other
   available terminal. Exercise shell history, generic nested TUI, Herdr entry/first/continuous/reverse
   wheel, resize, screen exit/re-entry, return-live, reconnect, detach, and cleanup.
