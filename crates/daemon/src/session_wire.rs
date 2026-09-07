@@ -55,13 +55,8 @@ const ATTACHMENT_OUTBOUND_CAPACITY: usize = 8;
 #[cfg(unix)]
 const DEFAULT_SESSION_WIRE_DEADLINE: Duration = Duration::from_secs(5);
 
-/// One decoded first frame plus the single decoder's retained leftovers.
 #[cfg(unix)]
-pub(crate) struct FirstFrame {
-    pub(crate) frame: DecodedFrame,
-    pub(crate) decoder: FrameDecoder,
-    pub(crate) queued: VecDeque<DecodedFrame>,
-}
+pub(crate) use zterm_client::framing::{FirstFrame, read_first};
 
 /// Deadlines consumed by the shared Session stream owner.
 #[cfg(unix)]
@@ -399,38 +394,6 @@ impl RemoteServiceHandler for RemoteSessionServiceHandler {
                 .handle_remote_stream(stream, context, limits, first_frame_deadline)
                 .await
         })
-    }
-}
-
-/// Reads exactly through the first complete frame while retaining decoder
-/// state and any additional frames received by the same bounded read.
-#[cfg(unix)]
-pub(crate) async fn read_first<Reader>(reader: &mut Reader) -> Result<FirstFrame, DaemonError>
-where
-    Reader: AsyncRead + Unpin,
-{
-    let mut decoder = FrameDecoder::new();
-    let mut buffer = Zeroizing::new([0_u8; 16 * 1024]);
-    loop {
-        let read = reader
-            .read(&mut *buffer)
-            .await
-            .map_err(|error| daemon_io("read Session request", error))?;
-        if read == 0 {
-            decoder.finish().map_err(protocol_error)?;
-            return Err(DaemonError::new(
-                DomainErrorKind::Cancelled,
-                "client closed before sending a Session request",
-            ));
-        }
-        let mut frames = VecDeque::from(decoder.feed(&buffer[..read]).map_err(protocol_error)?);
-        if let Some(frame) = frames.pop_front() {
-            return Ok(FirstFrame {
-                frame,
-                decoder,
-                queued: frames,
-            });
-        }
     }
 }
 

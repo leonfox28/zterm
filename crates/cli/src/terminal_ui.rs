@@ -124,7 +124,7 @@ mod unix {
     const HOST_INPUT_CAPTURE: &[u8] = b"\x1b[?1003h\x1b[?1006h";
     const ENTER_TERMINAL_UI: &[u8] = b"\x1b[?1049h\x1b[?25l\x1b[>0u\x1b[?1003h\x1b[?1006h";
     const HOST_SEQUENCE_BOUND: usize = 64;
-    const RESUME_INPUT_BOUND: usize = 1024 * 1024 - 1024;
+    use zterm_client::input::RESUME_INPUT_BOUND;
     const PAGE_UP: &[u8] = b"\x1b[5~";
     const PAGE_DOWN: &[u8] = b"\x1b[6~";
     const PASTE_START: &[u8] = b"\x1b[200~";
@@ -351,7 +351,8 @@ mod unix {
             prepared.initial_snapshot().surface.active_screen,
         );
         let view_target = prepared.target().clone();
-        let surface = AttachmentSurface::from_snapshot(prepared.initial_snapshot())?;
+        let surface = AttachmentSurface::from_snapshot(prepared.initial_snapshot())
+            .map_err(|_| semantic_surface_error("semantic terminal snapshot is invalid"))?;
         // The creation hint does not resize a retained Session. Only the host
         // snapshot establishes the actual geometry for resize deduplication.
         let mut resize_coalescer = ResizeCoalescer::new(surface.surface.size);
@@ -2356,15 +2357,8 @@ mod unix {
     }
 
     fn append_resume_input(retained: &mut Vec<u8>, bytes: &[u8]) -> Result<(), CliError> {
-        let combined = retained
-            .len()
-            .checked_add(bytes.len())
-            .ok_or_else(resume_input_overflow)?;
-        if combined > RESUME_INPUT_BOUND {
-            return Err(resume_input_overflow());
-        }
-        retained.extend_from_slice(bytes);
-        Ok(())
+        zterm_client::input::append_resume_input(retained, bytes)
+            .map_err(|_| resume_input_overflow())
     }
 
     fn resume_input_overflow() -> CliError {
@@ -2925,86 +2919,26 @@ mod unix {
         active_screen: ActiveScreen,
         modes: TerminalModes,
     ) -> Option<Vec<u8>> {
-        if modes.mouse_mode != TerminalMouseMode::None {
-            return mouse_event_allowed(mouse, modes.mouse_mode)
-                .then(|| encode_child_mouse(mouse, modes.mouse_encoding))
-                .flatten();
-        }
-        if mouse.is_wheel() && active_screen == ActiveScreen::Alternate && modes.alternate_scroll {
-            return Some(emulated_wheel_cursor_keys(
-                mouse.wheel_is_up(),
-                modes.application_cursor,
-            ));
-        }
-        None
-    }
-
-    fn mouse_event_allowed(mouse: &SgrMouse, mode: TerminalMouseMode) -> bool {
-        if mouse.is_wheel() {
-            return true;
-        }
-        let motion = mouse.code & 32 != 0;
-        if motion {
-            return match mode {
-                TerminalMouseMode::ButtonMotion => mouse.code & 3 != 3,
-                TerminalMouseMode::AnyMotion => true,
-                TerminalMouseMode::None
-                | TerminalMouseMode::Press
-                | TerminalMouseMode::PressRelease => false,
-            };
-        }
-        if mouse.release {
-            matches!(
-                mode,
-                TerminalMouseMode::PressRelease
-                    | TerminalMouseMode::ButtonMotion
-                    | TerminalMouseMode::AnyMotion
-            )
-        } else {
-            true
-        }
-    }
-
-    fn encode_child_mouse(mouse: &SgrMouse, encoding: TerminalMouseEncoding) -> Option<Vec<u8>> {
-        if encoding == TerminalMouseEncoding::Sgr {
-            return Some(mouse.raw.clone());
-        }
-        let code = if mouse.release {
-            (mouse.code & !3) | 3
-        } else {
-            mouse.code
+        let input = zterm_client::mouse::MouseInput {
+            code: mouse.code,
+            column: mouse.column,
+            row: mouse.row,
+            release: mouse.release,
         };
-        let values = [code, mouse.column, mouse.row];
-        let mut bytes = b"\x1b[M".to_vec();
-        match encoding {
-            TerminalMouseEncoding::Default => {
-                for value in values {
-                    bytes.push(u8::try_from(value.checked_add(32)?).ok()?);
-                }
-            }
-            TerminalMouseEncoding::Utf8 => {
-                for value in values {
-                    bytes.extend_from_slice(
-                        char::from_u32(u32::from(value.checked_add(32)?))?
-                            .encode_utf8(&mut [0; 4])
-                            .as_bytes(),
-                    );
-                }
-            }
-            TerminalMouseEncoding::Sgr => unreachable!(),
-        }
-        Some(bytes)
+        let encoded = input.route(active_screen, modes)?;
+        // Preserve byte-exact physical SGR passthrough, including legal padding.
+        Some(
+            if modes.mouse_mode != TerminalMouseMode::None
+                && modes.mouse_encoding == TerminalMouseEncoding::Sgr
+            {
+                mouse.raw.clone()
+            } else {
+                encoded
+            },
+        )
     }
 
-    fn emulated_wheel_cursor_keys(up: bool, application_cursor: bool) -> Vec<u8> {
-        let sequence: &[u8] = match (up, application_cursor) {
-            (true, true) => b"\x1bOA",
-            (false, true) => b"\x1bOB",
-            (true, false) => b"\x1b[A",
-            (false, false) => b"\x1b[B",
-        };
-        sequence.to_vec()
-    }
+    use zterm_client::mouse::cursor_wheel as emulated_wheel_cursor_keys;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 
@@ -3226,7 +3160,8 @@ mod unix {
         status: &StatusRenderer,
         transport_state: TerminalViewTransportState,
     ) -> Result<(), CliError> {
-        let candidate = AttachmentSurface::from_snapshot(snapshot)?;
+        let candidate = AttachmentSurface::from_snapshot(snapshot)
+            .map_err(|_| semantic_surface_error("semantic terminal snapshot is invalid"))?;
         let layout = ChromeLayout::new(
             status.physical_size,
             viewport.effective_screen(candidate.active_screen()),
@@ -3305,7 +3240,10 @@ mod unix {
         transport_state: TerminalViewTransportState,
         resume_barrier: bool,
     ) -> Result<DeltaRender, CliError> {
-        let Some(candidate) = surface.candidate_after_delta(delta)? else {
+        let Some(candidate) = surface
+            .candidate_after_delta(delta)
+            .map_err(|_| semantic_surface_error("semantic terminal delta is incompatible"))?
+        else {
             return Ok(DeltaRender::Gap);
         };
         let render_live = viewport.is_live() || (resume_barrier && viewport.is_resume_pending());

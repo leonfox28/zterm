@@ -113,6 +113,55 @@ fn screen_and_size_transitions_require_complete_semantic_resync() {
 }
 
 #[test]
+fn alternate_resize_clipping_a_wide_cell_keeps_the_snapshot_valid() {
+    let mut model = TerminalModel::new(TerminalSize::new(2, 8), 8).expect("model");
+    model
+        .ingest("\x1b[?1049h\x1b[2;1H好\x1b[1;3H\x1b[44m界".as_bytes())
+        .expect("wide cells");
+    model.snapshot().validate().expect("complete wide pair");
+    let before = model.checkpoint();
+    model
+        .resize(TerminalSize::new(2, 3))
+        .expect("clip the continuation column");
+    let TerminalSurfaceDeltaResult::Resync(clipped) = model.delta_or_resync(&before) else {
+        panic!("geometry change requires a snapshot");
+    };
+    clipped
+        .validate()
+        .expect("clipped wide pair must stay wire-valid");
+    assert_eq!(clipped.surface.rows[0].cells[2].contents, " ");
+    assert_eq!(
+        clipped.surface.rows[0].cells[2].style.background,
+        TerminalColor::Indexed(4)
+    );
+    assert!(!clipped.surface.rows[0].cells[2].wide);
+    assert_eq!(clipped.surface.rows[1].cells[0].contents, "好");
+    assert!(clipped.surface.rows[1].cells[1].wide_continuation);
+
+    model
+        .resize(TerminalSize::new(2, 8))
+        .expect("grow before child repaint");
+    let mut grown = model.snapshot();
+    grown
+        .validate()
+        .expect("growth must not revive an orphan head");
+    assert_eq!(grown.surface.rows[0].cells[2].contents, " ");
+    let checkpoint = model.checkpoint();
+    model
+        .ingest("\x1b[1;3H界".as_bytes())
+        .expect("child repaints a complete pair");
+    let TerminalSurfaceDeltaResult::Delta(delta) = model.delta_or_resync(&checkpoint) else {
+        panic!("same-size repaint must produce a delta");
+    };
+    delta
+        .apply_to(grown.revision, &mut grown.surface)
+        .expect("repaint delta applies");
+    assert_eq!(grown.surface, model.snapshot().surface);
+    assert_eq!(grown.surface.rows[0].cells[2].contents, "界");
+    assert!(grown.surface.rows[0].cells[3].wide_continuation);
+}
+
+#[test]
 fn checkpoint_is_visible_only_and_revision_only_updates_are_preserved() {
     let size = TerminalSize::new(6, 32);
     let mut model = TerminalModel::new(size, 2_000).expect("model");

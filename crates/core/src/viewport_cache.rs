@@ -1,5 +1,10 @@
 //! Renderer-neutral bounded viewport-window cache and request coalescer.
 
+mod pages;
+use pages::Pages;
+pub use pages::ViewportCacheBudget;
+use std::sync::Arc;
+
 use crate::terminal::{
     MAX_HISTORY_WINDOW_ROWS, TerminalHistoryWindowAnchor, TerminalHistoryWindowQuery, TerminalSize,
     TerminalViewportDisposition,
@@ -74,6 +79,25 @@ impl<Row> CachedViewportWindow<Row> {
         self.rows.get(range)
     }
 
+    /// Known overscan rows for fractional native scrolling; never fabricates a row.
+    #[must_use]
+    pub fn visible_rows_with_overscan(&self, offset: u64, extra: u16) -> Option<&[Row]> {
+        let mut range = self.visible_range(offset)?;
+        range.end = range
+            .end
+            .saturating_add(usize::from(extra))
+            .min(self.rows.len());
+        self.rows.get(range)
+    }
+
+    /// Stable first historical ordinal, valid only within this epoch/geometry.
+    #[must_use]
+    pub fn first_ordinal(&self) -> Option<i64> {
+        i64::try_from(self.anchor.max_offset_from_bottom)
+            .ok()?
+            .checked_add(self.first_row_from_live_top)
+    }
+
     fn visible_range(&self, target_offset_from_bottom: u64) -> Option<std::ops::Range<usize>> {
         if target_offset_from_bottom > self.anchor.max_offset_from_bottom {
             return None;
@@ -104,6 +128,8 @@ pub struct ViewportCacheUpdate {
 /// Result of installing one response window.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ViewportCacheInstall {
+    /// Valid response could not fit without evicting pinned content.
+    pub capacity_rejected: bool,
     /// The response covers the latest desired target and may be presented.
     pub render_local: bool,
     /// A newer uncovered desired target requires one follow-up request.
@@ -151,6 +177,7 @@ enum AnchorCacheAction {
 pub struct ViewportCache<Row> {
     latest_anchor: Option<TerminalHistoryWindowAnchor>,
     window: Option<CachedViewportWindow<Row>>,
+    pages: Option<Pages<Row>>,
     desired_offset_from_bottom: u64,
     presented_offset_from_bottom: Option<u64>,
     pending_query: Option<TerminalHistoryWindowQuery>,
@@ -169,10 +196,89 @@ impl<Row> ViewportCache<Row> {
         Self {
             latest_anchor: None,
             window: None,
+            pages: None,
             desired_offset_from_bottom: 0,
             presented_offset_from_bottom: None,
             pending_query: None,
         }
+    }
+
+    /// Opts into accounted immutable pages; the desktop default stays single-window.
+    #[must_use]
+    pub fn with_budget(budget: ViewportCacheBudget) -> Self {
+        Self {
+            pages: Some(Pages::new(budget)),
+            ..Self::new()
+        }
+    }
+
+    /// Accounted retained allocations, including pages held by selection pins.
+    #[must_use]
+    pub fn retained_usage(&self) -> Option<ViewportCacheBudget> {
+        self.pages.as_ref().map(Pages::usage)
+    }
+
+    /// Pins the visible source without cloning rows. Keep this owner until the
+    /// selection or presentation no longer refers to its captured content.
+    #[must_use]
+    pub fn pin_visible_window(&self) -> Option<Arc<CachedViewportWindow<Row>>> {
+        self.pages
+            .as_ref()?
+            .pin(self.latest_anchor?, self.desired_offset_from_bottom)
+    }
+
+    /// Accounts and pins an authoritative live snapshot for a local selection.
+    /// It does not claim that this snapshot supplies older retained history.
+    pub fn capture_live(
+        &mut self,
+        rows: Vec<Row>,
+        nested_bytes: usize,
+    ) -> Option<Arc<CachedViewportWindow<Row>>> {
+        self.capture_live_at(self.latest_anchor?, rows, nested_bytes)
+    }
+
+    /// Pins a validated local frame at its own revision, even when an earlier
+    /// history response has already advanced cache metrics beyond that frame.
+    pub fn capture_live_at(
+        &mut self,
+        anchor: TerminalHistoryWindowAnchor,
+        rows: Vec<Row>,
+        nested_bytes: usize,
+    ) -> Option<Arc<CachedViewportWindow<Row>>> {
+        if !anchor.is_valid()
+            || rows.len() != usize::from(anchor.viewport.rows)
+            || self
+                .latest_anchor
+                .is_none_or(|latest| anchor.revision > latest.revision)
+        {
+            return None;
+        }
+        let window = CachedViewportWindow {
+            disposition: TerminalViewportDisposition::Exact,
+            anchor,
+            target_offset_from_bottom: 0,
+            first_row_from_live_top: 0,
+            rows,
+        };
+        let pages = self.pages.as_mut()?;
+        if !pages.insert(window, nested_bytes) {
+            return None;
+        }
+        pages.pin(anchor, 0)
+    }
+
+    fn window_for(
+        &self,
+        latest: TerminalHistoryWindowAnchor,
+        target: u64,
+    ) -> Option<(&CachedViewportWindow<Row>, u64)> {
+        if let Some(pages) = &self.pages {
+            return pages.find(latest, target);
+        }
+        let window = self.window.as_ref()?;
+        let offset = target_in_window_coordinates(latest, window.anchor, target)?;
+        window.visible_rows(offset)?;
+        Some((window, offset))
     }
 
     /// Returns the latest authoritative coordinate-space anchor.
@@ -202,50 +308,32 @@ impl<Row> ViewportCache<Row> {
     /// Returns the exact full-height slice for the latest desired target.
     #[must_use]
     pub fn visible_rows(&self) -> Option<&[Row]> {
-        let window = self.window.as_ref()?;
-        let target = target_in_window_coordinates(
-            self.latest_anchor?,
-            window.anchor,
-            self.desired_offset_from_bottom,
-        )?;
+        let (window, target) =
+            self.window_for(self.latest_anchor?, self.desired_offset_from_bottom)?;
         window.visible_rows(target)
     }
 
-    /// Returns the immutable identity of the latest desired full-height slice.
+    /// Immutable identity of the latest desired full-height slice.
     #[must_use]
     pub fn visible_slice_identity(&self) -> Option<ViewportSliceIdentity> {
-        let window = self.window.as_ref()?;
-        let target = target_in_window_coordinates(
-            self.latest_anchor?,
-            window.anchor,
-            self.desired_offset_from_bottom,
-        )?;
-        window.visible_rows(target)?;
+        let (window, target) =
+            self.window_for(self.latest_anchor?, self.desired_offset_from_bottom)?;
         slice_identity(window, target)
     }
 
-    /// Returns the last complete slice committed for presentation.
+    /// Last complete slice committed for presentation.
     #[must_use]
     pub fn presented_rows(&self) -> Option<&[Row]> {
-        let window = self.window.as_ref()?;
-        let target = target_in_window_coordinates(
-            self.latest_anchor?,
-            window.anchor,
-            self.presented_offset_from_bottom?,
-        )?;
+        let (window, target) =
+            self.window_for(self.latest_anchor?, self.presented_offset_from_bottom?)?;
         window.visible_rows(target)
     }
 
-    /// Returns the immutable identity of the last locally presentable slice.
+    /// Immutable identity of the last locally presentable slice.
     #[must_use]
     pub fn presented_slice_identity(&self) -> Option<ViewportSliceIdentity> {
-        let window = self.window.as_ref()?;
-        let target = target_in_window_coordinates(
-            self.latest_anchor?,
-            window.anchor,
-            self.presented_offset_from_bottom?,
-        )?;
-        window.visible_rows(target)?;
+        let (window, target) =
+            self.window_for(self.latest_anchor?, self.presented_offset_from_bottom?)?;
         slice_identity(window, target)
     }
 
@@ -328,7 +416,9 @@ impl<Row> ViewportCache<Row> {
             // latest metrics separate from the immutable response snapshot and
             // force the next live gesture to refill instead of presenting stale
             // live rows as the new revision.
-            cache_action = AnchorCacheAction::InvalidateRows;
+            if self.pages.is_none() {
+                cache_action = AnchorCacheAction::InvalidateRows;
+            }
             presented_offset_from_bottom = None;
         }
         self.anchor_observation(
@@ -346,9 +436,17 @@ impl<Row> ViewportCache<Row> {
     pub fn commit_anchor_observation(&mut self, observation: ViewportAnchorObservation) -> bool {
         match observation.cache_action {
             AnchorCacheAction::Preserve => {}
-            AnchorCacheAction::InvalidateRows => self.window = None,
+            AnchorCacheAction::InvalidateRows => {
+                self.window = None;
+                if let Some(pages) = &mut self.pages {
+                    pages.discard_unpinned();
+                }
+            }
             AnchorCacheAction::InvalidateAll => {
                 self.window = None;
+                if let Some(pages) = &mut self.pages {
+                    pages.discard_unpinned();
+                }
                 self.pending_query = None;
             }
         }
@@ -367,13 +465,8 @@ impl<Row> ViewportCache<Row> {
         compatible: bool,
     ) -> ViewportAnchorObservation {
         let presented_slice_identity = if cache_action == AnchorCacheAction::Preserve {
-            self.window.as_ref().and_then(|window| {
-                let target = target_in_window_coordinates(
-                    latest_anchor?,
-                    window.anchor,
-                    presented_offset_from_bottom?,
-                )?;
-                window.visible_rows(target)?;
+            latest_anchor.and_then(|latest| {
+                let (window, target) = self.window_for(latest, presented_offset_from_bottom?)?;
                 slice_identity(window, target)
             })
         } else {
@@ -400,9 +493,13 @@ impl<Row> ViewportCache<Row> {
         };
         self.desired_offset_from_bottom =
             target_offset_from_bottom.min(anchor.max_offset_from_bottom);
+        if let Some(pages) = &mut self.pages {
+            pages.touch(anchor, self.desired_offset_from_bottom);
+        }
         let render_local = self.visible_rows().is_some();
         let request = if self.pending_query.is_none()
-            && (!render_local || self.needs_prefetch(self.desired_offset_from_bottom))
+            && (!render_local
+                || (self.pages.is_none() && self.needs_prefetch(self.desired_offset_from_bottom)))
         {
             let query = make_query(anchor, self.desired_offset_from_bottom);
             self.pending_query = Some(query);
@@ -420,6 +517,20 @@ impl<Row> ViewportCache<Row> {
     pub fn install_window(
         &mut self,
         window: CachedViewportWindow<Row>,
+    ) -> Result<ViewportCacheInstall, CachedViewportWindow<Row>> {
+        if self.pages.is_some() {
+            return Err(window);
+        }
+        self.install_accounted_window(window, 0)
+    }
+
+    /// Installs one correlated reply. `nested_bytes` accounts cell buffers,
+    /// strings and other allocations reachable from rows, excluding the row Vec
+    /// itself. Multi-page callers must use this method rather than omit accounting.
+    pub fn install_accounted_window(
+        &mut self,
+        window: CachedViewportWindow<Row>,
+        nested_bytes: usize,
     ) -> Result<ViewportCacheInstall, CachedViewportWindow<Row>> {
         let Some(pending_query) = self.pending_query else {
             return Err(window);
@@ -473,8 +584,12 @@ impl<Row> ViewportCache<Row> {
         // A response to a live prefetch cannot update rows after a newer live
         // revision. Leave it dirty and wait for the first actual history miss
         // instead of continuously refreshing under active output.
-        if desired == 0 && response_anchor.revision.get() < latest_anchor.revision.get() {
+        if self.pages.is_none()
+            && desired == 0
+            && response_anchor.revision.get() < latest_anchor.revision.get()
+        {
             return Ok(ViewportCacheInstall {
+                capacity_rejected: false,
                 render_local: false,
                 request: None,
             });
@@ -486,15 +601,30 @@ impl<Row> ViewportCache<Row> {
         let covers_latest = window_target
             .and_then(|target| window.visible_rows(target))
             .is_some();
-        if covers_latest {
+        let mut capacity_rejected = false;
+        if let Some(pages) = &mut self.pages {
+            if !same_identity {
+                pages.discard_unpinned();
+            }
+            capacity_rejected = !pages.insert(window, nested_bytes);
+        } else if covers_latest {
             self.window = Some(window);
         }
-        let request = (!covers_latest).then(|| {
-            let query = make_query(latest_anchor, desired);
-            self.pending_query = Some(query);
-            query
-        });
+        let covers_latest = if self.pages.is_some() {
+            self.visible_rows().is_some()
+        } else {
+            covers_latest
+        };
+        let request = (!covers_latest
+            && !capacity_rejected
+            && (self.pages.is_none() || desired > 0))
+            .then(|| {
+                let query = make_query(latest_anchor, desired);
+                self.pending_query = Some(query);
+                query
+            });
         Ok(ViewportCacheInstall {
+            capacity_rejected,
             render_local: covers_latest,
             request,
         })
@@ -520,6 +650,9 @@ impl<Row> ViewportCache<Row> {
     pub fn invalidate(&mut self) {
         self.latest_anchor = None;
         self.window = None;
+        if let Some(pages) = &mut self.pages {
+            pages.discard_unpinned();
+        }
         self.desired_offset_from_bottom = 0;
         self.presented_offset_from_bottom = None;
         self.pending_query = None;
@@ -532,6 +665,9 @@ impl<Row> ViewportCache<Row> {
         // pixels are not part of this reducer; stale rows must not satisfy a
         // later cache hit or be repainted after invalidation.
         self.window = None;
+        if let Some(pages) = &mut self.pages {
+            pages.discard_unpinned();
+        }
         self.presented_offset_from_bottom = None;
     }
 
@@ -549,9 +685,45 @@ impl<Row> ViewportCache<Row> {
             query
         });
         ViewportCacheInstall {
+            capacity_rejected: false,
             render_local: false,
             request,
         }
+    }
+
+    /// Fills missing pages toward travel without moving the desired viewport.
+    /// The caller derives a 2–8 screen horizon from velocity/latency, or four
+    /// screens for initial warmup. One correlation owner bounds all reads.
+    pub fn prefetch_toward(
+        &mut self,
+        offset: u64,
+        older: bool,
+        screens: u8,
+    ) -> Option<TerminalHistoryWindowQuery> {
+        self.pages.as_ref()?;
+        if self.pending_query.is_some() {
+            return None;
+        }
+        let anchor = self.latest_anchor?;
+        for screen in 1..=screens.clamp(2, 8) {
+            let distance = u64::from(anchor.viewport.rows) * u64::from(screen);
+            let target = if older {
+                offset
+                    .saturating_add(distance)
+                    .min(anchor.max_offset_from_bottom)
+            } else {
+                offset.saturating_sub(distance)
+            };
+            if target == offset {
+                break;
+            }
+            if self.window_for(anchor, target).is_none() {
+                let query = make_query(anchor, target);
+                self.pending_query = Some(query);
+                return Some(query);
+            }
+        }
+        None
     }
 
     fn needs_prefetch(&self, target: u64) -> bool {
@@ -648,6 +820,205 @@ mod tests {
             max_offset_from_bottom: maximum,
             viewport: crate::terminal::TerminalSize::new(4, 10),
         }
+    }
+
+    fn response(query: TerminalHistoryWindowQuery) -> CachedViewportWindow<i64> {
+        let shape = query
+            .response_shape(query.anchor)
+            .expect("valid test fixture");
+        CachedViewportWindow {
+            disposition: shape.disposition,
+            anchor: query.anchor,
+            target_offset_from_bottom: shape.target_offset_from_bottom,
+            first_row_from_live_top: shape.first_row_from_live_top,
+            rows: (0..shape.row_count)
+                .map(|row| {
+                    query.anchor.max_offset_from_bottom as i64
+                        + shape.first_row_from_live_top
+                        + row as i64
+                })
+                .collect(),
+        }
+    }
+    fn paged(rows: usize, bytes: usize) -> ViewportCache<i64> {
+        let mut cache = ViewportCache::with_budget(ViewportCacheBudget { rows, bytes });
+        cache.observe_anchor(anchor(1, 100));
+        cache
+    }
+    fn fetch(cache: &mut ViewportCache<i64>, offset: u64, nested: usize) -> ViewportCacheInstall {
+        let query = cache
+            .set_target(offset)
+            .request
+            .expect("valid test fixture");
+        cache
+            .install_accounted_window(response(query), nested)
+            .expect("valid test fixture")
+    }
+
+    #[test]
+    fn multiple_pages_backtrack_locally_and_preserve_proven_rows_on_live_updates() {
+        let mut cache = paged(4096, 16 * 1024 * 1024);
+        fetch(&mut cache, 12, 0);
+        fetch(&mut cache, 20, 0);
+        fetch(&mut cache, 28, 0);
+        for offset in (8..=32).chain((8..=32).rev()) {
+            let update = cache.set_target(offset);
+            assert!(update.render_local);
+            assert!(update.request.is_none());
+            assert_eq!(
+                cache.visible_rows().expect("valid test fixture")[0],
+                100 - offset as i64
+            );
+        }
+        let _ = cache.set_target(0);
+        cache.defer_pending_request();
+        cache.observe_anchor(anchor(2, 100));
+        assert!(cache.set_target(12).render_local);
+        cache.commit_visible_presentation();
+        cache.observe_anchor(anchor(3, 107));
+        assert_eq!(cache.desired_offset_from_bottom(), 19);
+        assert_eq!(
+            cache.visible_rows().expect("valid test fixture"),
+            &[88, 89, 90, 91]
+        );
+    }
+
+    #[test]
+    fn mutable_live_rows_cannot_be_relabelled_as_history_after_append() {
+        let mut cache = paged(4096, 16 * 1024 * 1024);
+        fetch(&mut cache, 0, 0);
+        let pin = cache.pin_visible_window().expect("valid test fixture");
+        cache.observe_anchor(anchor(2, 104));
+        // Offset four translates to the old live screen, which was mutable.
+        assert!(!cache.set_target(4).render_local);
+        cache.defer_pending_request();
+        // Historical part of that same immutable page remains reusable.
+        assert!(cache.set_target(8).render_local);
+        assert_eq!(
+            cache.visible_rows().expect("valid test fixture"),
+            &[96, 97, 98, 99]
+        );
+        assert_eq!(
+            pin.visible_rows(0).expect("valid test fixture"),
+            &[100, 101, 102, 103]
+        );
+    }
+
+    #[test]
+    fn row_budget_evicts_lru_but_never_pinned_selection_source() {
+        let mut cache = paged(24, usize::MAX);
+        fetch(&mut cache, 12, 0);
+        let selected = cache.pin_visible_window().expect("valid test fixture");
+        fetch(&mut cache, 28, 0);
+        fetch(&mut cache, 44, 0);
+        assert_eq!(cache.retained_usage().expect("valid test fixture").rows, 24);
+        assert!(cache.set_target(12).render_local);
+        assert_eq!(
+            selected.visible_rows(12).expect("valid test fixture"),
+            &[88, 89, 90, 91]
+        );
+        assert!(!cache.set_target(28).render_local);
+        cache.defer_pending_request();
+        drop(selected);
+        fetch(&mut cache, 60, 0);
+        assert!(cache.retained_usage().expect("valid test fixture").rows <= 24);
+    }
+
+    #[test]
+    fn pinned_capacity_rejection_clears_request_without_eviction_or_retry_loop() {
+        let mut cache = paged(12, usize::MAX);
+        fetch(&mut cache, 12, 0);
+        let pin = cache.pin_visible_window().expect("valid test fixture");
+        let rejected = fetch(&mut cache, 40, 0);
+        assert!(rejected.capacity_rejected);
+        assert!(!rejected.render_local);
+        assert!(rejected.request.is_none());
+        assert!(!cache.request_pending());
+        assert_eq!(
+            pin.visible_rows(12).expect("valid test fixture"),
+            &[88, 89, 90, 91]
+        );
+        drop(pin);
+        assert!(!fetch(&mut cache, 40, 0).capacity_rejected);
+    }
+
+    #[test]
+    fn nested_allocation_budget_is_admitted_and_oversized_response_is_atomic() {
+        let mut cache = paged(4096, 1800);
+        assert!(!fetch(&mut cache, 12, 1000).capacity_rejected);
+        let before = cache.retained_usage().expect("valid test fixture");
+        assert!(before.bytes >= 1000);
+        assert!(before.bytes <= 1800);
+        assert!(fetch(&mut cache, 40, 1800).capacity_rejected);
+        assert_eq!(cache.retained_usage().expect("valid test fixture"), before);
+        assert!(!fetch(&mut cache, 40, 1000).capacity_rejected);
+        assert!(cache.retained_usage().expect("valid test fixture").bytes <= 1800);
+    }
+
+    #[test]
+    fn bounded_prefetch_has_one_owner_and_gives_latest_miss_priority() {
+        let mut cache = paged(4096, 16 * 1024 * 1024);
+        let first = cache
+            .prefetch_toward(0, true, 4)
+            .expect("valid test fixture");
+        assert!(cache.prefetch_toward(0, true, 4).is_none());
+        assert_eq!(cache.desired_offset_from_bottom(), 0);
+        let _ = cache.set_target(80);
+        let next = cache
+            .install_accounted_window(response(first), 0)
+            .expect("valid test fixture");
+        assert_eq!(
+            next.request
+                .expect("valid test fixture")
+                .target_offset_from_bottom,
+            80
+        );
+        cache
+            .install_accounted_window(response(next.request.expect("valid test fixture")), 0)
+            .expect("valid test fixture");
+        assert!(cache.visible_rows().is_some());
+        assert!(cache.set_target(4).render_local); // completed speculative page was kept
+    }
+
+    #[test]
+    fn warmup_fills_four_screens_without_duplicate_reads() {
+        let mut cache = paged(4096, 16 * 1024 * 1024);
+        let mut queries = 0;
+        while let Some(query) = cache.prefetch_toward(0, true, 4) {
+            queries += 1;
+            assert!(queries <= 3);
+            assert!(response(query).rows.len() <= MAX_HISTORY_WINDOW_ROWS);
+            cache
+                .install_accounted_window(response(query), 0)
+                .expect("valid test fixture");
+        }
+        assert_eq!(queries, 2);
+        for offset in 4..=16 {
+            assert!(cache.set_target(offset).render_local);
+        }
+    }
+
+    #[test]
+    fn epoch_change_rejects_joining_but_preserves_frozen_pins_and_accounting() {
+        let mut cache = paged(24, usize::MAX);
+        fetch(&mut cache, 12, 0);
+        let pin = cache.pin_visible_window().expect("valid test fixture");
+        let changed = TerminalHistoryWindowAnchor {
+            epoch: Revision::new(2),
+            ..anchor(2, 100)
+        };
+        assert!(!cache.observe_anchor(changed));
+        assert!(!cache.set_target(12).render_local);
+        assert_eq!(cache.retained_usage().expect("valid test fixture").rows, 12);
+        assert_eq!(
+            pin.visible_rows(12).expect("valid test fixture"),
+            &[88, 89, 90, 91]
+        );
+        cache.invalidate();
+        assert_eq!(cache.retained_usage().expect("valid test fixture").rows, 12);
+        drop(pin);
+        cache.invalidate();
+        assert_eq!(cache.retained_usage().expect("valid test fixture").rows, 0);
     }
 
     #[test]

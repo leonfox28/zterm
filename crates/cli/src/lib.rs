@@ -17,6 +17,7 @@ use zterm_daemon::operations::{
 use zterm_daemon::pairing::PairTicketText;
 use zterm_daemon::service::{DaemonStatus, SessionImpact};
 
+mod pair_qr;
 mod terminal_ui;
 
 pub use terminal_ui::run_terminal;
@@ -242,6 +243,12 @@ struct PairCreateArgs {
     /// Ticket lifetime such as 60s, 10m, or 1h.
     #[arg(long, value_parser = parse_pair_ttl)]
     ttl: Option<u32>,
+    /// Show a QR code on interactive stdout.
+    #[arg(long, conflicts_with = "qr_image")]
+    qr: bool,
+    /// Save a QR code to a new PNG file; stdout still contains the ticket.
+    #[arg(long, value_name = "NEW_PNG_PATH")]
+    qr_image: Option<PathBuf>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -662,6 +669,15 @@ async fn pair(
 ) -> Result<CommandOutcome, CliError> {
     match command {
         PairCommand::Create(arguments) => {
+            if arguments.qr && !io::stdout().is_terminal() {
+                return Err(CliError::Usage(
+                    "--qr requires interactive stdout; use --qr-image or the default ticket output"
+                        .to_owned(),
+                ));
+            }
+            if let Some(path) = &arguments.qr_image {
+                pair_qr::check_destination(path)?;
+            }
             let ttl = arguments.ttl.unwrap_or(
                 u32::try_from(zterm_core::DEFAULT_PAIR_TTL_SECONDS)
                     .expect("default TTL fits wire field"),
@@ -670,7 +686,19 @@ async fn pair(
             eprintln!(
                 "Ticket expires in {ttl} seconds. On the connecting device, run zterm pair accept and paste this ticket."
             );
-            let output = Zeroizing::new(format!("{}\n", ticket.expose()));
+            let mut output = Zeroizing::new(format!("{}\n", ticket.expose()));
+            let presentation = if arguments.qr {
+                pair_qr::terminal(ticket.expose()).map(|qr| output = qr)
+            } else if let Some(path) = &arguments.qr_image {
+                pair_qr::write_png(ticket.expose(), path)
+            } else {
+                Ok(())
+            };
+            if let Err(error) = presentation {
+                // The offer was already committed. Preserve that exact ticket for
+                // manual entry rather than silently create another offer.
+                eprintln!("QR presentation failed: {error}. Use the ticket printed below.");
+            }
             drop(ticket);
             Ok(CommandOutcome::PairTicket(output))
         }

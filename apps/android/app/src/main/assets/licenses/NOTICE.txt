@@ -1,0 +1,8 @@
+UniFFI 0.32.0 — Mozilla and contributors
+
+This app uses unmodified UniFFI runtime/bindings and its generated code.
+Source: https://github.com/mozilla/uniffi-rs/tree/v0.32.0
+Source archive: https://github.com/mozilla/uniffi-rs/archive/refs/tags/v0.32.0.tar.gz
+License: Mozilla Public License 2.0, included as UniFFI-MPL-2.0.txt.
+Crate versions are pinned in Cargo.lock. UniFFI source remains available under
+MPL-2.0; distribution of this app does not restrict those source rights.

@@ -85,10 +85,10 @@ matrix explicit:
   conforming terminal.
 - Continuous interaction uses the renderer-neutral
   `ViewportCache<TerminalSurfaceRow>` in
-  core: wheel, Page, mouse drag, and future touch gestures update a local
+  core: wheel, Page, mouse drag, and Android touch gestures update a local
   desired offset immediately. The desktop CLI presents only the latest complete
-  cached slice through an event-driven 16 ms minimum interval; Android should
-  use native display vsync rather than inherit that constant. Network window
+  cached slice through an event-driven 16 ms minimum interval; Android uses
+  native display vsync rather than inheriting that constant. Network window
   reads are bounded miss/low-water prefetch, never the per-gesture animation
   loop; one in-flight request coalesces to the latest target.
 - Semantic rows, anchors, deltas, and history windows are the canonical v2 wire
@@ -113,6 +113,11 @@ matrix explicit:
   chrome, compositor, or desktop presenter. Begin Android implementation only
   after the macOS/Linux local/direct/relay matrix above is recorded, so mobile
   work does not hide a host transport or nested-TUI regression.
+  The Android task records the user's completed host-baseline confirmation and
+  separately observed Android direct/relay evidence. Shared outbound client
+  ownership now lives in `crates/client`; see
+  [Shared client](../backend/shared-client.md) and
+  [Android application](../frontend/android-app.md).
 
 ## Incident: Windows Rust Formatting Failure
 

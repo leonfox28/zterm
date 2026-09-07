@@ -1,0 +1,6 @@
+{"file": ".trellis/tasks/09-06-android-app/prd.md", "reason": "Approved Android product and acceptance requirements"}
+{"file": ".trellis/tasks/09-06-android-app/design.md", "reason": "Approved architecture and native bridge contracts"}
+{"file": ".trellis/spec/backend/shared-client.md", "reason": "Shared protocol input source and lifetime contracts"}
+{"file": ".trellis/spec/frontend/android-app.md", "reason": "Android UI identity lifecycle and build conventions"}
+{"file": ".trellis/tasks/09-06-android-app/research/selection-touch-recovery.md", "reason": "Selection exit ownership and projection optimization scope"}
+{"file": ".trellis/tasks/09-06-android-app/research/client-architecture-cleanup.md", "reason": "Approved architecture cleanup and typed handshake/shutdown evidence"}

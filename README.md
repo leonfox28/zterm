@@ -5,7 +5,9 @@ terminal Sessions and end-to-end encrypted Iroh connections. The current tree
 contains the shared terminal/domain model, versioned protobuf contract, secure
 per-user state, one same-UID daemon, pairing and directional authorization, a
 daemon-owned connection broker, local and remote Session adapters, and the
-public raw-terminal CLI.
+public raw-terminal CLI. The Android app adds native touch scrolling, cross-screen
+selection, system IME, QR pairing and Session management over the same shared
+client. See [Android build, usage and APK installation](docs/android.md).
 
 This is still a development build. The Linux real-Iroh remote Session target
 exists but its hosted runtime result and public multi-process CLI evidence are
@@ -31,7 +33,7 @@ zterm setup [--name <name>] [--profile <official-n0|self-hosted>]
             [--relay-url <https-url>]
 zterm status
 zterm doctor
-zterm pair create [--ttl <duration-with-s|m|h-suffix>]
+zterm pair create [--ttl <duration-with-s|m|h-suffix>] [--qr | --qr-image <new.png>]
 zterm pair accept [--stdin] [--alias <alias>]
 zterm device list
 zterm device rename <device> <alias>
@@ -96,7 +98,7 @@ version.
 - `install/` and `tools/release/` — the reviewed bootstrap/template and private
   signed native-asset assembler.
 - `.github/workflows/release.yml` — protected exact-tag native Release workflow
-  for the three supported Unix targets, reusing exact main CI candidates.
+  for the three supported Unix targets and Android arm64, reusing exact main CI candidates.
 - `docs/development.md` — exact local toolchain baseline and repeatable commands.
 - `docs/releasing.md` — one-PR version preparation, exact main candidates, signing,
   publication, and resumable operator commands.

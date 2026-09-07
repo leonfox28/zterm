@@ -60,40 +60,7 @@ type MutationResult = Result<SessionSummary, DaemonError>;
 type FinalAttachmentUpdate = Result<Option<AttachmentUpdate>, DaemonError>;
 type FinalAttachmentUpdateSlot = Arc<Mutex<Option<FinalAttachmentUpdate>>>;
 
-/// Current user-visible state of one live session.
-#[derive(Clone, Eq, PartialEq)]
-pub struct SessionSummary {
-    /// Stable daemon-lifetime identity.
-    pub session_id: SessionId,
-    /// Current unique name.
-    pub name: SessionName,
-    /// Latest host terminal revision.
-    pub revision: Revision,
-    /// Whether an attachment owns controller input.
-    pub has_controller: bool,
-    /// Validated working directory used to start the login shell.
-    pub working_directory: PathBuf,
-    /// Last accepted terminal viewport.
-    pub viewport: TerminalSize,
-}
-
-impl fmt::Debug for SessionSummary {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("SessionSummary")
-            .field("session_id", &self.session_id)
-            .field("name", &self.name)
-            .field("revision", &self.revision)
-            .field("has_controller", &self.has_controller)
-            .field("working_directory", &"[REDACTED]")
-            .field(
-                "working_directory_len",
-                &self.working_directory.as_os_str().len(),
-            )
-            .field("viewport", &self.viewport)
-            .finish()
-    }
-}
+pub use zterm_client::model::SessionSummary;
 
 /// Latest state transition of one attachment.
 #[derive(Clone, Debug, Eq, PartialEq)]

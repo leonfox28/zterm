@@ -8,7 +8,7 @@
 
 This directory contains guidelines for backend development. Fill in each file with your project's specific conventions.
 
-Current CI/distribution scope is macOS arm64 and Linux arm64/x64. Intel macOS,
+Current CI/distribution scope is macOS arm64, Linux arm64/x64 and Android arm64. Intel macOS,
 Windows CI/distribution, and relay image publication remain paused until an
 explicit future task requests them; see [Distribution](./distribution-lifecycle.md).
 
@@ -18,6 +18,7 @@ explicit future task requests them; see [Distribution](./distribution-lifecycle.
 
 | Guide | Description | Status |
 |-------|-------------|--------|
+| [Shared Client and Android Bridge](./shared-client.md) | Shared outbound protocol ownership, mobile source/input epochs, bounded pages and validation | Active |
 | [Directory Structure](./directory-structure.md) | Module organization and file layout | To fill |
 | [Database Guidelines](./database-guidelines.md) | ORM patterns, queries, migrations | To fill |
 | [Error Handling](./error-handling.md) | Error types, handling strategies | To fill |

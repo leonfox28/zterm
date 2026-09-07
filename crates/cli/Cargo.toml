@@ -13,10 +13,14 @@ path = "src/main.rs"
 base64.workspace = true
 clap.workspace = true
 futures-util.workspace = true
+qrcode.workspace = true
+png.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 unicode-width.workspace = true
 zeroize.workspace = true
 zterm-core.workspace = true
+zterm-client.workspace = true
 zterm-daemon.workspace = true
 
 [target.'cfg(unix)'.dependencies]
@@ -24,7 +28,6 @@ nix = { workspace = true, features = ["term"] }
 rustix.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
 zterm-platform.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]

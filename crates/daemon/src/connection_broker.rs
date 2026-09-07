@@ -17,15 +17,15 @@ use futures_util::StreamExt;
 use iroh::endpoint::{Connection, PathEvent, RecvStream, SendStream, VarInt};
 use iroh::{Endpoint, EndpointAddr, TransportAddr};
 use ring::rand::{SecureRandom, SystemRandom};
-use tokio::io::{AsyncRead, AsyncReadExt};
+
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use zterm_core::{
-    AuthGeneration, AuthorizationSnapshot, AuthorizationStatus, Capabilities, ConnectionAttemptId,
-    ConnectionCandidateKey, ConnectionHello, ConnectionWelcome, DeviceDisplayName, DeviceId,
-    DomainErrorKind, RelayHint, TransportLimits, designated_primary,
+    AuthGeneration, AuthorizationSnapshot, AuthorizationStatus, ConnectionAttemptId,
+    ConnectionCandidateKey, ConnectionHello, ConnectionWelcome, DeviceId, DomainErrorKind,
+    RelayHint, TransportLimits, designated_primary,
 };
-use zterm_proto::{DecodedFrame, FrameDecoder, WireKind, encode_message, v2};
+use zterm_proto::{DecodedFrame, WireKind, encode_message, v2};
 
 use crate::authorization::AuthorizationRegistry;
 use crate::error::DaemonError;
@@ -37,7 +37,6 @@ use crate::route::{RouteResolver, device_from_endpoint_id, endpoint_id_from_devi
 use crate::store::{RelayRouteCache, StoreHandle};
 use crate::transport::{ZTERM_ALPN, ZTERM_PAIR_ALPN};
 
-const CLOSE_UNAUTHORIZED: u32 = 0x100;
 const CLOSE_INCOMPATIBLE: u32 = 0x101;
 const CLOSE_DUPLICATE: u32 = 0x102;
 const CLOSE_SHUTTING_DOWN: u32 = 0x103;
@@ -47,94 +46,10 @@ const STREAM_REJECTED: u32 = 0x200;
 const RETRY_BASE: Duration = Duration::from_millis(250);
 const RETRY_CAP: Duration = Duration::from_secs(10);
 
-/// Stable local diagnostics placed in every normal connection handshake.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ConnectionIdentity {
-    device_id: DeviceId,
-    display_name: DeviceDisplayName,
-    build: String,
-    platform: String,
-    capabilities: Capabilities,
-}
-
-impl ConnectionIdentity {
-    /// Validates local display/build/platform fields once at composition time.
-    pub fn new(
-        device_id: DeviceId,
-        display_name: impl Into<String>,
-        build: impl Into<String>,
-        platform: impl Into<String>,
-        capabilities: Capabilities,
-    ) -> Result<Self, DaemonError> {
-        let display_name = DeviceDisplayName::new(display_name).map_err(|error| {
-            DaemonError::new(
-                DomainErrorKind::IdentityInvalid,
-                format!("invalid local device display name: {error}"),
-            )
-        })?;
-        let build = build.into();
-        let platform = platform.into();
-        // Reuse the domain handshake constructor as the single text boundary.
-        ConnectionHello::new(
-            zterm_proto::WIRE_MAJOR,
-            zterm_proto::WIRE_MAJOR,
-            capabilities,
-            ConnectionAttemptId::from_array([1; 16]),
-            display_name.as_str(),
-            build.clone(),
-            platform.clone(),
-        )
-        .map_err(|error| {
-            DaemonError::new(
-                DomainErrorKind::IdentityInvalid,
-                format!("invalid local connection diagnostics: {error}"),
-            )
-        })?;
-        Ok(Self {
-            device_id,
-            display_name,
-            build,
-            platform,
-            capabilities,
-        })
-    }
-
-    /// Product-default local diagnostics.
-    pub fn product(
-        device_id: DeviceId,
-        display_name: impl Into<String>,
-    ) -> Result<Self, DaemonError> {
-        Self::new(
-            device_id,
-            display_name,
-            env!("CARGO_PKG_VERSION"),
-            format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
-            Capabilities::from_bits_retain(
-                Capabilities::LOCAL_LIFECYCLE
-                    | Capabilities::SESSION_SERVICE
-                    | Capabilities::TERMINAL_SERVICE,
-            ),
-        )
-    }
-
-    /// Stable public device ID.
-    #[must_use]
-    pub const fn device_id(&self) -> DeviceId {
-        self.device_id
-    }
-
-    /// Validated local display name used by pairing and normal handshakes.
-    #[must_use]
-    pub fn display_name(&self) -> &str {
-        self.display_name.as_str()
-    }
-
-    /// Stable product build string used only for peer diagnostics.
-    #[must_use]
-    pub fn build(&self) -> &str {
-        &self.build
-    }
-}
+pub use zterm_client::handshake::ConnectionIdentity;
+use zterm_client::handshake::{
+    CLOSE_UNAUTHORIZED, controller_handshake, read_one_frame, write_handshake_message,
+};
 
 /// Why the broker is intentionally closing a peer connection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -348,7 +263,7 @@ impl RemoteServiceHandlerSlot {
 impl fmt::Debug for ConnectionBroker {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut debug = formatter.debug_struct("ConnectionBroker");
-        debug.field("local_device_id", &self.inner.identity.device_id);
+        debug.field("local_device_id", &self.inner.identity.device_id());
         #[cfg(unix)]
         debug.field(
             "service_handler_installed",
@@ -1138,13 +1053,13 @@ impl ConnectionBroker {
         authorization: AuthorizationRegistry,
         limits: TransportLimits,
     ) -> Result<Self, DaemonError> {
-        if endpoint.id().as_bytes() != identity.device_id.as_bytes() {
+        if endpoint.id().as_bytes() != identity.device_id().as_bytes() {
             return Err(DaemonError::new(
                 DomainErrorKind::IdentityStateMismatch,
                 "test Endpoint identity does not match broker identity",
             ));
         }
-        let (reporter, observer) = NetworkReporter::initializing(identity.device_id);
+        let (reporter, observer) = NetworkReporter::initializing(identity.device_id());
         reporter.update(|observation| {
             observation.state = crate::network::NetworkState::Bound;
             observation.endpoint_bound = true;
@@ -1261,7 +1176,7 @@ impl ConnectionBroker {
         if self.inner.lifecycle.is_quiescing() {
             return Err(cancelled("pairing transport is stopping"));
         }
-        if remote == self.inner.identity.device_id {
+        if remote == self.inner.identity.device_id() {
             return Err(DaemonError::new(
                 DomainErrorKind::Unauthorized,
                 "a device cannot pair with its own endpoint identity",
@@ -1288,7 +1203,7 @@ impl ConnectionBroker {
             .borrow()
             .clone()
             .ok_or_else(|| transport_unavailable("Iroh Endpoint is not bound"))?;
-        if endpoint.id().as_bytes() != self.inner.identity.device_id.as_bytes() {
+        if endpoint.id().as_bytes() != self.inner.identity.device_id().as_bytes() {
             return Err(DaemonError::new(
                 DomainErrorKind::IdentityStateMismatch,
                 "bound Endpoint does not own the broker identity",
@@ -1335,7 +1250,7 @@ impl ConnectionBroker {
             }
             return PairConnection::from_authenticated(
                 connection,
-                self.inner.identity.device_id,
+                self.inner.identity.device_id(),
                 remote,
                 route.verified_relay,
                 admission,
@@ -1363,7 +1278,7 @@ impl ConnectionBroker {
             close_connection(&connection, CLOSE_INCOMPATIBLE, b"identity mismatch");
             return Err(error);
         }
-        if remote == self.inner.identity.device_id {
+        if remote == self.inner.identity.device_id() {
             close_connection(&connection, CLOSE_UNAUTHORIZED, b"not authorized");
             return Err(DaemonError::new(
                 DomainErrorKind::Unauthorized,
@@ -1373,7 +1288,7 @@ impl ConnectionBroker {
         let verified_relay = selected_relay(&connection);
         PairConnection::from_authenticated(
             connection,
-            self.inner.identity.device_id,
+            self.inner.identity.device_id(),
             remote,
             verified_relay,
             admission,
@@ -1386,7 +1301,7 @@ impl ConnectionBroker {
         remote: DeviceId,
         transient_routes: Vec<RelayHint>,
     ) -> Result<ConnectionDemand, DaemonError> {
-        if remote == self.inner.identity.device_id {
+        if remote == self.inner.identity.device_id() {
             return Err(DaemonError::new(
                 DomainErrorKind::TransportUnavailable,
                 "the local device cannot be reached through its own broker",
@@ -1483,7 +1398,7 @@ impl ConnectionBroker {
             endpoint.close().await;
             return Err(transport_unavailable("network transport is stopping"));
         }
-        if endpoint.id().as_bytes() != self.inner.identity.device_id.as_bytes() {
+        if endpoint.id().as_bytes() != self.inner.identity.device_id().as_bytes() {
             endpoint.close().await;
             return Err(DaemonError::new(
                 DomainErrorKind::IdentityStateMismatch,
@@ -1813,7 +1728,7 @@ impl ConnectionBroker {
             .borrow()
             .clone()
             .ok_or_else(|| transport_unavailable("Iroh Endpoint is not bound"))?;
-        if endpoint.id().as_bytes() != self.inner.identity.device_id.as_bytes() {
+        if endpoint.id().as_bytes() != self.inner.identity.device_id().as_bytes() {
             return Err(DaemonError::new(
                 DomainErrorKind::IdentityStateMismatch,
                 "bound Endpoint does not own the broker identity",
@@ -1829,7 +1744,7 @@ impl ConnectionBroker {
             .dial_routes(&endpoint, slot.remote, &transient_routes, deadline)
             .await?;
         let attempt = random_attempt_id()?;
-        let key = ConnectionCandidateKey::new(self.inner.identity.device_id, attempt);
+        let key = ConnectionCandidateKey::new(self.inner.identity.device_id(), attempt);
         let mut last_error = None;
 
         for route in routes {
@@ -1964,69 +1879,14 @@ impl ConnectionBroker {
             .await?;
         let deadline = Instant::now() + self.inner.limits.first_frame_deadline;
         let result = async {
-            let (mut send, mut recv) = timeout_until(deadline, candidate.connection.open_bi())
-                .await?
-                .map_err(|_| transport_unavailable("unable to open Hello stream"))?;
-            let hello = ConnectionHello::new(
-                zterm_proto::WIRE_MAJOR,
-                zterm_proto::WIRE_MAJOR,
-                self.inner.identity.capabilities,
+            let welcome = controller_handshake(
+                &candidate.connection,
+                &self.inner.identity,
                 key.attempt,
-                self.inner.identity.display_name.as_str(),
-                self.inner.identity.build.clone(),
-                self.inner.identity.platform.clone(),
-            )
-            .map_err(|error| {
-                DaemonError::new(
-                    DomainErrorKind::IdentityInvalid,
-                    format!("local Hello became invalid: {error}"),
-                )
-            })?;
-            write_handshake_message(
-                &mut send,
-                WireKind::ConnectionHello,
-                &v2::ConnectionHello::from(&hello),
-                deadline,
-            )
-            .await?;
-            send.finish()
-                .map_err(|_| transport_unavailable("unable to finish Hello stream"))?;
-            let frame = read_handshake_frame(
-                &mut recv,
                 self.inner.limits.max_pair_hello_frame_bytes,
                 deadline,
             )
-            .await
-            .map_err(|error| {
-                if matches!(
-                    error.kind(),
-                    DomainErrorKind::MalformedFrame
-                        | DomainErrorKind::FrameTooLarge
-                        | DomainErrorKind::ControlPayloadTooLarge
-                ) {
-                    error
-                } else {
-                    DaemonError::new(
-                        DomainErrorKind::Unauthorized,
-                        "remote did not complete an authorized normal handshake",
-                    )
-                }
-            })?;
-            let wire: v2::ConnectionWelcome = frame
-                .decode_message(WireKind::ConnectionWelcome)
-                .map_err(protocol_error)?;
-            let welcome = ConnectionWelcome::try_from(wire).map_err(|error| {
-                DaemonError::new(
-                    DomainErrorKind::WireMajorMismatch,
-                    format!("invalid ConnectionWelcome: {error}"),
-                )
-            })?;
-            if welcome.wire_major() != zterm_proto::WIRE_MAJOR {
-                return Err(DaemonError::new(
-                    DomainErrorKind::WireMajorMismatch,
-                    "remote selected an incompatible wire major",
-                ));
-            }
+            .await?;
             {
                 let mut state = slot.state.lock().await;
                 state.remote_acceptance = Some(welcome.accepted_authorization_generation());
@@ -2124,10 +1984,10 @@ impl ConnectionBroker {
 
         let welcome = ConnectionWelcome::new(
             zterm_proto::WIRE_MAJOR,
-            self.inner.identity.capabilities,
-            self.inner.identity.display_name.as_str(),
-            self.inner.identity.build.clone(),
-            self.inner.identity.platform.clone(),
+            self.inner.identity.capabilities(),
+            self.inner.identity.display_name(),
+            self.inner.identity.build().to_owned(),
+            self.inner.identity.platform().to_owned(),
             admission.snapshot.generation,
         )
         .map_err(|error| {
@@ -2696,18 +2556,6 @@ impl BrokerMetrics {
     }
 }
 
-async fn write_handshake_message<M: prost::Message>(
-    send: &mut SendStream,
-    kind: WireKind,
-    message: &M,
-    deadline: Instant,
-) -> Result<(), DaemonError> {
-    let bytes = encode_message(kind, 0, 0, message).map_err(protocol_error)?;
-    timeout_until(deadline, send.write_all(&bytes))
-        .await?
-        .map_err(|_| transport_unavailable("handshake stream write failed"))
-}
-
 async fn read_handshake_frame(
     recv: &mut RecvStream,
     maximum_body_bytes: usize,
@@ -2721,51 +2569,6 @@ async fn read_service_frame(
     deadline: Instant,
 ) -> Result<DecodedFrame, DaemonError> {
     read_one_frame(recv, zterm_proto::MAX_FRAME_BYTES, deadline).await
-}
-
-async fn read_one_frame<Reader>(
-    recv: &mut Reader,
-    maximum_body_bytes: usize,
-    deadline: Instant,
-) -> Result<DecodedFrame, DaemonError>
-where
-    Reader: AsyncRead + Unpin,
-{
-    timeout_until(deadline, async {
-        let mut decoder = FrameDecoder::with_maximum_body_bytes(maximum_body_bytes);
-        let mut buffer = [0_u8; 4096];
-        loop {
-            let read = AsyncReadExt::read(recv, &mut buffer)
-                .await
-                .map_err(|_| transport_unavailable("stream read failed"))?;
-            if read == 0 {
-                decoder.finish().map_err(protocol_error)?;
-                return Err(DaemonError::new(
-                    DomainErrorKind::MalformedFrame,
-                    "stream ended before its first frame",
-                ));
-            }
-            let frames = decoder.feed(&buffer[..read]).map_err(protocol_error)?;
-            match frames.len() {
-                0 => {}
-                1 => {
-                    return frames.into_iter().next().ok_or_else(|| {
-                        DaemonError::new(
-                            DomainErrorKind::MalformedFrame,
-                            "decoder returned an inconsistent frame count",
-                        )
-                    });
-                }
-                _ => {
-                    return Err(DaemonError::new(
-                        DomainErrorKind::MalformedFrame,
-                        "stream sent multiple frames before dispatch",
-                    ));
-                }
-            }
-        }
-    })
-    .await?
 }
 
 fn reject_stream(send: &mut SendStream, recv: &mut RecvStream, _reason: &'static [u8]) {

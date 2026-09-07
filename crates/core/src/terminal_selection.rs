@@ -1,6 +1,6 @@
 //! Renderer-neutral terminal text-range normalization and extraction.
 
-use std::fmt;
+use std::{borrow::Borrow, fmt};
 
 use crate::terminal::{
     MAX_TERMINAL_CLIPBOARD_BYTES, TerminalCell, TerminalClipboardError, TerminalClipboardWrite,
@@ -52,9 +52,9 @@ impl TerminalTextRange {
     }
 
     /// Expands endpoints so a wide glyph is selected atomically.
-    pub fn expand_wide(
+    pub fn expand_wide<Row: Borrow<TerminalSurfaceRow>>(
         self,
-        rows: &[TerminalSurfaceRow],
+        rows: &[Row],
     ) -> Result<Self, TerminalTextSelectionError> {
         validate_point(rows, self.start)?;
         validate_point(rows, self.end)?;
@@ -87,9 +87,9 @@ impl TerminalTextRange {
     }
 
     /// Extracts exact semantic text under the shared clipboard byte limit.
-    pub fn extract(
+    pub fn extract<Row: Borrow<TerminalSurfaceRow>>(
         self,
-        rows: &[TerminalSurfaceRow],
+        rows: &[Row],
     ) -> Result<TerminalClipboardWrite, TerminalTextSelectionError> {
         let range = self.expand_wide(rows)?;
         let mut text = String::new();
@@ -97,7 +97,8 @@ impl TerminalTextRange {
         for row_index in range.start.row..=range.end.row {
             let row = rows
                 .get(usize::from(row_index))
-                .ok_or(TerminalTextSelectionError::InvalidRange)?;
+                .ok_or(TerminalTextSelectionError::InvalidRange)?
+                .borrow();
             let first_column = if row_index == range.start.row {
                 range.start.column
             } else {
@@ -158,25 +159,26 @@ impl fmt::Display for TerminalTextSelectionError {
 
 impl std::error::Error for TerminalTextSelectionError {}
 
-fn validate_point(
-    rows: &[TerminalSurfaceRow],
+fn validate_point<Row: Borrow<TerminalSurfaceRow>>(
+    rows: &[Row],
     point: TerminalTextPoint,
 ) -> Result<(), TerminalTextSelectionError> {
     let row = rows
         .get(usize::from(point.row))
-        .ok_or(TerminalTextSelectionError::InvalidRange)?;
+        .ok_or(TerminalTextSelectionError::InvalidRange)?
+        .borrow();
     if usize::from(point.column) >= row.cells.len() {
         return Err(TerminalTextSelectionError::InvalidRange);
     }
     Ok(())
 }
 
-fn cell(
-    rows: &[TerminalSurfaceRow],
+fn cell<Row: Borrow<TerminalSurfaceRow>>(
+    rows: &[Row],
     point: TerminalTextPoint,
 ) -> Result<&TerminalCell, TerminalTextSelectionError> {
     rows.get(usize::from(point.row))
-        .and_then(|row| row.cells.get(usize::from(point.column)))
+        .and_then(|row| row.borrow().cells.get(usize::from(point.column)))
         .ok_or(TerminalTextSelectionError::InvalidRange)
 }
 

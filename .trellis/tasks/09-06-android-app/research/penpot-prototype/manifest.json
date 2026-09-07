@@ -1,0 +1,1145 @@
+{
+  "pageId": "c828d3cf-7d4e-8145-8008-98f4fa037d49",
+  "fileId": "c828d3cf-7d4e-8145-8008-98f4fa037d48",
+  "revision": 8,
+  "boards": [
+    {
+      "key": "home",
+      "id": "89af369c-c4a2-806f-8008-98fcc53e4a71",
+      "name": "01 · 主机",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "scanner",
+      "id": "89af369c-c4a2-806f-8008-98fcc5959a2e",
+      "name": "02 · 扫码配对",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "sessions",
+      "id": "89af369c-c4a2-806f-8008-98fcc5dc25ed",
+      "name": "03 · 标题展开 / android-app",
+      "width": 390,
+      "height": 326,
+      "preview": false
+    },
+    {
+      "key": "album",
+      "id": "89af369c-c4a2-806f-8008-98fcc63b0886",
+      "name": "系统交互说明 / 图片选择器",
+      "width": 390,
+      "height": 250,
+      "preview": false,
+      "role": "editor-only system handoff"
+    },
+    {
+      "key": "ticket",
+      "id": "89af369c-c4a2-806f-8008-98fcc67d920e",
+      "name": "凭据弹窗 / 空白",
+      "width": 342,
+      "height": 272,
+      "preview": false
+    },
+    {
+      "key": "paired",
+      "id": "89af369c-c4a2-806f-8008-98fcc6b810e7",
+      "name": "07 · 配对成功",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "terminal",
+      "id": "89af369c-c4a2-806f-8008-98fd5fee3833",
+      "name": "04 · 终端 / 底部",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "keyboard",
+      "id": "89af369c-c4a2-806f-8008-98fd60e53e3b",
+      "name": "08 · 终端 / 键盘展开",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "history",
+      "id": "89af369c-c4a2-806f-8008-98fd62c29481",
+      "name": "09 · 终端 / 向上滚动",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "selection",
+      "id": "89af369c-c4a2-806f-8008-98fd6374d25f",
+      "name": "10 · 选区复制",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "extended",
+      "id": "89af369c-c4a2-806f-8008-98fd64513e78",
+      "name": "11 · 跨屏延伸选区",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "copied",
+      "id": "89af369c-c4a2-806f-8008-98fd65274965",
+      "name": "17 · 终端 / 复制后",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "recover",
+      "id": "89af369c-c4a2-806f-8008-98fd65ef1203",
+      "name": "12 · 连接恢复",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "new",
+      "id": "89af369c-c4a2-806f-8008-98fddadfd813",
+      "name": "13 · 新建会话",
+      "width": 390,
+      "height": 488,
+      "preview": false
+    },
+    {
+      "key": "rename",
+      "id": "89af369c-c4a2-806f-8008-98fddbe7e369",
+      "name": "15 · 重命名会话",
+      "width": 390,
+      "height": 352,
+      "preview": false
+    },
+    {
+      "key": "close",
+      "id": "89af369c-c4a2-806f-8008-98fddc41d12d",
+      "name": "16 · 结束会话确认",
+      "width": 342,
+      "height": 312,
+      "preview": false
+    },
+    {
+      "key": "takeover",
+      "id": "89af369c-c4a2-806f-8008-98fddca2ebde",
+      "name": "21 · 接管会话确认",
+      "width": 342,
+      "height": 354,
+      "preview": false
+    },
+    {
+      "key": "hostOffline",
+      "id": "89af369c-c4a2-806f-8008-98fddd05d7fd",
+      "name": "22 · 主机暂不可达",
+      "width": 342,
+      "height": 304,
+      "preview": false
+    },
+    {
+      "key": "renamed",
+      "id": "89af369c-c4a2-806f-8008-98fddd54b734",
+      "name": "18 · 标题展开 / android-work",
+      "width": 390,
+      "height": 326,
+      "preview": false
+    },
+    {
+      "key": "closed",
+      "id": "89af369c-c4a2-806f-8008-98fddf0b9535",
+      "name": "19 · 终端 / 会话已结束",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "newTerminal",
+      "id": "89af369c-c4a2-806f-8008-98fde06325f5",
+      "name": "20 · 新会话已创建",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "devTerminal",
+      "id": "89af369c-c4a2-806f-8008-98fde1edc11d",
+      "name": "23 · 切换到开发服务",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "deployTerminal",
+      "id": "89af369c-c4a2-806f-8008-98fde3840a21",
+      "name": "24 · 接管部署会话",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "renamedTerminal",
+      "id": "89af369c-c4a2-806f-8008-98fde579e60d",
+      "name": "25 · 重命名后继续工作",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "ticketReady",
+      "id": "89af369c-c4a2-806f-8008-98fef7138a07",
+      "name": "凭据弹窗 / 已填入",
+      "width": 342,
+      "height": 272,
+      "preview": false
+    },
+    {
+      "key": "settings",
+      "id": "89af369c-c4a2-806f-8008-9904cb720ce8",
+      "name": "设置 / system / system",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "homeNoRecent",
+      "id": "89af369c-c4a2-806f-8008-9904cd3d46fe",
+      "name": "28 · 主机 / 无最近连接",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "pickerDev",
+      "id": "89af369c-c4a2-806f-8008-99091e741cd1",
+      "name": "标题展开 / dev-server",
+      "width": 390,
+      "height": 326,
+      "preview": false
+    },
+    {
+      "key": "pickerDeploy",
+      "id": "89af369c-c4a2-806f-8008-99091fa8ac18",
+      "name": "标题展开 / deploy",
+      "width": 390,
+      "height": 326,
+      "preview": false
+    },
+    {
+      "key": "pickerNew",
+      "id": "89af369c-c4a2-806f-8008-990920e28b9b",
+      "name": "标题展开 / scratch",
+      "width": 390,
+      "height": 382,
+      "preview": false
+    },
+    {
+      "key": "pickerIdle",
+      "id": "89af369c-c4a2-806f-8008-9909221f7121",
+      "name": "标题展开 / 会话",
+      "width": 390,
+      "height": 270,
+      "preview": false
+    },
+    {
+      "key": "rowActions0",
+      "id": "89af369c-c4a2-806f-8008-990c25de3c18",
+      "name": "会话操作 / android-app",
+      "width": 390,
+      "height": 202,
+      "preview": false
+    },
+    {
+      "key": "rowRename0",
+      "id": "89af369c-c4a2-806f-8008-990c261b17f4",
+      "name": "重命名 / android-app",
+      "width": 390,
+      "height": 352,
+      "preview": false
+    },
+    {
+      "key": "rowClose0",
+      "id": "89af369c-c4a2-806f-8008-990c262dca48",
+      "name": "结束确认 / android-app",
+      "width": 342,
+      "height": 312,
+      "preview": false
+    },
+    {
+      "key": "rowActions1",
+      "id": "89af369c-c4a2-806f-8008-990c26754ff7",
+      "name": "会话操作 / dev-server",
+      "width": 390,
+      "height": 202,
+      "preview": false
+    },
+    {
+      "key": "rowRename1",
+      "id": "89af369c-c4a2-806f-8008-990c26a456bc",
+      "name": "重命名 / dev-server",
+      "width": 390,
+      "height": 352,
+      "preview": false
+    },
+    {
+      "key": "rowClose1",
+      "id": "89af369c-c4a2-806f-8008-990c26b5e00a",
+      "name": "结束确认 / dev-server",
+      "width": 342,
+      "height": 312,
+      "preview": false
+    },
+    {
+      "key": "rowActions2",
+      "id": "89af369c-c4a2-806f-8008-990c27035df6",
+      "name": "会话操作 / deploy",
+      "width": 390,
+      "height": 202,
+      "preview": false
+    },
+    {
+      "key": "rowRename2",
+      "id": "89af369c-c4a2-806f-8008-990c2735af3b",
+      "name": "重命名 / deploy",
+      "width": 390,
+      "height": 352,
+      "preview": false
+    },
+    {
+      "key": "rowClose2",
+      "id": "89af369c-c4a2-806f-8008-990c274829a0",
+      "name": "结束确认 / deploy",
+      "width": 342,
+      "height": 312,
+      "preview": false
+    },
+    {
+      "key": "rowActions3",
+      "id": "89af369c-c4a2-806f-8008-990c279f745f",
+      "name": "会话操作 / scratch",
+      "width": 390,
+      "height": 202,
+      "preview": false
+    },
+    {
+      "key": "rowRename3",
+      "id": "89af369c-c4a2-806f-8008-990c27e31274",
+      "name": "重命名 / scratch",
+      "width": 390,
+      "height": 352,
+      "preview": false
+    },
+    {
+      "key": "rowClose3",
+      "id": "89af369c-c4a2-806f-8008-990c27ffc712",
+      "name": "结束确认 / scratch",
+      "width": 342,
+      "height": 312,
+      "preview": false
+    },
+    {
+      "key": "rowActions4",
+      "id": "89af369c-c4a2-806f-8008-990c28c6706e",
+      "name": "会话操作 / android-work",
+      "width": 390,
+      "height": 202,
+      "preview": false
+    },
+    {
+      "key": "rowRename4",
+      "id": "89af369c-c4a2-806f-8008-990c29bda45d",
+      "name": "重命名 / android-work",
+      "width": 390,
+      "height": 352,
+      "preview": false
+    },
+    {
+      "key": "rowClose4",
+      "id": "89af369c-c4a2-806f-8008-990c29fb304a",
+      "name": "结束确认 / android-work",
+      "width": 342,
+      "height": 312,
+      "preview": false
+    },
+    {
+      "key": "rowActionsCurrent",
+      "id": "89af369c-c4a2-806f-8008-990c2aed4d91",
+      "name": "会话操作 / android-app 当前",
+      "width": 390,
+      "height": 202,
+      "preview": false
+    },
+    {
+      "key": "settings_system_dark",
+      "id": "89af369c-c4a2-806f-8008-991397b1b36c",
+      "name": "设置 / system / dark",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "settings_system_light",
+      "id": "89af369c-c4a2-806f-8008-99139d39a0d0",
+      "name": "设置 / system / light",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "settings_zh_system",
+      "id": "89af369c-c4a2-806f-8008-9913a0fa696a",
+      "name": "设置 / zh / system",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "settings_zh_dark",
+      "id": "89af369c-c4a2-806f-8008-9913a4ad1889",
+      "name": "设置 / zh / dark",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "settings_zh_light",
+      "id": "89af369c-c4a2-806f-8008-9913a85b4a92",
+      "name": "设置 / zh / light",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "settings_en_system",
+      "id": "89af369c-c4a2-806f-8008-9913abe9a69c",
+      "name": "设置 / en / system",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "settings_en_dark",
+      "id": "89af369c-c4a2-806f-8008-9913b00b29d7",
+      "name": "设置 / en / dark",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "settings_en_light",
+      "id": "89af369c-c4a2-806f-8008-9913b592959d",
+      "name": "设置 / en / light",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "font_zh_dark_12",
+      "id": "89af369c-c4a2-806f-8008-991a00f183d4",
+      "name": "字号 / zh / dark / 12",
+      "width": 342,
+      "height": 280,
+      "preview": false
+    },
+    {
+      "key": "font_zh_dark_14",
+      "id": "89af369c-c4a2-806f-8008-991a07e7a6c1",
+      "name": "字号 / zh / dark / 14",
+      "width": 342,
+      "height": 280,
+      "preview": false
+    },
+    {
+      "key": "font_zh_dark_16",
+      "id": "89af369c-c4a2-806f-8008-991a1129db6f",
+      "name": "字号 / zh / dark / 16",
+      "width": 342,
+      "height": 280,
+      "preview": false
+    },
+    {
+      "key": "font_zh_light_12",
+      "id": "89af369c-c4a2-806f-8008-991a17f49223",
+      "name": "字号 / zh / light / 12",
+      "width": 342,
+      "height": 280,
+      "preview": false
+    },
+    {
+      "key": "font_zh_light_14",
+      "id": "89af369c-c4a2-806f-8008-991a1ef1bf0e",
+      "name": "字号 / zh / light / 14",
+      "width": 342,
+      "height": 280,
+      "preview": false
+    },
+    {
+      "key": "font_zh_light_16",
+      "id": "89af369c-c4a2-806f-8008-991a2724c2d4",
+      "name": "字号 / zh / light / 16",
+      "width": 342,
+      "height": 280,
+      "preview": false
+    },
+    {
+      "key": "font_en_dark_12",
+      "id": "89af369c-c4a2-806f-8008-991a2fc71e56",
+      "name": "字号 / en / dark / 12",
+      "width": 342,
+      "height": 280,
+      "preview": false
+    },
+    {
+      "key": "font_en_dark_14",
+      "id": "89af369c-c4a2-806f-8008-991a36a806a9",
+      "name": "字号 / en / dark / 14",
+      "width": 342,
+      "height": 280,
+      "preview": false
+    },
+    {
+      "key": "font_en_dark_16",
+      "id": "89af369c-c4a2-806f-8008-991a3d38a9fd",
+      "name": "字号 / en / dark / 16",
+      "width": 342,
+      "height": 280,
+      "preview": false
+    },
+    {
+      "key": "font_en_light_12",
+      "id": "89af369c-c4a2-806f-8008-991a4589e5aa",
+      "name": "字号 / en / light / 12",
+      "width": 342,
+      "height": 280,
+      "preview": false
+    },
+    {
+      "key": "font_en_light_14",
+      "id": "89af369c-c4a2-806f-8008-991a4e222962",
+      "name": "字号 / en / light / 14",
+      "width": 342,
+      "height": 280,
+      "preview": false
+    },
+    {
+      "key": "font_en_light_16",
+      "id": "89af369c-c4a2-806f-8008-991a55157458",
+      "name": "字号 / en / light / 16",
+      "width": 342,
+      "height": 280,
+      "preview": false
+    },
+    {
+      "key": "landscape",
+      "id": "89af369c-c4a2-806f-8008-991b619f4b66",
+      "name": "终端 / 横屏",
+      "width": 844,
+      "height": 390,
+      "preview": true
+    },
+    {
+      "key": "landscapeSessions",
+      "id": "89af369c-c4a2-806f-8008-991b831403bb",
+      "name": "横屏 / 标题展开",
+      "width": 844,
+      "height": 312,
+      "preview": false
+    },
+    {
+      "key": "homeRemoved",
+      "id": "89af369c-c4a2-806f-8008-991b858058c0",
+      "name": "主机 / 已移除 MacStudio",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "removeDevice",
+      "id": "89af369c-c4a2-806f-8008-991b86ad1254",
+      "name": "移除设备 / MacStudio",
+      "width": 342,
+      "height": 228,
+      "preview": false
+    },
+    {
+      "key": "homeRemovalDemo",
+      "id": "89af369c-c4a2-806f-8008-991b8b8e3735",
+      "name": "主机 / 长按设备示例",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "homeEmpty",
+      "id": "89af369c-c4a2-806f-8008-991b8c281733",
+      "name": "主机 / 尚未添加",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "firstEntry",
+      "id": "89af369c-c4a2-806f-8008-991cfba548d1",
+      "name": "终端 / 首次选择会话",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "firstSessions",
+      "id": "89af369c-c4a2-806f-8008-991cfcc49b10",
+      "name": "首次连接 / 多个会话",
+      "width": 390,
+      "height": 326,
+      "preview": false
+    },
+    {
+      "key": "firstEmpty",
+      "id": "89af369c-c4a2-806f-8008-991cfee7660a",
+      "name": "终端 / 暂无会话",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "newFromEmpty",
+      "id": "89af369c-c4a2-806f-8008-991cffb748c2",
+      "name": "新建会话 / 首个会话",
+      "width": 390,
+      "height": 488,
+      "preview": false
+    },
+    {
+      "key": "firstCreated",
+      "id": "89af369c-c4a2-806f-8008-991d00741a67",
+      "name": "终端 / 首个会话已创建",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "firstEmptyList",
+      "id": "89af369c-c4a2-806f-8008-991d0142f46c",
+      "name": "标题展开 / 暂无会话",
+      "width": 390,
+      "height": 154,
+      "preview": false
+    },
+    {
+      "key": "firstCreatedList",
+      "id": "89af369c-c4a2-806f-8008-991d0663139f",
+      "name": "标题展开 / 首个 scratch",
+      "width": 390,
+      "height": 214,
+      "preview": false
+    },
+    {
+      "key": "firstOneConnecting",
+      "id": "89af369c-c4a2-806f-8008-991d0bcfcc84",
+      "name": "终端 / 首次连接单个会话",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "recoverFailed",
+      "id": "89af369c-c4a2-806f-8008-991d41fdce36",
+      "name": "终端 / 重连失败",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "revoked",
+      "id": "89af369c-c4a2-806f-8008-991d43b9dde4",
+      "name": "终端 / 授权已失效",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "scannerDenied",
+      "id": "89af369c-c4a2-806f-8008-991d44c87ffe",
+      "name": "扫码 / 相机未授权",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "imageNoQr",
+      "id": "89af369c-c4a2-806f-8008-991d4adfe2b4",
+      "name": "扫码 / 图片中无二维码",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "ticketPending",
+      "id": "89af369c-c4a2-806f-8008-991d89477c21",
+      "name": "连接凭据 / 连接中",
+      "width": 342,
+      "height": 272,
+      "preview": false
+    },
+    {
+      "key": "ticketExpired",
+      "id": "89af369c-c4a2-806f-8008-991d8a815d2f",
+      "name": "连接凭据 / 凭据已过期",
+      "width": 342,
+      "height": 304,
+      "preview": false
+    },
+    {
+      "key": "ticketExpiredDemo",
+      "id": "89af369c-c4a2-806f-8008-991d8ceb0d1c",
+      "name": "扫码 / 凭据已过期示例",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    },
+    {
+      "key": "ticketInvalid",
+      "id": "89af369c-c4a2-806f-8008-991d8da53241",
+      "name": "连接凭据 / 凭据格式不正确",
+      "width": 342,
+      "height": 304,
+      "preview": false
+    },
+    {
+      "key": "ticketInvalidDemo",
+      "id": "89af369c-c4a2-806f-8008-991d915eac54",
+      "name": "扫码 / 凭据格式不正确示例",
+      "width": 390,
+      "height": 844,
+      "preview": true
+    }
+  ],
+  "interactions": 354,
+  "textOverflow": [],
+  "invalidDestinations": [],
+  "flows": [
+    {
+      "name": "扫码 · 凭据无效",
+      "start": "89af369c-c4a2-806f-8008-991d915eac54"
+    },
+    {
+      "name": "完整流程 · 从主机开始",
+      "start": "89af369c-c4a2-806f-8008-98fcc53e4a71"
+    },
+    {
+      "name": "首次连接 · 无会话",
+      "start": "89af369c-c4a2-806f-8008-991cfee7660a"
+    },
+    {
+      "name": "终端 · 横屏",
+      "start": "89af369c-c4a2-806f-8008-991b619f4b66"
+    },
+    {
+      "name": "配对 · 三种入口",
+      "start": "89af369c-c4a2-806f-8008-98fcc5959a2e"
+    },
+    {
+      "name": "扫码 · 图片无二维码",
+      "start": "89af369c-c4a2-806f-8008-991d4adfe2b4"
+    },
+    {
+      "name": "扫码 · 相机权限",
+      "start": "89af369c-c4a2-806f-8008-991d44c87ffe"
+    },
+    {
+      "name": "扫码 · 凭据过期",
+      "start": "89af369c-c4a2-806f-8008-991d8ceb0d1c"
+    },
+    {
+      "name": "连接 · 重连失败",
+      "start": "89af369c-c4a2-806f-8008-991d41fdce36"
+    },
+    {
+      "name": "首页 · 尚未添加",
+      "start": "89af369c-c4a2-806f-8008-991b8c281733"
+    },
+    {
+      "name": "首次连接 · 多个会话",
+      "start": "89af369c-c4a2-806f-8008-991cfba548d1"
+    },
+    {
+      "name": "首次连接 · 一个会话",
+      "start": "89af369c-c4a2-806f-8008-991d0bcfcc84"
+    },
+    {
+      "name": "连接 · 授权失效",
+      "start": "89af369c-c4a2-806f-8008-991d43b9dde4"
+    },
+    {
+      "name": "设备 · 长按移除",
+      "start": "89af369c-c4a2-806f-8008-991b8b8e3735"
+    },
+    {
+      "name": "终端 · 输入与跨屏复制",
+      "start": "89af369c-c4a2-806f-8008-98fd5fee3833"
+    }
+  ],
+  "shortcutRows": [
+    {
+      "key": "terminal",
+      "rows": [
+        {
+          "keys": 8,
+          "y": 764,
+          "width": 373.9999999999998,
+          "opacity": null
+        }
+      ],
+      "gridBottom": 754
+    },
+    {
+      "key": "keyboard",
+      "rows": [
+        {
+          "keys": 8,
+          "y": 478,
+          "width": 373.9999999999998,
+          "opacity": null
+        }
+      ],
+      "gridBottom": 465
+    },
+    {
+      "key": "history",
+      "rows": [
+        {
+          "keys": 8,
+          "y": 764,
+          "width": 373.99999999999994,
+          "opacity": null
+        }
+      ],
+      "gridBottom": 754
+    },
+    {
+      "key": "selection",
+      "rows": [
+        {
+          "keys": 8,
+          "y": 764,
+          "width": 374,
+          "opacity": null
+        }
+      ],
+      "gridBottom": 754
+    },
+    {
+      "key": "extended",
+      "rows": [
+        {
+          "keys": 8,
+          "y": 764,
+          "width": 374,
+          "opacity": null
+        }
+      ],
+      "gridBottom": 720
+    },
+    {
+      "key": "copied",
+      "rows": [
+        {
+          "keys": 8,
+          "y": 764,
+          "width": 373.99999999999994,
+          "opacity": null
+        }
+      ],
+      "gridBottom": 754
+    },
+    {
+      "key": "recover",
+      "rows": [
+        {
+          "keys": 8,
+          "y": 764,
+          "width": 373.9999999999998,
+          "opacity": 0.35
+        }
+      ],
+      "gridBottom": 754
+    },
+    {
+      "key": "closed",
+      "rows": [
+        {
+          "keys": 8,
+          "y": 764,
+          "width": 374,
+          "opacity": 0.35
+        }
+      ],
+      "gridBottom": 0
+    },
+    {
+      "key": "newTerminal",
+      "rows": [
+        {
+          "keys": 8,
+          "y": 764,
+          "width": 373.9999999999998,
+          "opacity": null
+        }
+      ],
+      "gridBottom": 142
+    },
+    {
+      "key": "devTerminal",
+      "rows": [
+        {
+          "keys": 8,
+          "y": 764,
+          "width": 374,
+          "opacity": null
+        }
+      ],
+      "gridBottom": 142
+    },
+    {
+      "key": "deployTerminal",
+      "rows": [
+        {
+          "keys": 8,
+          "y": 764,
+          "width": 373.9999999999998,
+          "opacity": null
+        }
+      ],
+      "gridBottom": 176
+    },
+    {
+      "key": "renamedTerminal",
+      "rows": [
+        {
+          "keys": 8,
+          "y": 764,
+          "width": 373.99999999999994,
+          "opacity": null
+        }
+      ],
+      "gridBottom": 754
+    },
+    {
+      "key": "landscape",
+      "rows": [
+        {
+          "keys": 8,
+          "y": 322,
+          "width": 828,
+          "opacity": null
+        }
+      ],
+      "gridBottom": 312
+    },
+    {
+      "key": "firstEntry",
+      "rows": [
+        {
+          "keys": 8,
+          "y": 764,
+          "width": 374,
+          "opacity": 0.35
+        }
+      ],
+      "gridBottom": 0
+    },
+    {
+      "key": "firstEmpty",
+      "rows": [
+        {
+          "keys": 8,
+          "y": 764,
+          "width": 374,
+          "opacity": 0.35
+        }
+      ],
+      "gridBottom": 0
+    },
+    {
+      "key": "firstCreated",
+      "rows": [
+        {
+          "keys": 8,
+          "y": 764,
+          "width": 374,
+          "opacity": null
+        }
+      ],
+      "gridBottom": 142
+    },
+    {
+      "key": "firstOneConnecting",
+      "rows": [
+        {
+          "keys": 8,
+          "y": 764,
+          "width": 374,
+          "opacity": 0.35
+        }
+      ],
+      "gridBottom": 0
+    },
+    {
+      "key": "recoverFailed",
+      "rows": [
+        {
+          "keys": 8,
+          "y": 764,
+          "width": 373.9999999999998,
+          "opacity": 0.35
+        }
+      ],
+      "gridBottom": 754
+    },
+    {
+      "key": "revoked",
+      "rows": [
+        {
+          "keys": 8,
+          "y": 764,
+          "width": 374,
+          "opacity": 0.35
+        }
+      ],
+      "gridBottom": 0
+    }
+  ],
+  "homeTargets": [
+    {
+      "key": "home",
+      "cards": [
+        {
+          "name": "Recent connection",
+          "actions": [
+            {
+              "type": "navigate-to",
+              "to": "89af369c-c4a2-806f-8008-98fd5fee3833"
+            }
+          ]
+        },
+        {
+          "name": "Host / MacStudio",
+          "actions": [
+            {
+              "type": "navigate-to",
+              "to": "89af369c-c4a2-806f-8008-98fd5fee3833"
+            }
+          ]
+        },
+        {
+          "name": "Host / build-server",
+          "actions": [
+            {
+              "type": "open-overlay",
+              "to": "89af369c-c4a2-806f-8008-98fddd05d7fd"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "key": "homeNoRecent",
+      "cards": [
+        {
+          "name": "Host / MacStudio",
+          "actions": [
+            {
+              "type": "navigate-to",
+              "to": "89af369c-c4a2-806f-8008-991cfba548d1"
+            }
+          ]
+        },
+        {
+          "name": "Host / build-server",
+          "actions": [
+            {
+              "type": "open-overlay",
+              "to": "89af369c-c4a2-806f-8008-98fddd05d7fd"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "key": "homeRemoved",
+      "cards": [
+        {
+          "name": "Host / build-server",
+          "actions": [
+            {
+              "type": "open-overlay",
+              "to": "89af369c-c4a2-806f-8008-98fddd05d7fd"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "fontDialogs": [
+    {
+      "key": "font_zh_dark_12",
+      "selected": 1
+    },
+    {
+      "key": "font_zh_dark_14",
+      "selected": 1
+    },
+    {
+      "key": "font_zh_dark_16",
+      "selected": 1
+    },
+    {
+      "key": "font_zh_light_12",
+      "selected": 1
+    },
+    {
+      "key": "font_zh_light_14",
+      "selected": 1
+    },
+    {
+      "key": "font_zh_light_16",
+      "selected": 1
+    },
+    {
+      "key": "font_en_dark_12",
+      "selected": 1
+    },
+    {
+      "key": "font_en_dark_14",
+      "selected": 1
+    },
+    {
+      "key": "font_en_dark_16",
+      "selected": 1
+    },
+    {
+      "key": "font_en_light_12",
+      "selected": 1
+    },
+    {
+      "key": "font_en_light_14",
+      "selected": 1
+    },
+    {
+      "key": "font_en_light_16",
+      "selected": 1
+    }
+  ],
+  "limitation": "Static click/state illustrations; no Android runtime, persisted preferences, OS permissions/picker, network, clipboard, or true touch gesture execution."
+}

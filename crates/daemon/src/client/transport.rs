@@ -1,20 +1,23 @@
 //! Direct and opaque-tunnel byte transport for one attachment epoch.
-use super::{
-    DEFAULT_DEADLINE, attachment_cancelled, connect_error, daemon_io,
-    local_attachment_command_error, local_attachment_io, malformed, service_error,
-};
-use crate::{
-    device_directory::ResolvedSessionTarget, error::DaemonError, service::protocol_error,
-    session_wire::FirstFrame,
-};
-use std::{collections::VecDeque, path::Path};
+use std::{collections::VecDeque, path::Path, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use zeroize::Zeroizing;
+use zterm_client::transport::{
+    AttachmentConnector, AttachmentIo, AttachmentTransport, AttachmentTransportItem,
+    TransportFuture,
+};
+use zterm_client::{
+    error::ClientError as DaemonError,
+    framing::FirstFrame,
+    model::ResolvedSessionTarget,
+    protocol::{DEFAULT_DEADLINE, attachment_cancelled, malformed, protocol_error, service_error},
+};
 use zterm_core::DomainErrorKind;
 use zterm_proto::{DecodedFrame, FrameDecoder, WireKind, encode_message, v2};
 
-pub(super) enum AttachmentTransport {
-    Closed,
+/// Concrete same-UID Session adapter, including opaque remote envelopes.
+#[allow(missing_docs)]
+pub(super) enum UnixAttachmentTransport {
     Direct {
         stream: tokio::net::UnixStream,
         decoder: FrameDecoder,
@@ -30,19 +33,17 @@ pub(super) enum AttachmentTransport {
     },
 }
 
-pub(super) enum AttachmentTransportItem {
-    Session(DecodedFrame),
-    Path(v2::LocalSessionTunnelPath),
-}
-
-impl AttachmentTransport {
+impl UnixAttachmentTransport {
     pub(super) async fn open(
         socket: &Path,
         target: ResolvedSessionTarget,
     ) -> Result<Self, DaemonError> {
-        tokio::time::timeout_at(super::control_deadline(), Self::open_inner(socket, target))
-            .await
-            .map_err(|_| super::control_timeout())?
+        tokio::time::timeout_at(
+            zterm_client::protocol::control_deadline(),
+            Self::open_inner(socket, target),
+        )
+        .await
+        .map_err(|_| zterm_client::protocol::control_timeout())?
     }
 
     async fn open_inner(socket: &Path, target: ResolvedSessionTarget) -> Result<Self, DaemonError> {
@@ -118,7 +119,6 @@ impl AttachmentTransport {
 
     pub(super) fn queued_session_count(&self) -> usize {
         match self {
-            Self::Closed => 0,
             Self::Direct { queued, .. } => queued.len(),
             Self::Tunnel {
                 queued_session_frames,
@@ -127,46 +127,8 @@ impl AttachmentTransport {
         }
     }
 
-    pub(super) async fn write_session_bytes(&mut self, bytes: &[u8]) -> Result<(), DaemonError> {
-        self.write_until(bytes, super::control_deadline()).await
-    }
-
-    pub(super) fn invalidate(&mut self) {
-        *self = Self::Closed;
-    }
-
-    pub(super) async fn write_until(
-        &mut self,
-        bytes: &[u8],
-        deadline: tokio::time::Instant,
-    ) -> Result<(), DaemonError> {
-        // Move the epoch into the write future. Cancellation drops its socket;
-        // only a complete write can restore it for subsequent commands.
-        let mut epoch = std::mem::replace(self, Self::Closed);
-        let result = if deadline <= tokio::time::Instant::now() {
-            Err(super::control_timeout())
-        } else {
-            tokio::time::timeout_at(deadline, epoch.write_inner(bytes))
-                .await
-                .unwrap_or_else(|_| Err(super::control_timeout()))
-        };
-        // A peer may close its read half before delivering a typed terminal
-        // outcome. Preserve only that bounded read-drain opportunity; the
-        // Session client rejects all subsequent writes on this epoch.
-        if result.is_ok()
-            || result
-                .as_ref()
-                .err()
-                .is_some_and(super::is_attachment_command_stream_closed)
-        {
-            *self = epoch;
-        }
-        result
-    }
-
     async fn write_inner(&mut self, bytes: &[u8]) -> Result<(), DaemonError> {
         match self {
-            Self::Closed => Err(attachment_cancelled()),
             Self::Direct { stream, .. } => stream
                 .write_all(bytes)
                 .await
@@ -194,7 +156,6 @@ impl AttachmentTransport {
 
     pub(super) async fn read_item(&mut self) -> Result<AttachmentTransportItem, DaemonError> {
         match self {
-            Self::Closed => Err(attachment_cancelled()),
             Self::Direct {
                 stream,
                 decoder,
@@ -290,17 +251,8 @@ impl AttachmentTransport {
         }
     }
 
-    pub(super) async fn shutdown(&mut self) -> Result<(), DaemonError> {
-        let result = tokio::time::timeout_at(super::control_deadline(), self.shutdown_inner())
-            .await
-            .unwrap_or_else(|_| Err(super::control_timeout()));
-        self.invalidate();
-        result
-    }
-
     async fn shutdown_inner(&mut self) -> Result<(), DaemonError> {
         match self {
-            Self::Closed => Ok(()),
             Self::Direct { stream, .. } => stream
                 .shutdown()
                 .await
@@ -364,6 +316,7 @@ fn tunnel_closed(reason: v2::LocalSessionTunnelCloseReason) -> DaemonError {
     }
 }
 
+/// Reads a tunnel Open result, retaining coalesced envelope bytes.
 pub(super) async fn read_tunnel_first(
     stream: &mut tokio::net::UnixStream,
 ) -> Result<FirstFrame, DaemonError> {
@@ -426,6 +379,7 @@ async fn read_tunnel_frame_parts(
     }
 }
 
+/// Reads one local frame while preserving partial and coalesced bytes.
 pub(super) async fn read_frame_parts(
     stream: &mut tokio::net::UnixStream,
     decoder: &mut FrameDecoder,
@@ -451,4 +405,108 @@ pub(super) async fn read_frame_parts(
             return Ok(frame);
         }
     }
+}
+
+/// Frozen desktop socket factory; aliases have already been resolved by the daemon.
+pub(crate) struct UnixAttachmentConnector {
+    socket: std::path::PathBuf,
+    remote_restarter: Option<Arc<dyn RemoteDaemonRestarter>>,
+}
+
+/// Desktop-only capability for restoring the viewer daemon of a remote Session.
+/// Implementations use the ordinary lifecycle lock; local Sessions never restart.
+pub trait RemoteDaemonRestarter: Send + Sync {
+    /// Ensures the configured local daemon is available for a replacement tunnel.
+    fn ensure_running(&self) -> TransportFuture<'_, Result<(), DaemonError>>;
+}
+
+impl UnixAttachmentConnector {
+    /// Creates a connector without opening or starting the daemon.
+    pub fn new(socket: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            socket: socket.into(),
+            remote_restarter: None,
+        }
+    }
+    /// Injects desktop lifecycle recovery without exposing it to the protocol owner.
+    pub fn with_remote_restarter(mut self, restarter: Arc<dyn RemoteDaemonRestarter>) -> Self {
+        self.remote_restarter = Some(restarter);
+        self
+    }
+}
+impl AttachmentConnector for UnixAttachmentConnector {
+    fn open(
+        &self,
+        target: ResolvedSessionTarget,
+    ) -> TransportFuture<'_, Result<AttachmentTransport, DaemonError>> {
+        Box::pin(async move {
+            let opened = UnixAttachmentTransport::open(&self.socket, target).await;
+            match (opened, &self.remote_restarter, target.device_id()) {
+                (Err(error), Some(restarter), Some(_))
+                    if error.kind() == DomainErrorKind::DaemonStopped =>
+                {
+                    restarter.ensure_running().await?;
+                    UnixAttachmentTransport::open(&self.socket, target).await
+                }
+                (result, _, _) => result,
+            }
+            .map(AttachmentTransport::new)
+        })
+    }
+}
+impl AttachmentIo for UnixAttachmentTransport {
+    fn queued_session_count(&self) -> usize {
+        UnixAttachmentTransport::queued_session_count(self)
+    }
+    fn write<'a>(&'a mut self, bytes: &'a [u8]) -> TransportFuture<'a, Result<(), DaemonError>> {
+        Box::pin(self.write_inner(bytes))
+    }
+    fn read(&mut self) -> TransportFuture<'_, Result<AttachmentTransportItem, DaemonError>> {
+        Box::pin(self.read_item())
+    }
+    fn shutdown(&mut self) -> TransportFuture<'_, Result<(), DaemonError>> {
+        Box::pin(self.shutdown_inner())
+    }
+}
+
+pub(super) fn connect_error(error: std::io::Error) -> DaemonError {
+    let kind = match error.kind() {
+        std::io::ErrorKind::PermissionDenied => DomainErrorKind::PermissionMismatch,
+        _ => DomainErrorKind::DaemonStopped,
+    };
+    DaemonError::new(kind, format!("local daemon is unavailable: {error}"))
+}
+
+pub(super) fn daemon_io(operation: &str, error: std::io::Error) -> DaemonError {
+    DaemonError::new(
+        DomainErrorKind::DaemonStopped,
+        format!("{operation}: {error}"),
+    )
+}
+
+pub(super) fn local_attachment_command_error(error: std::io::Error) -> DaemonError {
+    if is_attachment_closure_error(error.kind()) {
+        zterm_client::protocol::attachment_command_stream_closed()
+    } else {
+        daemon_io("write local terminal message", error)
+    }
+}
+
+pub(super) fn local_attachment_io(operation: &str, error: std::io::Error) -> DaemonError {
+    if is_attachment_closure_error(error.kind()) {
+        attachment_cancelled()
+    } else {
+        daemon_io(operation, error)
+    }
+}
+
+pub(super) const fn is_attachment_closure_error(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::UnexpectedEof
+    )
 }

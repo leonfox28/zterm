@@ -258,11 +258,12 @@ No new crate, background owner, or second Session interpreter is introduced.
   It never blindly replays input, resize, snapshot acknowledgement, history, or
   a possibly committed takeover. A reconnect may accept only a target snapshot
   or a delta contiguous with the advertised applied revision.
-- A production remote view receives one narrow daemon-restart capability from
-  `LocalRuntime`. If opening its replacement IPC socket reports
+- A production remote view's `UnixAttachmentConnector` receives one narrow
+  daemon-restart capability from `LocalRuntime`; the shared Session protocol
+  owner never stores that capability. If opening its IPC socket reports
   `DaemonStopped`, that capability calls the ordinary `DaemonLauncher::ensure`
   with the same `UserPaths`; the lifecycle lock provides cross-frontend
-  singleflight, after which each frontend independently reopens its tunnel.
+  singleflight, after which the adapter independently reopens its tunnel.
   A local view never receives this capability because its target Session ended
   with the stopped daemon and cannot be resumed into a new daemon incarnation.
   Network-only failures never launch the viewer daemon.

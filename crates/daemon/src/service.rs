@@ -1218,24 +1218,7 @@ fn resolved_target_wire(
 }
 
 #[cfg(unix)]
-pub(crate) fn protocol_error(error: zterm_proto::ProtocolError) -> DaemonError {
-    use zterm_proto::ProtocolError;
-    let kind = match error {
-        ProtocolError::WireMajorMismatch { .. } => DomainErrorKind::WireMajorMismatch,
-        ProtocolError::UnknownKind(_) => DomainErrorKind::UnknownKind,
-        ProtocolError::FrameTooLarge(_) => DomainErrorKind::FrameTooLarge,
-        ProtocolError::ControlPayloadTooLarge(_) => DomainErrorKind::ControlPayloadTooLarge,
-        ProtocolError::MalformedVarint
-        | ProtocolError::TruncatedFrame
-        | ProtocolError::MalformedProtobuf(_)
-        | ProtocolError::UnexpectedKind { .. }
-        | ProtocolError::InvalidIdentifier(_)
-        | ProtocolError::InvalidTerminalSize { .. }
-        | ProtocolError::InvalidTerminalSurface(_)
-        | ProtocolError::InvalidTerminalSemanticField(_) => DomainErrorKind::MalformedFrame,
-    };
-    DaemonError::new(kind, error.to_string())
-}
+pub(crate) use zterm_client::protocol::protocol_error;
 
 #[cfg(unix)]
 fn decode_request<Message>(frame: &DecodedFrame) -> Result<Message, DaemonError>

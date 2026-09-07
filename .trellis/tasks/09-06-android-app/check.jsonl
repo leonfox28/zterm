@@ -1,0 +1,6 @@
+{"file": ".trellis/tasks/09-06-android-app/implement.md", "reason": "Ordered implementation and remaining acceptance matrix"}
+{"file": ".trellis/spec/backend/shared-client.md", "reason": "Shared extraction and native epoch validation"}
+{"file": ".trellis/spec/frontend/android-app.md", "reason": "Native UI and signed APK quality checks"}
+{"file": ".trellis/tasks/09-06-android-app/research/implementation-progress.md", "reason": "Actual emulator evidence and explicit pending cases"}
+{"file": ".trellis/tasks/09-06-android-app/research/selection-touch-recovery.md", "reason": "Baseline failure and selection exit regression evidence"}
+{"file": ".trellis/tasks/09-06-android-app/research/client-architecture-cleanup.md", "reason": "Architecture boundaries, captured duplicate closure, and final validation"}

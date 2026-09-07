@@ -9,12 +9,13 @@
   uninstall`, or managed `install.json`.
 - Default publication targets are `aarch64-apple-darwin` and
   `aarch64/x86_64-unknown-linux-gnu`; floors are macOS 13.0 and glibc 2.28.
+  Android arm64 APK publication was added on 2026-09-07; see the extension below.
   macOS Intel, Windows CI/distribution, and relay image publication are paused
   by explicit user direction. Restore them only in a future task that expressly
   requests it. Historical assets and unrelated platform/runtime boundaries are
   not removed by this publication policy.
 - This contract must not introduce background checks, package-manager channels,
-  mirrors, services/login items, sudo installation, or a second signature
+  mirrors, services/login items, sudo installation, or a second runtime signature
   format/verifier.
 
 ### 2. Signatures
@@ -633,3 +634,33 @@ The architectural boundary is the exact clean release commit: before it,
 failures retain local evidence for manual diagnosis; after it, identity can be
 proven across local Git, the remote branch, and the open PR without inventing
 another durable state model.
+
+
+## Android publication addition (2026-09-07)
+
+The user expanded formal publication to Android arm64. The native target set,
+schema-v1 manifest and native installer remain unchanged. Main CI's Android job
+builds/debug-lints/release-lints/JVM-tests the APK and validates package identity,
+source commit, SDK floors, ABI and all packaged 16 KB alignments. CI gate requires
+this job on every event; the main unsigned inventory includes its APK/metadata.
+
+`tools/android/release.py` owns Android versionCode and platform inspection.
+Gradle embeds source/version/code into `assets/zterm-build.json`; the native task
+tracks explicit release authority as an input. Only main candidates set Rust's
+ZTERM_SOURCE_COMMIT authority; PR metadata can identify the synthetic source
+without classifying its native library as a managed release.
+
+The existing protected signing job adds the APK signature using the retained
+PKCS12 certificate pinned by `release/android-certificate.sha256`. The two Android
+secrets have no access from PR/main jobs. The job checks payload equality after
+signing and then the reviewed Rust release tool signs the native manifest and
+exact complete SHA256SUMS bytes. Formal inventory adds `zterm-android-arm64.apk`,
+`zterm-android.json`, `SHA256SUMS.sig`. SHA256SUMS excludes itself and its detached
+signature. Every downstream inventory verification authenticates both signatures
+and all asset digests. The SPDX document includes locked Android release-runtime
+Maven coordinates as well as Cargo packages; unavailable Maven license metadata
+is honestly NOASSERTION. Android uses APK platform signing for installation;
+there is no Android updater or app-store publication in this contract.
+
+Formal version codes, credential provisioning and reproduction commands are in
+`docs/releasing.md`. Stable 0.1.26 maps to 102699 and upgrades acceptance 1016.
