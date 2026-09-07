@@ -522,3 +522,29 @@ Detached updater survives originating PTY termination. PR #30 merged and v0.1.24
 ### Next Steps
 
 - Bootstrap v0.1.24 via SSH, then validate a subsequent signed upgrade from a real remote zterm Session; keep remote-self-update task active.
+
+
+## Session 20: Release v0.1.26 with Android
+<!-- trellis-session: v=2 fp=57c4721a9d71d70b -->
+
+**Date**: 2026-09-07
+**Task**: Release v0.1.26 with Android
+**Branch**: `holy-zebra`
+
+### Summary
+
+Published immutable v0.1.26 through PR #33 and the canonical release operator. Added Android ARM64 APK to exact-main candidates and protected signing while retaining macOS ARM64 and Linux ARM64/x64. All hosted checks, installers, complete public inventory verification, APK certificate/16 KB inspection, and public-APK emulator upgrade passed. Broader phone-specific acceptance remains pending; no phone or installed host-daemon operation.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `f793542` | feat(android): add terminal app and signed APK releases |
+| `9ec604d` | chore: prepare v0.1.26 release |
+| `85dff0f` | docs(android): clarify hosted and emulator validation evidence |
+| `77fadca` | Merge pull request #33 from leonfox28/feat/android-release |
+| `891a219` | chore(android): record v0.1.26 publication evidence |
+
+### Status
+
+[OK] **Completed**
