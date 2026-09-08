@@ -2,6 +2,7 @@ package io.github.leonfox28.zterm
 
 import android.content.ClipboardManager
 import android.os.SystemClock
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
@@ -21,6 +22,93 @@ class TerminalUiTest {
     @get:Rule val ui = createAndroidComposeRule<MainActivity>()
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
     private val repository get() = (ui.activity.application as ZtermApplication).repository
+
+    @Test fun keyboardDismissalSurvivesTaskResume() {
+        val hostName = InstrumentationRegistry.getArguments().getString("hostName")
+        org.junit.Assume.assumeTrue("explicit disposable host", hostName?.startsWith("presentation-") == true)
+        ui.waitUntil(20_000) { repository.state.value.initialized }
+        val host = repository.state.value.saved.hosts.first { it.name == hostName }
+        val preferences = repository.state.value.saved.preferences
+        val name = "android-keyboard-${System.nanoTime()}"
+        var owned: String? = null
+        try {
+            ui.runOnIdle { repository.goHome(); repository.setPreferences(Preferences("en", "dark", 12)) }
+            ui.waitUntil { repository.frame.value == null && !repository.state.value.busy }
+            val originalMode = ui.runOnIdle { ui.activity.window.attributes.softInputMode }
+            ui.runOnIdle { repository.connectHost(host.id) }
+            ui.waitUntil(20_000) { repository.state.value.route == Route.Terminal && !repository.state.value.busy }
+            ui.runOnIdle { repository.createSession(name, "") }
+            await("keyboard regression Session") { repository.frame.value?.state == "active" && repository.state.value.sessions.any { it.name == name } && !repository.state.value.busy }
+            owned = repository.state.value.sessionId
+            await("initial keyboard geometry") { geometrySettled() && terminal().hasWindowFocus() }
+            val viewport = repository.frame.value!!.viewport
+            val epoch = repository.frame.value!!.inputEpoch
+            resumeTerminalTaskWithKeyboard(false)
+
+            for (back in listOf(false, true)) {
+                ui.onNodeWithContentDescription("Show keyboard").performClick()
+                await("keyboard explicitly opened") { keyboardVisible() && geometrySettled() && repository.frame.value!!.viewport.rows < viewport.rows }
+                if (back) instrumentation.sendKeyDownUpSync(KeyEvent.KEYCODE_BACK)
+                else ui.onNodeWithContentDescription("Hide keyboard").performClick()
+                await("keyboard explicitly dismissed") { !keyboardVisible() && geometrySettled() && repository.frame.value!!.viewport == viewport }
+                repeat(2) { resumeTerminalTaskWithKeyboard(false) }
+                assertTrue("hidden IME retains terminal input focus", ui.runOnIdle { terminal().hasFocus() })
+                assertEquals("same Session after resume", owned, repository.state.value.sessionId)
+                assertEquals("keyboard lifetime survives resume", epoch, repository.frame.value!!.inputEpoch)
+            }
+
+            // Deliver actual key events while the software keyboard is hidden.
+            instrumentation.sendStringSync("printf 'KEYBOARD_%s\\n' 'RESUMED'")
+            instrumentation.sendKeyDownUpSync(KeyEvent.KEYCODE_ENTER)
+            await("hardware key input after resume") { content().contains("KEYBOARD_RESUMED") }
+            // Gboard can explicitly show itself in response to injected virtual-keyboard events.
+            if (keyboardVisible()) instrumentation.sendKeyDownUpSync(KeyEvent.KEYCODE_BACK)
+            await("key injection settled") { !keyboardVisible() && geometrySettled() }
+            ui.onNodeWithContentDescription("Show keyboard").performClick()
+            await("keyboard can reopen after resume") { keyboardVisible() && geometrySettled() }
+            resumeTerminalTaskWithKeyboard(true)
+            ui.runOnIdle {
+                val connection = terminal().onCreateInputConnection(EditorInfo())
+                assertTrue(connection.commitText("printf 'RESUME_%s\\n' '中文'", 1))
+                assertTrue(connection.performEditorAction(EditorInfo.IME_ACTION_NONE))
+            }
+            await("IME input after visible resume") { content().contains("RESUME_中文") }
+            ui.onNodeWithContentDescription("Hide keyboard").performClick()
+            await("keyboard closed after input") { !keyboardVisible() && geometrySettled() }
+            tap(terminal(), .4f, .4f)
+            resumeTerminalTaskWithKeyboard(false)
+
+            ui.runOnIdle { repository.goHome() }
+            ui.waitUntil { repository.frame.value == null }
+            assertEquals("leaving Terminal restores the prior visibility policy",
+                originalMode and android.view.WindowManager.LayoutParams.SOFT_INPUT_MASK_STATE,
+                ui.runOnIdle { ui.activity.window.attributes.softInputMode } and android.view.WindowManager.LayoutParams.SOFT_INPUT_MASK_STATE)
+        } finally {
+            ui.runOnIdle { repository.goHome(); repository.setPreferences(preferences) }
+            ui.waitUntil(15_000) { repository.frame.value == null }
+            owned?.let { id -> runBlocking { repository.runtime.closeSession(host.id, id) } }
+        }
+    }
+
+    private fun resumeTerminalTaskWithKeyboard(visible: Boolean) {
+        val activity = ui.activity
+        val task = activity.taskId
+        ui.runOnIdle { assertTrue("task moved to background", activity.moveTaskToBack(true)) }
+        ui.waitUntil(5_000) { !activity.hasWindowFocus() && !activity.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED) }
+        val component = android.content.ComponentName(activity, MainActivity::class.java).flattenToString()
+        android.os.ParcelFileDescriptor.AutoCloseInputStream(instrumentation.uiAutomation.executeShellCommand(
+            "am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n $component"
+        )).use { it.readBytes() }
+        await("same task returned with settled IME") { activity.hasWindowFocus() && activity.lifecycle.currentState == Lifecycle.State.RESUMED && geometrySettled() }
+        assertSame("resume does not recreate Activity", activity, ui.activity)
+        assertEquals(task, activity.taskId)
+        // Observe a settled interval: an immediate hidden sample can precede auto-show.
+        val until = SystemClock.uptimeMillis() + 1_000
+        while (SystemClock.uptimeMillis() < until) {
+            assertEquals("task resume preserves keyboard visibility", visible, keyboardVisible())
+            SystemClock.sleep(25)
+        }
+    }
 
     @Test fun keyboardPresentationAndCompositionStayContinuous() {
         val hostName = InstrumentationRegistry.getArguments().getString("hostName")
