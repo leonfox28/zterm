@@ -275,13 +275,10 @@ fn nested_escape_and_c1_introducers_cannot_bypass_ingress_policy() {
 
     assert_same_presented_surface(&chunked, &model);
     assert_eq!(chunked_events, sync.events);
+    assert!(!visible_text(&model).contains("visible-immediately"));
+    assert!(sync.events.is_empty());
+    model.ingest(b"\x1b[?2026l").expect("publish held output");
     assert!(visible_text(&model).contains("visible-immediately"));
-    assert_eq!(
-        sync.events,
-        vec![TerminalSideEvent::UnsupportedSequence(
-            UnsupportedSequenceKind::Csi,
-        )]
-    );
 
     let title = model
         .ingest(b"\x1b[\x1b]2;nested-title\x1b\\after-title")
@@ -305,7 +302,7 @@ fn nested_escape_and_c1_introducers_cannot_bypass_ingress_policy() {
 
 #[test]
 fn embedded_controls_do_not_obscure_filtered_sequence_identity() {
-    let input = b"\x1b[?2026\x07hvisible-now\x1b\x07]2;control-title\x1b\\after-title";
+    let input = b"\x1b[?2026\x07hvisible-now\x1b\x07]2;control-title\x1b\\after-title\x1b[?2026l";
     let mut whole = TerminalModel::new(TerminalSize::new(4, 80), 8).expect("whole model");
     let whole_update = whole
         .ingest(input)
@@ -329,7 +326,6 @@ fn embedded_controls_do_not_obscure_filtered_sequence_identity() {
         whole_update.events,
         vec![
             TerminalSideEvent::AudibleBell,
-            TerminalSideEvent::UnsupportedSequence(UnsupportedSequenceKind::Csi),
             TerminalSideEvent::AudibleBell,
             TerminalSideEvent::TitleChanged {
                 title: "control-title".to_owned(),

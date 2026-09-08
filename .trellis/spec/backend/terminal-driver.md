@@ -65,11 +65,16 @@ blocking PtyReader
   mark cannot exceed configured capacity.
 - Attachments hold shared terminal-state access and one opaque checkpoint only.
   They never hold a PTY session, reader, writer, child, or close capability.
-- Contiguous history-window projection is a stateless read-only attachment
-  operation. It checks health, acquires the model mutex once, and returns the
-  model-authored request-shaped Frame/Changed/Gap. The driver stores neither
-  the query nor a target/baseline, and it does not advance the checkpoint or
-  revision watch.
+- History projection remains read-only and has no stored scroll position. In
+  Live, project immediately under one model lock. During DEC 2026 hold,
+  `begin_history_window(query, deadline) -> TerminalHistoryRead` registers one
+  cancellable slot per driver. `wait_until(deadline)` runs outside Session,
+  model and commit locks. At the exact eligible boundary, project one capped
+  Frame/Changed/Gap before any next batch; retain only that response for delivery.
+  Drop/deadline, detach, takeover and end retire the slot. A second active read
+  returns `HistoryReadPending`; cancellation returns `Cancelled`, timeout
+  `Deadline`, and recorded driver failures take precedence. The blocking public
+  `history_window` convenience must never run inside a producer/Session owner.
 - `sync_latest` is the mandatory initial/reconnect synchronization API: a
   missing, future, or incompatible checkpoint produces a complete semantic
   snapshot. `sync_changed` is the steady-state API: an exact-equal checkpoint
@@ -84,6 +89,11 @@ blocking PtyReader
   reader, one `PtyIo` writer/master, and independent `PtyChild` control. A PTY
   write/flush or resize may hold only the I/O mutex; it cannot prevent the
   session owner from interrupting/reaping the child through the child mutex.
+- The model worker waits on the byte queue until its optional presentation
+  deadline, so a silent PTY cannot freeze publication forever. Timeout/EOF
+  serialize with ingest, resize and color commits. Processing byte/chunk
+  counters remain independent of eligible publication. Do not wake unchanged
+  published revisions or compare held working progress in `sync_changed`.
 - Revision notification is latest-only. No list or channel grows once per
   revision. The Tokio watch sender overwrites one watermark; a slow attachment
   may discard its checkpoint and fetch one full latest snapshot.
@@ -156,8 +166,8 @@ No environment variable or network object participates in this data path.
 | revision/idle wait expires with no recorded failure | `Deadline` |
 | revision wait races a recorded failure | return the recorded failure, not `Deadline` |
 | history-window projection observes a recorded model/driver failure | return that typed failure before any Frame/Changed/Gap |
-| history-window query is invalid/future, rebased, or alternate-screen | return the model-authored Gap/Rebased/Changed result; never retain a query or synthesize/merge rows in the driver |
-| `sync_changed` sees checkpoint revision equal to the model | `Ok(None)`; do not replace the checkpoint or publish a frame |
+| history-window query is invalid/future, rebased, or alternate-screen | return the model-authored Gap/Rebased/Changed result; only defer the bounded query during a hold; never synthesize/merge rows in the driver |
+| `sync_changed` sees checkpoint revision equal to the published model | `Ok(None)`; do not replace the checkpoint or publish a frame |
 | `sync_changed` sees a behind/incompatible checkpoint | one semantic Delta/Resync and replace the checkpoint at that exact latest state |
 | host effect is produced with no eligible target | drop it without waking a writer or failing PTY drain |
 | multiple effects precede one take | retain only the latest value for the event-time target |
@@ -237,7 +247,7 @@ attachment.model.lock()?.scroll_display(delta);
 // PTY bytes always reach one model owner. Attachments query latest state.
 byte_queue.push(bytes); // bounded, blocking, no-drop
 let update = terminal_model.ingest(bytes)?;
-latest_revision.publish(update.revision);
+latest_revision.publish(terminal_model.published_revision());
 
 let window = attachment.history_window(query)?;
 // `query` is not retained: cache/retry/coalescing belongs above the driver.
@@ -270,3 +280,7 @@ output log or one delta per revision would make a disconnected phone or hidden
 tab an unbounded memory/backpressure source. One opaque checkpoint per active
 attachment preserves efficient warm updates while full resync remains the
 single recovery path.
+
+Publication regression evidence: `history_read_captures_completed_batch_before_next_partial_batch`,
+`synchronized_output_deadline_wakes_without_any_pty_output`, `eof_releases_the_last_unfinished_batch`,
+and SessionWire's `pending_marked_history_leaves_input_and_snapshot_ack_unblocked` must pass.

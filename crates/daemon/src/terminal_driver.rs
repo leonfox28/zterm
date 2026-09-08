@@ -3,7 +3,8 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::Read;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -71,6 +72,10 @@ pub enum TerminalDriverError {
     Synchronization(&'static str),
     /// A bounded wait elapsed.
     Deadline(&'static str),
+    /// The single bounded history read is already occupied.
+    HistoryReadPending,
+    /// A pending read lost its attachment or was cancelled.
+    Cancelled(&'static str),
 }
 
 impl fmt::Display for TerminalDriverError {
@@ -87,6 +92,10 @@ impl fmt::Display for TerminalDriverError {
                 )
             }
             Self::Deadline(detail) => write!(formatter, "terminal driver deadline: {detail}"),
+            Self::HistoryReadPending => {
+                formatter.write_str("terminal history read already pending")
+            }
+            Self::Cancelled(detail) => write!(formatter, "terminal driver cancelled: {detail}"),
         }
     }
 }
@@ -341,7 +350,32 @@ impl TerminalDriver {
             thread::Builder::new()
                 .name("zterm-terminal-model".into())
                 .spawn(move || {
-                    while let Some(bytes) = model_queue.pop() {
+                    loop {
+                        let deadline = match lock(&model_shared.model, "terminal model") {
+                            Ok(model) => model.presentation_deadline(),
+                            Err(error) => {
+                                model_shared.fail(error);
+                                model_queue.abort();
+                                return;
+                            }
+                        };
+                        let bytes = match model_queue.pop_until(deadline) {
+                            QueueRead::Bytes(bytes) => bytes,
+                            QueueRead::Deadline => {
+                                if let Err(error) = model_shared.finish_presentation(false) {
+                                    model_shared.fail(error);
+                                    model_queue.abort();
+                                    return;
+                                }
+                                continue;
+                            }
+                            QueueRead::Finished => {
+                                if let Err(error) = model_shared.finish_presentation(true) {
+                                    model_shared.fail(error);
+                                }
+                                break;
+                            }
+                        };
                         let _commit = match lock(&model_shared.commit, "terminal commit") {
                             Ok(guard) => guard,
                             Err(error) => {
@@ -351,7 +385,7 @@ impl TerminalDriver {
                                 return;
                             }
                         };
-                        let update = match model_shared.ingest(&bytes) {
+                        let (update, published) = match model_shared.ingest(&bytes) {
                             Ok(update) => update,
                             Err(error) => {
                                 model_queue.complete();
@@ -382,7 +416,7 @@ impl TerminalDriver {
                                 return;
                             }
                         }
-                        model_shared.record_processed(bytes.len(), update.revision);
+                        model_shared.record_processed(bytes.len(), published);
                         model_queue.complete();
                     }
                     model_shared.mark_drain_finished();
@@ -467,6 +501,7 @@ impl TerminalDriver {
             #[cfg(unix)]
             effects: self.effects.clone(),
             checkpoint: None,
+            alive: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -481,9 +516,12 @@ impl TerminalDriver {
         let _commit = lock(&self.shared.commit, "terminal commit")?;
         lock(&self.shared.model, "terminal model")?.preflight_resize(size)?;
         lock(&self.io, "PTY I/O")?.resize(PtySize::new(size.rows, size.columns))?;
-        let revision = lock(&self.shared.model, "terminal model")?
-            .resize(size)?
-            .revision;
+        let revision = {
+            let mut model = lock(&self.shared.model, "terminal model")?;
+            let revision = model.resize(size)?.revision;
+            self.shared.complete_history_read(&model);
+            revision
+        };
         self.shared.publish_revision(revision)?;
         Ok(revision)
     }
@@ -496,12 +534,12 @@ impl TerminalDriver {
         base: zterm_core::terminal::TerminalColorProfile,
     ) -> Result<Option<Revision>, TerminalDriverError> {
         let _commit = lock(&self.shared.commit, "terminal commit")?;
-        let (update, changed) = {
+        let (update, changed, published) = {
             let mut model = lock(&self.shared.model, "terminal model")?;
             let before = model.revision();
             let update = model.update_base_colors(base)?;
             let changed = update.revision != before;
-            (update, changed)
+            (update, changed, model.published_revision())
         };
         if !update.replies.is_empty()
             && let Err(error) = lock(&self.io, "PTY I/O")
@@ -511,7 +549,7 @@ impl TerminalDriver {
             return Err(error);
         }
         if changed {
-            self.shared.publish_revision(update.revision)?;
+            self.shared.publish_revision(published)?;
         }
         Ok(changed.then_some(update.revision))
     }
@@ -706,6 +744,7 @@ pub struct TerminalAttachment {
     #[cfg(unix)]
     effects: TerminalEffectBroker,
     checkpoint: Option<TerminalCheckpoint>,
+    alive: Arc<AtomicBool>,
 }
 
 impl TerminalAttachment {
@@ -759,7 +798,7 @@ impl TerminalAttachment {
         if self
             .checkpoint
             .as_ref()
-            .is_some_and(|checkpoint| checkpoint.revision() == model.revision())
+            .is_some_and(|checkpoint| checkpoint.revision() == model.published_revision())
         {
             return Ok(None);
         }
@@ -784,14 +823,107 @@ impl TerminalAttachment {
         &self,
         query: TerminalHistoryWindowQuery,
     ) -> Result<TerminalSurfaceHistoryWindowResult, TerminalDriverError> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        self.begin_history_window(query, deadline)?
+            .wait_until(deadline)
+    }
+
+    pub(crate) fn begin_history_window(
+        &self,
+        query: TerminalHistoryWindowQuery,
+        deadline: Instant,
+    ) -> Result<TerminalHistoryRead, TerminalDriverError> {
         self.shared.check_failure()?;
-        Ok(lock(&self.shared.model, "terminal model")?.history_window(query))
+        let model = lock(&self.shared.model, "terminal model")?;
+        let (reply, response) = mpsc::sync_channel(1);
+        let active = Arc::new(AtomicBool::new(true));
+        if let Some(result) = model.history_window(query) {
+            let _ = reply.try_send(result);
+        } else {
+            let mut pending = lock(&self.shared.history_read, "terminal history read")?;
+            if pending.as_ref().is_some_and(PendingHistoryRead::is_active) {
+                return Err(TerminalDriverError::HistoryReadPending);
+            }
+            *pending = Some(PendingHistoryRead {
+                query,
+                deadline,
+                reply,
+                active: Arc::clone(&active),
+                alive: Arc::clone(&self.alive),
+            });
+        }
+        Ok(TerminalHistoryRead {
+            response,
+            active,
+            shared: Arc::clone(&self.shared),
+        })
+    }
+
+    pub(crate) fn cancel_pending_history(&self) {
+        let mut slot = cleanup_lock(&self.shared.history_read);
+        if slot
+            .as_ref()
+            .is_some_and(|pending| Arc::ptr_eq(&pending.alive, &self.alive))
+        {
+            slot.take();
+        }
     }
 }
 
 impl Drop for TerminalAttachment {
     fn drop(&mut self) {
+        self.alive.store(false, Ordering::Release);
+        self.cancel_pending_history();
         self.shared.attachments.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// A bounded read admitted by the actor; waiting happens outside that actor.
+pub(crate) struct TerminalHistoryRead {
+    response: Receiver<TerminalSurfaceHistoryWindowResult>,
+    active: Arc<AtomicBool>,
+    shared: Arc<SharedTerminal>,
+}
+
+impl TerminalHistoryRead {
+    pub(crate) fn wait_until(
+        self,
+        deadline: Instant,
+    ) -> Result<TerminalSurfaceHistoryWindowResult, TerminalDriverError> {
+        let result = self
+            .response
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        self.shared.check_failure()?;
+        result.map_err(|error| match error {
+            mpsc::RecvTimeoutError::Timeout => {
+                TerminalDriverError::Deadline("terminal history read did not complete")
+            }
+            mpsc::RecvTimeoutError::Disconnected => {
+                TerminalDriverError::Cancelled("terminal history read retired")
+            }
+        })
+    }
+}
+
+impl Drop for TerminalHistoryRead {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
+
+struct PendingHistoryRead {
+    query: TerminalHistoryWindowQuery,
+    deadline: Instant,
+    reply: SyncSender<TerminalSurfaceHistoryWindowResult>,
+    active: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
+}
+
+impl PendingHistoryRead {
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+            && self.alive.load(Ordering::Acquire)
+            && Instant::now() < self.deadline
     }
 }
 
@@ -806,6 +938,7 @@ struct SharedTerminal {
     processed_bytes: AtomicU64,
     attachments: AtomicUsize,
     drain_finished: Mutex<bool>,
+    history_read: Mutex<Option<PendingHistoryRead>>,
 }
 
 struct RevisionState {
@@ -815,7 +948,7 @@ struct RevisionState {
 
 impl SharedTerminal {
     fn new(model: TerminalModel) -> Self {
-        let revision = model.revision();
+        let revision = model.published_revision();
         let (revision_sender, _) = watch::channel(revision);
         Self {
             commit: Mutex::new(()),
@@ -831,14 +964,46 @@ impl SharedTerminal {
             processed_bytes: AtomicU64::new(0),
             attachments: AtomicUsize::new(0),
             drain_finished: Mutex::new(false),
+            history_read: Mutex::new(None),
         }
     }
 
     fn ingest(
         &self,
         bytes: &[u8],
-    ) -> Result<zterm_core::terminal::TerminalUpdate, TerminalDriverError> {
-        Ok(lock(&self.model, "terminal model")?.ingest(bytes)?)
+    ) -> Result<(zterm_core::terminal::TerminalUpdate, Revision), TerminalDriverError> {
+        let mut model = lock(&self.model, "terminal model")?;
+        let update =
+            model.ingest_observing(bytes, |eligible| self.complete_history_read(eligible))?;
+        Ok((update, model.published_revision()))
+    }
+
+    fn complete_history_read(&self, model: &TerminalModel) {
+        let mut slot = cleanup_lock(&self.history_read);
+        let Some(pending) = slot.as_ref() else {
+            return;
+        };
+        if !pending.is_active() {
+            slot.take();
+        } else if let Some(result) = model.history_window(pending.query) {
+            let _ = pending.reply.try_send(result);
+            slot.take();
+        }
+    }
+
+    fn finish_presentation(&self, eof: bool) -> Result<(), TerminalDriverError> {
+        let _commit = lock(&self.commit, "terminal commit")?;
+        let published = {
+            let mut model = lock(&self.model, "terminal model")?;
+            if eof {
+                model.finish_synchronized_output();
+            } else {
+                model.expire_synchronized_output(Instant::now());
+            }
+            self.complete_history_read(&model);
+            model.published_revision()
+        };
+        self.publish_revision(published)
     }
 
     fn record_processed(&self, byte_count: usize, revision: Revision) {
@@ -853,8 +1018,12 @@ impl SharedTerminal {
     }
 
     fn publish_revision(&self, revision: Revision) -> Result<(), TerminalDriverError> {
+        let mut state = lock(&self.revision_wait, "revision waterline")?;
+        if state.latest == revision {
+            return Ok(());
+        }
         self.revision.store(revision.get(), Ordering::Release);
-        lock(&self.revision_wait, "revision waterline")?.latest = revision;
+        state.latest = revision;
         self.revision_sender.send_replace(revision);
         self.revision_changed.notify_all();
         Ok(())
@@ -903,6 +1072,7 @@ impl SharedTerminal {
             state.failure = Some(error);
         }
         self.revision_changed.notify_all();
+        cleanup_lock(&self.history_read).take();
     }
 
     fn check_failure(&self) -> Result<(), TerminalDriverError> {
@@ -944,6 +1114,12 @@ struct ByteQueueStats {
     maximum_pending: usize,
 }
 
+enum QueueRead {
+    Bytes(Vec<u8>),
+    Deadline,
+    Finished,
+}
+
 impl ByteQueue {
     fn new(capacity: usize) -> Self {
         Self {
@@ -979,22 +1155,43 @@ impl ByteQueue {
         true
     }
 
+    #[cfg(test)]
     fn pop(&self) -> Option<Vec<u8>> {
+        match self.pop_until(None) {
+            QueueRead::Bytes(bytes) => Some(bytes),
+            QueueRead::Deadline | QueueRead::Finished => None,
+        }
+    }
+
+    fn pop_until(&self, deadline: Option<Instant>) -> QueueRead {
         let Ok(mut state) = self.state.lock() else {
-            return None;
+            return QueueRead::Finished;
         };
         while state.chunks.is_empty() && !state.finished && !state.aborted {
-            let Ok(next) = self.not_empty.wait(state) else {
-                return None;
-            };
-            state = next;
+            if let Some(deadline) = deadline {
+                if Instant::now() >= deadline {
+                    return QueueRead::Deadline;
+                }
+                let Ok((next, _)) = self
+                    .not_empty
+                    .wait_timeout(state, deadline.saturating_duration_since(Instant::now()))
+                else {
+                    return QueueRead::Finished;
+                };
+                state = next;
+            } else {
+                let Ok(next) = self.not_empty.wait(state) else {
+                    return QueueRead::Finished;
+                };
+                state = next;
+            }
         }
         let bytes = state.chunks.pop_front();
         if bytes.is_some() {
             state.in_flight = state.in_flight.saturating_add(1);
             self.not_full.notify_one();
         }
-        bytes
+        bytes.map_or(QueueRead::Finished, QueueRead::Bytes)
     }
 
     fn complete(&self) {
@@ -1256,6 +1453,7 @@ mod tests {
             #[cfg(unix)]
             effects: TerminalEffectBroker::new(),
             checkpoint: None,
+            alive: Arc::new(AtomicBool::new(true)),
         };
 
         assert!(matches!(
@@ -1288,6 +1486,159 @@ mod tests {
             attachment.sync_changed().expect("divergent update"),
             Some(TerminalSurfaceDeltaResult::Resync(_))
         ));
+    }
+
+    #[test]
+    fn history_read_captures_completed_batch_before_next_partial_batch() {
+        use zterm_core::terminal::TerminalHistoryWindowAnchor;
+
+        let model = TerminalModel::new(TerminalSize::new(2, 20), 4).expect("model");
+        let shared = Arc::new(SharedTerminal::new(model));
+        shared.attachments.store(1, Ordering::Release);
+        let mut attachment = TerminalAttachment {
+            shared: Arc::clone(&shared),
+            #[cfg(unix)]
+            effects: TerminalEffectBroker::new(),
+            checkpoint: None,
+            alive: Arc::new(AtomicBool::new(true)),
+        };
+        shared
+            .ingest(b"before\x1b[?2026h\x1b[2J\x1b[HA")
+            .expect("held A");
+        attachment.sync_latest().expect("initial eligible snapshot");
+        assert!(
+            attachment
+                .sync_changed()
+                .expect("held revision is a no-op")
+                .is_none()
+        );
+        let snapshot = attachment.latest_snapshot().expect("snapshot");
+        let metrics = snapshot.surface.scroll_metrics.expect("main metrics");
+        let query = TerminalHistoryWindowQuery {
+            anchor: TerminalHistoryWindowAnchor {
+                epoch: metrics.epoch,
+                revision: snapshot.revision,
+                max_offset_from_bottom: metrics.max_offset_from_bottom,
+                viewport: snapshot.surface.size,
+            },
+            target_offset_from_bottom: 0,
+            older_margin_rows: 0,
+            newer_margin_rows: 0,
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let pending = attachment
+            .begin_history_window(query, deadline)
+            .expect("register read");
+        assert!(matches!(
+            attachment.begin_history_window(query, deadline),
+            Err(TerminalDriverError::HistoryReadPending)
+        ));
+        shared
+            .ingest(b"-complete\x1b[?2026l\x1b[?2026h\x1b[2J\x1b[HB-partial")
+            .expect("A closes before B begins");
+        let TerminalSurfaceHistoryWindowResult::Frame(frame) =
+            pending.wait_until(deadline).expect("bounded read")
+        else {
+            panic!("eligible history frame");
+        };
+        let contents: String = frame
+            .rows
+            .iter()
+            .flat_map(|row| &row.cells)
+            .map(|cell| cell.contents.as_str())
+            .collect();
+        assert!(contents.contains("A-complete"));
+        assert!(!contents.contains("B-partial"));
+        attachment
+            .sync_changed()
+            .expect("publish A")
+            .expect("changed");
+        assert!(
+            attachment
+                .sync_changed()
+                .expect("no duplicate resync")
+                .is_none()
+        );
+
+        let retired = attachment
+            .begin_history_window(query, deadline)
+            .expect("read during B");
+        attachment.cancel_pending_history();
+        assert!(matches!(
+            retired.wait_until(deadline),
+            Err(TerminalDriverError::Cancelled(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn synchronized_output_deadline_wakes_without_any_pty_output() {
+        let size = TerminalSize::new(2, 20);
+        let mut model = TerminalModel::new(size, 0).expect("model");
+        model
+            .ingest(b"\x1b[?2026hdeadline-visible")
+            .expect("unfinished batch");
+        let frozen = model.published_revision();
+        let session = PtyHost::new()
+            .spawn(
+                ExplicitPtyCommand::new("/bin/sh", std::env::temp_dir())
+                    .arg("-c")
+                    .arg("read -r line"),
+                PtySize::new(size.rows, size.columns),
+            )
+            .expect("isolated quiet PTY");
+        let driver =
+            TerminalDriver::start(session, model, TerminalDriverConfig::default()).expect("driver");
+        let attachment = driver.attach();
+        attachment
+            .wait_for_revision_after(frozen, Duration::from_secs(2))
+            .expect("timer publishes without another byte");
+        let snapshot = attachment.latest_snapshot().expect("released view");
+        let contents: String = snapshot
+            .surface
+            .rows
+            .iter()
+            .flat_map(|row| &row.cells)
+            .map(|cell| cell.contents.as_str())
+            .collect();
+        assert!(contents.contains("deadline-visible"));
+        assert_eq!(driver.stats().expect("drain stats").processed_bytes, 0);
+        driver
+            .finalize_explicit()
+            .expect("close only the fixture child");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn eof_releases_the_last_unfinished_batch() {
+        let size = TerminalSize::new(2, 20);
+        let mut model = TerminalModel::new(size, 0).expect("model");
+        model
+            .ingest(b"\x1b[?2026hfinal-visible")
+            .expect("unfinished batch");
+        let session = PtyHost::new()
+            .spawn(
+                ExplicitPtyCommand::new("/bin/sh", std::env::temp_dir())
+                    .arg("-c")
+                    .arg("exit 0"),
+                PtySize::new(size.rows, size.columns),
+            )
+            .expect("isolated exiting PTY");
+        let driver =
+            TerminalDriver::start(session, model, TerminalDriverConfig::default()).expect("driver");
+        let attachment = driver.attach();
+        driver.finalize_natural().expect("EOF finalization");
+        let snapshot = attachment
+            .latest_snapshot()
+            .expect("final eligible snapshot");
+        let contents: String = snapshot
+            .surface
+            .rows
+            .iter()
+            .flat_map(|row| &row.cells)
+            .map(|cell| cell.contents.as_str())
+            .collect();
+        assert!(contents.contains("final-visible"));
     }
 
     #[cfg(unix)]

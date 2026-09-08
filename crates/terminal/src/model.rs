@@ -1,4 +1,6 @@
 use std::fmt;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::Line;
@@ -11,14 +13,22 @@ use zterm_core::terminal::{
 };
 
 use crate::engine::AlacrittyEngine;
-use crate::ingress::{IngressError, TerminalIngressPolicy, UpdateCollector};
+use crate::ingress::{IngressError, PresentationBoundary, TerminalIngressPolicy, UpdateCollector};
 use crate::projection::{CHECKPOINT_FORMAT_VERSION, ProjectedScreen, project, project_row};
 
 /// Opaque, content-redacted baseline for one merged latest-state delta.
 #[derive(Clone)]
 pub struct TerminalCheckpoint {
     revision: Revision,
-    projection: ProjectedScreen,
+    projection: Arc<ProjectedScreen>,
+}
+
+const SYNCHRONIZED_OUTPUT_LIMIT: Duration = Duration::from_millis(150);
+
+struct SynchronizedOutput {
+    checkpoint: TerminalCheckpoint,
+    scroll_metrics: Option<TerminalScrollMetrics>,
+    deadline: Instant,
 }
 
 impl fmt::Debug for TerminalCheckpoint {
@@ -117,6 +127,7 @@ pub struct TerminalModel {
     scrollback_rows: usize,
     history_epoch: Revision,
     retained_history_rows: usize,
+    synchronized: Option<SynchronizedOutput>,
 }
 
 impl TerminalModel {
@@ -130,6 +141,7 @@ impl TerminalModel {
             scrollback_rows,
             history_epoch: Revision::ZERO,
             retained_history_rows: 0,
+            synchronized: None,
         })
     }
 
@@ -137,6 +149,38 @@ impl TerminalModel {
     #[must_use]
     pub const fn revision(&self) -> Revision {
         self.revision
+    }
+
+    /// Returns the exact revision available to visible readers.
+    #[must_use]
+    pub fn published_revision(&self) -> Revision {
+        self.synchronized
+            .as_ref()
+            .map_or(self.revision, |held| held.checkpoint.revision)
+    }
+
+    /// The driver must wake at this deadline even when no more PTY bytes arrive.
+    #[must_use]
+    pub fn presentation_deadline(&self) -> Option<Instant> {
+        self.synchronized.as_ref().map(|held| held.deadline)
+    }
+
+    /// Releases an unfinished batch once its hard hold limit has elapsed.
+    pub fn expire_synchronized_output(&mut self, now: Instant) -> bool {
+        if self
+            .presentation_deadline()
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.finish_synchronized_output()
+        } else {
+            false
+        }
+    }
+
+    /// Ends a batch for serialized timeout, resize, reset or EOF recovery.
+    pub fn finish_synchronized_output(&mut self) -> bool {
+        self.ingress.end_synchronized_output();
+        self.synchronized.take().is_some()
     }
 
     /// Returns the current viewport size.
@@ -147,6 +191,19 @@ impl TerminalModel {
 
     /// Processes one ordered PTY byte chunk.
     pub fn ingest(&mut self, bytes: &[u8]) -> Result<TerminalUpdate, TerminalError> {
+        self.ingest_observing(bytes, |_| {})
+    }
+
+    /// Processes bytes and exposes synchronous eligible read boundaries.
+    ///
+    /// The observer may project a bounded pending history read before a following
+    /// batch mutates or evicts its rows. It must not block on external work.
+    #[doc(hidden)]
+    pub fn ingest_observing(
+        &mut self,
+        mut bytes: &[u8],
+        mut published: impl FnMut(&Self),
+    ) -> Result<TerminalUpdate, TerminalError> {
         if bytes.is_empty() {
             return Ok(TerminalUpdate {
                 revision: self.revision,
@@ -156,14 +213,53 @@ impl TerminalModel {
             });
         }
 
-        let next_revision = self.next_revision()?;
         let mut output = UpdateCollector::new();
-        self.engine.grid_input = false;
-        self.ingress.process(bytes, &mut self.engine, &mut output)?;
-        self.engine.colors.commit(next_revision);
-        self.revision = next_revision;
-        if self.engine.grid_input {
-            self.refresh_history_epoch_after_ingest();
+        while !bytes.is_empty() {
+            if self.expire_synchronized_output(Instant::now()) {
+                published(self);
+            }
+            self.revision = self.next_revision()?;
+            self.engine.grid_input = false;
+            let consumed =
+                self.ingress
+                    .process_until_boundary(bytes, &mut self.engine, &mut output)?;
+            bytes = &bytes[consumed..];
+            self.commit_metadata();
+            match self.ingress.take_boundary() {
+                Some(PresentationBoundary::SynchronizedOutput { enabled, modes }) => {
+                    if enabled && self.synchronized.is_none() {
+                        published(self);
+                        self.synchronized = Some(SynchronizedOutput {
+                            checkpoint: self.checkpoint(),
+                            scroll_metrics: self.live_scroll_metrics(),
+                            deadline: Instant::now() + SYNCHRONIZED_OUTPUT_LIMIT,
+                        });
+                        // Sibling mode changes belong inside this batch, not in
+                        // the just-frozen view with the same revision.
+                        if !modes.is_empty() {
+                            self.revision = self.next_revision()?;
+                        }
+                    }
+                    self.engine.grid_input = false;
+                    TerminalIngressPolicy::apply_private_modes(&modes, enabled, &mut self.engine);
+                    for event in self.engine.take_events() {
+                        output.push_event(event);
+                    }
+                    self.commit_metadata();
+                    if !enabled {
+                        self.finish_synchronized_output();
+                        published(self);
+                    }
+                }
+                Some(PresentationBoundary::Reset) => {
+                    self.finish_synchronized_output();
+                    published(self);
+                }
+                None => {}
+            }
+        }
+        if self.synchronized.is_none() {
+            published(self);
         }
         let (replies, events, host_effect) = output.finish();
         Ok(TerminalUpdate {
@@ -172,6 +268,13 @@ impl TerminalModel {
             events,
             host_effect,
         })
+    }
+
+    fn commit_metadata(&mut self) {
+        self.engine.colors.commit(self.revision);
+        if self.engine.grid_input {
+            self.refresh_history_epoch_after_ingest();
+        }
     }
 
     /// Installs observations from the authorized controller without waiting on it.
@@ -205,6 +308,7 @@ impl TerminalModel {
     pub fn resize(&mut self, size: TerminalSize) -> Result<TerminalUpdate, TerminalError> {
         let next_revision = self.preflight_resize(size)?;
         self.engine.resize(size);
+        self.finish_synchronized_output();
         self.revision = next_revision;
         self.history_epoch = next_revision;
         if self.engine.active_screen() == ActiveScreen::Main {
@@ -227,19 +331,22 @@ impl TerminalModel {
     /// Captures an opaque visible-screen baseline for a later merged delta.
     #[must_use]
     pub fn checkpoint(&self) -> TerminalCheckpoint {
+        if let Some(held) = &self.synchronized {
+            return held.checkpoint.clone();
+        }
         TerminalCheckpoint {
             revision: self.revision,
-            projection: project(&self.engine),
+            projection: Arc::new(project(&self.engine)),
         }
     }
 
     /// Captures a complete exact semantic surface without constructing ANSI.
     #[must_use]
     pub fn snapshot(&self) -> TerminalSurfaceSnapshot {
-        let projection = project(&self.engine);
+        let checkpoint = self.checkpoint();
         TerminalSurfaceSnapshot {
-            revision: self.revision,
-            surface: projection.to_surface(self.live_scroll_metrics()),
+            revision: checkpoint.revision,
+            surface: checkpoint.projection.to_surface(self.live_scroll_metrics()),
         }
     }
 
@@ -266,13 +373,13 @@ impl TerminalModel {
         latest: &ProjectedScreen,
     ) -> TerminalSurfaceDeltaResult {
         let snapshot = || TerminalSurfaceSnapshot {
-            revision: self.revision,
+            revision: self.published_revision(),
             surface: latest.to_surface(self.live_scroll_metrics()),
         };
         let Some(checkpoint) = checkpoint else {
             return TerminalSurfaceDeltaResult::Resync(snapshot());
         };
-        if checkpoint.revision >= self.revision
+        if checkpoint.revision >= self.published_revision()
             || checkpoint.projection.version != CHECKPOINT_FORMAT_VERSION
             || checkpoint.projection.size != latest.size
             || checkpoint.projection.active_screen != latest.active_screen
@@ -295,7 +402,7 @@ impl TerminalModel {
         let delta = TerminalSurfaceDelta {
             colors: latest.colors.clone(),
             from_revision: checkpoint.revision,
-            to_revision: self.revision,
+            to_revision: self.published_revision(),
             size: latest.size,
             active_screen: latest.active_screen,
             row_patches,
@@ -310,6 +417,9 @@ impl TerminalModel {
     /// Returns the live main-screen scroll extent without changing terminal state.
     #[must_use]
     pub fn live_scroll_metrics(&self) -> Option<TerminalScrollMetrics> {
+        if let Some(held) = &self.synchronized {
+            return held.scroll_metrics;
+        }
         (self.engine.active_screen() == ActiveScreen::Main).then_some(TerminalScrollMetrics {
             epoch: self.history_epoch,
             revision: self.revision,
@@ -319,9 +429,20 @@ impl TerminalModel {
         })
     }
 
-    /// Projects one semantic history window without constructing ANSI.
+    /// Projects a semantic history window, or returns `None` during a held batch.
+    /// The driver can register a bounded read for the next eligible boundary.
     #[must_use]
     pub fn history_window(
+        &self,
+        query: TerminalHistoryWindowQuery,
+    ) -> Option<TerminalSurfaceHistoryWindowResult> {
+        if self.synchronized.is_some() {
+            return None;
+        }
+        Some(self.project_history_window(query))
+    }
+
+    fn project_history_window(
         &self,
         query: TerminalHistoryWindowQuery,
     ) -> TerminalSurfaceHistoryWindowResult {
@@ -572,7 +693,7 @@ mod tests {
     fn an_older_checkpoint_format_forces_a_complete_resync() {
         let mut model = TerminalModel::new(TerminalSize::new(2, 8), 0).expect("current model");
         let mut stale = model.checkpoint();
-        stale.projection.version = CHECKPOINT_FORMAT_VERSION.saturating_sub(1);
+        Arc::make_mut(&mut stale.projection).version = CHECKPOINT_FORMAT_VERSION.saturating_sub(1);
         model.ingest(b"new state").expect("advance current model");
 
         let TerminalSurfaceDeltaResult::Resync(snapshot) = model.delta_or_resync(&stale) else {
@@ -603,7 +724,8 @@ mod tests {
             older_margin_rows: 1,
             newer_margin_rows: 1,
         };
-        let TerminalSurfaceHistoryWindowResult::Frame(frame) = model.history_window(query) else {
+        let Some(TerminalSurfaceHistoryWindowResult::Frame(frame)) = model.history_window(query)
+        else {
             panic!("semantic history is available");
         };
         frame.validate_for(query).expect("request-shaped frame");
