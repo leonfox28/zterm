@@ -611,3 +611,25 @@ User accepted scrolling on the updated phone. Committed all optimization changes
 ### Status
 
 [OK] **Completed**
+
+
+## Session 23: Android reconnect recovery and connection status
+<!-- trellis-session: v=2 fp=27c7606a99978864 -->
+
+**Date**: 2026-09-08
+**Task**: Android reconnect recovery and connection status
+**Branch**: `perf/android-local-scroll`
+
+### Summary
+
+Completed stale-session/default-main recovery, typed unary error retirement, and fixed-English Direct/Relay with RTT. 88 Rust and 12 Android instrumentation tests passed, including real disposable-daemon restart. Android build/lint and source policies passed. User authorized release preparation; physical-phone and forced Relay routing remain untested.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `b13ae75` | fix(android): recover stale sessions and show connection status |
+
+### Status
+
+[OK] **Completed**
