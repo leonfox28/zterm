@@ -3,7 +3,7 @@
   "name": "android-keyboard-resume",
   "title": "修复 Android 终端返回前台时键盘自动弹出",
   "description": "修复终端中打开并收起软键盘后，应用切至后台再返回时键盘自动弹出的问题，覆盖焦点与前后台回归验证。",
-  "status": "in_progress",
+  "status": "completed",
   "dev_type": null,
   "scope": null,
   "package": null,
@@ -11,12 +11,12 @@
   "creator": "leon",
   "assignee": "leon",
   "createdAt": "2026-09-08",
-  "completedAt": null,
+  "completedAt": "2026-09-08",
   "branch": "fix/android-keyboard-resume",
   "base_branch": "main",
   "worktree_path": null,
-  "commit": null,
-  "pr_url": null,
+  "commit": "e6f5e6bf52a85c0e8f5ee05dae011d5fa84cbe4c",
+  "pr_url": "https://github.com/leonfox28/zterm/pull/38",
   "subtasks": [],
   "children": [],
   "parent": null,
@@ -25,6 +25,6 @@
     "apps/android/app/src/androidTest/java/io/github/leonfox28/zterm/TerminalUiTest.kt",
     ".trellis/spec/frontend/android-app.md"
   ],
-  "notes": "Approved implementation complete on fix/android-keyboard-resume: terminal-scoped SOFT_INPUT_STATE_UNCHANGED, native focus and explicit IME calls retained. Old regression fails, final new regression and three existing UI methods pass. Debug/test build, Debug/Release lint pass. Same-Activity Recents/direct cross-app and editable-dialog manual checks pass. See verification.md for transient fixture/test-assumption failures and emulator-only limits. User authorized the approved work commit, branch push and PR creation on 2026-09-08; preparing delivery and Trellis archive/journal. No phone install or release publication.",
+  "notes": "Approved implementation complete on fix/android-keyboard-resume: terminal-scoped SOFT_INPUT_STATE_UNCHANGED, native focus and explicit IME calls retained. Old regression fails, final new regression and three existing UI methods pass. Debug/test build, Debug/Release lint pass. Same-Activity Recents/direct cross-app and editable-dialog manual checks pass. See verification.md for transient fixture/test-assumption failures and emulator-only limits. User authorized the approved work commit, branch push and PR creation on 2026-09-08; work committed and PR #38 opened; completing Trellis archive/journal. No phone install or release publication.",
   "meta": {}
 }
