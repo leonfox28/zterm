@@ -210,6 +210,14 @@ impl Navigation {
                 .as_ref()
                 .map(|display| (Arc::clone(&display.page), display.offset));
         }
+        // A completed warmup at this exact live revision also supplies nearby
+        // history for the first touch. Never substitute stale mutable live rows.
+        if let Some(page) = self.cache.pin_visible_window()
+            && page.anchor.revision == surface.revision()
+            && page.visible_rows(0) == Some(surface.surface.rows.as_slice())
+        {
+            return Some((page, 0));
+        }
         if self
             .live_capture
             .as_ref()
@@ -740,12 +748,133 @@ mod tests {
     }
 
     #[test]
+    fn live_warmup_supplies_adjacent_rows_without_moving_the_viewport() {
+        let live = surface(1, 1, 100);
+        let mut nav = Navigation::new(&live);
+        let query = nav.prefetch().expect("warmup");
+        nav.install(response(query)).expect("warm page");
+        let frame = super::super::project_navigation(
+            &live,
+            1,
+            "active",
+            None,
+            true,
+            &mut nav,
+            7,
+            1,
+            false,
+            &Arc::new(()),
+            None,
+        );
+        assert_eq!(frame.history_offset, 0);
+        assert!(frame.window_offset >= 4);
+        let source = frame.source.expect("warm live source");
+        assert!(
+            source.viewport_source(100).is_ok(),
+            "current live pixels remain available"
+        );
+        assert!(
+            source.viewport_source(99).is_ok(),
+            "first row of motion needs no actor reply"
+        );
+    }
+
+    #[test]
+    fn presentation_window_reuses_rows_and_binds_locally_drawn_coordinates() {
+        let live = surface(1, 1, 100);
+        let origin = Arc::new(());
+        let mut nav = Navigation::new(&live);
+        scroll(&mut nav, &live, 50);
+        let first = super::super::project_navigation(
+            &live, 1, "active", None, true, &mut nav, 7, 1, false, &origin, None,
+        );
+        let source = first.source.as_ref().expect("window source");
+        let rows = source.presentation_rows();
+        assert!(first.rows.is_empty(), "metadata does not marshal cells");
+        assert!(
+            rows.len() > 4 && rows.len() <= 13,
+            "at most three screens plus overscan"
+        );
+        let repeated = super::super::project_navigation(
+            &live,
+            2,
+            "active",
+            None,
+            true,
+            &mut nav,
+            7,
+            1,
+            false,
+            &origin,
+            Some(&first),
+        );
+        assert_eq!(first.content_generation, repeated.content_generation);
+        scroll(&mut nav, &live, 51);
+        let moved = super::super::project_navigation(
+            &live,
+            3,
+            "active",
+            None,
+            true,
+            &mut nav,
+            7,
+            1,
+            false,
+            &origin,
+            Some(&repeated),
+        );
+        assert_eq!(
+            first.content_generation, moved.content_generation,
+            "a local row step reuses the DTO window"
+        );
+        assert_eq!(first.first_row, moved.first_row);
+        assert_eq!(first.window_offset, moved.window_offset);
+        let displayed_first = first.first_row + 1;
+        let drawn = source
+            .viewport_source(displayed_first)
+            .expect("locally drawn viewport");
+        assert!(drawn.valid_for(&origin, 7, 1, &live));
+        assert!(source.viewport_source(first.first_row - 1).is_err());
+        assert!(
+            source
+                .viewport_source(first.first_row + rows.len() as i64 - 3)
+                .is_err()
+        );
+        nav.select_source(Arc::clone(&drawn.page), drawn.offset, 0, 0)
+            .expect("select drawn rows");
+        assert_eq!(
+            nav.endpoints().expect("selected endpoints").0.row,
+            displayed_first
+        );
+        assert!(!drawn.valid_for(&origin, 7, 2, &live));
+        assert!(!drawn.valid_for(&origin, 8, 1, &live));
+        assert!(!drawn.valid_for(&Arc::new(()), 7, 1, &live));
+        let recolored = super::super::project_navigation(
+            &live,
+            4,
+            "active",
+            None,
+            false,
+            &mut nav,
+            7,
+            1,
+            false,
+            &origin,
+            Some(&moved),
+        );
+        assert_ne!(
+            moved.content_generation, recolored.content_generation,
+            "palette changes replace projected rows"
+        );
+    }
+
+    #[test]
     fn healthy_resize_retains_input_but_retires_coordinates_even_after_a_b_a() {
         let live = surface(1, 1, 100);
         let origin = Arc::new(());
         let mut nav = Navigation::new(&live);
         let initial = super::super::project_navigation(
-            &live, 1, "active", None, true, &mut nav, 7, 1, false, &origin,
+            &live, 1, "active", None, true, &mut nav, 7, 1, false, &origin, None,
         );
         let source = initial.source.expect("drawn source");
         assert!(source.valid_for(&origin, 7, 1, &live));
@@ -760,10 +889,18 @@ mod tests {
             2,
             true,
             &origin,
+            None,
         );
         assert!(resizing.input_ready);
         assert_eq!(resizing.cursor_visible, live.surface.cursor.visible);
-        assert!(resizing.source.is_none(), "no pointer source during resize");
+        assert!(
+            !resizing
+                .source
+                .as_ref()
+                .expect("presentation rows remain available")
+                .valid_for(&origin, 7, 2, &live),
+            "presentation-only resize source cannot authorize pointer input"
+        );
         assert!(
             !source.valid_for(&origin, 7, 3, &live),
             "same dimensions do not revive old coordinates"
@@ -779,6 +916,7 @@ mod tests {
             3,
             false,
             &origin,
+            None,
         );
         assert!(!reconnected.input_ready);
         assert!(!source.valid_for(&origin, 8, 1, &live));
@@ -806,10 +944,17 @@ mod tests {
             assert_eq!(nav.copy().expect("captured text").as_str(), "0");
             let origin = Arc::new(());
             let frozen = super::super::project_navigation(
-                &next, 1, "active", None, true, &mut nav, 7, 1, false, &origin,
+                &next, 1, "active", None, true, &mut nav, 7, 1, false, &origin, None,
             );
             assert_eq!(
-                frozen.rows[0].cells[0].text, "0",
+                frozen
+                    .source
+                    .as_ref()
+                    .expect("presentation source")
+                    .presentation_rows()[0]
+                    .cells[0]
+                    .text,
+                "0",
                 "render the captured selection"
             );
             assert!(!frozen.cursor_visible);
@@ -825,10 +970,17 @@ mod tests {
             );
             assert!(nav.rows().is_none(), "release frozen display");
             let restored = super::super::project_navigation(
-                &next, 2, "active", None, true, &mut nav, 7, 1, false, &origin,
+                &next, 2, "active", None, true, &mut nav, 7, 1, false, &origin, None,
             );
             assert_eq!(
-                restored.rows[0].cells[0].text, "x",
+                restored
+                    .source
+                    .as_ref()
+                    .expect("presentation source")
+                    .presentation_rows()[0]
+                    .cells[0]
+                    .text,
+                "x",
                 "render current live pixels"
             );
             assert!(restored.cursor_visible);

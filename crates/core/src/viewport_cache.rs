@@ -501,7 +501,7 @@ impl<Row> ViewportCache<Row> {
             && (!render_local
                 || (self.pages.is_none() && self.needs_prefetch(self.desired_offset_from_bottom)))
         {
-            let query = make_query(anchor, self.desired_offset_from_bottom);
+            let query = self.make_query(anchor, self.desired_offset_from_bottom);
             self.pending_query = Some(query);
             Some(query)
         } else {
@@ -619,7 +619,7 @@ impl<Row> ViewportCache<Row> {
             && !capacity_rejected
             && (self.pages.is_none() || desired > 0))
             .then(|| {
-                let query = make_query(latest_anchor, desired);
+                let query = self.make_query(latest_anchor, desired);
                 self.pending_query = Some(query);
                 query
             });
@@ -680,7 +680,7 @@ impl<Row> ViewportCache<Row> {
             .desired_offset_from_bottom
             .min(latest_anchor.max_offset_from_bottom);
         let request = (self.desired_offset_from_bottom > 0).then(|| {
-            let query = make_query(latest_anchor, self.desired_offset_from_bottom);
+            let query = self.make_query(latest_anchor, self.desired_offset_from_bottom);
             self.pending_query = Some(query);
             query
         });
@@ -718,12 +718,34 @@ impl<Row> ViewportCache<Row> {
                 break;
             }
             if self.window_for(anchor, target).is_none() {
-                let query = make_query(anchor, target);
+                let query = self.make_query(anchor, target);
                 self.pending_query = Some(query);
                 return Some(query);
             }
         }
         None
+    }
+
+    fn make_query(
+        &self,
+        anchor: TerminalHistoryWindowAnchor,
+        target: u64,
+    ) -> TerminalHistoryWindowQuery {
+        let mut query = make_query(anchor, target);
+        if self.pages.is_some() {
+            let rows = anchor.viewport.rows;
+            // A local pixel viewport can remain at either physical edge while
+            // its neighbor loads. Include that complete edge viewport so the
+            // new page can replace it without replaying an unseen row step.
+            if target <= u64::from(rows) {
+                query.newer_margin_rows = target as u16;
+                query.older_margin_rows = rows * 2 - query.newer_margin_rows;
+            } else if anchor.max_offset_from_bottom - target <= u64::from(rows) {
+                query.older_margin_rows = (anchor.max_offset_from_bottom - target) as u16;
+                query.newer_margin_rows = rows * 2 - query.older_margin_rows;
+            }
+        }
+        query
     }
 
     fn needs_prefetch(&self, target: u64) -> bool {
@@ -1185,6 +1207,29 @@ mod tests {
                 <= u32::from(query.anchor.viewport.rows) * 2
         );
         assert!(cache.set_target(6).request.is_none());
+    }
+
+    #[test]
+    fn multipage_edge_queries_also_cover_the_waiting_full_viewport() {
+        for (target, edge) in [(1, 0), (4, 0), (96, 100), (99, 100)] {
+            let mut cache = ViewportCache::<i64>::with_budget(ViewportCacheBudget {
+                rows: 128,
+                bytes: 64 * 1024,
+            });
+            cache.observe_anchor(anchor(1, 100));
+            let query = cache.set_target(target).request.expect("edge query");
+            assert_eq!(query.older_margin_rows + query.newer_margin_rows, 8);
+            let window = response(query);
+            assert!(
+                window.visible_rows(edge).is_some(),
+                "handoff retains a complete edge viewport"
+            );
+            cache
+                .install_accounted_window(window, 0)
+                .expect("bounded window");
+            let cached = cache.set_target(edge);
+            assert!(cached.render_local && cached.request.is_none());
+        }
     }
 
     #[test]

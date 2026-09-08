@@ -49,6 +49,7 @@ internal class TerminalView(context: Context) : View(context) {
     var consumedModifiers: () -> Unit = {}
     private var current: NativeFrame? = null
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { typeface = Typeface.MONOSPACE }
+    private val rowRenderer = TerminalRowRenderer()
     private val underlinePath = Path()
     private val dotted = android.graphics.DashPathEffect(floatArrayOf(resources.displayMetrics.density,resources.displayMetrics.density*2),0f)
     private val dashed = android.graphics.DashPathEffect(floatArrayOf(resources.displayMetrics.density*3,resources.displayMetrics.density*2),0f)
@@ -81,6 +82,9 @@ internal class TerminalView(context: Context) : View(context) {
     }
     private val scroller = OverScroller(context)
     private var scrollPixels = 0f
+    private var lastScrollTarget: Long? = null
+    private var scrollRequestGeneration = 0L
+    private var waitingEdge = 0
     private var actionMode: ActionMode? = null
     private var draggingHandle: Boolean? = null
     private var touchX = 0f
@@ -109,7 +113,7 @@ internal class TerminalView(context: Context) : View(context) {
     private val gesture = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
         override fun onDown(event: MotionEvent): Boolean {
             scroller.forceFinished(true); releaseGestureSource(); wheelPixels = 0f
-            gestureMode = drawnFrame?.pointerMode ?: NativePointerMode.NONE
+            gestureMode = if (scrollPixels == 0f) drawnFrame?.pointerMode ?: NativePointerMode.NONE else NativePointerMode.NONE
             childGesture = gestureMode != NativePointerMode.NONE && !imeAnimating()
             if (childGesture) {
                 gestureSource = drawnSource?.retained()
@@ -175,34 +179,87 @@ internal class TerminalView(context: Context) : View(context) {
         if (unobserve == null) unobserve = repository?.observeTerminalFrames(::acceptFrame)
     }
     private fun acceptFrame(frame: NativeFrame?) {
-        if (current !== frame) {
-            pendingSource?.close()
-            pendingSource = frame?.source?.retained()
-            if (frame == null) { drawnSource?.close(); drawnSource = null; drawnFrame = null }
-            val previous = current
-            current = frame
-            if (previous?.inputEpoch != frame?.inputEpoch || previous?.geometryGeneration != frame?.geometryGeneration || gestureMode != frame?.pointerMode) invalidateCoordinates()
-            if (previous?.inputEpoch != frame?.inputEpoch) {
-                composing.clear(); consumedModifiers(); manager.restartInput(this)
-                scroller.forceFinished(true); scrollPixels = (frame?.historyOffset?.toLong() ?: 0) * cellHeight
-            } else if (frame != null && previous != null) {
-                val growth = frame.historyMaximum.toLong() - previous.historyMaximum.toLong()
-                if (scrollPixels > 0f && growth > 0) scrollPixels += growth * cellHeight
-                if (frame.historyOffset == 0uL && frame.cursorVisible && frame.selection == null) scrollPixels = 0f
-            }
-            if (frame?.selection != null && actionMode == null) showSelectionActions()
-            if (frame?.selection == null) { val old = actionMode; actionMode = null; old?.finish() }
-            actionMode?.invalidateContentRect()
-            updateAnchor()
-            postInvalidateOnAnimation()
+        if (current === frame) return
+        val previous = current
+        val epochChanged = previous?.inputEpoch != frame?.inputEpoch
+        val geometryChanged = previous?.geometryGeneration != frame?.geometryGeneration
+        val growth = if (previous != null && frame != null) frame.historyMaximum.toLong() - previous.historyMaximum.toLong() else 0L
+        val returningLive = repository?.scrollIntent == 0L && frame?.historyOffset == 0uL && frame.cursorVisible && frame.selection == null &&
+            (waitingEdge == 0 || repository?.scrollRequestGeneration != scrollRequestGeneration)
+        if (epochChanged || geometryChanged) {
+            scroller.forceFinished(true)
+            scrollPixels = (frame?.historyOffset?.toLong() ?: 0) * cellHeight
+            lastScrollTarget = null; waitingEdge = 0
+            invalidateCoordinates()
+            rowRenderer.clear()
+        } else if ((scrollPixels > 0f || waitingEdge > 0) && growth > 0) {
+            // Preserve the logical reading position as live output appends.
+            scrollPixels += growth * cellHeight
+            scroller.forceFinished(true)
+            lastScrollTarget = null
         }
+        if (returningLive) { scrollPixels = 0f; scroller.forceFinished(true) }
+        if (epochChanged) {
+            composing.clear(); consumedModifiers(); manager.restartInput(this)
+        }
+        repository?.let { owner ->
+            val intent = owner.scrollIntent
+            if (owner.scrollRequestGeneration != scrollRequestGeneration && intent != null &&
+                frame?.historyOffset?.toLong() == intent) {
+                scrollPixels = intent * cellHeight
+                scrollRequestGeneration = owner.scrollRequestGeneration
+                scroller.forceFinished(true); waitingEdge = 0; lastScrollTarget = null
+            }
+        }
+        // A delayed response after reversal may no longer cover the View. Keep
+        // its still-valid rows/source until a response covers the actual position.
+        val retainedWindow = if (!epochChanged && !geometryChanged && !returningLive &&
+            frame?.state == "active" && previous?.state == "active") {
+            previous.copy(windowOffset = (previous.windowOffset.toLong() + growth.coerceAtLeast(0)).toULong())
+                .takeIf { scrollPixels !in scrollBounds(frame) && scrollPixels in scrollBounds(it) }
+        } else null
+        if (retainedWindow != null) {
+            if (pendingSource == null) pendingSource = drawnSource?.retained()
+            current = frame!!.copy(rows = retainedWindow.rows, firstRow = retainedWindow.firstRow,
+                windowOffset = retainedWindow.windowOffset, contentGeneration = retainedWindow.contentGeneration,
+                background = retainedWindow.background, cursorVisible = false, source = null)
+        } else {
+            pendingSource?.close(); pendingSource = frame?.source?.retained()
+            current = frame
+        }
+        if (frame == null) {
+            drawnSource?.close(); drawnSource = null; drawnFrame = null; drawnGeometry = null
+            rowRenderer.clear()
+        }
+        current?.let { shown ->
+            scrollPixels = scrollPixels.coerceIn(scrollBounds(shown))
+            if (waitingEdge != 0 && previous != null && frame != null) {
+                val before = scrollBounds(previous)
+                val after = scrollBounds(frame)
+                if (waitingEdge > 0 && after.endInclusive > before.endInclusive + growth.coerceAtLeast(0) * cellHeight ||
+                    waitingEdge < 0 && after.start < before.start + growth.coerceAtLeast(0) * cellHeight) {
+                    val older = waitingEdge > 0
+                    waitingEdge = 0
+                    submitScroll(kotlin.math.ceil(scrollPixels / cellHeight).toLong(), older)
+                }
+            }
+        }
+        if (gestureMode != frame?.pointerMode && childGesture) invalidateCoordinates()
+        if (frame?.selection != null && actionMode == null) showSelectionActions()
+        if (frame?.selection == null) { val old = actionMode; actionMode = null; old?.finish() }
+        actionMode?.invalidateContentRect()
+        updateAnchor()
+        postInvalidateOnAnimation()
     }
     private fun updateMetrics() {
+        val rows = scrollPixels / cellHeight
+        rowRenderer.clear()
         paint.textSize = android.util.TypedValue.applyDimension(android.util.TypedValue.COMPLEX_UNIT_SP, font.toFloat(), resources.displayMetrics)
         cellWidth = paint.measureText("M").coerceAtLeast(1f)
         val metrics = paint.fontMetrics
         cellHeight = kotlin.math.ceil((metrics.descent - metrics.ascent).toDouble()).toFloat().coerceAtLeast(1f)
         baseline = -metrics.ascent
+        scrollPixels = rows * cellHeight
         invalidateCoordinates()
         onCellHeightChanged(gridCellHeight)
     }
@@ -212,7 +269,7 @@ internal class TerminalView(context: Context) : View(context) {
         releaseGestureSource(); childGesture = false; draggingHandle = null
         removeCallbacks(autoScroll)
     }
-    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) { invalidateCoordinates(); measureGrid() }
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) { rowRenderer.clear(); invalidateCoordinates(); measureGrid() }
     override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) { measureGrid() }
     private fun measureGrid() {
         if (width <= 0 || height <= 0 || animatedInsets || imeMeasurePending || imeAnimating()) return
@@ -222,68 +279,32 @@ internal class TerminalView(context: Context) : View(context) {
     override fun onDraw(canvas: Canvas) {
         val frame = current ?: return
         canvas.clipRect(0, 0, width, height)
-        val shift = drawShift(frame)
+        val offset = kotlin.math.ceil(scrollPixels / cellHeight).toLong()
+        val firstRow = frame.firstRow + frame.windowOffset.toLong() - offset
+        val shift = geometryShift(frame) + scrollPixels - offset * cellHeight
         val location = IntArray(2); getLocationOnScreen(location)
         val geometry = DrawnTerminalGeometry(cellWidth, cellHeight, baseline, shift, width, height,
-            location[0], location[1], geometryVersion)
+            location[0], location[1], geometryVersion, firstRow)
         canvas.drawColor(frame.background.toInt())
         canvas.save(); canvas.translate(0f, shift)
         frame.rows.forEachIndexed { row, line ->
-            val top = row * cellHeight
+            val logical = frame.firstRow + row
+            val top = (logical - geometry.firstRow) * cellHeight
             if (top + shift >= height || top + cellHeight + shift <= 0) return@forEachIndexed
-            line.cells.forEachIndexed { column, cell ->
-                if (cell.width == 0.toUByte()) return@forEachIndexed
-                val x = column * cellWidth
-                val right = x + cellWidth * cell.width.toInt()
-                if (x >= width) return@forEachIndexed
-                paint.color = cell.background.toInt(); paint.alpha = 255
-                canvas.drawRect(x, top, right, top + cellHeight, paint)
-                paint.color = cell.foreground.toInt()
-                paint.alpha = if (cell.attributes.toInt() and 2 != 0) 150 else 255
-                paint.isFakeBoldText = cell.attributes.toInt() and 1 != 0
-                paint.textSkewX = if (cell.attributes.toInt() and 4 != 0) -.2f else 0f
-                if (cell.text.isNotEmpty()) {
-                    canvas.save(); canvas.clipRect(x, top, right, top + cellHeight)
-                    canvas.drawText(cell.text, x, top + baseline, paint); canvas.restore()
-                }
-                paint.isFakeBoldText = false; paint.textSkewX = 0f; paint.alpha = 255
-                if (cell.underline.toInt() != 0) {
-                    paint.color = cell.underlineColor.toInt(); paint.strokeWidth = resources.displayMetrics.density
-                    val y = top + cellHeight - paint.strokeWidth
-                    when (cell.underline.toInt()) {
-                        3 -> {
-                            val path = underlinePath.apply {
-                                reset()
-                                moveTo(x,y)
-                                var position = x
-                                while (position < right) {
-                                    val end = minOf(position+4*paint.strokeWidth,right)
-                                    quadTo((position+end)/2, y-3*paint.strokeWidth,end,y)
-                                    position = end
-                                }
-                            }
-                            paint.style = Paint.Style.STROKE; canvas.drawPath(path,paint); paint.style = Paint.Style.FILL
-                        }
-                        4, 5 -> {
-                            paint.pathEffect = if (cell.underline.toInt() == 4) dotted else dashed
-                            canvas.drawLine(x,y,right,y,paint); paint.pathEffect = null
-                        }
-                        else -> {
-                            canvas.drawLine(x,y,right,y,paint)
-                            if (cell.underline.toInt() == 2) canvas.drawLine(x,y-2*paint.strokeWidth,right,y-2*paint.strokeWidth,paint)
-                        }
-                    }
-                }
+            canvas.save(); canvas.translate(0f, top)
+            rowRenderer.draw(canvas, logical, line, width, cellHeight.toInt(), frame.viewport.rows.toInt() * 3 + 1) {
+                drawRow(it, line)
             }
+            canvas.restore()
         }
         drawSelection(canvas, frame, geometry)
         val cursorX = frame.cursorColumn.toInt() * cellWidth
-        val cursorY = frame.cursorRow.toInt() * cellHeight
-        if (frame.cursorVisible) {
+        val cursorY = (frame.firstRow + frame.windowOffset.toLong() + frame.cursorRow.toInt() - firstRow) * cellHeight
+        if (frame.cursorVisible && scrollPixels == 0f) {
             paint.color = frame.cursorColor.toInt(); paint.alpha = 130
             canvas.drawRect(cursorX,cursorY,cursorX+cellWidth,cursorY+cellHeight,paint); paint.alpha = 255
         }
-        if (composing.isNotEmpty()) {
+        if (composing.isNotEmpty() && scrollPixels == 0f) {
             paint.color = frame.background.toInt()
             val extent = paint.measureText(composing.toString())
             canvas.drawRect(cursorX,cursorY,cursorX+extent,cursorY+cellHeight,paint)
@@ -292,8 +313,12 @@ internal class TerminalView(context: Context) : View(context) {
             canvas.drawLine(cursorX,cursorY+cellHeight-1,cursorX+extent,cursorY+cellHeight-1,paint)
         }
         canvas.restore()
-        if (drawnFrame !== frame) {
-            drawnSource?.close(); drawnSource = pendingSource; pendingSource = null
+        if (drawnFrame !== frame || drawnGeometry?.firstRow != firstRow) {
+            if (drawnGeometry?.firstRow != firstRow) repository?.retireGeometry()
+            val base = pendingSource ?: drawnSource
+            val source = try { base?.viewportSource(firstRow) } catch (_: NativeException.RequestFailed) { null }
+            drawnSource?.close(); drawnSource = source
+            pendingSource?.close(); pendingSource = null
         }
         drawnFrame = frame
         drawnGeometry = geometry
@@ -301,16 +326,63 @@ internal class TerminalView(context: Context) : View(context) {
         actionMode?.invalidateContentRect()
         if (draggingHandle != null) post { extendHandle() }
     }
+    private fun drawRow(canvas: Canvas, line: NativeRow) {
+        val top = 0f
+        line.cells.forEachIndexed { column, cell ->
+            if (cell.width == 0.toUByte()) return@forEachIndexed
+            val x = column * cellWidth
+            val right = x + cellWidth * cell.width.toInt()
+            if (x >= width) return@forEachIndexed
+            paint.color = cell.background.toInt(); paint.alpha = 255
+            canvas.drawRect(x, top, right, top + cellHeight, paint)
+            paint.color = cell.foreground.toInt()
+            paint.alpha = if (cell.attributes.toInt() and 2 != 0) 150 else 255
+            paint.isFakeBoldText = cell.attributes.toInt() and 1 != 0
+            paint.textSkewX = if (cell.attributes.toInt() and 4 != 0) -.2f else 0f
+            if (cell.text.isNotEmpty()) {
+                canvas.save(); canvas.clipRect(x, top, right, top + cellHeight)
+                canvas.drawText(cell.text, x, top + baseline, paint); canvas.restore()
+            }
+            paint.isFakeBoldText = false; paint.textSkewX = 0f; paint.alpha = 255
+            if (cell.underline.toInt() != 0) {
+                paint.color = cell.underlineColor.toInt(); paint.strokeWidth = resources.displayMetrics.density
+                val y = top + cellHeight - paint.strokeWidth
+                when (cell.underline.toInt()) {
+                    3 -> {
+                        val path = underlinePath.apply {
+                            reset()
+                            moveTo(x,y)
+                            var position = x
+                            while (position < right) {
+                                val end = minOf(position+4*paint.strokeWidth,right)
+                                quadTo((position+end)/2, y-3*paint.strokeWidth,end,y)
+                                position = end
+                            }
+                        }
+                        paint.style = Paint.Style.STROKE; canvas.drawPath(path,paint); paint.style = Paint.Style.FILL
+                    }
+                    4, 5 -> {
+                        paint.pathEffect = if (cell.underline.toInt() == 4) dotted else dashed
+                        canvas.drawLine(x,y,right,y,paint); paint.pathEffect = null
+                    }
+                    else -> {
+                        canvas.drawLine(x,y,right,y,paint)
+                        if (cell.underline.toInt() == 2) canvas.drawLine(x,y-2*paint.strokeWidth,right,y-2*paint.strokeWidth,paint)
+                    }
+                }
+            }
+        }
+    }
     private fun geometryShift(frame: NativeFrame): Float {
-        if (frame.historyOffset != 0uL || frame.selection != null || !frame.cursorVisible) return 0f
+        if (scrollPixels != 0f || frame.historyOffset != 0uL || frame.selection != null || !frame.cursorVisible) return 0f
         if (frame.viewport.columns.toInt() != floor(width / cellWidth).toInt().coerceIn(1, 240)) return 0f
         return terminalPan(minOf(height.toFloat(), 80 * cellHeight), cellHeight, frame.viewport.rows.toInt(), frame.cursorRow.toInt(), frame.historyMaximum.toLong())
     }
-    private fun drawShift(frame: NativeFrame): Float {
-        val geometry = geometryShift(frame)
-        val target = kotlin.math.ceil(scrollPixels / cellHeight).toLong()
-        if (frame.historyOffset.toLong() != target) return geometry
-        return geometry - (target * cellHeight - scrollPixels)
+    private fun scrollBounds(frame: NativeFrame): ClosedFloatingPointRange<Float> {
+        val maximum = minOf(frame.windowOffset.toLong(), frame.historyMaximum.toLong())
+        val minimum = (frame.windowOffset.toLong() - (frame.rows.size - frame.viewport.rows.toInt()).coerceAtLeast(0))
+            .coerceIn(0, maximum)
+        return minimum * cellHeight..maximum * cellHeight
     }
     private fun hit(x: Float, y: Float): Pair<Int,Int> {
         val frame = drawnFrame
@@ -322,15 +394,34 @@ internal class TerminalView(context: Context) : View(context) {
         val frame = current ?: return
         if (frame.state != "active") return
         val previous = scrollPixels
-        scrollPixels = value.coerceIn(0f,frame.historyMaximum.toLong() * cellHeight)
+        val bounds = scrollBounds(frame)
+        scrollPixels = value.coerceIn(bounds)
         val target = kotlin.math.ceil(scrollPixels / cellHeight).toLong()
-        repository?.scroll(target, scrollPixels >= previous, (2 + kotlin.math.abs(scroller.currVelocity) / (cellHeight*12)).toInt().coerceIn(2,8))
+        val edge = when { value > bounds.endInclusive -> 1; value < bounds.start -> -1; else -> 0 }
+        if (edge != 0) {
+            scroller.forceFinished(true)
+            waitingEdge = edge
+            // Ask for the next row to expose an adjacent cached/prefetched page.
+            // Discard excess distance: delivery expands bounds, never replays it.
+            submitScroll((target + edge).coerceIn(0, frame.historyMaximum.toLong()), edge > 0)
+        } else {
+            waitingEdge = 0
+            submitScroll(target, scrollPixels >= previous)
+        }
         awakenScrollBars()
         postInvalidateOnAnimation()
     }
+    private fun submitScroll(target: Long, older: Boolean) {
+        if (lastScrollTarget == target) return
+        lastScrollTarget = target
+        repository?.scroll(target, older,
+            (2 + kotlin.math.abs(scroller.currVelocity) / (cellHeight * 12)).toInt().coerceIn(2, 8),
+            kotlin.math.ceil(scrollPixels / cellHeight).toLong())
+        scrollRequestGeneration = repository?.scrollRequestGeneration ?: scrollRequestGeneration
+    }
     override fun computeVerticalScrollRange(): Int = ((current?.historyMaximum?.toLong() ?: 0) * cellHeight + height).coerceAtMost(Int.MAX_VALUE.toFloat()).toInt()
     override fun computeVerticalScrollExtent(): Int = height
-    override fun computeVerticalScrollOffset(): Int = (((current?.historyMaximum?.toLong() ?: 0) - (current?.historyOffset?.toLong() ?: 0)) * cellHeight).coerceIn(0f,Int.MAX_VALUE.toFloat()).toInt()
+    override fun computeVerticalScrollOffset(): Int = ((current?.historyMaximum?.toLong() ?: 0) * cellHeight - scrollPixels).coerceIn(0f,Int.MAX_VALUE.toFloat()).toInt()
     override fun computeScroll() {
         if (scroller.computeScrollOffset()) { moveScroll(scroller.currY.toFloat()); postInvalidateOnAnimation() }
     }
@@ -338,7 +429,7 @@ internal class TerminalView(context: Context) : View(context) {
         frame ?: return null
         geometry ?: return null
         val selection = frame.selection ?: return null
-        val row = (if (anchor) selection.anchorRow else selection.focusRow) - frame.firstRow
+        val row = (if (anchor) selection.anchorRow else selection.focusRow) - geometry.firstRow
         if (row !in 0 until frame.viewport.rows.toLong()) return null
         val column = if (anchor) selection.anchorColumn.toInt() else selection.focusColumn.toInt()+1
         return (column * geometry.cellWidth).coerceIn(handleRadius, maxOf(handleRadius,geometry.width-handleRadius)) to (row+1) * geometry.cellHeight + geometry.shift
@@ -391,7 +482,8 @@ internal class TerminalView(context: Context) : View(context) {
             if (logical in first.first..last.first) {
                 val left = if (logical == first.first) first.second else 0
                 val right = if (logical == last.first) last.second+1 else frame.viewport.columns.toInt()
-                canvas.drawRect(left*cellWidth,index*cellHeight,right*cellWidth,(index+1)*cellHeight,paint)
+                val row = logical - geometry.firstRow
+                canvas.drawRect(left*cellWidth,row*cellHeight,right*cellWidth,(row+1)*cellHeight,paint)
             }
         }
         paint.alpha = 255
@@ -432,13 +524,14 @@ internal class TerminalView(context: Context) : View(context) {
     override fun onWindowVisibilityChanged(visibility: Int) {
         super.onWindowVisibilityChanged(visibility)
         repository?.terminalVisible(visibility == VISIBLE)
-        if (visibility != VISIBLE) { scroller.forceFinished(true); draggingHandle = null; releaseGestureSource(); removeCallbacks(autoScroll) }
+        if (visibility != VISIBLE) { rowRenderer.clear(); scroller.forceFinished(true); draggingHandle = null; releaseGestureSource(); removeCallbacks(autoScroll) }
     }
     override fun onAttachedToWindow() {
         super.onAttachedToWindow(); disposing = false; observeFrames()
     }
     override fun onDetachedFromWindow() {
         disposing = true
+        rowRenderer.clear()
         imeMeasurePending = false
         releaseGestureSource()
         unobserve?.invoke(); unobserve = null
@@ -474,10 +567,10 @@ internal class TerminalView(context: Context) : View(context) {
         val frame = drawnFrame ?: return
         val geometry = drawnGeometry ?: return
         if (geometry.version != geometryVersion || frame.inputEpoch != current?.inputEpoch) return
-        if (!frame.inputReady || frame.historyOffset != 0uL || frame.selection != null) return
+        if (!frame.inputReady || scrollPixels != 0f || frame.historyOffset != 0uL || frame.selection != null) return
         val matrix = Matrix().apply { setTranslate(geometry.screenX.toFloat(), geometry.screenY.toFloat()) }
         val x = frame.cursorColumn.toInt() * geometry.cellWidth
-        val y = frame.cursorRow.toInt() * geometry.cellHeight + geometry.shift
+        val y = (frame.firstRow + frame.windowOffset.toLong() + frame.cursorRow.toInt() - geometry.firstRow) * geometry.cellHeight + geometry.shift
         val visible = x in 0f..geometry.width.toFloat() && y >= 0f && y + geometry.cellHeight <= geometry.height
         val flags = if (visible) CursorAnchorInfo.FLAG_HAS_VISIBLE_REGION else CursorAnchorInfo.FLAG_HAS_INVISIBLE_REGION
         val builder = CursorAnchorInfo.Builder().setMatrix(matrix).setSelectionRange(composing.length, composing.length)

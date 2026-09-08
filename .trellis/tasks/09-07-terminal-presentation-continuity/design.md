@@ -1,5 +1,45 @@
 # Terminal presentation continuity design
 
+## Approved Android row-window extension (2026-09-08)
+
+The measured gap is at the native-to-View boundary: retained pages exist, but
+each row crossing projects/copies a viewport and records all glyphs again.
+Rust keeps semantic/cache ownership; Kotlin owns local pixels and rendering reuse.
+
+Change boundary: `crates/android/src/terminal.rs` and `terminal/navigation.rs`
+expose an immutable slice (up to three viewports plus one row) through the existing
+accounted `NativeFrameSource`. `content_generation` identifies its page/range/
+resolved colors independently from ordinary metadata generation. Fetch rows from
+the source only when content changes. Keep eager complete rows if no source can
+be accounted. Prefer current-revision cached rows at live bottom when available.
+
+Emulator warmup exposed an additional necessary boundary in
+`crates/core/src/viewport_cache.rs`: the existing directional query gives zero
+newer margin near Live, so an edge probe can return rows that cannot cover the
+still-displayed full viewport. Multi-page queries now include the nearby complete
+physical-edge viewport within the same two-screen margin budget. Default desktop
+single-window query behavior stays unchanged. This avoids a 0→1→0 cache handoff
+loop without merging unproven mutable live rows or replaying blocked movement.
+
+`AppRepository.kt` resolves new rows off Main and reuses the immutable Kotlin row
+list across unchanged content generations. Preserve source retain/close and
+attachment fences. `TerminalView.kt` draws an arbitrary viewport within those
+rows and binds its drawn source to the actual logical first row through an O(1)
+validated source handle. Metadata replies do not overwrite local pixel motion;
+missing-edge requests do not accumulate an unseen fling.
+
+`TerminalRowRenderer.kt` owns API 29+ RenderNode reuse keyed by logical row and
+complete cell content, bounded to three screens. Font/width/detach invalidate it.
+Use the original cell painter for software/API 26–28 and for recording nodes;
+cursor, selection and preedit remain current-frame overlays. `TerminalScreen.kt`
+observes only chrome fields; the direct View observer keeps exact source delivery.
+Extend existing native/pixel/UI/profiling test owners; regenerate bridge outputs.
+
+No wire, host daemon, desktop presenter, input protocol, inertia curve or release
+change belongs to this slice. Existing 4,096-row/16 MiB native accounting includes
+pinned pages; Kotlin rows and render lists have separate row bounds. Content IDs
+are attachment-local and cleared with Repository retirement.
+
 Status: implemented; local quality checks complete, desktop GUI visual evidence unavailable. Baseline `be66a16`. Product choices are in [prd.md](prd.md).
 This design retains the current semantic wire format and changes publication and presentation
 ownership inside the existing host, desktop CLI and Android client.

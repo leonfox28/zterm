@@ -84,7 +84,6 @@ resize rule supports clipping/minimum pan; real TUI layout changes can still aff
 
 - Earlier submission of a reliably known final size to overlap IME animation with remote resize is a
   separate optional optimization. First implementation retains settled-size submission.
-- Android row/RenderNode caches and broader projection optimization require a demonstrated need.
 - Unmarked application frames cannot be identified perfectly; no all-program zero-flicker guarantee.
 - Outer desktop emulators can reflow independently and may not support synchronized output.
 - Explicit batch timeout/recovery prioritizes progress over retaining a never-completed frame.
@@ -106,3 +105,65 @@ independent test hosts and state directories. The unrelated e2e-hardening work r
 
 Research: `research/cross-client-presentation.md` and `research/second-review.md`. Historical open
 questions in those records are superseded by this converged PRD and its design.
+
+## Post-release scrolling follow-up — 2026-09-08
+
+The user reports intermittent doubled text during Android upward shell-history
+drag, while downward drag is normal. Restore the existing PRES-1/2/6 committed
+geometry contract: crossing an integer row with a delayed native frame must not
+reverse unchanged rows or translate a stale page across unbounded missing history.
+Verify actual Canvas pixels before/after delivery in both directions and on
+reversal, then exercise cached history and selection on a disposable host.
+Root-cause evidence and scope are in `research/android-scroll-handoff.md`.
+This local scroll correction does not close the separate keyboard-close visual
+acceptance gap or authorize activation on the user's running daemon.
+
+Phone follow-up: the user confirms the ghosting is gone but asks for a better
+bidirectional scrolling approach because motion remains insufficiently smooth.
+Review the current per-row asynchronous presentation dependency and per-frame
+conversion/drawing work. The new review proposes bounded nearby-row presentation
+and local pixel motion, with measurement-driven rendering reuse; it has not been
+implemented. See the smoothness review in `research/android-scroll-handoff.md`.
+Preserve cached-history correctness, source-aware selection, resource limits and
+child-owned TUI input while assessing this next optimization.
+
+The user subsequently authorized emulator profiling. The opt-in real-touch test
+and Dev/non-debuggable comparison are complete; both show material repeated
+drawing work and missed deadlines on cached history. Exact natural motion-stall
+rates are not established. Keep the improved row-window/render-reuse design as
+a proposal; see accepted measurements and rejected sampling evidence in the same
+research note.
+
+## Approved Android scrolling optimization — 2026-09-08
+
+The user approved implementation after clarifying that available local content
+scrolls immediately, nearby rows are prefetched, unavailable content stops motion
+at the known edge, and received rows remain reusable within bounded cache lifetime.
+Android row/render caching is now in scope, supported by the emulator measurements.
+This approval does not request another release.
+
+- Move through a bounded contiguous adjacent-row window without waiting for a
+  native actor reply or row conversion at each crossing.
+- Retain native history/selection/prefetch ownership. Coalesce integer-row
+  intents, avoiding duplicate requests within a row. At an unavailable edge,
+  clamp motion, stop the fling and request only the adjacent missing viewport;
+  late data extends the range without accumulated overshoot replay.
+- Reuse projected rows across metadata frames and load replacements off Main.
+  Reuse bounded hardware row display lists; preserve API 26–28/software rendering.
+- Keep drawn row/source/geometry aligned for selection, Copy, pointer and IME.
+  Preserve append anchors and retire incompatible geometry/input/window sources.
+  Child-owned TUI gestures retain their owner.
+- Verify held-delivery multi-row/reversed pixel motion, bounded edges/refill,
+  exact source-aware selection, hardware invalidation, native identity/budgets,
+  real-input before/after profiling and existing IME/Copy/child-pointer smoke.
+
+
+## 2026-09-08 — phone acceptance and v0.1.28 authorization
+
+The user tested the installed 8c61cdf0 development APK and reported
+“测试了一下非常棒”, then explicitly requested committing all changes and the
+release workflow. This accepts phone scrolling experience; it does not establish
+a phone FPS measurement or close the separate keyboard-close/history-refill and
+desktop visual gaps. Publish the scoped scrolling improvements as v0.1.28 using
+normal PR/CI/main-candidate/tag/protected-signing/publication checks. No running
+Mac daemon update or interaction with its main Session is authorized.

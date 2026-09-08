@@ -70,6 +70,16 @@ new connection through duplicate arbitration, even with valid authorization.
 - `ViewportCache::with_budget(ViewportCacheBudget { rows, bytes })` opts Android
   into multiple pages. Default construction preserves desktop single-window
   behavior. `install_accounted_window` requires nested row allocation bytes.
+- `NativeFrame.content_generation` identifies an attachment-local immutable
+  presentation window (page/range/resolved colors); zero is the eager fallback.
+  Metadata-only frames carry no row DTOs. `source.presentation_rows()` resolves
+  at most three viewports plus one row; `first_row` is its logical window start
+  and `window_offset` locates it in the current reading-offset basis.
+- `source.viewport_source(first_row)` rebinds O(1) to a full viewport contained
+  in that same exported window. It retains the accounted page and original
+  origin/input/geometry/screen fences; an out-of-window request returns
+  `selection_changed`. Inactive presentation sources carry no usable input
+  epoch. Coordinate authority is never revived by matching pixels or dimensions.
 - `NativeFrame.stats` contains query counts, local hits/misses, retained rows,
   allocation/peak bytes and smoothed response RTT. It contains no content or peer
   addresses. `notice` is a recoverable local reading error, distinct from `state`
@@ -115,7 +125,11 @@ View source handles have explicit close/retain ownership, independent of JVM GC.
 
 Warm four screens using bounded replies; prefetch 2–8 screens according to
 movement and observed latency. A prefetch response never moves an already frozen
-reading viewport. Source revisions may advance independently of historical page
+reading viewport. Multi-page queries near either physical edge reserve enough of their existing
+two-screen margin to also contain that complete edge viewport. A query centered
+one row away must not force the waiting View to jump one row when it arrives.
+Default single-window desktop query margins remain unchanged.
+Source revisions may advance independently of historical page
 anchors. Reuse older pages only where historical row identity is proven; mutable
 live rows require matching content. Never display new selected cells while Copy
 still extracts older pins.
@@ -140,6 +154,7 @@ do not hardcode a public resolver or replace the controller identity on changes.
 | --- | --- |
 | Invalid/oversize ticket | Shared decoder rejects before pairing |
 | Same endpoint, different seed | `identity_state_mismatch` |
+| Out-of-window presentation binding | `selection_changed`, no new coordinate authority |
 | Stale source or input epoch | `selection_changed` / `input_not_ready`, no remote input |
 | Cache full with pinned rows | `resource_limit`, keep Session and old copy |
 | Failed speculative read | Recoverable `history_unavailable`, pending query retired |
@@ -167,7 +182,12 @@ deadlines to hide platform packet loss.
 
 Preserve shared pairing/replay/attachment and daemon desktop-adapter fixtures.
 Core cache tests cover default behavior, page reuse, budgets/pins, one pending
-query, epoch validation and warmup. Native navigation tests cover old rendered
+query, epoch validation and warmup.
+`multipage_edge_queries_also_cover_the_waiting_full_viewport` checks full overlap
+at both ends within the unchanged margin budget; native warmup tests prove that
+Live and its adjacent row share a valid exported window. Source-window tests
+check stable content IDs across metadata/row steps, changed color identity,
+rebased selection coordinates and retained origin/input/geometry fences. Native navigation tests cover old rendered
 source identity, cross-page exact copy, missing joins, trim, healthy-return ACK
 barriers and disconnection invalidation. Native emulator integration verifies
 a sleeping subscriber receiving its final lease_lost/ended/closed frame before
