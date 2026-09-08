@@ -15,12 +15,12 @@
   "branch": "perf/android-local-scroll",
   "base_branch": "main",
   "worktree_path": null,
-  "commit": "cb19c754641d6c0a715ace9d02354b88c57abb2c",
-  "pr_url": "https://github.com/leonfox28/zterm/pull/35",
+  "commit": "9c5ecad4d22efc9a2092da25957900c5726d977d",
+  "pr_url": "https://github.com/leonfox28/zterm/pull/36",
   "subtasks": [],
   "children": [],
   "parent": "08-20-cross-platform-relay-terminal-mvp",
   "relatedFiles": [],
-  "notes": "Published immutable v0.1.27 via PR #35. User approved Android scroll optimization on 2026-09-08; implemented bounded native row windows, off-Main reusable projection, local pixel navigation/source rebinding, hardware row display lists, and multi-page physical-edge overlap. Full just check, Android lint/JVM/build, six pixel tests, native integration, keyboard/Chinese/Copy/Activity retention and isolated Herdr/child-pointer acceptance pass. Adjacent old/new emulator comparison: gesture draw p50 15.01 -> 1.79 ms, p95 20.11 -> 5.30 ms; manual drag/reversal frame timing is not uniformly improved, physical-phone acceptance remains open. Restored ordinary Dev 0.1.27 on the owned emulator, then updated the physical phone (1680fce0) on explicit user request; installed APK hash matches the tested 8c61cdf0 build. Phone visual/scrolling acceptance awaits user trial. Pending Phase 3.4 commit workflow; no new release or real daemon activation. Keep prior keyboard-close history refill and broader desktop/phone visual acceptance open. See research/android-scroll-optimization.md and research/android-scroll-handoff.md. User now accepts physical-phone scrolling (测试了一下非常棒) and explicitly authorizes all commits and v0.1.28 publication. Earlier phone-trial/commit-pending statements are superseded. Keep the separate keyboard-close and desktop visual gaps open.",
+  "notes": "Phone scrolling accepted by user; all scrolling implementation committed and released as immutable v0.1.28 via PR #36. Full local checks, Android runtime acceptance, PR/exact-main CI and signed release checks passed. Eleven assets verified; Android 102899. No real Mac daemon/main Session operation. Keep earlier keyboard-close/history-refill and desktop visual follow-ups open; parent remains in_progress. See research/release-0.1.28.md and research/android-scroll-optimization.md.",
   "meta": {}
 }

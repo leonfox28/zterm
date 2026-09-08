@@ -18,11 +18,13 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.github.leonfox28.zterm.nativebridge.NativeKey
+import io.github.leonfox28.zterm.nativebridge.NativeConnectionPath
 import io.github.leonfox28.zterm.nativebridge.NativeSession
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -44,7 +46,6 @@ import io.github.leonfox28.zterm.nativebridge.NativeSession
         onDispose { stop?.invoke() }
     }
     BackHandler(enabled = state.panel || !imeVisible) { if (state.panel) repository.closePanel() else repository.goHome() }
-    LaunchedEffect(state.needsSession) { if (state.needsSession) { creating = true; repository.sessionPromptShown() } }
     LaunchedEffect(frame?.inputEpoch, state.sessionId) { modifiers = 0 }
     BoxWithConstraints(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().imePadding()) {
         val panelHeight = (maxHeight * .65f).coerceAtMost(420.dp)
@@ -54,7 +55,7 @@ import io.github.leonfox28.zterm.nativebridge.NativeSession
                 Row(Modifier.weight(1f).fillMaxHeight().clickable { repository.togglePanel() }, verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
                         Text(session?.name ?: host?.name ?: "zterm", maxLines = 1, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
-                        if (session != null) Text(host?.name.orEmpty(), maxLines = 1, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        TerminalConnectionSubtitle(host?.name.orEmpty(), frame, state.busy, state.error)
                     }
                     LineIcon("down", Modifier.padding(horizontal = 12.dp).size(20.dp))
                 }
@@ -181,6 +182,34 @@ import io.github.leonfox28.zterm.nativebridge.NativeSession
         ConfirmDialog(stringResource(R.string.takeover), name?.let { "$it\n" }.orEmpty() + stringResource(R.string.takeover_message), stringResource(R.string.takeover), { taking = null }) {
             taking = null; repository.selectSession(id,true)
         }
+    }
+}
+@Composable internal fun TerminalConnectionSubtitle(host: String, status: TerminalStatus?, busy: Boolean, error: String?) {
+    val label = when (status?.state) {
+        "reconnecting" -> stringResource(R.string.reconnecting)
+        "ended" -> stringResource(R.string.session_ended)
+        "lease_lost" -> stringResource(R.string.lease_lost)
+        "closed" -> stringResource(R.string.disconnected)
+        "active", "synchronizing" -> {
+            if (status.state == "synchronizing" && status.connectionPath == NativeConnectionPath.UNKNOWN && !status.inputReady) {
+                stringResource(R.string.connecting)
+            } else {
+                val route = stringResource(when (status.connectionPath) {
+                    NativeConnectionPath.DIRECT -> R.string.connection_direct
+                    NativeConnectionPath.RELAY -> R.string.connection_relay
+                    NativeConnectionPath.UNKNOWN -> R.string.connected
+                })
+                val latency = stringResource(R.string.connection_latency, status.rttMs?.toString() ?: "—")
+                "$route · $latency"
+            }
+        }
+        else -> stringResource(if (busy) R.string.connecting else if (error != null) R.string.connection_error else R.string.disconnected)
+    }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(host, Modifier.weight(1f, fill = false), maxLines = 1, overflow = TextOverflow.Ellipsis,
+            fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(" · $label", maxLines = 1, overflow = TextOverflow.Ellipsis,
+            fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 /** The fifth, unoccupied area is below the fixed toolbar, inside the already consumed insets. */

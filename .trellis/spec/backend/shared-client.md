@@ -47,7 +47,12 @@ new connection through duplicate arbitration, even with valid authorization.
   identity fails. `pair_ticket` returns a provisional `NativePairing`; Kotlin
   stores its public host then invokes idempotent `commit_pairing`.
 - `connect_terminal(host, session, viewport, dark, takeover)` uses an exact Session
-  ID and never creates or retargets implicitly. Creation is a separate unary op.
+  ID and never creates or retargets implicitly. Named creation is a separate unary
+  op. `connect_default_terminal(host, viewport, dark)` explicitly invokes the
+  existing selector-free `create_main=true`, `takeover=false` attachment contract;
+  the daemon alone owns reserved main creation/reuse. Both entry points share
+  native preparation, ACK, resize and actor startup. `NativeTerminal.session_id()`
+  returns the authoritative prepared ID; Kotlin must persist this returned ID.
   Attach viewport is a host creation hint, not a resize of retained Sessions.
   Before returning the native handle, submit its requested size to the actor;
   the actor applies it after Active/takeover and waits for synchronization.
@@ -80,6 +85,12 @@ new connection through duplicate arbitration, even with valid authorization.
   origin/input/geometry/screen fences; an out-of-window request returns
   `selection_changed`. Inactive presentation sources carry no usable input
   epoch. Coordinate authority is never revived by matching pixels or dimensions.
+- `NativeFrame.connection_path: NativeConnectionPath` (Unknown/Direct/Relay) and
+  `rtt_ms: Option<u32>` project the shared `ConnectionStatus` event for this
+  attachment. Never use history-query RTT or a second diagnostic polling owner
+  for connection chrome. True reconnect/end/lease loss/closure clears both;
+  same-attachment synchronization preserves them. Metadata-only changes retain
+  the existing content-generation/page ownership.
 - `NativeFrame.stats` contains query counts, local hits/misses, retained rows,
   allocation/peak bytes and smoothed response RTT. It contains no content or peer
   addresses. `notice` is a recoverable local reading error, distinct from `state`
@@ -91,6 +102,21 @@ new connection through duplicate arbitration, even with valid authorization.
 cancellation becomes ready simultaneously. Re-read the frame on cancellation
 before returning Closed; otherwise sleeping observers can miss lease_lost/ended.
 The actor publishes the final complete state before canceling its token.
+
+`IrohSessionIo::read` reobserves the selected QUIC path/rounded RTT after at most
+one second without Session bytes. Its timeout cancels only the cancel-safe
+RecvStream.read future; partial decoded frames remain in the adapter. Emit only
+changed observations, send no application ping/input, and let normal stream
+errors retain their types. This observation is separate from input readiness.
+
+The Iroh `SessionUnaryTransport` adapter converts validated ServiceError frames
+from RemoteUnaryClient into typed redacted errors before the shared unary client
+can decode success payloads. RemoteUnaryClient itself retains frames for desktop
+forwarding. In particular OperationOutcomeUnknown retires the cached operation
+lease; only a subsequent explicit mutation requests a new lease. Otherwise a
+daemon restart can turn valid domain errors into malformed_frame indefinitely.
+`restarted_daemon_error_retires_unary_lease_without_replaying_mutation` verifies
+lease retirement, no hidden mutation retry and preserved error/redaction types.
 
 The shared driver remains the only wire synchronization/reconnect owner. Native
 navigation is local presentation state, with one core pending history query.
@@ -160,7 +186,10 @@ do not hardcode a public resolver or replace the controller identity on changes.
 | Failed speculative read | Recoverable `history_unavailable`, pending query retired |
 | Conflicting/trimmed range join | Pause extension; existing capture remains copyable |
 | Local saved-host deletion | Forget local route/connection only, no remote close/revoke |
-| Post-write mutation ambiguity | Preserve shared `operation_outcome_unknown`; never create again blindly |
+| Post-write mutation/default-attach ambiguity | Preserve shared `operation_outcome_unknown`; never create again blindly |
+| Default attach with a concurrent existing main | Host reuses its reserved main; no implicit takeover |
+| Reconnect/end/closed frame | Unknown path and absent RTT; old metrics never revive on Active |
+| Healthy same-attachment synchronization | Preserve selected path/RTT and unchanged content identity |
 | Welcome read deadline / reset | `deadline_exceeded` / `transport_unavailable`, never infer Unauthorized |
 | Authenticated peer explicitly closes with 0x100 | `unauthorized`; no authorized connection cached |
 | Explicit runtime shutdown then immediate same-identity restart | Await endpoint closure before executor disposal; new handshake succeeds |
@@ -200,6 +229,10 @@ path separately; a compiled target is not runtime evidence.
 Wrong: Kotlin checks `currentFrame.inputEpoch`, then native stamps a newer epoch
 when a queued call finally arrives. Correct: Kotlin passes the originating epoch
 as data and the native actor compares it at the actual write boundary.
+
+Wrong: call ordinary create_session with the reserved name main or add fallback
+creation to the shared exact-ID reconnect loop. Correct: machine-entry policy
+chooses a separate default-attach operation and stores the returned identity.
 
 Wrong: retain selection pixels but free/unaccount their semantic source. Correct:
 explicit frame-source handles pin pages inside the existing core cache budget.

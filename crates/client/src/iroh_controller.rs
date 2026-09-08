@@ -13,7 +13,7 @@ use crate::{
     },
     remote_unary::{
         RemoteAttemptError, RemoteUnaryClient, RemoteUnaryDemand, RemoteUnaryTransport,
-        read_exact_response, timeout_until,
+        decode_session_service_error, read_exact_response, timeout_until,
     },
     route::{
         build_relay_candidates, device_from_endpoint_id, endpoint_id_from_device, fresh_relay_hints,
@@ -638,6 +638,7 @@ impl SessionUnaryTransport for IrohController {
                     Instant::now() + request.deadline,
                 )
                 .await
+                .and_then(session_unary_result)
         })
     }
 }
@@ -645,6 +646,16 @@ struct IrohDemand {
     controller: IrohController,
     remote: DeviceId,
     peer: Arc<Peer>,
+}
+// RemoteUnaryClient retains a validated ServiceError frame for forwarding
+// adapters. A frontend unary consumer instead needs the typed error, including
+// OutcomeUnknown so its old-daemon operation lease can be retired.
+fn session_unary_result(frame: DecodedFrame) -> Result<DecodedFrame, ClientError> {
+    if frame.kind == WireKind::ServiceErrorResponse {
+        Err(decode_session_service_error(&frame)?)
+    } else {
+        Ok(frame)
+    }
 }
 impl RemoteUnaryTransport for IrohController {
     fn demand<'a>(
@@ -720,33 +731,33 @@ impl AttachmentIo for IrohSessionIo {
     }
     fn read(&mut self) -> TransportFuture<'_, Result<AttachmentTransportItem, ClientError>> {
         Box::pin(async move {
-            let sample = self
-                .connection
-                .paths()
-                .iter()
-                .find(|path| path.is_selected())
-                .map_or((v2::TerminalConnectionPath::Unknown as i32, None), |path| {
-                    let kind = match path.remote_addr() {
-                        TransportAddr::Ip(_) => v2::TerminalConnectionPath::Direct,
-                        TransportAddr::Relay(_) => v2::TerminalConnectionPath::Relay,
-                        _ => v2::TerminalConnectionPath::Unknown,
-                    };
-                    (
-                        kind as i32,
-                        Some(
-                            u32::try_from((path.rtt().as_nanos() + 500_000) / 1_000_000)
-                                .unwrap_or(u32::MAX),
-                        ),
-                    )
-                });
-            if self.last_path != Some(sample) {
-                self.last_path = Some(sample);
-                return Ok(AttachmentTransportItem::Path(v2::LocalSessionTunnelPath {
-                    path: sample.0,
-                    rtt_ms: sample.1,
-                }));
-            }
             loop {
+                let sample = self
+                    .connection
+                    .paths()
+                    .iter()
+                    .find(|path| path.is_selected())
+                    .map_or((v2::TerminalConnectionPath::Unknown as i32, None), |path| {
+                        let kind = match path.remote_addr() {
+                            TransportAddr::Ip(_) => v2::TerminalConnectionPath::Direct,
+                            TransportAddr::Relay(_) => v2::TerminalConnectionPath::Relay,
+                            _ => v2::TerminalConnectionPath::Unknown,
+                        };
+                        (
+                            kind as i32,
+                            Some(
+                                u32::try_from((path.rtt().as_nanos() + 500_000) / 1_000_000)
+                                    .unwrap_or(u32::MAX),
+                            ),
+                        )
+                    });
+                if self.last_path != Some(sample) {
+                    self.last_path = Some(sample);
+                    return Ok(AttachmentTransportItem::Path(v2::LocalSessionTunnelPath {
+                        path: sample.0,
+                        rtt_ms: sample.1,
+                    }));
+                }
                 if let Some(frame) = self.queued.pop_front() {
                     if !matches!(
                         frame.kind,
@@ -768,10 +779,17 @@ impl AttachmentIo for IrohSessionIo {
                     return Ok(AttachmentTransportItem::Session(frame));
                 }
                 let mut buffer = Zeroizing::new([0_u8; 16 * 1024]);
-                let count = self
-                    .recv
-                    .read(&mut *buffer)
-                    .await
+                // A quiet shell must still expose path upgrades and new RTT
+                // estimates. This only observes QUIC; it sends no terminal input.
+                let read = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    self.recv.read(&mut *buffer),
+                )
+                .await;
+                let Ok(read) = read else {
+                    continue;
+                };
+                let count = read
                     .map_err(|_| unavailable("Session stream read failed"))?
                     .unwrap_or(0);
                 if count == 0 {
@@ -863,4 +881,121 @@ fn random_bytes<const N: usize>() -> Result<[u8; N], ClientError> {
 }
 fn unavailable(detail: &'static str) -> ClientError {
     ClientError::new(DomainErrorKind::TransportUnavailable, detail)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::unary::SessionUnaryClient;
+    use zterm_core::{DaemonIncarnation, OperationLease, SessionId};
+
+    struct Replies {
+        frames: StdMutex<VecDeque<DecodedFrame>>,
+        requests: StdMutex<Vec<WireKind>>,
+    }
+    impl SessionUnaryTransport for Replies {
+        fn request(
+            &self,
+            request: SessionUnaryRequest,
+        ) -> TransportFuture<'_, Result<DecodedFrame, ClientError>> {
+            self.requests
+                .lock()
+                .expect("request capture lock")
+                .push(request.request_kind);
+            let frame = self
+                .frames
+                .lock()
+                .expect("reply fixture lock")
+                .pop_front()
+                .expect("expected unary request");
+            Box::pin(async move { session_unary_result(frame) })
+        }
+    }
+    fn frame(kind: WireKind, message: &impl prost::Message) -> DecodedFrame {
+        let bytes =
+            zterm_proto::encode_message(kind, 1, 0, message).expect("encode fixture response");
+        FrameDecoder::new()
+            .feed(&bytes)
+            .expect("decode fixture response")
+            .pop()
+            .expect("one fixture frame")
+    }
+    fn error(kind: DomainErrorKind) -> DecodedFrame {
+        frame(
+            WireKind::ServiceErrorResponse,
+            &v2::ServiceError {
+                code: kind.code().to_owned(),
+                message: "PRIVATE_REMOTE_DIAGNOSTIC".to_owned(),
+            },
+        )
+    }
+    #[tokio::test]
+    async fn restarted_daemon_error_retires_unary_lease_without_replaying_mutation() {
+        let lease = |incarnation| {
+            frame(
+                WireKind::SessionOperationLeaseResponse,
+                &v2::SessionOperationLeaseResponse {
+                    lease: Some(
+                        OperationLease {
+                            daemon_incarnation: DaemonIncarnation::from_array([incarnation; 16]),
+                            ordinal: 1,
+                        }
+                        .into(),
+                    ),
+                },
+            )
+        };
+        let transport = Replies {
+            frames: StdMutex::new(VecDeque::from([
+                lease(1),
+                error(DomainErrorKind::OperationOutcomeUnknown),
+                lease(2),
+                error(DomainErrorKind::SessionNotFound),
+            ])),
+            requests: StdMutex::new(Vec::new()),
+        };
+        let client = SessionUnaryClient::default();
+        let target = ResolvedSessionTarget::device(DeviceId::from_array([7; 32]));
+        let session = SessionId::from_array([1; 16]);
+        let first = client
+            .close_session_at(&transport, target, session)
+            .await
+            .expect_err("definitive fixture service failure");
+        assert_eq!(first.kind(), DomainErrorKind::OperationOutcomeUnknown);
+        assert!(!first.detail().contains("PRIVATE_REMOTE_DIAGNOSTIC"));
+        assert_eq!(
+            *transport.requests.lock().expect("request capture lock"),
+            vec![
+                WireKind::SessionOperationLeaseRequest,
+                WireKind::SessionCloseRequest
+            ]
+        );
+        // Only a new explicit call acquires the new daemon's lease. Its definitive
+        // service failure remains typed rather than being decoded as Session data.
+        let second = client
+            .close_session_at(&transport, target, session)
+            .await
+            .expect_err("definitive fixture service failure");
+        assert_eq!(second.kind(), DomainErrorKind::SessionNotFound);
+        assert_eq!(
+            *transport.requests.lock().expect("request capture lock"),
+            vec![
+                WireKind::SessionOperationLeaseRequest,
+                WireKind::SessionCloseRequest,
+                WireKind::SessionOperationLeaseRequest,
+                WireKind::SessionCloseRequest
+            ]
+        );
+        for kind in [
+            DomainErrorKind::Unauthorized,
+            DomainErrorKind::SessionOccupied,
+        ] {
+            assert_eq!(
+                session_unary_result(error(kind))
+                    .expect_err("typed service error")
+                    .kind(),
+                kind
+            );
+        }
+    }
 }

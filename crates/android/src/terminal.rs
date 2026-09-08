@@ -15,8 +15,8 @@ use zterm_client::{
     session::SessionClient,
     surface::AttachmentSurface,
     view::{
-        PreparedTerminalView, TerminalViewCommandWriter, TerminalViewEvent, TerminalViewRoute,
-        TerminalViewTarget, TerminalViewTransportState,
+        PreparedTerminalView, TerminalViewCommandWriter, TerminalViewConnectionPath,
+        TerminalViewEvent, TerminalViewRoute, TerminalViewTarget, TerminalViewTransportState,
     },
 };
 use zterm_core::{ResourceLimits, SessionId, SessionSelector, terminal::*};
@@ -71,6 +71,10 @@ pub struct NativeRow {
 /// Latest complete frame, replacing any unobserved predecessor.
 #[derive(Clone, uniffi::Record)]
 pub struct NativeFrame {
+    /// Current attachment's selected network route, independent of visual sync.
+    pub connection_path: NativeConnectionPath,
+    /// Selected-path round-trip estimate in milliseconds; absent when unknown.
+    pub rtt_ms: Option<u32>,
     /// Gesture ownership of the synchronized live grid, never of pinned history.
     pub pointer_mode: NativePointerMode,
     /// Opaque accounted semantic source for the exact frame drawn by Android.
@@ -118,6 +122,26 @@ pub struct NativeFrame {
     pub background: u32,
     /// Available retained-history offset.
     pub history_maximum: u64,
+}
+/// Address-free network route for terminal chrome.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, uniffi::Enum)]
+pub enum NativeConnectionPath {
+    /// No selected route has been observed for the current attachment.
+    #[default]
+    Unknown,
+    /// Iroh selected a direct IP path.
+    Direct,
+    /// Iroh selected a relay path.
+    Relay,
+}
+impl From<TerminalViewConnectionPath> for NativeConnectionPath {
+    fn from(value: TerminalViewConnectionPath) -> Self {
+        match value {
+            TerminalViewConnectionPath::Unknown => Self::Unknown,
+            TerminalViewConnectionPath::Direct => Self::Direct,
+            TerminalViewConnectionPath::Relay => Self::Relay,
+        }
+    }
 }
 /// Content-free mobile navigation evidence. Never contains addresses or text.
 #[derive(Clone, Default, uniffi::Record)]
@@ -300,6 +324,7 @@ impl NativeKey {
 /// One attachment retained by the Application, not by an Activity's subscription.
 #[derive(uniffi::Object)]
 pub struct NativeTerminal {
+    session_id: SessionId,
     commands: mpsc::Sender<Command>,
     frame: watch::Sender<NativeFrame>,
     cancel: CancellationToken,
@@ -353,6 +378,10 @@ struct Command {
 }
 #[uniffi::export]
 impl NativeTerminal {
+    /// Authoritative Session ID, including a newly created default main.
+    pub fn session_id(&self) -> String {
+        self.session_id.to_string()
+    }
     /// Complete tap (zero) or bounded signed wheel steps (positive = up).
     /// Coordinates are zero-based in the actually drawn source; never replayed.
     pub async fn send_pointer(
@@ -562,8 +591,36 @@ impl NativeRuntime {
         dark: bool,
         takeover: bool,
     ) -> Result<Arc<NativeTerminal>, NativeError> {
-        let host = parse_device(&host)?;
-        let session = parse_session(&session)?;
+        self.open_terminal(
+            parse_device(&host)?,
+            Some(parse_session(&session)?),
+            viewport,
+            dark,
+            takeover,
+        )
+        .await
+    }
+    /// Opens the daemon-owned default main, creating it atomically if absent.
+    /// Used only by explicit machine entry/Retry after resolving live Sessions.
+    pub async fn connect_default_terminal(
+        &self,
+        host: String,
+        viewport: NativeViewport,
+        dark: bool,
+    ) -> Result<Arc<NativeTerminal>, NativeError> {
+        self.open_terminal(parse_device(&host)?, None, viewport, dark, false)
+            .await
+    }
+}
+impl NativeRuntime {
+    async fn open_terminal(
+        &self,
+        host: zterm_core::DeviceId,
+        session: Option<SessionId>,
+        viewport: NativeViewport,
+        dark: bool,
+        takeover: bool,
+    ) -> Result<Arc<NativeTerminal>, NativeError> {
         let size = viewport.size()?;
         let network = Arc::clone(&self.network);
         let closed = self.closed.clone();
@@ -572,8 +629,8 @@ impl NativeRuntime {
             let client = SessionClient::connect(
                 Arc::new(controller),
                 ResolvedSessionTarget::device(host),
-                Some(SessionSelector::Id(session)),
-                false,
+                session.map(SessionSelector::Id),
+                session.is_none(),
                 takeover,
                 Some(size),
                 base_colors(dark),
@@ -586,6 +643,7 @@ impl NativeRuntime {
             )?;
             let surface = AttachmentSurface::from_snapshot(prepared.initial_snapshot())
                 .map_err(|_| failure("malformed_frame"))?;
+            let session_id = prepared.session_id();
             let (frame, _) = watch::channel(project(
                 &surface,
                 1,
@@ -600,6 +658,7 @@ impl NativeRuntime {
             let (commands, receiver) = mpsc::channel(32);
             let cancel = closed.child_token();
             let terminal = Arc::new(NativeTerminal {
+                session_id,
                 commands,
                 frame: frame.clone(),
                 cancel: cancel.clone(),
@@ -625,6 +684,7 @@ async fn run(
     mut dark: bool,
 ) {
     let mut state = "synchronizing";
+    let mut connection = None;
     let mut generation = 1;
     let mut input_epoch = 1;
     let mut geometry_generation = 1;
@@ -750,7 +810,8 @@ async fn run(
                     TerminalViewEvent::SyncRequired { .. } => { state = "synchronizing"; Ok(()) },
                     TerminalViewEvent::LeaseLost { .. } => { healthy_resize = false; navigation.disconnected(); input_epoch += 1; state = "lease_lost"; Ok(()) },
                     TerminalViewEvent::SessionEnded(_) => { healthy_resize = false; navigation.disconnected(); input_epoch += 1; state = "ended"; Ok(()) },
-                    TerminalViewEvent::ConnectionStatus(_) | TerminalViewEvent::ClipboardWrite(_) => Ok(()),
+                    TerminalViewEvent::ConnectionStatus(status) => { connection = Some(status); Ok(()) },
+                    TerminalViewEvent::ClipboardWrite(_) => Ok(()),
                 },
                 Ok(None) => break,
                 Err(error) => Err(error.into()),
@@ -777,7 +838,10 @@ async fn run(
             navigation.disconnected();
             input_epoch += 1;
         }
-        let next = project_navigation(
+        if matches!(state, "reconnecting" | "ended" | "lease_lost" | "closed") {
+            connection = None;
+        }
+        let mut next = project_navigation(
             &surface,
             generation,
             state,
@@ -790,6 +854,14 @@ async fn run(
             &origin,
             Some(&frame.borrow()),
         );
+        if let Some(status) = &connection {
+            next.connection_path = status.path().into();
+            next.rtt_ms = if next.connection_path == NativeConnectionPath::Unknown {
+                None
+            } else {
+                status.rtt_ms()
+            };
+        }
         frame.send_replace(next);
         if error.is_some() || matches!(state, "ended" | "lease_lost") {
             break;
@@ -1013,6 +1085,8 @@ fn project(
 ) -> NativeFrame {
     let surface = &surface.surface;
     NativeFrame {
+        connection_path: NativeConnectionPath::Unknown,
+        rtt_ms: None,
         pointer_mode: NativePointerMode::None,
         stats: NativeNavigationStats::default(),
         notice: None,

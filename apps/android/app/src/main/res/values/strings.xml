@@ -45,6 +45,11 @@
     <string name="retry">Retry</string>
     <string name="connecting">Connecting…</string>
     <string name="reconnecting">Reconnecting…</string>
+    <string name="connected">Connected</string>
+    <string name="disconnected">Disconnected</string>
+    <string name="connection_direct" translatable="false">Direct</string>
+    <string name="connection_relay" translatable="false">Relay</string>
+    <string name="connection_latency" translatable="false">%1$s ms</string>
     <string name="session_ended">Session ended</string>
     <string name="lease_lost">Connected elsewhere</string>
     <string name="allow_camera">Allow camera</string>

@@ -21,7 +21,7 @@ class OccupiedRecoveryTest {
         val application = ApplicationProvider.getApplicationContext<ZtermApplication>()
         val store = AppStore(application)
         val saved = store.load()
-        val host = saved.hosts.first { it.name == "my-mac" }
+        val host = saved.hosts.first { it.name == (InstrumentationRegistry.getArguments().getString("hostName") ?: "my-mac") }
         val runtime = application.runtime
         val seed = store.loadOrCreateSeed()
         try { runtime.initialize(seed,PlatformNetwork(application) {}.current(),saved.hosts.map { it.native() }) }

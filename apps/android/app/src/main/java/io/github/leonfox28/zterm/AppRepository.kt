@@ -9,7 +9,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 internal enum class Route { Home, Scanner, Terminal, Settings }
-internal data class TerminalStatus(val inputEpoch: ULong, val state: String, val error: String?, val notice: String?, val inputReady: Boolean)
+internal data class TerminalStatus(val inputEpoch: ULong, val state: String, val error: String?, val notice: String?, val inputReady: Boolean, val connectionPath: NativeConnectionPath, val rttMs: UInt?)
 internal data class AppState(
     val saved: SavedState = SavedState(),
     val initialized: Boolean = false,
@@ -18,7 +18,6 @@ internal data class AppState(
     val sessionId: String? = null,
     val sessions: List<NativeSession> = emptyList(),
     val panel: Boolean = false,
-    val needsSession: Boolean = false,
     val busy: Boolean = false,
     val error: String? = null,
 )
@@ -33,7 +32,7 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
     private val mutableFrame = MutableStateFlow<NativeFrame?>(null)
     val frame = mutableFrame.asStateFlow()
     val terminalStatus = frame.map { it?.let { frame ->
-        TerminalStatus(frame.inputEpoch, frame.state, frame.error, frame.notice, frame.inputReady)
+        TerminalStatus(frame.inputEpoch, frame.state, frame.error, frame.notice, frame.inputReady, frame.connectionPath, frame.rttMs)
     } }.distinctUntilChanged().stateIn(scope, SharingStarted.Eagerly, null)
     private val frameObservers = linkedSetOf<(NativeFrame?) -> Unit>()
     private var selectionVersion = 0L
@@ -171,26 +170,33 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
         openHost(host, if (recent) state.value.saved.recent?.takeIf { it.host == host }?.session else null)
     }
     private suspend fun openHost(host: String, exact: String? = null) {
-        if (retire() != epoch) return
-        mutable.update { it.copy(route = Route.Terminal, hostId = host, sessionId = null, sessions = emptyList(), panel = false, needsSession = false) }
+        val mine = retire()
+        if (mine != epoch) return
         val last = exact ?: state.value.saved.hosts.first { it.id == host }.lastSession
-        // A remembered ID remains authoritative even if it has disappeared.
-        if (last != null) {
-            mutable.update { it.copy(sessionId = last) }
+        mutable.update { it.copy(route = Route.Terminal, hostId = host, sessionId = last, sessions = emptyList(), panel = false) }
+        // Only a successful live list proves a remembered ID no longer exists.
+        // Transport/auth/occupancy errors never authorize default creation.
+        val sessions = refresh(host)
+        if (mine != epoch || state.value.route != Route.Terminal) return
+        if (last != null && sessions.any { it.sessionId == last }) {
             attach(host, last, false)
-            refresh(host)
-        } else {
-            val mine = epoch
-            val sessions = refresh(host)
+            return
+        }
+        if (last != null) {
+            save { saved -> saved.copy(
+                hosts = saved.hosts.map { if (it.id == host && it.lastSession == last) it.copy(lastSession = null) else it },
+                recent = saved.recent?.takeUnless { it.host == host && it.session == last },
+            ) }
             if (mine != epoch || state.value.route != Route.Terminal) return
-            when (sessions.size) {
-                0 -> mutable.update { it.copy(panel = true, needsSession = true) }
-                1 -> { val session = sessions.single();
-                    if (session.occupied) mutable.update { it.copy(panel = true) }
-                    else attach(host, session.sessionId, false)
-                }
-                else -> mutable.update { it.copy(panel = true) }
+        }
+        mutable.update { it.copy(sessionId = null) }
+        when (sessions.size) {
+            0 -> { attach(host, null, false); if (state.value.route == Route.Terminal && state.value.hostId == host) refresh(host) }
+            1 -> { val session = sessions.single()
+                if (session.occupied) mutable.update { it.copy(panel = true) }
+                else attach(host, session.sessionId, false)
             }
+            else -> mutable.update { it.copy(panel = true) }
         }
     }
     private suspend fun refresh(host: String): List<NativeSession> {
@@ -206,26 +212,27 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
         if (next) scope.launch { try { refresh(host) } catch (error: Exception) { report(error) } }
     }
     fun closePanel() { mutable.update { it.copy(panel = false) } }
-    fun sessionPromptShown() { mutable.update { it.copy(needsSession = false) } }
     fun selectSession(session: String, takeover: Boolean = false) {
         if (session == state.value.sessionId && frame.value?.state == "active") { closePanel(); return }
         act { val host = state.value.hostId ?: return@act; attach(host, session, takeover) }
     }
     fun retry() = act {
         val host = state.value.hostId ?: return@act
-        val session = state.value.sessionId
-        if (session != null) attach(host, session, false) else openHost(host)
+        openHost(host, state.value.sessionId)
     }
-    private suspend fun attach(host: String, session: String, takeover: Boolean) {
+    private suspend fun attach(host: String, session: String?, takeover: Boolean) {
         val mine = retire()
         if (mine != epoch || state.value.route != Route.Terminal) return
-        mutable.update { it.copy(sessionId = session, panel = false, needsSession = false) }
+        mutable.update { it.copy(sessionId = session, panel = false) }
         val requestedViewport = viewport
-        val attached = runtime.connectTerminal(host, session, requestedViewport, dark, takeover)
+        val attached = if (session == null) runtime.connectDefaultTerminal(host, requestedViewport, dark)
+            else runtime.connectTerminal(host, session, requestedViewport, dark, takeover)
         if (mine != epoch || state.value.route != Route.Terminal) {
             try { attached.detach() } finally { attached.close() }; return
         }
+        val attachedSession = attached.sessionId()
         terminal = attached
+        mutable.update { it.copy(sessionId = attachedSession) }
         // Measurement can finish while connectTerminal is suspended and there
         // is no terminal for the size consumer yet. Reapply its latest intent
         // through that same consumer without overwriting newer measurements.
@@ -259,14 +266,14 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
             catch (cancel: CancellationException) { throw cancel }
             catch (error: Exception) { if (mine == epoch) report(error) }
         }
-        save { saved -> saved.copy(hosts = saved.hosts.map { if (it.id == host) it.copy(lastSession = session) else it }, recent = RecentConnection(host, session)) }
+        save { saved -> saved.copy(hosts = saved.hosts.map { if (it.id == host) it.copy(lastSession = attachedSession) else it }, recent = RecentConnection(host, attachedSession)) }
     }
     fun createSession(name: String, directory: String) = act {
         val host = state.value.hostId ?: return@act
         val mine = epoch
         val session = runtime.createSession(host, name, directory.ifBlank { null }, viewport, dark)
         // Save the returned identity before attach: retries never create again.
-        if (mine == epoch) mutable.update { it.copy(sessionId = session.sessionId, needsSession = false) }
+        if (mine == epoch) mutable.update { it.copy(sessionId = session.sessionId) }
         save { saved -> saved.copy(hosts = saved.hosts.map { if (it.id == host) it.copy(lastSession = session.sessionId) else it }) }
         if (mine == epoch && state.value.route == Route.Terminal && state.value.hostId == host) {
             attach(host, session.sessionId, false)

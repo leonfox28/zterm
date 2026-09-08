@@ -588,3 +588,48 @@ Published immutable v0.1.27 through PR #35 and the canonical exact-main candidat
 
 - Keep terminal-presentation-continuity active to fix Android keyboard-close blank/history refill and complete controlled whole-transition/desktop visual acceptance.
 - No real Mac main Session was touched and no local daemon was restarted or updated.
+
+
+## Session 22: Accept Android local scrolling and publish v0.1.28
+<!-- trellis-session: v=2 fp=9477bccd9a034e26 -->
+
+**Date**: 2026-09-08
+**Task**: Accept Android local scrolling and publish v0.1.28
+**Branch**: `perf/android-local-scroll`
+
+### Summary
+
+User accepted scrolling on the updated phone. Committed all optimization changes; PR #36, exact-main CI, normal protected signing and immutable v0.1.28 publication succeeded. Verified 11 assets and Android 102899 metadata. Keep parent task active for prior keyboard-close and desktop visual follow-ups; real Mac daemon/main Session untouched.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `022ffb7` | perf(android): scroll cached terminal rows locally |
+| `4eef9a4` | chore: prepare v0.1.28 release |
+
+### Status
+
+[OK] **Completed**
+
+
+## Session 23: Android reconnect recovery and connection status
+<!-- trellis-session: v=2 fp=27c7606a99978864 -->
+
+**Date**: 2026-09-08
+**Task**: Android reconnect recovery and connection status
+**Branch**: `perf/android-local-scroll`
+
+### Summary
+
+Completed stale-session/default-main recovery, typed unary error retirement, and fixed-English Direct/Relay with RTT. 88 Rust and 12 Android instrumentation tests passed, including real disposable-daemon restart. Android build/lint and source policies passed. User authorized release preparation; physical-phone and forced Relay routing remain untested.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `b13ae75` | fix(android): recover stale sessions and show connection status |
+
+### Status
+
+[OK] **Completed**
