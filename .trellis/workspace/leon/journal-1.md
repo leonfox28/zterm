@@ -655,3 +655,41 @@ Scoped SOFT_INPUT_STATE_UNCHANGED to Terminal while preserving editor focus, exp
 ### Status
 
 [OK] **Completed**
+
+
+## Session 26: Desktop connection stages and persisted startup logs
+<!-- trellis-session: v=2 fp=1a68c58f43f5a34e -->
+
+**Date**: 2026-09-08
+**Task**: Desktop connection stages and persisted startup logs
+**Branch**: `fix/desktop-connection-progress`
+
+### Summary
+
+Fixed Ghostty palette-query leakage and added actual connection-stage presentation plus configured daemon.log records. Native just check passed. User requested PR creation and merge; required GitHub CI remains the merge gate.
+
+### Main Changes
+
+- Single-index complete OSC palette queries preserve one bounded startup observation round.
+- Actual local/remote connection stages feed a bounded first-screen journal and daemon.log, without visible time or detach hints.
+- Retain submitted operation results, validate bounded same-UID progress frames, and retire startup observations at Active.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `c0e1ba9` | fix(cli): show and log real connection stages and bound color queries |
+
+### Testing
+
+- [OK] Final just check passed on macOS: CLI 93 passed, shared client 76 passed, daemon 173 passed, plus the real local PTY lifecycle and exact persisted stage order.
+- [OK] Wire fragmentation/coalescing, correlation/bounds, cancellation and early Session end, file rotation/no-creation/path-safety tests passed.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- Create the PR, wait for required CI including Linux real-Iroh fresh/reuse tests, and merge as requested.
+- Corrected Ghostty and real remote manual smoke remain disclosed follow-up; no live daemon or installed executable was replaced.
