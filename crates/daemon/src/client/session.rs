@@ -119,7 +119,8 @@ impl SessionClient {
         viewport: Option<zterm_core::terminal::TerminalSize>,
         base_colors: TerminalColorProfile,
     ) -> Result<Self, DaemonError> {
-        zterm_client::session::SessionClient::connect(
+        let progress = connector.progress();
+        zterm_client::session::SessionClient::connect_with_progress(
             Arc::new(connector),
             target,
             selector,
@@ -127,6 +128,7 @@ impl SessionClient {
             takeover,
             viewport,
             base_colors,
+            progress,
         )
         .await
         .map(Self)

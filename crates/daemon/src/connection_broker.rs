@@ -12,6 +12,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use zterm_client::progress::{ProgressEvent, ProgressHistory, ProgressObserver};
+use zterm_core::connection_progress::ConnectionStage;
 
 use futures_util::StreamExt;
 use iroh::endpoint::{Connection, PathEvent, RecvStream, SendStream, VarInt};
@@ -300,8 +302,19 @@ struct PeerSlot {
     active_streams: Arc<AtomicUsize>,
 }
 
+impl PeerSlot {
+    async fn report_progress(&self, stage: ConnectionStage) {
+        self.state.lock().await.progress.record(ProgressEvent {
+            stage,
+            failure: None,
+        });
+        self.changed.notify_waiters();
+    }
+}
+
 #[derive(Default)]
 struct PeerState {
+    progress: ProgressHistory,
     candidates: CandidateRegistry<Arc<Candidate>>,
     remote_acceptance: Option<AuthGeneration>,
     dial_worker_running: bool,
@@ -973,6 +986,7 @@ impl PeerState {
     fn begin_demand_cycle(&mut self, previous_demands: usize) {
         if previous_demands == 0 {
             self.terminal_error = None;
+            self.progress.clear();
         }
     }
 
@@ -1505,9 +1519,17 @@ impl ConnectionDemand {
     async fn wait_for_confirmed_primary(
         &self,
         deadline: Instant,
+        progress: &ProgressObserver,
+        seen: &mut u64,
     ) -> Result<(Arc<Candidate>, AuthGeneration), DaemonError> {
         self.ensure_active()?;
+        let mut first = true;
         loop {
+            // Register before reading the journal/selection: observations may
+            // arrive while this reader forwards a previous burst to the CLI.
+            let changed = self.slot.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
             if Instant::now() >= deadline {
                 return Err(deadline_exceeded(
                     "timed out waiting for a primary connection",
@@ -1516,30 +1538,46 @@ impl ConnectionDemand {
             if self.broker.inner.lifecycle.is_quiescing() {
                 return Err(transport_unavailable("network transport is stopping"));
             }
-
-            let selection = {
+            let (selection, records, terminal_error) = {
                 let state = self.slot.state.lock().await;
-                if let Some(error) = &state.terminal_error
-                    && !is_retryable(error.kind())
-                {
-                    return Err(error.clone());
-                }
-                match (state.candidates.primary(), state.remote_acceptance) {
+                let selection = match (state.candidates.primary(), state.remote_acceptance) {
                     (Some(key), Some(generation)) => state
                         .candidates
                         .get(&key)
                         .map(|candidate| (Arc::clone(candidate), generation)),
                     _ => None,
-                }
+                };
+                (
+                    selection,
+                    state.progress.after(*seen).collect::<Vec<_>>(),
+                    state
+                        .terminal_error
+                        .as_ref()
+                        .filter(|error| !is_retryable(error.kind()))
+                        .cloned(),
+                )
             };
-
+            let reusing = first && selection.is_some();
+            for (sequence, event) in records {
+                *seen = sequence;
+                if !reusing {
+                    progress.emit(event);
+                }
+            }
+            if let Some(error) = terminal_error {
+                return Err(error);
+            }
             if let Some(selection) = selection {
+                if reusing {
+                    progress.report(ConnectionStage::ReusingConnection);
+                }
                 return Ok(selection);
             }
+            first = false;
             self.broker
                 .ensure_dial_worker(Arc::clone(&self.slot))
                 .await?;
-            wait_for_notify(&self.slot.changed, deadline).await?;
+            timeout_until(deadline, changed).await?;
         }
     }
 
@@ -1549,7 +1587,9 @@ impl ConnectionDemand {
         &self,
         deadline: Instant,
     ) -> Result<AuthorizationConfirmation, DaemonError> {
-        let (candidate, generation) = self.wait_for_confirmed_primary(deadline).await?;
+        let (candidate, generation) = self
+            .wait_for_confirmed_primary(deadline, &ProgressObserver::default(), &mut 0)
+            .await?;
         Ok(AuthorizationConfirmation {
             remote: self.slot.remote,
             generation,
@@ -1563,6 +1603,19 @@ impl ConnectionDemand {
         purpose: StreamPurpose,
         deadline: Instant,
     ) -> Result<AuthenticatedBiStream, DaemonError> {
+        self.open_bi_with_progress(purpose, deadline, &ProgressObserver::default())
+            .await
+    }
+
+    /// Observes admission and dialing without introducing another dial owner.
+    pub async fn open_bi_with_progress(
+        &self,
+        purpose: StreamPurpose,
+        deadline: Instant,
+        progress: &ProgressObserver,
+    ) -> Result<AuthenticatedBiStream, DaemonError> {
+        progress.report(ConnectionStage::CheckingConnection);
+        let mut seen = 0;
         self.ensure_active()?;
         let _queue = self
             .slot
@@ -1573,7 +1626,9 @@ impl ConnectionDemand {
             .map_err(|_| resource_exhausted("peer open-stream queue is full"))?;
 
         loop {
-            let (candidate, generation) = self.wait_for_confirmed_primary(deadline).await?;
+            let (candidate, generation) = self
+                .wait_for_confirmed_primary(deadline, progress, &mut seen)
+                .await?;
             let stream_permit = acquire_until(
                 Arc::clone(&candidate.admission.streams),
                 deadline,
@@ -1591,12 +1646,14 @@ impl ConnectionDemand {
                 continue;
             }
 
+            progress.report(ConnectionStage::OpeningSessionChannel);
             match timeout_until(deadline, candidate.connection.open_bi()).await {
                 Ok(Ok((send, recv))) => {
                     let metric = StreamMetricGuard::new(
                         Arc::clone(&self.broker.inner.metrics),
                         Arc::clone(&self.slot.active_streams),
                     )?;
+                    progress.report(ConnectionStage::SessionChannelReady);
                     return Ok(AuthenticatedBiStream {
                         send,
                         recv,
@@ -1675,6 +1732,8 @@ impl ConnectionBroker {
                             let mut state = slot.state.lock().await;
                             state.terminal_error = Some(error);
                         }
+                        slot.report_progress(ConnectionStage::RetryingConnection)
+                            .await;
                         let delay = retry_delay(retry, slot.remote);
                         retry = retry.saturating_add(1);
                         tokio::select! {
@@ -1740,6 +1799,8 @@ impl ConnectionBroker {
             + self.inner.limits.address_lookup_budget
             + self.inner.limits.connect_attempt_budget
             + self.inner.limits.first_frame_deadline;
+        slot.report_progress(ConnectionStage::LookingUpAddress)
+            .await;
         let routes = self
             .dial_routes(&endpoint, slot.remote, &transient_routes, deadline)
             .await?;
@@ -1755,6 +1816,8 @@ impl ConnectionBroker {
                 ));
             }
             let connect_deadline = Instant::now() + self.inner.limits.connect_attempt_budget;
+            slot.report_progress(ConnectionStage::ConnectingSecurely)
+                .await;
             let connection = match timeout_until(
                 connect_deadline,
                 endpoint.connect(route.address.clone(), ZTERM_ALPN),
@@ -1779,6 +1842,8 @@ impl ConnectionBroker {
                     "connected Iroh identity did not match the target device",
                 ));
             }
+            slot.report_progress(ConnectionStage::SecureConnectionReady)
+                .await;
             let connection_permit = match self
                 .inner
                 .admission
@@ -1879,6 +1944,8 @@ impl ConnectionBroker {
             .await?;
         let deadline = Instant::now() + self.inner.limits.first_frame_deadline;
         let result = async {
+            slot.report_progress(ConnectionStage::CheckingProtocolAndAccess)
+                .await;
             let welcome = controller_handshake(
                 &candidate.connection,
                 &self.inner.identity,
@@ -1903,7 +1970,11 @@ impl ConnectionBroker {
             return Err(error);
         }
 
+        slot.report_progress(ConnectionStage::ProtocolAndAccessReady)
+            .await;
         self.persist_verified_handshake(&candidate);
+        slot.report_progress(ConnectionStage::SelectingConnection)
+            .await;
         self.promote_candidate(slot, candidate).await
     }
 
@@ -3060,6 +3131,7 @@ fn protocol_error(error: zterm_proto::ProtocolError) -> DaemonError {
         | ProtocolError::InvalidIdentifier(_)
         | ProtocolError::InvalidTerminalSize { .. }
         | ProtocolError::InvalidTerminalSurface(_)
+        | ProtocolError::InvalidLocalConnectionStage
         | ProtocolError::InvalidTerminalSemanticField(_) => DomainErrorKind::MalformedFrame,
     };
     DaemonError::new(kind, error.to_string())

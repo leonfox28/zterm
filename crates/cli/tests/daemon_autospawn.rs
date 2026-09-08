@@ -301,10 +301,6 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
 
     let connect_output = run_local_terminal_child(&runtime, &state.paths, "connect").await;
     assert!(contains_bytes(&connect_output, TERMINAL_RESTORE_BYTES));
-    assert!(
-        contains_bytes(&connect_output, b"cli-host | local"),
-        "the real local-daemon view must render the exact two-field local status"
-    );
     let ui_sessions = runtime
         .session_list("local")
         .await
@@ -855,6 +851,51 @@ async fn run_local_terminal_child(
         "fixture input must advance the authoritative terminal model"
     );
     let quiescent_revision = wait_for_terminal_quiescence(runtime, &presentation_count, mode).await;
+    if mode == "connect" {
+        let rows =
+            outer_terminal::project_outer_rows(&captured.lock().expect("connected presentation"));
+        let status: String = rows[23][..74]
+            .iter()
+            .map(|cell| cell.contents.as_str())
+            .collect();
+        assert_eq!(
+            status.trim_end(),
+            "cli-host | local",
+            "the real local-daemon view must replace startup with the exact two-field local status"
+        );
+        let log = std::fs::read_to_string(paths.daemon_log()).expect("connection stage log");
+        let correlation = format!("connection_startup pid={} connection=1 ", child.id());
+        let stages = log
+            .lines()
+            .filter(|line| line.contains(&correlation))
+            .map(|line| {
+                line.split_whitespace()
+                    .find_map(|field| field.strip_prefix("stage="))
+                    .expect("typed stage")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stages,
+            [
+                "starting",
+                "initializing_terminal",
+                "terminal_initialized",
+                "checking_local_service",
+                "local_service_ready",
+                "resolving_target",
+                "target_resolved",
+                "opening_local_channel",
+                "session_channel_ready",
+                "requesting_session",
+                "receiving_terminal_state",
+                "terminal_state_received",
+                "displaying_terminal",
+                "synchronizing_terminal",
+                "terminal_ready",
+            ],
+            "actual local attachment must persist its complete ordered startup"
+        );
+    }
     if matches!(
         mode,
         "alternate-reattach" | "alternate-wider" | "main-wider"
@@ -1424,75 +1465,8 @@ fn assert_terminal_attributes_restored(
     assert_eq!(cfgetospeed(&actual), cfgetospeed(&expected));
 }
 
-// Reuse the product's sole terminal model through a disposable SessionService.
-// The outer ANSI is replayed verbatim by a PTY child; no test ANSI interpreter or
-// direct CLI -> terminal-engine dependency is introduced.
 #[cfg(unix)]
-fn project_outer_child_rows(bytes: &[u8]) -> Vec<Vec<zterm_core::terminal::TerminalCell>> {
-    use zterm_core::{AttachmentId, DeviceId, DomainErrorKind, ResourceLimits};
-    use zterm_daemon::error::DaemonError;
-    use zterm_daemon::session::SessionService;
-    use zterm_platform::pty::{ExplicitPtyCommand, PtyHost, PtySize};
-
-    let temporary = tempfile::tempdir().expect("outer frame fixture");
-    let transcript = temporary.path().join("frame.ansi");
-    std::fs::write(&transcript, bytes).expect("retain exact outer output");
-    let cwd = temporary.path().to_path_buf();
-    let sessions = SessionService::with_spawner(
-        DeviceId::from_array([0x42; 32]),
-        ResourceLimits::default(),
-        move |size, _| {
-            let command = ExplicitPtyCommand::new("/bin/sh", &cwd)
-                .arg("-c")
-                // Replayed color/status queries receive real terminal replies.
-                // They are input to this fixture, not echoed presentation.
-                .arg(r#"stty -echo; cat "$1"; printf '\033[24;75HSYNCED'; read -r hold"#)
-                .arg("outer-frame")
-                .arg(&transcript);
-            let pty = PtyHost::new()
-                .spawn(command, PtySize::new(size.rows, size.columns))
-                .map_err(|error| {
-                    DaemonError::new(DomainErrorKind::InvalidWorkingDirectory, error.to_string())
-                })?;
-            Ok((pty, cwd.clone()))
-        },
-    );
-    let principal = sessions.local_principal(AttachmentId::from_array([0x43; 16]));
-    let prepared = sessions
-        .prepare_attach(
-            principal,
-            None,
-            true,
-            false,
-            Some(TerminalSize::new(24, 80)),
-        )
-        .expect("outer presentation fixture succeeds");
-    let deadline = std::time::Instant::now() + TERMINAL_TEST_TIMEOUT;
-    let rows = loop {
-        let snapshot = prepared
-            .attachment
-            .sync_latest(Revision::ZERO)
-            .expect("outer presentation fixture succeeds");
-        let status: String = snapshot.surface.rows[23]
-            .cells
-            .iter()
-            .map(|cell| cell.contents.as_str())
-            .collect();
-        if status.ends_with("SYNCED") {
-            break snapshot.surface.rows[..23]
-                .iter()
-                .map(|row| row.cells[..79].to_vec())
-                .collect();
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "outer frame replay did not finish"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    };
-    drop(prepared);
-    sessions
-        .shutdown()
-        .expect("outer presentation fixture succeeds");
-    rows
-}
+#[path = "support/outer_terminal.rs"]
+mod outer_terminal;
+#[cfg(unix)]
+use outer_terminal::project_outer_child_rows;

@@ -123,3 +123,83 @@ async fn read_response(
         }
     }
 }
+
+// Keep the first demand and observer registration on the same executor turn;
+// this makes a fresh dial assertion independent of scheduler preemption.
+#[tokio::test(flavor = "current_thread")]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "real Iroh UDP listeners are disabled on macOS to avoid application firewall prompts"
+)]
+async fn connection_progress_observes_fresh_dial_and_exact_reuse_without_redial_stages() {
+    use zterm_client::progress::ProgressObserver;
+    use zterm_core::connection_progress::ConnectionStage;
+    let a_id = device([0x31; 32]);
+    let b_id = device([0x32; 32]);
+    let limits = TransportLimits::default();
+    let a = NetworkPeer::create([0x31; 32], "host-a", &[(b_id, "host-b")], &[], limits).await;
+    let b = NetworkPeer::create(
+        [0x32; 32],
+        "host-b",
+        &[],
+        &[(a_id, "host-a", "host-a")],
+        limits,
+    )
+    .await;
+    b.broker
+        .set_test_route(a_id, a.address())
+        .expect("authenticated connection progress fixture");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let demand = b
+        .broker
+        .demand(a_id, deadline)
+        .await
+        .expect("authenticated connection progress fixture");
+    let (observer, history) = ProgressObserver::channel(|_| {});
+    let fresh = demand
+        .open_bi_with_progress(StreamPurpose::Service, deadline, &observer)
+        .await
+        .expect("authenticated connection progress fixture");
+    let candidate = fresh.candidate();
+    let stages = history
+        .borrow()
+        .after(0)
+        .map(|(_, event)| event.stage)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stages,
+        [
+            ConnectionStage::CheckingConnection,
+            ConnectionStage::LookingUpAddress,
+            ConnectionStage::ConnectingSecurely,
+            ConnectionStage::SecureConnectionReady,
+            ConnectionStage::CheckingProtocolAndAccess,
+            ConnectionStage::ProtocolAndAccessReady,
+            ConnectionStage::SelectingConnection,
+            ConnectionStage::OpeningSessionChannel,
+            ConnectionStage::SessionChannelReady,
+        ]
+    );
+    let (observer, history) = ProgressObserver::channel(|_| {});
+    let reused = demand
+        .open_bi_with_progress(StreamPurpose::Service, deadline, &observer)
+        .await
+        .expect("authenticated connection progress fixture");
+    assert_eq!(reused.candidate(), candidate);
+    assert_eq!(
+        history
+            .borrow()
+            .after(0)
+            .map(|(_, event)| event.stage)
+            .collect::<Vec<_>>(),
+        [
+            ConnectionStage::CheckingConnection,
+            ConnectionStage::ReusingConnection,
+            ConnectionStage::OpeningSessionChannel,
+            ConnectionStage::SessionChannelReady,
+        ]
+    );
+    drop((fresh, reused, demand));
+    b.shutdown().await;
+    a.shutdown().await;
+}

@@ -21,6 +21,7 @@ pub fn protocol_error(error: zterm_proto::ProtocolError) -> ClientError {
         | ProtocolError::InvalidIdentifier(_)
         | ProtocolError::InvalidTerminalSize { .. }
         | ProtocolError::InvalidTerminalSurface(_)
+        | ProtocolError::InvalidLocalConnectionStage
         | ProtocolError::InvalidTerminalSemanticField(_) => DomainErrorKind::MalformedFrame,
     };
     ClientError::new(kind, error.to_string())

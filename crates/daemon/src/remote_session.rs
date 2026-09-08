@@ -10,6 +10,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
+use zterm_client::progress::ProgressObserver;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 #[cfg(test)]
@@ -90,12 +91,13 @@ impl RemoteSessionService {
         Ok(target)
     }
 
-    pub(crate) async fn forward_preencoded(
+    pub(crate) async fn forward_preencoded_with_progress(
         &self,
         target: DeviceId,
         request_id: u64,
         request: &[u8],
         deadline: Instant,
+        progress: ProgressObserver,
     ) -> Result<DecodedFrame, DaemonError> {
         if target == self.own_device_id {
             return Err(DaemonError::new(
@@ -119,7 +121,7 @@ impl RemoteSessionService {
             ));
         };
         client
-            .execute_validated(target, request, deadline, contract)
+            .execute_validated_with_progress(target, request, deadline, contract, progress)
             .await
     }
 
@@ -198,14 +200,25 @@ impl RemoteUnaryTransport for BrokerRemoteUnaryTransport {
         target: DeviceId,
         deadline: Instant,
     ) -> BoxFuture<'a, Result<Box<dyn RemoteUnaryDemand>, DaemonError>> {
+        self.demand_with_progress(target, deadline, ProgressObserver::default())
+    }
+
+    fn demand_with_progress<'a>(
+        &'a self,
+        target: DeviceId,
+        deadline: Instant,
+        progress: ProgressObserver,
+    ) -> BoxFuture<'a, Result<Box<dyn RemoteUnaryDemand>, DaemonError>> {
         Box::pin(async move {
             let demand = self.broker.demand(target, deadline).await?;
-            Ok(Box::new(BrokerRemoteUnaryDemand { demand }) as Box<dyn RemoteUnaryDemand>)
+            Ok(Box::new(BrokerRemoteUnaryDemand { demand, progress })
+                as Box<dyn RemoteUnaryDemand>)
         })
     }
 }
 
 struct BrokerRemoteUnaryDemand {
+    progress: ProgressObserver,
     demand: ConnectionDemand,
 }
 
@@ -218,7 +231,7 @@ impl RemoteUnaryDemand for BrokerRemoteUnaryDemand {
         Box::pin(async move {
             let mut stream = self
                 .demand
-                .open_bi(StreamPurpose::Service, deadline)
+                .open_bi_with_progress(StreamPurpose::Service, deadline, &self.progress)
                 .await
                 .map_err(RemoteAttemptError::PreWrite)?;
             timeout_until(deadline, stream.send.write_all(request))
@@ -708,6 +721,7 @@ mod tests {
             131,
             1_000,
             &v2::LocalSessionUnaryRequest {
+                report_progress: false,
                 target_device_id: Some(target.into()),
                 frame: list_request(target, 131),
             },

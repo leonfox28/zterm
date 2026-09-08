@@ -65,6 +65,7 @@ followed by a request carrying one exact `OperationId`.
 The terminal wire registry is canonical and non-negotiated:
 
 ```text
+31  LocalConnectionProgress                same-UID startup observation
 209 SessionCreateRequest
 323 TerminalAttachRequest
 324 TerminalBaseColors                     controller observation
@@ -89,6 +90,16 @@ The product ALPNs are `zterm/2` and `zterm-pair/2`. Protobuf source/package and
 the generated Rust module are exactly `proto/zterm/v2`, `zterm.v2`, and `v2`.
 
 ## 3. Contracts
+
+### Connection observations
+
+`zterm_core::connection_progress::ConnectionStage` owns fixed content-free
+operation boundaries and their stable diagnostic code/display label. Client
+observers are optional; stages are not connection state, Session semantics or
+proof of earlier completion. Kind 31 maps only the 11 broker stages, rejects
+unspecified/unknown enum values with `InvalidLocalConnectionStage`, and has a
+64-byte control-payload ceiling. This opt-in local prefix is described in
+[Local IPC](./local-daemon-ipc.md); there is no remote Session progress dialect.
 
 ### Shared identities and replay
 
@@ -217,7 +228,8 @@ underline shape/color. Missing metadata is invalid, never an old-client default.
 | terminal keyboard flags contain unknown bits | reject during protocol conversion; never silently mask or invent child state |
 | kind 322 has nonzero request ID, missing/wrong attachment ID, or invalid clipboard text | reject at the attachment boundary; never reinterpret it as raw OSC or ordinary replayable control |
 | selection endpoint is out of bounds or splits a valid wide glyph | reject invalid coordinates / expand valid head-continuation endpoints to the whole glyph before extraction |
-| connection status arrives on remote normal ALPN | reject; status is same-UID local IPC only |
+| connection status/progress arrives on remote normal ALPN | reject; observations are same-UID local IPC only |
+| kind 31 payload exceeds 64 bytes / stage is unspecified or unknown | reject before stage presentation |
 | old v1 ALPN or wire major is used | explicit incompatibility; never enter terminal attachment or downgrade |
 
 ## 5. Good / Base / Bad Cases
@@ -241,6 +253,9 @@ underline shape/color. Missing metadata is invalid, never an old-client default.
   extraction, and renderer-neutral cache/slice-identity transitions.
 - An incomplete public delta baseline returns `InvalidRowCount` and remains
   unchanged; candidate/flush-failure UI tests retain the last committed surface.
+- `local_connection_progress_has_a_small_wire_bound` covers all fixed stage
+  mappings and encoder/decoder payload rejection; client local-progress tests
+  cover correlation, opt-in, count and stream-prefix ordering.
 - Proto tests cover v2 round trip, unknown fields/kinds, major mismatch,
   non-canonical/malformed varints, truncated bodies, both size limits, exact
   kind registry including 322, semantic Unicode/wide/style rows, request-bound

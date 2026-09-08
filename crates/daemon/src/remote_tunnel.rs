@@ -41,15 +41,26 @@ where
     LocalStream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let request_id = first.frame.request_id;
-    let demand = match broker.demand(target, deadline).await {
-        Ok(demand) => demand,
-        Err(error) => {
-            write_service_error_best_effort(&mut local_stream, request_id, &error, deadline).await;
-            return Err(error);
-        }
-    };
-    let remote = match demand.open_bi(StreamPurpose::Service, deadline).await {
-        Ok(remote) => remote,
+    let request: v2::LocalSessionTunnelOpenRequest = first
+        .frame
+        .decode_message(WireKind::LocalSessionTunnelOpenRequest)
+        .map_err(protocol_error)?;
+    let opened = crate::connection_progress::local::observe(
+        &mut local_stream,
+        request_id,
+        deadline,
+        request.report_progress,
+        |progress| async move {
+            let demand = broker.demand(target, deadline).await?;
+            let remote = demand
+                .open_bi_with_progress(StreamPurpose::Service, deadline, &progress)
+                .await?;
+            Ok::<_, DaemonError>((demand, remote))
+        },
+    )
+    .await;
+    let (demand, remote) = match opened {
+        Ok(opened) => opened,
         Err(error) => {
             write_service_error_best_effort(&mut local_stream, request_id, &error, deadline).await;
             return Err(error);
@@ -595,6 +606,7 @@ mod tests {
             7,
             5_000,
             &v2::LocalSessionTunnelOpenRequest {
+                report_progress: false,
                 protocol_version: LOCAL_SESSION_TUNNEL_VERSION,
                 target_device_id: Some(device(0x41).into()),
             },

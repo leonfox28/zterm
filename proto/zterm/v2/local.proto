@@ -84,6 +84,7 @@ message LocalTargetResolveResponse { TargetSelector target = 1; }
 message LocalSessionUnaryRequest {
   DeviceId target_device_id = 1;
   bytes frame = 2;
+  bool report_progress = 3;
 }
 
 // Same-UID-only request for one opaque authenticated Session service stream.
@@ -92,6 +93,28 @@ message LocalSessionUnaryRequest {
 message LocalSessionTunnelOpenRequest {
   uint32 protocol_version = 1;
   DeviceId target_device_id = 2;
+  bool report_progress = 3;
+}
+
+// Same-UID-only, opt-in observations before the correlated Opened/unary result.
+// No text, addresses, peer IDs or Session state crosses this sideband.
+enum LocalConnectionStage {
+  LOCAL_CONNECTION_STAGE_UNSPECIFIED = 0;
+  LOCAL_CONNECTION_STAGE_CHECKING_CONNECTION = 1;
+  LOCAL_CONNECTION_STAGE_REUSING_CONNECTION = 2;
+  LOCAL_CONNECTION_STAGE_LOOKING_UP_ADDRESS = 3;
+  LOCAL_CONNECTION_STAGE_CONNECTING_SECURELY = 4;
+  LOCAL_CONNECTION_STAGE_SECURE_CONNECTION_READY = 5;
+  LOCAL_CONNECTION_STAGE_CHECKING_PROTOCOL_AND_ACCESS = 6;
+  LOCAL_CONNECTION_STAGE_PROTOCOL_AND_ACCESS_READY = 7;
+  LOCAL_CONNECTION_STAGE_SELECTING_CONNECTION = 8;
+  LOCAL_CONNECTION_STAGE_OPENING_SESSION_CHANNEL = 9;
+  LOCAL_CONNECTION_STAGE_SESSION_CHANNEL_READY = 10;
+  LOCAL_CONNECTION_STAGE_RETRYING_CONNECTION = 11;
+}
+
+message LocalConnectionProgress {
+  LocalConnectionStage stage = 1;
 }
 
 // Emitted only after exact-target validation, connection demand, remote

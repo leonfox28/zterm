@@ -433,15 +433,27 @@ async fn handle_connection(
     };
     let remaining = deadline.saturating_sub(started.elapsed());
     let session_wire = SessionWireServer::new(service.sessions().clone());
-    let reply = match tokio::time::timeout(remaining, async {
-        if SessionWireServer::handles_unary(frame.kind) {
-            session_wire
-                .dispatch_local_unary_until(frame, absolute_deadline)
-                .await
-        } else {
-            service.dispatch_until(frame, absolute_deadline).await
-        }
-    })
+    let report_progress = frame.kind == WireKind::LocalSessionUnaryRequest;
+    let reply = match tokio::time::timeout(
+        remaining,
+        crate::connection_progress::local::observe(
+            &mut stream,
+            request_id,
+            absolute_deadline,
+            report_progress,
+            |progress| async {
+                if SessionWireServer::handles_unary(frame.kind) {
+                    session_wire
+                        .dispatch_local_unary_until(frame, absolute_deadline)
+                        .await
+                } else {
+                    service
+                        .dispatch_until_with_progress(frame, absolute_deadline, progress)
+                        .await
+                }
+            },
+        ),
+    )
     .await
     {
         Ok(reply) => reply,

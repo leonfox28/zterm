@@ -1,6 +1,7 @@
 //! Shared zterm domain types and build identity.
 
 pub mod authorization;
+pub mod connection_progress;
 pub mod device;
 pub mod domain;
 pub mod pairing;

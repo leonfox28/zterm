@@ -127,8 +127,16 @@ latest profile and supplies it with each fresh attachment identity on reconnect.
 ### Physical input and observation
 
 - Probe once before interactive create/attach, bounded by 250 ms/64 KiB.
-  Query all 256 entries in batches, default/special roles, appearance and mode
-  2031, followed by DSR 5n as the response boundary. No IDs are available.
+  Query all 256 palette entries with **one index per complete OSC 4 command**,
+  then default/special roles, appearance and mode 2031, followed by one DSR 5n
+  response boundary. Serialize all commands in one write/flush/observation round;
+  never add a per-index wait. No IDs are available.
+  Bound the response to each physical command, not only its request length:
+  Ghostty 1.3.1 uses a fixed 1 KiB response allocator whose ArrayList growth
+  fails on a 32-index reply, aborting slice processing and exposing query tails.
+  Single-index OSCs avoid that demonstrated failure without brand detection or
+  changing host-authoritative color semantics. A short incoming OSC is not proof
+  its expanded RGB response fits a terminal's allocation budget.
 - At most one accepting/draining round plus one pending refresh bit. Timeout
   closes acceptance but retains consume-only framing until DSR 0n. Missing
   boundary prevents another ambiguous round. Partial refresh preserves prior
@@ -183,6 +191,9 @@ latest profile and supplies it with each fresh attachment identity on reconnect.
   publication watermark using gates, not sleeps.
 - `host_colors` and reader-fence tests: fragmented replies across epochs, paste,
   missing boundary, bounded oversized controls, coalescing, owned restoration.
+  `palette_probe_bounds_each_terminal_response_and_keeps_one_round` asserts
+  independently framed single-index queries for every slot and exactly one
+  flush/final fence. Slot-substring coverage alone missed the physical failure.
 - Presenter/UI tests: palette-only live/history repaint, semantic retry,
   selection and wide cursor behavior; reconnect preserves latest profile.
 - `just check` is the authoritative native gate. The bounded

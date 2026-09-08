@@ -1,4 +1,5 @@
 //! Authenticated remote unary framing, correlation and exact-byte retry policy.
+use crate::progress::ProgressObserver;
 use crate::{
     error::ClientError as DaemonError,
     model::session_summary_from_wire,
@@ -50,7 +51,29 @@ impl RemoteUnaryClient {
         deadline: Instant,
         contract: RequestContract,
     ) -> Result<DecodedFrame, DaemonError> {
-        let mut demand = self.transport.demand(target, deadline).await?;
+        self.execute_validated_with_progress(
+            target,
+            request,
+            deadline,
+            contract,
+            ProgressObserver::default(),
+        )
+        .await
+    }
+
+    /// Observes connection setup while preserving the same unary retry owner.
+    pub async fn execute_validated_with_progress(
+        &self,
+        target: DeviceId,
+        request: &[u8],
+        deadline: Instant,
+        contract: RequestContract,
+        progress: ProgressObserver,
+    ) -> Result<DecodedFrame, DaemonError> {
+        let mut demand = self
+            .transport
+            .demand_with_progress(target, deadline, progress)
+            .await?;
 
         let first = exchange_and_validate(&mut *demand, request, deadline, contract).await;
         match first {
@@ -315,6 +338,16 @@ fn validate_session_unary_response_payload(
 
 /// Acquires one authenticated demand for both possible stream attempts.
 pub trait RemoteUnaryTransport: Send + Sync {
+    /// Optional startup observer; adapters without local progress retain their path.
+    fn demand_with_progress<'a>(
+        &'a self,
+        target: DeviceId,
+        deadline: Instant,
+        _progress: ProgressObserver,
+    ) -> BoxFuture<'a, Result<Box<dyn RemoteUnaryDemand>, DaemonError>> {
+        self.demand(target, deadline)
+    }
+
     /// Acquires a bounded authenticated connection demand for an exact host.
     fn demand<'a>(
         &'a self,

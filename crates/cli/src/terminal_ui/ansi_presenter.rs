@@ -167,6 +167,26 @@ impl DesktopPresenter {
         }
         let semantic = desired.clone();
         resolve_frame(&mut desired, selection.range_for(source));
+        self.present_resolved(writer, desired, Some(semantic), source, selection)
+    }
+
+    /// Startup owns physical cells, but is never a Session/history baseline.
+    pub(super) fn present_startup(
+        &mut self,
+        writer: &mut impl Write,
+        desired: ComposedFrame,
+    ) -> Result<bool, CliError> {
+        self.present_resolved(writer, desired, None, None, SelectionPresentation::default())
+    }
+
+    fn present_resolved(
+        &mut self,
+        writer: &mut impl Write,
+        mut desired: ComposedFrame,
+        semantic: Option<ComposedFrame>,
+        source: Option<SelectionSourceIdentity>,
+        selection: SelectionPresentation,
+    ) -> Result<bool, CliError> {
         let desired_input_modes =
             HostInputModes::desired(desired.modes, selection.copy_ready_for(source));
         // A committed frame retains only modes represented in the physical
@@ -175,7 +195,7 @@ impl DesktopPresenter {
         desired.modes = desired_input_modes.terminal_modes();
         if self.baseline.as_ref() == Some(&desired) {
             self.selection = selection;
-            self.semantic_baseline = Some(semantic);
+            self.semantic_baseline = semantic;
             return Ok(false);
         }
         let baseline = self.baseline.as_ref().filter(|baseline| {
@@ -262,7 +282,7 @@ impl DesktopPresenter {
         }
         self.committed_input_modes = desired_input_modes;
         self.selection = selection;
-        self.semantic_baseline = Some(semantic);
+        self.semantic_baseline = semantic;
         self.baseline = Some(desired);
         Ok(true)
     }
@@ -277,12 +297,12 @@ impl DesktopPresenter {
         match command {
             HostColorCommand::EnableAppearance => bytes.extend_from_slice(b"\x1b[?2031h"),
             HostColorCommand::Probe => {
-                for start in (0..256).step_by(32) {
-                    bytes.extend_from_slice(b"\x1b]4");
-                    for index in start..start + 32 {
-                        write!(bytes, ";{index};?").expect("memory writer");
-                    }
-                    bytes.extend_from_slice(b"\x1b\\");
+                // Bound the reply to each OSC, not just the request bytes.
+                // Fixed response allocators in some terminals overflow while
+                // growing a 32-index reply and abandons the current input slice.
+                // Independent commands still share this one write/flush/round.
+                for index in 0..256 {
+                    write!(bytes, "\x1b]4;{index};?\x1b\\").expect("memory writer");
                 }
                 for role in [10, 11, 12, 17, 19] {
                     write!(bytes, "\x1b]{role};?\x1b\\").expect("memory writer");
