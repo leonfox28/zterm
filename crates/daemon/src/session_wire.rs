@@ -19,6 +19,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::sync::{mpsc, oneshot};
 #[cfg(unix)]
+use tokio::task::JoinSet;
+#[cfg(unix)]
 use zeroize::Zeroizing;
 #[cfg(unix)]
 use zterm_core::terminal::{
@@ -1046,7 +1048,11 @@ where
     Reader: AsyncRead + Unpin,
 {
     let mut buffer = [0_u8; 16 * 1024];
+    let mut history_tasks = JoinSet::new();
     loop {
+        if let Some(result) = history_tasks.try_join_next() {
+            finish_history_task(result)?;
+        }
         if let Some(frame) = queued.pop_front() {
             match process_attachment_frame(
                 frame.clone(),
@@ -1055,6 +1061,7 @@ where
                 &context.request_context,
                 &context.outbound,
                 context.limits,
+                &mut history_tasks,
             )
             .await
             {
@@ -1073,10 +1080,14 @@ where
             }
         }
 
-        let read = reader
-            .read(&mut buffer)
-            .await
-            .map_err(|error| daemon_io("read terminal stream", error))?;
+        let read = tokio::select! {
+            biased;
+            Some(result) = history_tasks.join_next(), if !history_tasks.is_empty() => {
+                finish_history_task(result)?;
+                continue;
+            }
+            read = reader.read(&mut buffer) => read.map_err(|error| daemon_io("read terminal stream", error))?,
+        };
         if read == 0 {
             if let Err(error) = decoder.finish() {
                 let error = protocol_error(error);
@@ -1106,6 +1117,18 @@ where
             }
         }
     }
+}
+
+#[cfg(unix)]
+fn finish_history_task(
+    result: Result<Result<(), DaemonError>, tokio::task::JoinError>,
+) -> Result<(), DaemonError> {
+    result.map_err(|_| {
+        DaemonError::new(
+            DomainErrorKind::StoreUnavailable,
+            "terminal history worker failed",
+        )
+    })?
 }
 
 #[cfg(unix)]
@@ -1142,6 +1165,7 @@ async fn process_attachment_frame(
     request_context: &SessionRequestContext,
     outbound: &mpsc::Sender<AttachmentOutbound>,
     limits: SessionWireLimits,
+    history_tasks: &mut JoinSet<Result<(), DaemonError>>,
 ) -> Result<bool, DaemonError> {
     let deadline = Instant::now() + limits.request_deadline(frame.deadline_ms);
     match frame.kind {
@@ -1178,34 +1202,72 @@ async fn process_attachment_frame(
             Ok(false)
         }
         WireKind::TerminalHistoryWindowRequest => {
+            if !history_tasks.is_empty() {
+                return Err(DaemonError::new(
+                    DomainErrorKind::ResourceExhausted,
+                    "terminal history read already pending",
+                ));
+            }
             let request: v2::TerminalHistoryWindowRequest = frame
                 .decode_message(WireKind::TerminalHistoryWindowRequest)
                 .map_err(protocol_error)?;
             let query = terminal_history_window_query(&request)?;
             require_attachment_id(request.attachment_id, attachment)?;
             let attachment_worker = Arc::clone(attachment);
-            let result = request_context
+            let read = request_context
                 .run_effect(&server.sessions, deadline, move |_sessions, _principal| {
-                    attachment_worker.history_window_until(query, deadline)
+                    attachment_worker.begin_history_window_until(query, deadline)
                 })
                 .await?;
-            let message = zterm_proto::terminal_surface_history_window_frame_message(
-                attachment.attachment_id(),
-                result,
-            );
-            let bytes = encode_message(
-                WireKind::TerminalSemanticHistoryWindowFrame,
-                frame.request_id,
-                0,
-                &message,
-            )
-            .map_err(protocol_error)?;
-            send_attachment_outbound_until(
-                outbound,
-                AttachmentOutbound::queued(bytes, deadline),
-                deadline,
-            )
-            .await?;
+            let request_context = request_context.clone();
+            let sessions = server.sessions.clone();
+            let attachment = Arc::clone(attachment);
+            let outbound = outbound.clone();
+            history_tasks.spawn(async move {
+                let result = async {
+                    // No Session actor or remote authorization commit is held
+                    // while a child batch finishes. Input/ACK reads continue.
+                    let result = run_blocking_until(deadline, move || {
+                        read.wait_until(deadline)
+                            .map_err(crate::session::map_driver_error)
+                    })
+                    .await?;
+                    let worker = Arc::clone(&attachment);
+                    request_context
+                        .run_effect(&sessions, deadline, move |_, _| {
+                            worker.validate_history_controller_until(deadline)
+                        })
+                        .await?;
+                    let message = zterm_proto::terminal_surface_history_window_frame_message(
+                        attachment.attachment_id(),
+                        result,
+                    );
+                    let bytes = encode_message(
+                        WireKind::TerminalSemanticHistoryWindowFrame,
+                        frame.request_id,
+                        0,
+                        &message,
+                    )
+                    .map_err(protocol_error)?;
+                    send_attachment_outbound_until(
+                        &outbound,
+                        AttachmentOutbound::queued(bytes, deadline),
+                        deadline,
+                    )
+                    .await
+                }
+                .await;
+                if let Err(error) = &result {
+                    flush_attachment_error(
+                        &outbound,
+                        frame.request_id,
+                        error,
+                        limits.operation_timeout,
+                    )
+                    .await;
+                }
+                result
+            });
             Ok(false)
         }
         WireKind::TerminalInput => {
@@ -2780,6 +2842,165 @@ mod tests {
         assert_eq!(write.as_str(), "wire clipboard");
     }
 
+    #[tokio::test]
+    async fn pending_marked_history_leaves_input_and_snapshot_ack_unblocked() {
+        let temp = tempfile::tempdir().expect("wire batch fixture");
+        let cwd = temp.path().to_path_buf();
+        let initialized = cwd.join("initialized");
+        let own = device(0x97);
+        let sessions = SessionService::with_spawner(
+            own,
+            ResourceLimits::default(),
+            move |size, _| {
+                let pty = PtyHost::new().spawn(
+                ExplicitPtyCommand::new("/bin/sh", &cwd).arg("-c").arg(
+                    "stty -echo; : > initialized; read -r begin; printf '\\033[?2026h'; read -r end; printf 'INPUT_RELEASE\\033[?2026l'; read -r finish"
+                ), PtySize::new(size.rows, size.columns),
+            ).map_err(|error| DaemonError::new(DomainErrorKind::StoreUnavailable, error.to_string()))?;
+                Ok((pty, cwd.clone()))
+            },
+        );
+        let view = AttachmentId::from_array([0x97; 16]);
+        let principal = sessions.local_principal(view);
+        let lease = sessions.issue_operation_lease(principal).expect("lease");
+        let summary = sessions
+            .create(
+                principal,
+                zterm_core::OperationId { lease, sequence: 1 },
+                zterm_core::SessionName::new("marked-history").expect("name"),
+                None,
+                None,
+            )
+            .expect("create");
+        let prepared = sessions
+            .prepare_attach(
+                principal,
+                Some(zterm_core::SessionSelector::Id(summary.session_id)),
+                false,
+                false,
+                None,
+            )
+            .expect("attach");
+        activate_attachment(&prepared);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !initialized.is_file() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("PTY initialized without echo");
+        let attachment = &prepared.attachment;
+        let mut revisions = attachment.revision_watch().expect("watch");
+        revisions.borrow_and_update();
+        attachment.write_input(b"begin\n").expect("start batch");
+        tokio::time::timeout(Duration::from_secs(2), revisions.changed())
+            .await
+            .expect("begin published")
+            .expect("watch live");
+        // A valid snapshot can be ACKed while history is waiting for the marked batch.
+        let snapshot = attachment
+            .sync_latest(prepared.snapshot.revision)
+            .expect("replacement");
+        let metrics = snapshot.surface.scroll_metrics.expect("main metrics");
+        let request = v2::TerminalHistoryWindowRequest {
+            attachment_id: Some(attachment.attachment_id().into()),
+            anchor: Some(v2::TerminalHistoryWindowAnchor {
+                epoch: metrics.epoch.get(),
+                revision: snapshot.revision.get(),
+                max_offset_from_bottom: metrics.max_offset_from_bottom,
+                viewport_rows: u32::from(snapshot.surface.size.rows),
+                viewport_columns: u32::from(snapshot.surface.size.columns),
+            }),
+            target_offset_from_bottom: 0,
+            older_margin_rows: 0,
+            newer_margin_rows: 0,
+        };
+        let query = terminal_history_window_query(&request).expect("history query");
+        let server = SessionWireServer::new(sessions.clone());
+        let context = SessionRequestContext::local(view);
+        let (outbound, mut responses) = mpsc::channel(8);
+        let mut reads = JoinSet::new();
+        let limits = SessionWireLimits::default();
+        process_attachment_frame(
+            decoded_message(WireKind::TerminalHistoryWindowRequest, 10, &request),
+            &server,
+            attachment,
+            &context,
+            &outbound,
+            limits,
+            &mut reads,
+        )
+        .await
+        .expect("history registered");
+        process_attachment_frame(
+            decoded_message(
+                WireKind::TerminalSnapshotApplied,
+                11,
+                &v2::TerminalSnapshotApplied {
+                    attachment_id: Some(attachment.attachment_id().into()),
+                    revision: snapshot.revision.get(),
+                },
+            ),
+            &server,
+            attachment,
+            &context,
+            &outbound,
+            limits,
+            &mut reads,
+        )
+        .await
+        .expect("ACK progresses");
+        process_attachment_frame(
+            decoded_message(
+                WireKind::TerminalInput,
+                12,
+                &v2::TerminalInput {
+                    attachment_id: Some(attachment.attachment_id().into()),
+                    operation_id: None,
+                    bytes: b"end\n".to_vec(),
+                },
+            ),
+            &server,
+            attachment,
+            &context,
+            &outbound,
+            limits,
+            &mut reads,
+        )
+        .await
+        .expect("input progresses");
+        let response = tokio::time::timeout(Duration::from_secs(2), responses.recv())
+            .await
+            .expect("history delivered")
+            .expect("response");
+        let frame = decode_one(&response.bytes);
+        assert_eq!(frame.request_id, 10);
+        let message = frame
+            .decode_message(WireKind::TerminalSemanticHistoryWindowFrame)
+            .expect("history frame");
+        let (_, result) = zterm_proto::terminal_surface_history_window_from_message(message, query)
+            .expect("valid history");
+        let zterm_core::terminal::TerminalSurfaceHistoryWindowResult::Frame(frame) = result else {
+            panic!("unchanged history epoch");
+        };
+        let text: String = frame
+            .rows
+            .iter()
+            .flat_map(|row| &row.cells)
+            .map(|cell| cell.contents.as_str())
+            .collect();
+        assert!(
+            text.contains("INPUT_RELEASE"),
+            "history must capture the input-released batch, not its timeout predecessor"
+        );
+        finish_history_task(reads.join_next().await.expect("history worker"))
+            .expect("history worker completes");
+        attachment.detach();
+        sessions
+            .shutdown()
+            .expect("only fixture sessions shut down");
+    }
+
     #[test]
     fn only_authenticated_clean_eof_can_move_a_resume_checkpoint() {
         assert!(should_move_remote_resume_checkpoint(
@@ -3311,6 +3532,7 @@ mod tests {
                 &input_context,
                 &input_outbound,
                 limits,
+                &mut JoinSet::new(),
             )
             .await
         });
@@ -3345,6 +3567,7 @@ mod tests {
                 &resize_context,
                 &resize_outbound,
                 limits,
+                &mut JoinSet::new(),
             )
             .await
         });
@@ -3379,6 +3602,7 @@ mod tests {
                 &takeover_context,
                 &takeover_outbound,
                 limits,
+                &mut JoinSet::new(),
             )
             .await
         });

@@ -291,7 +291,7 @@ mod unix {
                 cancellation = receive_terminal_cancellation(cancellation_receiver) => return Err(cancellation.error(None)),
                 () = wait_for_prefix_deadline(deadline) => {},
                 input = stdin_pump.recv() => match input {
-                    Some(StdinEvent::Bytes { epoch, bytes }) => {
+                    Some(StdinEvent::Bytes { epoch, bytes, .. }) => {
                         for event in input_codec.feed_for_epoch(&bytes, epoch, current_input_epoch)? {
                             if let HostInputEvent::TerminalReply { reply, bytes } = event {
                                 host_colors.observe(reply, bytes, Instant::now());
@@ -444,6 +444,7 @@ mod unix {
             stdin_pump,
             prefix,
             transport_state,
+            healthy_resize: false,
             resize_coalescer,
             physical_size,
             surface,
@@ -532,7 +533,7 @@ mod unix {
                 () = wait_for_prefix_deadline(color_deadline), if color_deadline.is_some() => { host_colors.expire(Instant::now()); }
                 input = stdin_pump.recv() => {
                     match input {
-                        Some(StdinEvent::Bytes { epoch, bytes }) =>
+                        Some(StdinEvent::Bytes { epoch, bytes, .. }) =>
                         {
                             for event in input_codec.feed_for_epoch(&bytes, epoch, current_input_epoch)? {
                                 if let HostInputEvent::TerminalReply { reply, bytes } = event { host_colors.observe(reply, bytes, Instant::now()); continue; }
@@ -1057,11 +1058,23 @@ mod unix {
     }
 
     #[derive(Clone)]
-    struct InputEpoch(Arc<AtomicU64>);
+    struct InputEpoch(Arc<AtomicU64>, Arc<AtomicU64>);
 
     impl InputEpoch {
         fn new() -> Self {
-            Self(Arc::new(AtomicU64::new(0)))
+            Self(Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)))
+        }
+
+        fn geometry(&self) -> u64 {
+            self.1.load(Ordering::Acquire)
+        }
+
+        fn invalidate_geometry(&self) {
+            self.1
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                    value.checked_add(1)
+                })
+                .expect("terminal geometry generation exhausted");
         }
 
         fn current(&self) -> u64 {
@@ -1080,7 +1093,11 @@ mod unix {
     }
 
     enum StdinEvent {
-        Bytes { epoch: u64, bytes: Vec<u8> },
+        Bytes {
+            epoch: u64,
+            geometry: u64,
+            bytes: Vec<u8>,
+        },
         Eof,
         Error(String),
     }
@@ -1273,6 +1290,7 @@ mod unix {
                     Ok(length) => {
                         drained += length;
                         retained.push_back(StdinEvent::Bytes {
+                            geometry: input_epoch.geometry(),
                             epoch: *current_input_epoch,
                             bytes: buffer[..length].to_vec(),
                         });
@@ -1401,6 +1419,7 @@ mod unix {
                 reader_test_seam.after_readable_poll()?;
             }
             let epoch = input_epoch.current();
+            let geometry = input_epoch.geometry();
             let mut buffer = [0_u8; STDIN_CHUNK_BYTES];
             match rustix::io::read(&input, &mut buffer) {
                 Ok(0) => {
@@ -1409,6 +1428,7 @@ mod unix {
                 }
                 Ok(read) => {
                     if let Err(error) = sender.blocking_send(StdinEvent::Bytes {
+                        geometry,
                         epoch,
                         bytes: buffer[..read].to_vec(),
                     }) {
@@ -2390,6 +2410,7 @@ mod unix {
         discarding_csi: bool,
         utf8_tail: u8,
         pending_epoch: Option<u64>,
+        pending_geometry: Option<u64>,
     }
 
     impl HostInputCodec {
@@ -2402,6 +2423,7 @@ mod unix {
                 discarding_csi: false,
                 utf8_tail: 0,
                 pending_epoch: None,
+                pending_geometry: None,
             }
         }
 
@@ -2411,6 +2433,18 @@ mod unix {
             epoch: u64,
             current: u64,
         ) -> Result<Vec<HostInputEvent>, CliError> {
+            self.feed_for_lifetimes(bytes, epoch, current, 0, 0)
+        }
+
+        fn feed_for_lifetimes(
+            &mut self,
+            bytes: &[u8],
+            epoch: u64,
+            current: u64,
+            geometry: u64,
+            current_geometry: u64,
+        ) -> Result<Vec<HostInputEvent>, CliError> {
+            let source_geometry = self.pending_geometry.unwrap_or(geometry);
             let source_epoch = self.pending_epoch.unwrap_or(epoch);
             let events = self.feed(bytes)?;
             self.pending_epoch = (!self.pending.is_empty()
@@ -2418,8 +2452,13 @@ mod unix {
                 || self.discarding_osc
                 || self.discarding_csi)
                 .then_some(source_epoch);
+            self.pending_geometry = self.pending_epoch.map(|_| source_geometry);
             Ok(events
                 .into_iter()
+                .filter(|event| {
+                    !matches!(event, HostInputEvent::Mouse(_))
+                        || (geometry == current_geometry && source_geometry == current_geometry)
+                })
                 .filter(|event| {
                     matches!(event, HostInputEvent::TerminalReply { .. })
                         || (epoch == current && source_epoch == current)
@@ -3539,6 +3578,7 @@ mod unix {
                     stdin_pump
                         .sender_for_test
                         .try_send(StdinEvent::Bytes {
+                            geometry: 0,
                             epoch: input_epoch.current(),
                             bytes: vec![byte],
                         })
@@ -3556,6 +3596,7 @@ mod unix {
             );
             let Err(tokio::sync::mpsc::error::TrySendError::Full(backpressured)) =
                 stdin_pump.sender_for_test.try_send(StdinEvent::Bytes {
+                    geometry: 0,
                     epoch: input_epoch.current(),
                     bytes: b"i".to_vec(),
                 })
@@ -3575,6 +3616,7 @@ mod unix {
                 stdin_pump
                     .sender_for_test
                     .try_send(StdinEvent::Bytes {
+                        geometry: 0,
                         epoch: input_epoch.current(),
                         bytes: b"i".to_vec(),
                     })
@@ -3772,7 +3814,7 @@ mod unix {
                     .await
                     .expect("bounded delivery")
                     .expect("live pump");
-                    let StdinEvent::Bytes { epoch, bytes } = event else {
+                    let StdinEvent::Bytes { epoch, bytes, .. } = event else {
                         panic!("expected input");
                     };
                     let decoded = codec
@@ -4434,6 +4476,7 @@ mod unix {
                         kill(Pid::this(), NixSignal::SIGWINCH).expect("notify inactive resize");
                         input_sender
                             .send(StdinEvent::Bytes {
+                                geometry: 0,
                                 epoch: input_epoch.current(),
                                 bytes: b"startup input".to_vec(),
                             })
@@ -4690,6 +4733,80 @@ mod unix {
                 alternate_frame.layout.content_size.columns,
                 physical.columns
             );
+        }
+
+        #[test]
+        fn live_height_handoff_preserves_minimum_pan_and_guards_unknown_width() {
+            for screen in [ActiveScreen::Main, ActiveScreen::Alternate] {
+                let old_layout = ChromeLayout::new(TerminalSize::new(8, 9), screen);
+                let physical = TerminalSize::new(4, 9);
+                let layout = ChromeLayout::new(physical, screen);
+                let viewport = ViewportController::with_layout(layout, None);
+                let status = StatusRenderer::new(
+                    TerminalViewTarget::for_display("fixture", TerminalViewRoute::Local),
+                    physical,
+                );
+                let mut snapshot = test_snapshot(old_layout.child, screen, Revision::new(1));
+                for (row, line) in snapshot.surface.rows.iter_mut().enumerate() {
+                    line.cells[0].contents = row.to_string();
+                }
+                for (cursor, pan) in [(1, 0), (5, 3)] {
+                    snapshot.surface.cursor.row = cursor;
+                    snapshot.surface.cursor.visible = true;
+                    let before = ComposedFrame::compose(
+                        &snapshot.surface,
+                        None,
+                        &viewport,
+                        &status,
+                        TerminalViewTransportState::Active,
+                    )
+                    .expect("local crop/pan");
+                    assert_eq!(before.rows[&0][0].contents, pan.to_string());
+                    assert_eq!(before.cursor.row, cursor - pan);
+
+                    let mut resized = snapshot.surface.clone();
+                    resized.rows = resized.rows
+                        [usize::from(pan)..usize::from(pan + layout.child.rows)]
+                        .to_vec();
+                    resized.size = layout.child;
+                    resized.cursor.row -= pan;
+                    let after = ComposedFrame::compose(
+                        &resized,
+                        Some(&before),
+                        &viewport,
+                        &status,
+                        TerminalViewTransportState::Active,
+                    )
+                    .expect("authoritative height handoff");
+                    assert_eq!(before, after, "no second displacement at the host handoff");
+                }
+                snapshot.surface.cursor.visible = false;
+                let hidden = ComposedFrame::compose(
+                    &snapshot.surface,
+                    None,
+                    &viewport,
+                    &status,
+                    TerminalViewTransportState::Active,
+                )
+                .expect("hidden cursor");
+                assert_eq!(hidden.rows[&0][0].contents, "0");
+                snapshot.surface.cursor.visible = true;
+                let mut wider = ViewportController::with_layout(layout, None);
+                wider.set_layout(ChromeLayout::new(TerminalSize::new(4, 10), screen));
+                let wider_status = StatusRenderer::new(
+                    TerminalViewTarget::for_display("fixture", TerminalViewRoute::Local),
+                    TerminalSize::new(4, 10),
+                );
+                let changed_width = ComposedFrame::compose(
+                    &snapshot.surface,
+                    None,
+                    &wider,
+                    &wider_status,
+                    TerminalViewTransportState::Active,
+                )
+                .expect("unknown width mapping");
+                assert_eq!(changed_width.rows[&0][0].contents, "0");
+            }
         }
 
         #[test]
@@ -5667,7 +5784,7 @@ mod unix {
                     )
                     .expect("unknown baseline forces a complete pre-delta recovery frame")
                 );
-                assert!(find_bytes(&recovery.bytes, b"\x1b[2J").is_some());
+                assert!(find_bytes(&recovery.bytes, b"\x1b[2J").is_none());
                 assert!(find_bytes(&recovery.bytes, HOST_INPUT_CAPTURE).is_some());
                 assert!(find_bytes(&recovery.bytes, b"\x1b[=7u").is_some());
                 assert_eq!(presenter.presented_keyboard_flags().bits(), 7);
@@ -5788,7 +5905,7 @@ mod unix {
                 )
                 .expect("full recovery presents the complete pre-delta state")
             );
-            assert!(find_bytes(&recovery.bytes, b"\x1b[2J").is_some());
+            assert!(find_bytes(&recovery.bytes, b"\x1b[2J").is_none());
             assert!(find_bytes(&recovery.bytes, b"\x1b[=7u").is_some());
             assert_eq!(presenter.presented_keyboard_flags().bits(), 7);
         }
@@ -5859,8 +5976,8 @@ mod unix {
                     .expect("retry frame presents")
             );
             assert!(
-                find_bytes(&writer.bytes, b"\x1b[2J").is_some(),
-                "unknown baseline requires a full clear and repaint"
+                find_bytes(&writer.bytes, b"\x1b[2J").is_none(),
+                "unknown baseline writes final cells without an intermediate screen erase"
             );
             assert!(presenter.baseline.is_some());
         }
@@ -5934,10 +6051,43 @@ mod unix {
                     .expect("retry frame presents")
             );
             assert!(
-                find_bytes(&writer.bytes, b"\x1b[2J").is_some(),
-                "unknown baseline requires a full clear and repaint"
+                find_bytes(&writer.bytes, b"\x1b[2J").is_none(),
+                "unknown baseline writes final cells without an intermediate screen erase"
             );
             assert!(presenter.baseline.is_some());
+        }
+
+        #[test]
+        fn geometry_generation_retires_mouse_without_discarding_keyboard_or_paste() {
+            let mut codec = HostInputCodec::new();
+            let stale = codec
+                .feed_for_lifetimes(b"key\x1b[<0;2;3M", 7, 7, 1, 3)
+                .expect("input");
+            assert_eq!(stale, vec![HostInputEvent::Bytes(b"key".to_vec())]);
+            assert!(
+                codec
+                    .feed_for_lifetimes(b"\x1b[<0;", 7, 7, 3, 3)
+                    .expect("partial mouse")
+                    .is_empty()
+            );
+            let split = codec
+                .feed_for_lifetimes(b"2;3Mnext", 7, 7, 4, 4)
+                .expect("geometry changed within mouse");
+            assert_eq!(split, vec![HostInputEvent::Bytes(b"next".to_vec())]);
+            let fresh = codec
+                .feed_for_lifetimes(b"\x1b[<0;2;3M", 7, 7, 4, 4)
+                .expect("fresh mouse");
+            assert!(matches!(fresh.as_slice(), [HostInputEvent::Mouse(_)]));
+            codec
+                .feed_for_lifetimes(b"\x1b[200~pre", 7, 7, 4, 4)
+                .expect("paste start");
+            let paste = codec
+                .feed_for_lifetimes(b"edit\x1b[201~", 7, 7, 5, 5)
+                .expect("resize in paste");
+            assert_eq!(
+                paste,
+                vec![HostInputEvent::Paste(b"\x1b[200~preedit\x1b[201~".to_vec())]
+            );
         }
 
         #[test]

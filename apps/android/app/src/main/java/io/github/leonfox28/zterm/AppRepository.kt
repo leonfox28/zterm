@@ -43,7 +43,7 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
         if (BuildConfig.DEBUG && (previous?.state != next?.state || previous?.error != next?.error)) {
             android.util.Log.d("ZtermState", "state=${next?.state ?: "detached"} code=${next?.error ?: "none"} rows=${next?.viewport?.rows} columns=${next?.viewport?.columns}")
         }
-        if (previous?.inputEpoch != next?.inputEpoch || previous?.selection != next?.selection) ++selectionVersion
+        if (previous?.inputEpoch != next?.inputEpoch || previous?.geometryGeneration != next?.geometryGeneration || previous?.selection != next?.selection) ++selectionVersion
         // View subscribers retain an independent source before the repository
         // releases its predecessor. Unobserved frames never wait for JVM GC.
         frameObservers.toList().forEach { it(next) }
@@ -70,7 +70,10 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
             for (input in keys) {
                 try {
                     val target = terminal ?: continue
-                    if (input.attachment != epoch || input.nativeEpoch != frame.value?.inputEpoch) continue
+                    if (input.attachment != epoch) continue
+                    if (input.nativeEpoch != frame.value?.inputEpoch) {
+                        mutable.update { it.copy(error = "input_not_ready") }; continue
+                    }
                     input.action(target, input.nativeEpoch)
                 } catch (cancel: CancellationException) { throw cancel }
                 catch (error: Exception) { report(error) }
@@ -137,6 +140,7 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
         dark = value
         scope.launch { try { terminal?.setDark(value) } catch (error: Exception) { report(error) } }
     }
+    fun retireGeometry() { ++selectionVersion }
     fun measure(rows: Int, columns: Int) {
         val size = NativeViewport(rows.coerceIn(1, 80).toUShort(), columns.coerceIn(1, 240).toUShort())
         if (size != viewport) { viewport = size; ++selectionVersion; sizes.trySend(Unit) }
@@ -287,12 +291,16 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
             mutable.update { it.copy(route = Route.Home, hostId = null, sessionId = null, panel = false, error = null, busy = operation?.isActive == true) }
         }
     }
-    fun text(text: String, modifiers: Int = 0, paste: Boolean = false) {
-        if (text.isEmpty()) return
-        enqueue { target, admitted -> target.commitText(admitted, text, modifiers.toUByte(), paste) }
+    fun text(text: String, modifiers: Int = 0, paste: Boolean = false): Boolean {
+        if (text.isEmpty()) return frame.value?.inputReady == true
+        return enqueue { target, admitted -> target.commitText(admitted, text, modifiers.toUByte(), paste) }
     }
-    fun key(key: NativeKey, modifiers: Int = 0, kind: Int = 1, text: String = "") {
-        enqueue { target, admitted -> target.sendKey(admitted, key, modifiers.toUByte(), kind.toUByte(), text) }
+    fun key(key: NativeKey, modifiers: Int = 0, kind: Int = 1, text: String = ""): Boolean {
+        return enqueue { target, admitted -> target.sendKey(admitted, key, modifiers.toUByte(), kind.toUByte(), text) }
+    }
+    fun deleteKeys(before: Int, after: Int, modifiers: Int): Boolean = enqueue { target, admitted ->
+        repeat(before) { target.sendKey(admitted, NativeKey.Backspace, modifiers.toUByte(), 1u, "") }
+        repeat(after) { target.sendKey(admitted, NativeKey.Delete, modifiers.toUByte(), 1u, "") }
     }
     fun pointer(source: NativeFrameSource, row: Int, column: Int, wheelLines: Int = 0) {
         val snapshot = frame.value ?: return
@@ -301,10 +309,12 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
         val input = Input(epoch, snapshot.inputEpoch, { target, _ -> target.sendPointer(held, row.toUShort(), column.toUShort(), wheelLines.toShort()) }, held)
         if (!keys.trySend(input).isSuccess) { held.close(); mutable.update { it.copy(error = "resource_limit") } }
     }
-    private fun enqueue(action: suspend (NativeTerminal, ULong) -> Unit) {
-        val snapshot = frame.value ?: return
-        if (!snapshot.inputReady) return
-        if (!keys.trySend(Input(epoch,snapshot.inputEpoch,action)).isSuccess) mutable.update { it.copy(error = "resource_limit") }
+    private fun enqueue(action: suspend (NativeTerminal, ULong) -> Unit): Boolean {
+        val snapshot = frame.value ?: return false
+        if (!snapshot.inputReady || terminal == null) return false
+        val accepted = keys.trySend(Input(epoch,snapshot.inputEpoch,action)).isSuccess
+        if (!accepted) mutable.update { it.copy(error = "resource_limit") }
+        return accepted
     }
     fun scroll(offset: Long, older: Boolean, horizon: Int = 4) {
         if (frame.value?.state == "active") scrolls.trySend(Scroll(epoch,offset.coerceAtLeast(0).toULong(),older,horizon.coerceIn(2,8).toUByte()))

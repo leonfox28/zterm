@@ -22,13 +22,136 @@ class TerminalUiTest {
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
     private val repository get() = (ui.activity.application as ZtermApplication).repository
 
+    @Test fun keyboardPresentationAndCompositionStayContinuous() {
+        val hostName = InstrumentationRegistry.getArguments().getString("hostName")
+        org.junit.Assume.assumeTrue("explicit disposable host", hostName?.startsWith("presentation-") == true)
+        ui.waitUntil(20_000) { repository.state.value.initialized }
+        val host = repository.state.value.saved.hosts.first { it.name == hostName }
+        val preferences = repository.state.value.saved.preferences
+        val font = InstrumentationRegistry.getArguments().getString("fontSize")?.toInt() ?: 14
+        require(font in terminalFontSizes)
+        val name = "android-continuity-${System.nanoTime()}"
+        var owned: String? = null
+        var stop: (() -> Unit)? = null
+        try {
+            ui.runOnIdle { repository.goHome(); repository.setPreferences(Preferences("en", "dark", font)) }
+            ui.waitUntil { repository.frame.value == null && !repository.state.value.busy }
+            ui.runOnIdle { repository.connectHost(host.id) }
+            ui.waitUntil(20_000) { repository.state.value.route == Route.Terminal && !repository.state.value.busy }
+            ui.runOnIdle { repository.createSession(name, "") }
+            await("continuity Session") { repository.frame.value?.state == "active" && repository.state.value.sessions.any { it.name == name } && !repository.state.value.busy }
+            owned = repository.state.value.sessionId
+            await("settled initial grid") { geometrySettled() && terminal().hasWindowFocus() }
+            val epoch = repository.frame.value!!.inputEpoch
+            val readiness = mutableListOf<Boolean>()
+            stop = ui.runOnIdle { repository.observeTerminalFrames { if (it != null) readiness.add(it.inputReady) } }
+            val connection = ui.runOnIdle { terminal().onCreateInputConnection(EditorInfo()) }
+            ui.runOnIdle {
+                assertTrue(connection.setComposingText("unused", 1))
+                assertTrue(connection.setComposingText("printf 'COMPOSITION_%s\\n' '中文'", 1))
+            }
+            ui.onNodeWithContentDescription("Show keyboard").performClick()
+            await("composition resize") { keyboardVisible() && geometrySettled() }
+            assertEquals(epoch, repository.frame.value!!.inputEpoch)
+            ui.runOnIdle {
+                assertTrue(connection.finishComposingText())
+                assertTrue(connection.finishComposingText()) // Finishing twice must not duplicate text.
+                assertTrue(connection.performEditorAction(EditorInfo.IME_ACTION_NONE))
+            }
+            await("Chinese committed exactly once") { content().contains("COMPOSITION_中文") }
+            assertEquals(1, content().split("COMPOSITION_中文").size - 1)
+            ui.onNodeWithContentDescription("Hide keyboard").performClick()
+            await("composition keyboard closed") { !keyboardVisible() && geometrySettled() }
+            assertEquals(epoch, repository.frame.value!!.inputEpoch)
+            assertTrue("healthy resize never suspends keyboard admission", readiness.all { it })
+            ui.runOnIdle { stop?.invoke(); stop = null }
+
+            for (mode in listOf("high", "low", "tui")) {
+                val fixture = "mode='$mode'\n" + continuityFixture
+                val encoded = android.util.Base64.encodeToString(fixture.toByteArray(), android.util.Base64.NO_WRAP)
+                ui.runOnIdle { assertTrue(repository.text("python3 -c 'import base64; exec(base64.b64decode(\"$encoded\"))'\r")) }
+                await("$mode scene") { geometrySettled() && content().startsWith("Tabs | One | Two") }
+                val oldRows = repository.frame.value!!.viewport.rows.toInt()
+                val before = captureContinuityGrid("$mode-before")
+                assertEquals(0, terminal().height % terminal().gridCellHeight)
+                val oldEpoch = repository.frame.value!!.inputEpoch
+                ui.onNodeWithContentDescription("Show keyboard").performClick()
+                await("$mode keyboard open") { keyboardVisible() && geometrySettled() && repository.frame.value!!.viewport.rows.toInt() < oldRows }
+                val newRows = repository.frame.value!!.viewport.rows.toInt()
+                if (mode == "tui") await("marked header restored") { content().startsWith("Tabs | One | Two") }
+                val after = captureContinuityGrid("$mode-open")
+                assertEquals(0, terminal().height % terminal().gridCellHeight)
+                assertEquals(oldEpoch, repository.frame.value!!.inputEpoch)
+                val pan = if (mode == "high") 0 else oldRows - newRows
+                val start = if (mode == "tui") 1 else 0
+                val cell = terminal().gridCellHeight
+                val width = minOf(before.width, after.width) - 32 // Exclude the fading local scrollbar.
+                val height = minOf(5, newRows - start - 1) * cell
+                val oldPatch = android.graphics.Bitmap.createBitmap(before, 0, (pan + start) * cell, width, height)
+                val newPatch = android.graphics.Bitmap.createBitmap(after, 0, start * cell, width, height)
+                assertTrue("$mode preserves unchanged pixels after host resize", oldPatch.sameAs(newPatch))
+                oldPatch.recycle(); newPatch.recycle(); before.recycle(); after.recycle()
+                ui.onNodeWithContentDescription("Hide keyboard").performClick()
+                await("$mode keyboard closed") { !keyboardVisible() && geometrySettled() && repository.frame.value!!.viewport.rows.toInt() == oldRows }
+                ui.runOnIdle { assertTrue(repository.text("\r")) }
+                await("$mode fixture ended") { content().contains("SCENE_DONE") }
+            }
+            ui.runOnIdle { assertTrue(repository.text("printf '\\033[2J\\033[H'; read -r unused\r")) }
+            await("legitimate final clear remains visible") { repository.frame.value?.rows?.all { row -> row.cells.all { it.text.isBlank() } } == true }
+            captureContinuityGrid("final-clear").recycle()
+            ui.runOnIdle { repository.text("\r") }
+        } finally {
+            ui.runOnIdle { stop?.invoke(); repository.goHome(); repository.setPreferences(preferences) }
+            ui.waitUntil(15_000) { repository.frame.value == null }
+            owned?.let { id -> runBlocking { repository.runtime.closeSession(host.id, id) } }
+        }
+    }
+
+    private fun captureContinuityGrid(name: String): android.graphics.Bitmap {
+        awaitDraw(terminal())
+        val view = terminal()
+        val origin = IntArray(2)
+        ui.runOnIdle { view.getLocationOnScreen(origin) }
+        val screenshot = requireNotNull(instrumentation.uiAutomation.takeScreenshot())
+        val grid = android.graphics.Bitmap.createBitmap(screenshot, origin[0], origin[1], view.width, view.height)
+        screenshot.recycle()
+        java.io.File(instrumentation.targetContext.cacheDir, "continuity-$name.png").outputStream().use {
+            grid.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it)
+        }
+        android.util.Log.i("ZtermAcceptance", "continuity=$name height=${view.height} cell=${view.gridCellHeight} rows=${repository.frame.value?.viewport?.rows}")
+        return grid
+    }
+
+    private val continuityFixture = """
+import os, signal, sys
+initial = os.get_terminal_size().lines
+def draw(*_):
+    rows = os.get_terminal_size().lines
+    out = '\x1b[?2026h' if mode == 'tui' else ''
+    out += '\x1b[2J\x1b[H'
+    for row in range(rows):
+        label = 'Tabs | One | Two' if row == 0 else 'ROW %02d   stable terminal content' % (row + initial - rows)
+        out += '\x1b[%d;1H%s' % (row + 1, label)
+    cursor = min(10, rows - 1) if mode == 'high' else rows - 1
+    out += '\x1b[%d;3H' % (cursor + 1)
+    if mode == 'tui': out += '\x1b[?2026l'
+    sys.stdout.write(out); sys.stdout.flush()
+if mode == 'tui':
+    sys.stdout.write('\x1b[?1049h')
+    signal.signal(signal.SIGWINCH, draw)
+draw()
+input()
+if mode == 'tui': sys.stdout.write('\x1b[?1049l')
+print('SCENE_DONE')
+""".trimIndent()
+
     @Test fun gesturesCopyOverlayAndActivityRetention() {
         instrumentation.uiAutomation.serviceInfo = instrumentation.uiAutomation.serviceInfo.apply {
             flags = flags or android.accessibilityservice.AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
         }
         ui.waitUntil(20_000) { repository.state.value.initialized }
         val preferences = repository.state.value.saved.preferences
-        val host = repository.state.value.saved.hosts.first { it.name == "my-mac" }
+        val host = repository.state.value.saved.hosts.first { it.name == (InstrumentationRegistry.getArguments().getString("hostName") ?: "my-mac") }
         val name = "android-ui-${System.nanoTime()}"
         var owned: String? = null
         var stopKeyboardFrames: (() -> Unit)? = null
@@ -81,10 +204,16 @@ class TerminalUiTest {
             assertEquals(owned,repository.state.value.sessionId)
             ui.runOnIdle { stopKeyboardFrames?.invoke(); stopKeyboardFrames = null }
             android.util.Log.i("ZtermAcceptance", "IME show/hide input epochs=${keyboardEpochs.size}")
-            assertEquals("one settled resize per keyboard transition", 3, keyboardEpochs.size)
-            ui.runOnIdle { assertFalse("retired IME callback cannot enter a new input epoch",originalInput.commitText("NEVER_SEND_OLD_IME",1)) }
+            assertEquals("healthy keyboard transitions preserve input lifetime", 1, keyboardEpochs.size)
+            ui.runOnIdle {
+                assertTrue("same InputConnection survives keyboard resize",originalInput.commitText("printf 'IME_RESIZE_%s\\n' '中文'",1))
+                assertTrue(originalInput.performEditorAction(EditorInfo.IME_ACTION_NONE))
+            }
+            await("composition committed once after keyboard resize") { repository.frame.value?.let { text(it).contains("IME_RESIZE_中文") } == true }
             awaitDraw(tapView)
-            ui.onNodeWithContentDescription("Show keyboard").performClick()
+            // Compose performClick waits for idleness and can return after the
+            // platform animation. Trigger this reversal probe before that wait.
+            instrumentation.runOnMainSync { tapView.setKeyboardVisible(true) }
             await("keyboard opening animation") { terminal().imeAnimating() && ui.activity.window.decorView.rootWindowInsets?.isVisible(android.view.WindowInsets.Type.ime()) == true }
             instrumentation.runOnMainSync { ui.activity.window.insetsController?.hide(android.view.WindowInsets.Type.ime()) }
             await("canceled keyboard opening restores final geometry") {
@@ -232,7 +361,7 @@ class TerminalUiTest {
         }
         ui.waitUntil(20_000) { repository.state.value.initialized }
         val preferences = repository.state.value.saved.preferences
-        val host = repository.state.value.saved.hosts.first { it.name == "my-mac" }
+        val host = repository.state.value.saved.hosts.first { it.name == (InstrumentationRegistry.getArguments().getString("hostName") ?: "my-mac") }
         val name = "android-ui-pointer-${System.nanoTime()}"
         try {
             ui.runOnIdle { repository.setPreferences(Preferences("en","dark",12)); repository.goHome() }
@@ -248,6 +377,7 @@ class TerminalUiTest {
             await("child mouse mode") { repository.frame.value?.pointerMode == io.github.leonfox28.zterm.nativebridge.NativePointerMode.MOUSE && content().contains("P=0 R=0") }
             ui.waitForIdle()
             val oldEpochBeforeTap = repository.frame.value!!.inputEpoch
+            val oldRowsBeforeTap = repository.frame.value!!.viewport.rows
             val old = repository.frame.value!!.source!!.retained()
             try {
                 val view = terminal()
@@ -267,7 +397,7 @@ class TerminalUiTest {
                 assertFalse("child tap does not open IME", keyboardVisible())
                 assertEquals("child tap does not resize", oldEpochBeforeTap, repository.frame.value!!.inputEpoch)
                 ui.onNodeWithContentDescription("Show keyboard").performClick()
-                await("explicit keyboard final size") { ui.activity.window.decorView.rootWindowInsets?.isVisible(android.view.WindowInsets.Type.ime()) == true && repository.frame.value?.state == "active" && repository.frame.value!!.inputEpoch > oldEpochBeforeTap }
+                await("explicit keyboard final size") { ui.activity.window.decorView.rootWindowInsets?.isVisible(android.view.WindowInsets.Type.ime()) == true && repository.frame.value?.state == "active" && repository.frame.value!!.viewport.rows < oldRowsBeforeTap }
                 // A source captured before IME geometry changes cannot click a
                 // different cell in the newly resized child grid.
                 ui.runOnIdle { repository.pointer(old,0,0) }
@@ -370,7 +500,7 @@ class TerminalUiTest {
         org.junit.Assume.assumeTrue("explicit isolated host fixture", directory?.startsWith("/tmp/zterm-herdr-android-") == true)
         ui.waitUntil(20_000) { repository.state.value.initialized }
         val preferences = repository.state.value.saved.preferences
-        val host = repository.state.value.saved.hosts.first { it.name == "my-mac" }
+        val host = repository.state.value.saved.hosts.first { it.name == (InstrumentationRegistry.getArguments().getString("hostName") ?: "my-mac") }
         val name = "android-ui-pointer-herdr-${System.nanoTime()}"
         try {
             ui.runOnIdle { repository.setPreferences(Preferences("en","dark",12)); repository.goHome() }

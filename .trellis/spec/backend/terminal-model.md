@@ -41,7 +41,12 @@ TerminalModel::capture(&self, checkpoint: Option<&TerminalCheckpoint>)
     -> (TerminalSurfaceDeltaResult, TerminalCheckpoint)
 TerminalModel::live_scroll_metrics(&self) -> Option<TerminalScrollMetrics>
 TerminalModel::history_window(query: TerminalHistoryWindowQuery)
-    -> TerminalSurfaceHistoryWindowResult
+    -> Option<TerminalSurfaceHistoryWindowResult>
+TerminalModel::published_revision(&self) -> Revision
+TerminalModel::presentation_deadline(&self) -> Option<Instant>
+TerminalModel::expire_synchronized_output(&mut self, now: Instant) -> bool
+TerminalModel::finish_synchronized_output(&mut self) -> bool
+TerminalModel::ingest_observing(bytes, observer: impl FnMut(&Self)) -> Result<TerminalUpdate, TerminalError>
 ```
 
 `TerminalCheckpoint` is opaque and content-redacted. No public signature or
@@ -69,11 +74,15 @@ Debug implementation exposes an `alacritty_terminal` or `vte` type.
 
 ## 4. Ordered Ingest and Revisions
 
-- Non-empty PTY chunks are ingested in order and advance exactly one checked
-  `Revision`, including chunks ending in a partial control. Empty input is a
-  no-op. A successful same-size or changed-size resize also advances exactly
-  one revision.
-- Revision and allocation preflight complete before terminal mutation. Reply
+- Non-empty PTY bytes advance checked working revisions in order, including
+  partial controls. An unmarked chunk normally advances once; parsed publication
+  boundaries can allocate additional tokens within one chunk. A frozen revision
+  never names subsequent mutations. Empty input is a no-op; successful resize
+  advances once. `revision()` is processing progress, `published_revision()` is
+  the exact state eligible for capture/snapshot/delta/scroll metrics.
+- Revision preflight precedes each bounded segment/mode mutation; allocation
+  preflight precedes resize. Exhaustion is terminal-fatal, including exhaustion
+  after earlier segments of the same ingest have committed. Reply
   overflow is terminal-fatal to the driver; it must not continue with an
   unknown child-reply stream.
 - Whole-input, one-byte, fixed-size, and deterministic-random chunking must
@@ -83,6 +92,30 @@ Debug implementation exposes an `alacritty_terminal` or `vte` type.
   appearance, stack, SGR and capability queries in
   [Terminal Colors](./terminal-colors.md). Replies execute at their stream
   position. Secondary DA and unsupported window/private queries stay rejected.
+
+### Synchronized-output publication contract
+
+- **Scope:** CSI `?2026h/l` and `?2026$p`, including fragmented/C1 and combined
+  private modes. First begin freezes one immutable checkpoint plus matching
+  colors/history metrics. Begin siblings mutate only after freezing; end
+  siblings mutate before publication. DECRQM returns set `1` / reset `2`.
+- **Contract:** working parsing, bounded replies and transient effects continue.
+  The observer runs synchronously at every eligible boundary. Complete A then
+  partial B in one read must expose A, including pending history projections.
+  `history_window` returns `None` while held, never a fabricated Gap.
+- **Recovery/errors:** the first begin arms 150 ms; repeats neither nest nor
+  extend it. Driver timeout, resize, RIS and EOF release through the serialized
+  owner. Unmarked output gains no timer. Existing resource/parse errors remain
+  fatal or contained according to their original contract.
+- **Cases:** Good: old snapshot/metadata while B is partial, A-readable history
+  captured before B. Base: no markers, ordinary streaming. Bad: publishing the
+  working grid or waiting for history under the lock that parses the end marker.
+- **Tests:** `synchronized_output` covers held read consistency, exact A/B
+  boundary, split/C1/combined modes, repeat deadline, queries, reset and resize;
+  driver tests cover a completely quiet PTY deadline and EOF.
+- **Wrong:** notify after a whole ingest, then project whatever state is current.
+  **Correct:** project the admitted bounded history read inside the eligible
+  observer before parsing subsequent bytes; publish only `published_revision()`.
 
 ## 5. Ingress and Side-Effect Policy
 
@@ -125,8 +158,9 @@ these hard caps:
   admitted controls use the pinned Alacritty engine's stack semantics directly.
   Unrelated CSI-u remains rejected. Exact color OSC, color stack/appearance
   CSI, SGR DECRQSS and XTGETTCAP are handled by the Zterm color owner.
-  OSC 8, other OSC/DCS, APC/PM/SOS, synchronized-update 2026 and REP remain
-  consumed or rejected before the engine.
+  OSC 8, other OSC/DCS, APC/PM/SOS and REP remain consumed or rejected
+  before the engine. DEC 2026 is owned at the Zterm parsed boundary, never
+  forwarded to upstream raw-byte synchronized-output buffering.
 - SGR 58/59 and all six underline shapes pass through the pinned SGR parser.
   Never discard sibling 0/31/38/48 parameters because an SGR contains underline
   color. Indexed/RGB components equal to 58/59 remain ordinary components.
@@ -257,7 +291,7 @@ released when the Session model is dropped.
 | --- | --- |
 | zero row/column | `TerminalError::InvalidSize`; no mutation |
 | checked `rows * columns`/history arithmetic overflow | `TerminalError::AllocationOverflow`; no allocation |
-| revision would exceed `u64::MAX` | `TerminalError::RevisionOverflow`; no mutation |
+| revision would exceed `u64::MAX` | `TerminalError::RevisionOverflow`; no mutation in the failing segment; driver stops |
 | canonical replies exceed 64 KiB/update | `TerminalError::ReplyOverflow`; driver fails closed |
 | history-window anchor/query is invalid, from the future, or has an unrepresentable exact range | `HistoryGap`; no row is returned and the model is unchanged |
 | history-window identity/size changed or retained extent decreased | one complete request-shaped `Rebased` frame, never mixed old/new rows |

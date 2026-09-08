@@ -33,8 +33,9 @@ SessionAttachment::snapshot_applied(revision) -> Result<(), DaemonError>
 SessionAttachment::next_update() -> Result<Option<AttachmentUpdate>, DaemonError>
 SessionAttachment::write_input(bytes) -> Result<(), DaemonError>
 SessionAttachment::resize(size) -> Result<Revision, DaemonError>
-SessionAttachment::history_window(query: TerminalHistoryWindowQuery)
-    -> Result<TerminalSurfaceHistoryWindowResult, DaemonError>
+SessionAttachment::begin_history_window_until(query, deadline)
+    -> Result<TerminalHistoryRead, DaemonError>
+SessionAttachment::validate_history_controller_until(deadline) -> Result<(), DaemonError>
 SessionAttachment::effect_watch() -> watch::Receiver<()>
 SessionAttachment::take_host_effect() -> Result<Option<TerminalHostEffect>, DaemonError>
 ```
@@ -161,12 +162,18 @@ before gaining ever-active input privilege.
   requests a fresh authoritative sync and never silently activates it.
 - A contiguous history-window request is controller-only and passes one fully
   validated anchor/target/margin query through the same initial-versus-
-  replacement sync fence. It is stateless at
-  the Session boundary: it does not read or update a scroll position,
+  replacement sync fence. The actor registers one bounded cancellable read;
+  a held DEC 2026 batch returns its ticket immediately. The attachment stream
+  owns at most one async history delivery task and continues reading input/ACKs.
+  Waiting retains no authorization commit or actor/model mutex. Recheck remote
+  authorization and the current controller before delivery; cancel reads when
+  their attachment ceases to own control. `HistoryReadPending` maps to
+  `resource_exhausted`, canceled reads to `cancelled`, expired reads to the
+  existing deadline error. No history read updates a scroll position,
   checkpoint, resume state, controller lease, PTY, or revision delivery. Query
   correlation/coalescing belongs to the local/remote adapter and client cache.
 - `next_update` and the final-drain path call the driver's `sync_changed`, not
-  mandatory `sync_latest`. An attachment checkpoint equal to the current model
+  mandatory `sync_latest`. An attachment checkpoint equal to the current published model
   revision is a no-op and emits no frame. Initial attach, explicit sync, and
   reconnect retain the mandatory full-sync API.
 - Prepared-takeover readiness is independent of current replacement-snapshot
@@ -415,7 +422,10 @@ let actor = registry.lookup(session_id)?; // short lock only
 let command = Command::input(input, absolute_deadline);
 actor.try_submit(command)?;               // bounded per-session mailbox
 
-let window = attachment.history_window(query)?; // stateless read
+let read = attachment.begin_history_window_until(query, deadline)?;
+// Leave the actor/authorization commit before waiting.
+let window = read.wait_until(deadline)?;
+attachment.validate_history_controller_until(deadline)?;
 assert_eq!(attachment.checkpoint_revision(), previous_checkpoint);
 ```
 

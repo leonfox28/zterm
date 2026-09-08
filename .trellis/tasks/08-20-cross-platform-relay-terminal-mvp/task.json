@@ -28,7 +28,8 @@
     "08-23-remote-cli",
     "08-24-distribution-release",
     "08-24-e2e-hardening",
-    "09-02-migrate-alacritty-terminal"
+    "09-02-migrate-alacritty-terminal",
+    "09-07-terminal-presentation-continuity"
   ],
   "parent": null,
   "relatedFiles": [

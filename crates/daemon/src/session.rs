@@ -20,9 +20,11 @@ use tokio::sync::watch;
 #[cfg(all(unix, test))]
 use zterm_core::terminal::TerminalHistoryWindowAnchor;
 #[cfg(unix)]
-use zterm_core::terminal::TerminalHostEffect;
+use zterm_core::terminal::TerminalHistoryWindowQuery;
 #[cfg(unix)]
-use zterm_core::terminal::{TerminalHistoryWindowQuery, TerminalSurfaceHistoryWindowResult};
+use zterm_core::terminal::TerminalHostEffect;
+#[cfg(all(unix, test))]
+use zterm_core::terminal::TerminalSurfaceHistoryWindowResult;
 use zterm_core::terminal::{
     TerminalSize, TerminalSurfaceDelta, TerminalSurfaceDeltaResult, TerminalSurfaceSnapshot,
 };
@@ -36,12 +38,12 @@ use zterm_platform::pty::{PtyChildState, PtyError, PtyHost, PtyPathKind, PtySess
 use zterm_terminal::{TerminalError, TerminalModel};
 
 use crate::error::DaemonError;
-#[cfg(unix)]
-use crate::terminal_driver::TerminalEffectBroker;
 use crate::terminal_driver::{
     TerminalAttachment, TerminalDriver, TerminalDriverConfig, TerminalDriverError,
     TerminalDriverInterrupt, TerminalDriverOwnership, spawn_background_reaper,
 };
+#[cfg(unix)]
+use crate::terminal_driver::{TerminalEffectBroker, TerminalHistoryRead};
 
 const OPERATION_RESULTS_PER_EPOCH: usize = 128;
 const MAX_ACTIVE_OPERATION_EPOCHS: usize = 64;
@@ -280,14 +282,25 @@ impl SessionAttachment {
             })
     }
 
-    /// Returns one stateless client-owned history window without changing any
-    /// attachment scroll baseline or live checkpoint.
-    #[cfg(unix)]
+    /// Waits for an eligible history read outside the Session actor.
+    #[cfg(all(unix, test))]
     pub(crate) fn history_window_until(
         &self,
         query: TerminalHistoryWindowQuery,
         deadline: Instant,
     ) -> Result<TerminalSurfaceHistoryWindowResult, DaemonError> {
+        let read = self.begin_history_window_until(query, deadline)?;
+        let result = read.wait_until(deadline).map_err(map_driver_error);
+        self.validate_history_controller_until(deadline)?;
+        result
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn begin_history_window_until(
+        &self,
+        query: TerminalHistoryWindowQuery,
+        deadline: Instant,
+    ) -> Result<TerminalHistoryRead, DaemonError> {
         self.actor
             .request(deadline, |meta, reply| SessionCommand::HistoryWindow {
                 meta,
@@ -295,6 +308,20 @@ impl SessionAttachment {
                 query,
                 reply,
             })
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn validate_history_controller_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<(), DaemonError> {
+        self.actor.request(deadline, |meta, reply| {
+            SessionCommand::ValidateHistoryController {
+                meta,
+                attachment_id: self.attachment_id,
+                reply,
+            }
+        })
     }
 
     /// Writes controller bytes only after snapshot synchronization.
@@ -2675,7 +2702,13 @@ enum SessionCommand {
         meta: CommandMeta,
         attachment_id: AttachmentId,
         query: TerminalHistoryWindowQuery,
-        reply: SyncSender<Result<TerminalSurfaceHistoryWindowResult, DaemonError>>,
+        reply: SyncSender<Result<TerminalHistoryRead, DaemonError>>,
+    },
+    #[cfg(unix)]
+    ValidateHistoryController {
+        meta: CommandMeta,
+        attachment_id: AttachmentId,
+        reply: SyncSender<Result<(), DaemonError>>,
     },
     WriteInput {
         meta: CommandMeta,
@@ -3346,8 +3379,19 @@ fn dispatch_command(
             attachment_id,
             query,
             reply,
+        } => {
+            let deadline = meta.deadline;
+            respond(actor, meta, reply, || {
+                history_window(runtime, attachment_id, query, deadline)
+            })
+        }
+        #[cfg(unix)]
+        SessionCommand::ValidateHistoryController {
+            meta,
+            attachment_id,
+            reply,
         } => respond(actor, meta, reply, || {
-            history_window(runtime, attachment_id, query)
+            require_existing_visual_sync_controller(runtime, attachment_id).map(|_| ())
         }),
         SessionCommand::WriteInput {
             meta,
@@ -3840,14 +3884,15 @@ fn history_window(
     runtime: &SessionRuntime,
     attachment_id: AttachmentId,
     query: TerminalHistoryWindowQuery,
-) -> Result<TerminalSurfaceHistoryWindowResult, DaemonError> {
+    deadline: Instant,
+) -> Result<TerminalHistoryRead, DaemonError> {
     require_existing_visual_sync_controller(runtime, attachment_id)?;
     runtime
         .attachments
         .get(&attachment_id)
         .ok_or_else(lease_lost)?
         .terminal
-        .history_window(query)
+        .begin_history_window(query, deadline)
         .map_err(map_driver_error)
 }
 
@@ -4124,6 +4169,11 @@ fn reconcile_effect_target(runtime: &SessionRuntime) -> Result<(), DaemonError> 
             })
             .map(|_| controller.attachment_id)
     });
+    for (id, attachment) in &runtime.attachments {
+        if Some(*id) != target {
+            attachment.terminal.cancel_pending_history();
+        }
+    }
     runtime
         .driver
         .as_ref()
@@ -4282,11 +4332,17 @@ fn map_terminal_error(error: TerminalError) -> DaemonError {
     DaemonError::new(DomainErrorKind::ResourceExhausted, error.to_string())
 }
 
-fn map_driver_error(error: TerminalDriverError) -> DaemonError {
+pub(crate) fn map_driver_error(error: TerminalDriverError) -> DaemonError {
     match error {
         TerminalDriverError::Pty(error) => map_pty_error(error),
         TerminalDriverError::Terminal(error) => map_terminal_error(error),
         TerminalDriverError::Deadline(detail) => deadline_error(detail),
+        TerminalDriverError::HistoryReadPending => {
+            resource_error("terminal history read already pending")
+        }
+        TerminalDriverError::Cancelled(detail) => {
+            DaemonError::new(DomainErrorKind::Cancelled, detail)
+        }
         error => DaemonError::new(DomainErrorKind::StoreUnavailable, error.to_string()),
     }
 }

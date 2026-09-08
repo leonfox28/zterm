@@ -65,7 +65,8 @@ new connection through duplicate arbitration, even with valid authorization.
 - `begin_selection(source, row, column)` / `extend_selection(source, row,
   column, anchor)` require the opaque `NativeFrameSource` of the actual drawn
   frame. The source pins an immutable accounted semantic page; attachment origin,
-  input epoch, active screen and geometry fence its use.
+  input epoch, active screen, viewport and monotonic `geometry_generation`
+  fence its use. Equal A-B-A dimensions never revive a retired source.
 - `ViewportCache::with_budget(ViewportCacheBudget { rows, bytes })` opts Android
   into multiple pages. Default construction preserves desktop single-window
   behavior. `install_accounted_window` requires nested row allocation bytes.
@@ -95,8 +96,15 @@ must not change them. Project only the actual displayed rows, not an unused live
 grid followed by a second frozen-grid conversion.
 An input-triggered history-to-live return retains first and ordered subsequent input within
 `RESUME_INPUT_BOUND`, releasing it once after the snapshot barrier and Active.
-Real reconnect, lease loss, Session end or geometry change invalidates queued
-input/selection; never replay actual-disconnect input.
+Real reconnect, lease loss and Session end invalidate queued input/selection;
+never replay actual-disconnect input. A healthy same-live-attachment resize
+preserves `NativeFrame.input_epoch`, ordinary ordered input and preedit, while
+advancing `geometry_generation` and retiring coordinate/selection sources.
+`healthy_resize` is entered only by a local resize from Active Live; initial
+attach, gap recovery and frozen-history return keep their existing barriers.
+Snapshots/resume deltas still ACK immediately after native installation.
+`NativeFrame.input_ready` and cursor readiness remain true for healthy resize;
+coordinates remain fenced until Active with an applicable drawn source.
 
 Android uses 4,096 accounted rows and 16 MiB including pinned sources. Cache
 allocation includes nested cells/strings, row vectors and page metadata; bounded

@@ -155,9 +155,16 @@ pub(crate) enum IngressError {
     ReplyOverflow,
 }
 
+pub(crate) enum PresentationBoundary {
+    SynchronizedOutput { enabled: bool, modes: Vec<u16> },
+    Reset,
+}
+
 pub(crate) struct TerminalIngressPolicy {
     state: PolicyState,
     utf8: Vec<u8>,
+    boundary: Option<PresentationBoundary>,
+    synchronized_output: bool,
 }
 
 impl Default for TerminalIngressPolicy {
@@ -165,24 +172,39 @@ impl Default for TerminalIngressPolicy {
         Self {
             state: PolicyState::Ground,
             utf8: Vec::with_capacity(4),
+            boundary: None,
+            synchronized_output: false,
         }
     }
 }
 
 impl TerminalIngressPolicy {
-    pub(crate) fn process(
+    /// Stops at an actual parsed presentation boundary, before sibling mode
+    /// changes. The model can freeze/publish before advancing the next bytes.
+    pub(crate) fn process_until_boundary(
         &mut self,
         bytes: &[u8],
         engine: &mut AlacrittyEngine,
         output: &mut UpdateCollector,
-    ) -> Result<(), IngressError> {
-        for byte in bytes {
+    ) -> Result<usize, IngressError> {
+        for (index, byte) in bytes.iter().enumerate() {
             self.process_byte(*byte, engine, output)?;
             for event in engine.take_events() {
                 output.push_event(event);
             }
+            if self.boundary.is_some() {
+                return Ok(index + 1);
+            }
         }
-        Ok(())
+        Ok(bytes.len())
+    }
+
+    pub(crate) fn take_boundary(&mut self) -> Option<PresentationBoundary> {
+        self.boundary.take()
+    }
+
+    pub(crate) fn end_synchronized_output(&mut self) {
+        self.synchronized_output = false;
     }
 
     fn process_byte(
@@ -388,7 +410,7 @@ impl TerminalIngressPolicy {
     }
 
     fn dispatch_escape(
-        &self,
+        &mut self,
         sequence: Sequence,
         engine: &mut AlacrittyEngine,
         output: &mut UpdateCollector,
@@ -401,13 +423,15 @@ impl TerminalIngressPolicy {
             output.push_event(TerminalSideEvent::VisualBell);
         } else if sequence.bytes == b"\x1bc" {
             engine.feed_reset(&sequence.bytes);
+            self.synchronized_output = false;
+            self.boundary = Some(PresentationBoundary::Reset);
         } else {
             engine.feed_raw(&sequence.bytes);
         }
     }
 
     fn dispatch_csi(
-        &self,
+        &mut self,
         sequence: Sequence,
         engine: &mut AlacrittyEngine,
         output: &mut UpdateCollector,
@@ -431,7 +455,11 @@ impl TerminalIngressPolicy {
             }
             if let Some(values) = values {
                 for value in values {
-                    let state = engine.report_mode(value, private == Some(b'?'));
+                    let state = if private == Some(b'?') && value == 2026 {
+                        if self.synchronized_output { 1 } else { 2 }
+                    } else {
+                        engine.report_mode(value, private == Some(b'?'))
+                    };
                     let prefix = if private == Some(b'?') { "?" } else { "" };
                     output.push_reply(format!("\x1b[{prefix}{value};{state}$y").as_bytes())?;
                 }
@@ -506,33 +534,17 @@ impl TerminalIngressPolicy {
                 return Ok(());
             };
             let enabled = final_byte == b'h';
-            let mut forwarded = Vec::new();
-            for parameter in parameters {
-                match parameter {
-                    5 => engine.colors.reverse = enabled,
-                    2031 => engine.colors.subscribed = enabled,
-                    9 => engine.set_legacy_x10_mouse(enabled),
-                    2026 => output.push_event(TerminalSideEvent::UnsupportedSequence(
-                        UnsupportedSequenceKind::Csi,
-                    )),
-                    value => forwarded.push(value),
-                }
-            }
-            if !forwarded.is_empty() {
-                let changes_screen = forwarded
-                    .iter()
-                    .any(|value| matches!(value, 47 | 1047 | 1049));
-                let body = forwarded
-                    .iter()
-                    .map(u16::to_string)
-                    .collect::<Vec<_>>()
-                    .join(";");
-                let sequence = format!("\x1b[?{body}{}", char::from(final_byte));
-                if changes_screen {
-                    engine.feed_screen_transition(sequence.as_bytes());
-                } else {
-                    engine.feed_raw(sequence.as_bytes());
-                }
+            if parameters.contains(&2026) {
+                self.synchronized_output = enabled;
+                self.boundary = Some(PresentationBoundary::SynchronizedOutput {
+                    enabled,
+                    modes: parameters
+                        .into_iter()
+                        .filter(|value| *value != 2026)
+                        .collect(),
+                });
+            } else {
+                Self::apply_private_modes(&parameters, enabled, engine);
             }
             return Ok(());
         }
@@ -545,6 +557,38 @@ impl TerminalIngressPolicy {
             engine.feed_raw(&sequence.bytes);
         }
         Ok(())
+    }
+
+    pub(crate) fn apply_private_modes(
+        parameters: &[u16],
+        enabled: bool,
+        engine: &mut AlacrittyEngine,
+    ) {
+        let mut forwarded = Vec::new();
+        for parameter in parameters {
+            match parameter {
+                5 => engine.colors.reverse = enabled,
+                2031 => engine.colors.subscribed = enabled,
+                9 => engine.set_legacy_x10_mouse(enabled),
+                value => forwarded.push(*value),
+            }
+        }
+        if !forwarded.is_empty() {
+            let changes_screen = forwarded
+                .iter()
+                .any(|value| matches!(value, 47 | 1047 | 1049));
+            let body = forwarded
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(";");
+            let sequence = format!("\x1b[?{body}{}", if enabled { 'h' } else { 'l' });
+            if changes_screen {
+                engine.feed_screen_transition(sequence.as_bytes());
+            } else {
+                engine.feed_raw(sequence.as_bytes());
+            }
+        }
     }
 
     fn dispatch_string(
