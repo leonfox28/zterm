@@ -105,3 +105,12 @@ a phone FPS measurement or close the separate keyboard-close/history-refill and
 desktop visual gaps. Publish the scoped scrolling improvements as v0.1.28 using
 normal PR/CI/main-candidate/tag/protected-signing/publication checks. No running
 Mac daemon update or interaction with its main Session is authorized.
+
+
+## 2026-09-08 — v0.1.28 published
+
+Phone scrolling accepted; all implementation changes committed in `022ffb7`.
+PR #36, exact-main CI and signed publication passed. Immutable v0.1.28 has all
+11 expected assets; Android code 102899. See `research/release-0.1.28.md`.
+Keep prior keyboard-close/history-refill and desktop visual follow-ups open.
+No real daemon/main Session operation or additional phone installation.

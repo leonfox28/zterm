@@ -103,3 +103,8 @@ After testing the updated phone, the user confirmed “测试了一下非常棒�
 Validation and remaining visual boundaries are in
 [scrolling acceptance](research/android-scroll-optimization.md). Keep the task
 active for prior keyboard-close/history-refill and broader desktop visual checks. Phone scrolling acceptance is now confirmed.
+
+
+Completed: work `022ffb7`, version `4eef9a4`, PR #36 merge
+`9c5ecad4d22efc9a2092da25957900c5726d977d`; immutable v0.1.28 published.
+Evidence: `research/release-0.1.28.md`.

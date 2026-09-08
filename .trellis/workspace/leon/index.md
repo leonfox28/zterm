@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 21
+- **Total Sessions**: 22
 - **Last Active**: 2026-09-08
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~590 | Active |
+| `journal-1.md` | ~613 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 22 | 2026-09-08 | Accept Android local scrolling and publish v0.1.28 | `022ffb7`, `4eef9a4` | `perf/android-local-scroll` |
 | 21 | 2026-09-08 | Publish v0.1.27 terminal presentation continuity | `ed7c170`, `a0065d9`, `807fd41`, `cb19c75` | `feat/terminal-presentation-continuity` |
 | 20 | 2026-09-07 | Release v0.1.26 with Android | `f793542`, `9ec604d`, `85dff0f`, `77fadca`, `891a219` | `holy-zebra` |
 | 19 | 2026-09-06 | Remote self-update fix and v0.1.24 release | `ca7eb7e`, `4048885` | `short-toad` |
