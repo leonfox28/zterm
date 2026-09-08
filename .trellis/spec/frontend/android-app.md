@@ -182,6 +182,21 @@ View focus, hiding remains available while input is suspended. Observe
 a floating keyboard can be visible with zero bottom inset. Do not guess an
 input region from terminal glyphs/cursor coordinates or special-case programs.
 
+`TerminalScreen` scopes `SOFT_INPUT_STATE_UNCHANGED` to its Activity window with
+`DisposableEffect(LocalActivity.current?.window)`. Replace only
+`SOFT_INPUT_MASK_STATE`, preserve resize/other bits, and restore the prior state
+bits on disposal. A focused terminal with the default `STATE_UNSPECIFIED` and
+`ADJUST_RESIZE` can trigger Android's `SHOW_AUTO_EDITOR_FORWARD_NAV` when its task
+returns, even after the button or Back successfully hid the IME. Keep native
+editor focus for hardware input and the existing explicit button calls; do not
+clear focus or hide IME unconditionally on resume. `keyboardDismissalSurvivesTaskResume`
+backgrounds the real task, returns to the same Activity, and observes a settled
+visibility interval. It covers both dismissal paths, repeated returns, retained
+input focus/Session/epoch, visible-state resume, input, and policy restoration
+after leaving Terminal. Virtual keyboard event injection can make Gboard request
+its own IME display (`SHOW_SOFT_INPUT_FROM_IME`); distinguish that from a window's
+automatic show request when diagnosing a failure.
+
 Disable local double-tap recognition: every completed tap, including rapid
 consecutive taps, follows the same ownership rule. At the live synchronized
 grid, declared mouse reporting routes completed taps

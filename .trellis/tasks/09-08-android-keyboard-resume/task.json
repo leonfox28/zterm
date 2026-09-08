@@ -1,0 +1,30 @@
+{
+  "id": "android-keyboard-resume",
+  "name": "android-keyboard-resume",
+  "title": "修复 Android 终端返回前台时键盘自动弹出",
+  "description": "修复终端中打开并收起软键盘后，应用切至后台再返回时键盘自动弹出的问题，覆盖焦点与前后台回归验证。",
+  "status": "in_progress",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "leon",
+  "assignee": "leon",
+  "createdAt": "2026-09-08",
+  "completedAt": null,
+  "branch": "fix/android-keyboard-resume",
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [
+    "apps/android/app/src/main/java/io/github/leonfox28/zterm/TerminalScreen.kt",
+    "apps/android/app/src/androidTest/java/io/github/leonfox28/zterm/TerminalUiTest.kt",
+    ".trellis/spec/frontend/android-app.md"
+  ],
+  "notes": "Approved implementation complete on fix/android-keyboard-resume: terminal-scoped SOFT_INPUT_STATE_UNCHANGED, native focus and explicit IME calls retained. Old regression fails, final new regression and three existing UI methods pass. Debug/test build, Debug/Release lint pass. Same-Activity Recents/direct cross-app and editable-dialog manual checks pass. See verification.md for transient fixture/test-assumption failures and emulator-only limits. User authorized the approved work commit, branch push and PR creation on 2026-09-08; preparing delivery and Trellis archive/journal. No phone install or release publication.",
+  "meta": {}
+}

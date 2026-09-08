@@ -1,6 +1,8 @@
 package io.github.leonfox28.zterm
 
+import android.view.WindowManager.LayoutParams
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.LocalActivity
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -41,6 +43,18 @@ import io.github.leonfox28.zterm.nativebridge.NativeSession
     val host = state.saved.hosts.firstOrNull { it.id == state.hostId }
     val imeVisible = WindowInsets.isImeVisible
     val imeAnimation = LocalImeAnimation.current
+    val window = LocalActivity.current?.window
+    DisposableEffect(window) {
+        val previous = window?.attributes?.softInputMode
+        // Keep editor focus for hardware input without Android auto-showing IME on task return.
+        if (previous != null) window.setSoftInputMode(
+            (previous and LayoutParams.SOFT_INPUT_MASK_STATE.inv()) or LayoutParams.SOFT_INPUT_STATE_UNCHANGED)
+        onDispose {
+            if (window != null && previous != null) window.setSoftInputMode(
+                (window.attributes.softInputMode and LayoutParams.SOFT_INPUT_MASK_STATE.inv()) or
+                    (previous and LayoutParams.SOFT_INPUT_MASK_STATE))
+        }
+    }
     DisposableEffect(terminalView, imeAnimation) {
         val stop = terminalView?.let { imeAnimation.observe(it::updateImeAnimation) }
         onDispose { stop?.invoke() }
