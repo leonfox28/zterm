@@ -251,6 +251,7 @@ fn protocol_error(error: ProtocolError) -> ClientError {
         | ProtocolError::InvalidIdentifier(_)
         | ProtocolError::InvalidTerminalSize { .. }
         | ProtocolError::InvalidTerminalSurface(_)
+        | ProtocolError::InvalidLocalConnectionStage
         | ProtocolError::InvalidTerminalSemanticField(_) => DomainErrorKind::MalformedFrame,
     };
     ClientError::new(kind, error.to_string())

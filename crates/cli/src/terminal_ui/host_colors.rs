@@ -488,6 +488,32 @@ mod tests {
         );
     }
     #[test]
+    fn palette_probe_bounds_each_terminal_response_and_keeps_one_round() {
+        #[derive(Default)]
+        struct ProbeWriter { bytes: Vec<u8>, flushes: usize }
+        impl Write for ProbeWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> { self.flushes += 1; Ok(()) }
+        }
+        let mut output = ProbeWriter::default();
+        DesktopPresenter::default().write_color_command(&mut output, HostColorCommand::Probe).expect("physical probe");
+        let text = String::from_utf8(output.bytes).expect("query text");
+        let mut slots = Vec::new();
+        for command in text.split("\x1b\\").filter_map(|command| command.strip_prefix("\x1b]4;")) {
+            let (index, query) = command.split_once(';').expect("palette query");
+            assert_eq!(query, "?", "a compound OSC response can overflow the host's fixed reply allocator");
+            slots.push(index.parse::<u16>().expect("palette index"));
+        }
+        assert_eq!(slots, (0..256).collect::<Vec<_>>());
+        assert_eq!(output.flushes, 1, "no per-index wait/round");
+        assert_eq!(text.matches("\x1b[5n").count(), 1);
+        assert!(text.ends_with("\x1b[5n"));
+    }
+
+    #[test]
     fn only_known_reset_subscription_is_owned_and_probe_queries_every_slot() {
         for mode in 0..=4 {
             let now = Instant::now();

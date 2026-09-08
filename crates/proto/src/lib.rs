@@ -463,6 +463,8 @@ pub enum WireKind {
     LocalSessionTunnelHalfClose = 29,
     /// Content-free terminal outcome for one tunnel epoch.
     LocalSessionTunnelClosed = 30,
+    /// Opt-in, same-UID connection-stage observation before a local result.
+    LocalConnectionProgress = 31,
     /// Controller opens a pairing handshake.
     PairBegin = 100,
     /// Host responds to a pairing handshake.
@@ -558,7 +560,9 @@ impl WireKind {
     /// Returns the maximum admitted control payload bytes for this kind.
     #[must_use]
     pub const fn max_control_payload_bytes(self) -> usize {
-        if self.is_pair_hello() {
+        if matches!(self, Self::LocalConnectionProgress) {
+            64
+        } else if self.is_pair_hello() {
             MAX_PAIR_HELLO_FRAME_BYTES
         } else if matches!(self, Self::LocalSessionTunnelData) {
             // One field tag plus the three-byte encoded length at this fixed
@@ -606,6 +610,7 @@ impl TryFrom<u32> for WireKind {
             28 => Self::LocalSessionTunnelPath,
             29 => Self::LocalSessionTunnelHalfClose,
             30 => Self::LocalSessionTunnelClosed,
+            31 => Self::LocalConnectionProgress,
             100 => Self::PairBegin,
             101 => Self::PairChallenge,
             102 => Self::PairProof,
@@ -728,6 +733,8 @@ pub enum ProtocolError {
     InvalidTerminalSurface(TerminalSurfaceError),
     /// A terminal enum or required semantic field used an unsupported value.
     InvalidTerminalSemanticField(&'static str),
+    /// A same-UID connection observation was unspecified or unsupported.
+    InvalidLocalConnectionStage,
 }
 
 impl fmt::Display for ProtocolError {
@@ -761,6 +768,9 @@ impl fmt::Display for ProtocolError {
                 write!(formatter, "invalid terminal viewport {columns}x{rows}")
             }
             Self::InvalidTerminalSurface(error) => error.fmt(formatter),
+            Self::InvalidLocalConnectionStage => {
+                write!(formatter, "invalid local connection progress stage")
+            }
             Self::InvalidTerminalSemanticField(field) => {
                 write!(formatter, "invalid semantic terminal field {field}")
             }
@@ -2526,6 +2536,7 @@ mod tests {
         const SECRET: &[u8] = b"TUNNEL_PAYLOAD_SECRET_22e8";
         let target = DeviceId::from_array([0x7a; DeviceId::LENGTH]);
         let open = v2::LocalSessionTunnelOpenRequest {
+            report_progress: false,
             protocol_version: LOCAL_SESSION_TUNNEL_VERSION,
             target_device_id: Some(target.into()),
         };
@@ -2631,6 +2642,7 @@ mod tests {
     fn local_session_forward_envelope_round_trips_and_redacts_inner_bytes() {
         const SENTINEL: &[u8] = b"REMOTE-SESSION-INNER-FRAME-SENTINEL";
         let message = v2::LocalSessionUnaryRequest {
+            report_progress: false,
             target_device_id: Some(DeviceId::from_array([7; 32]).into()),
             frame: SENTINEL.to_vec(),
         };
@@ -2640,12 +2652,45 @@ mod tests {
         assert_message_round_trip(WireKind::LocalSessionUnaryRequest, message);
 
         let bounded_tunnel = v2::LocalSessionUnaryRequest {
+            report_progress: false,
             target_device_id: Some(DeviceId::from_array([8; 32]).into()),
             frame: vec![0; MAX_CONTROL_PAYLOAD_BYTES],
         };
         assert!(matches!(
             encode_message(WireKind::LocalSessionUnaryRequest, 2, 0, &bounded_tunnel,),
             Err(ProtocolError::ControlPayloadTooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn local_connection_progress_has_a_small_wire_bound() {
+        for number in 1..=11 {
+            let message = v2::LocalConnectionProgress { stage: number };
+            let stage =
+                connection_stage_from_message(message).expect("valid fixed progress mapping");
+            assert_message_round_trip(
+                WireKind::LocalConnectionProgress,
+                connection_stage_to_message(stage).expect("valid fixed progress mapping"),
+            );
+        }
+        let body = v2::WireFrame {
+            wire_major: WIRE_MAJOR,
+            kind: WireKind::LocalConnectionProgress as u32,
+            payload: vec![0; 65],
+            request_id: 1,
+            deadline_ms: 0,
+        }
+        .encode_to_vec();
+        let mut bytes = Vec::new();
+        encode_varint(body.len() as u64, &mut bytes);
+        bytes.extend(body);
+        assert!(matches!(
+            FrameDecoder::new().feed(&bytes),
+            Err(ProtocolError::ControlPayloadTooLarge(65))
+        ));
+        assert!(matches!(
+            encode_payload(WireKind::LocalConnectionProgress, 1, 0, vec![0; 65]),
+            Err(ProtocolError::ControlPayloadTooLarge(65))
         ));
     }
 
@@ -2838,6 +2883,10 @@ mod tests {
             (
                 WireKind::LocalSessionTunnelPath,
                 v2::MessageKind::LocalSessionTunnelPath as u32,
+            ),
+            (
+                WireKind::LocalConnectionProgress,
+                v2::MessageKind::LocalConnectionProgress as u32,
             ),
             (
                 WireKind::LocalSessionTunnelHalfClose,
@@ -3526,3 +3575,6 @@ mod tests {
         }
     }
 }
+
+mod connection_progress;
+pub use connection_progress::{connection_stage_from_message, connection_stage_to_message};

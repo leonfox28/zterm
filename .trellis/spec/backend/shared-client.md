@@ -236,3 +236,30 @@ chooses a separate default-attach operation and stores the returned identity.
 
 Wrong: retain selection pixels but free/unaccount their semantic source. Correct:
 explicit frame-source handles pin pages inside the existing core cache budget.
+
+
+## Initial connection observations
+
+`progress::ProgressObserver` is an optional typed observation sink; its bounded
+`ProgressHistory` keeps at most 64 chronological entries and coalesces adjacent
+identical stages. Watch snapshots preserve bursts without a work queue or an
+operation owner. `stop()` retires every shared clone at the initial Active fence.
+An inactive observer is a no-op for Android and other callers.
+
+`SessionClient::connect_with_progress` reports request write, waiting for the
+initial snapshot, and successful initial snapshot validation. It keeps the same
+attach deadline, input/ACK/replay semantics and outcome-unknown classification.
+`RemoteUnaryClient::execute_validated_with_progress` and the transport's default
+`demand_with_progress` hook preserve the sole unary retry owner; adapters without
+an observer behave as before. No stage enters remote Session data or a semantic
+surface. The desktop `LocalProgressDecoder` validates kind-31 opt-in, correlation,
+fixed enum and 64-event bound before forwarding observations. Unary readers still
+require one final response and EOF; tunnel readers retain coalesced post-Opened
+bytes in the same decoder. See [Local IPC](./local-daemon-ipc.md).
+
+Good: a pending observer update refreshes the startup screen while the submitted
+create future remains owned. Bad: dropping/recreating that future to draw a stage,
+replaying old dial stages for an existing connection, or retaining the observer
+through later reconnect. Tests must check actual fragmented/coalesced local
+prefixes, unchanged final responses, burst retention and clone retirement; a
+copied list of labels alone is not evidence.

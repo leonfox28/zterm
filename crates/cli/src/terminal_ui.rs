@@ -43,6 +43,7 @@ mod unix {
     use rustix::event::{PollFd, PollFlags, poll};
     use tokio::signal::unix::{Signal, SignalKind, signal};
     use tokio::sync::{mpsc, watch};
+    use zterm_client::progress::{ProgressFailure, ProgressHistory, ProgressObserver};
     #[cfg(test)]
     use zterm_core::Revision;
     use zterm_core::terminal::{
@@ -60,7 +61,7 @@ mod unix {
     use zterm_core::viewport_cache::{
         CachedViewportWindow, ViewportAnchorObservation, ViewportCache, ViewportCacheUpdate,
     };
-    use zterm_core::{DomainErrorKind, SessionId};
+    use zterm_core::{DomainErrorKind, SessionId, connection_progress::ConnectionStage};
     use zterm_daemon::client::view::{
         PreparedTerminalView, TerminalViewConnectionPath, TerminalViewConnectionStatus,
         TerminalViewEndReason, TerminalViewEvent, TerminalViewHistoryWindow, TerminalViewRoute,
@@ -70,6 +71,11 @@ mod unix {
     use zterm_daemon::operations::LocalRuntime;
 
     use super::super::{CliError, TerminalRequest, TerminalRequestKind};
+
+    mod startup {
+        include!("terminal_ui/startup.rs");
+    }
+    use startup::{InactivePresentation, StartupProgress};
 
     mod host_colors {
         include!("terminal_ui/host_colors.rs");
@@ -156,6 +162,45 @@ mod unix {
         request: TerminalRequest,
         runtime: &LocalRuntime,
     ) -> Result<(), CliError> {
+        let (progress, history) = runtime.connection_progress();
+        progress.report(ConnectionStage::Starting);
+        let runtime = runtime.with_connection_progress(progress.clone());
+        let result = run_observed(request, &runtime, progress.clone(), history).await;
+        finish_startup_progress(&progress, &result);
+        result.and_then(emit_completion_diagnostic)
+    }
+
+    fn finish_startup_progress(
+        progress: &ProgressObserver,
+        result: &Result<TerminalCompletion, CliError>,
+    ) {
+        if progress.is_active() {
+            match result {
+                Ok(TerminalCompletion::Detached | TerminalCompletion::PreparedThenDetached(_)) => {
+                    progress.report(ConnectionStage::Cancelled)
+                }
+                Ok(TerminalCompletion::SessionEnded(_)) => {
+                    progress.report(ConnectionStage::SessionEnded)
+                }
+                Err(
+                    CliError::Daemon(error) | CliError::CreatedSessionAttach { source: error, .. },
+                ) => progress.fail(error.kind()),
+                Err(CliError::Usage(_)) => progress.fail(ProgressFailure::InvalidUsage),
+                Err(CliError::Io(_)) => progress.fail(ProgressFailure::TerminalIo),
+                Err(CliError::TerminalDriverFailure) => {
+                    progress.fail(ProgressFailure::TerminalDriver)
+                }
+            }
+            progress.stop();
+        }
+    }
+
+    async fn run_observed(
+        request: TerminalRequest,
+        runtime: &LocalRuntime,
+        progress: ProgressObserver,
+        history: watch::Receiver<ProgressHistory>,
+    ) -> Result<TerminalCompletion, CliError> {
         let stdin = io::stdin();
         let stdout = io::stdout();
         if !stdin.is_terminal() || !stdout.is_terminal() {
@@ -165,13 +210,12 @@ mod unix {
         }
 
         let panic_hook = ScopedPanicHook::suppress();
-        let result = AssertUnwindSafe(run_guarded_terminal(request, runtime))
+        let result = AssertUnwindSafe(run_guarded_terminal(request, runtime, progress, history))
             .catch_unwind()
             .await;
         drop(panic_hook);
         match result {
-            Ok(Ok(completion)) => emit_completion_diagnostic(completion),
-            Ok(Err(error)) => Err(error),
+            Ok(completion) => completion,
             Err(payload) => {
                 drop(payload);
                 Err(CliError::Io(
@@ -184,7 +228,10 @@ mod unix {
     async fn run_guarded_terminal(
         request: TerminalRequest,
         runtime: &LocalRuntime,
+        progress: ProgressObserver,
+        history: watch::Receiver<ProgressHistory>,
     ) -> Result<TerminalCompletion, CliError> {
+        progress.report(ConnectionStage::InitializingTerminal);
         io::stdout()
             .flush()
             .map_err(|error| terminal_io("flush stdout before raw mode", error))?;
@@ -207,6 +254,8 @@ mod unix {
                 &mut resize,
                 &mut cancellation_receiver,
                 Arc::clone(&guard.appearance_owned),
+                progress,
+                history,
             ),
             &mut interrupt,
             &mut terminate,
@@ -241,6 +290,7 @@ mod unix {
         view.await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_view(
         request: TerminalRequest,
         runtime: &LocalRuntime,
@@ -249,6 +299,8 @@ mod unix {
         resize_signal: &mut Signal,
         cancellation_receiver: &mut watch::Receiver<Option<TerminalSignalCancellation>>,
         appearance_owned: Arc<std::sync::atomic::AtomicBool>,
+        progress: ProgressObserver,
+        history: watch::Receiver<ProgressHistory>,
     ) -> Result<TerminalCompletion, CliError> {
         if let Some(cancellation) = current_terminal_cancellation(cancellation_receiver) {
             return Err(cancellation.error(None));
@@ -270,6 +322,8 @@ mod unix {
         let mut prefix = CommandMode::new();
         let mut input_codec = HostInputCodec::new();
         let mut presenter = DesktopPresenter::default();
+        let mut startup = StartupProgress::new(&request, progress.clone(), history);
+        startup.present(&mut stdout.lock(), &mut presenter, physical_size)?;
         let mut host_colors = HostColors::default();
         host_colors.owned_subscription = appearance_owned;
         host_colors.flush_commands(&mut presenter, &mut stdout.lock())?;
@@ -289,6 +343,13 @@ mod unix {
             );
             tokio::select! {
                 cancellation = receive_terminal_cancellation(cancellation_receiver) => return Err(cancellation.error(None)),
+                signal = resize_signal.recv() => {
+                    if signal.is_none() {
+                        return Err(terminal_daemon_error(DomainErrorKind::Cancelled, "SIGWINCH handler closed"));
+                    }
+                    physical_size = terminal_size(stdout)?;
+                    startup.present(&mut stdout.lock(), &mut presenter, physical_size)?;
+                }
                 () = wait_for_prefix_deadline(deadline) => {},
                 input = stdin_pump.recv() => match input {
                     Some(StdinEvent::Bytes { epoch, bytes, .. }) => {
@@ -309,10 +370,12 @@ mod unix {
             host_colors.flush_commands(&mut presenter, &mut stdout.lock())?;
         }
 
+        progress.report(ConnectionStage::TerminalInitialized);
         let transport_state = TerminalViewTransportState::Synchronizing;
         let prepared = match await_while_inactive(
             prepare(request, runtime, initial_size, host_colors.profile.clone()),
             InactiveWaitContext {
+                presentation: InactivePresentation::Startup(&mut startup),
                 stdout,
                 resize_signal,
                 cancellation_receiver,
@@ -326,6 +389,7 @@ mod unix {
                 preserve_submitted_result: stateful_prepare,
                 report_key_events: false,
             },
+            &mut io::stdout(),
         )
         .await?
         {
@@ -360,7 +424,9 @@ mod unix {
         let initial_scroll_metrics = prepared.initial_snapshot().surface.scroll_metrics;
         let mut viewport = ViewportController::with_layout(latest_layout, initial_scroll_metrics);
         let mut status_renderer = StatusRenderer::new(view_target, physical_size);
+        status_renderer.initial_synchronizing = true;
         reconcile_presenter_selection(&mut selection, &viewport, &surface, &mut presenter);
+        progress.report(ConnectionStage::DisplayingTerminal);
         present_surface_stdout(
             &surface,
             &mut presenter,
@@ -369,6 +435,7 @@ mod unix {
             transport_state,
         )?;
         viewport.observe_presentation();
+        progress.report(ConnectionStage::SynchronizingTerminal);
         let mut viewport_pacer = ViewportPresentationPacer::default();
         viewport_pacer.mark_presented(Instant::now());
         if let Some(cancellation) = current_terminal_cancellation(cancellation_receiver) {
@@ -385,6 +452,11 @@ mod unix {
         let view = match await_while_inactive(
             async move { prepared.acknowledge_initial().await.map_err(Into::into) },
             InactiveWaitContext {
+                presentation: InactivePresentation::Synchronizing {
+                    surface: &surface,
+                    viewport: &mut viewport,
+                    status: &mut status_renderer,
+                },
                 stdout,
                 resize_signal,
                 cancellation_receiver,
@@ -398,6 +470,7 @@ mod unix {
                 preserve_submitted_result: false,
                 report_key_events,
             },
+            &mut io::stdout(),
         )
         .await?
         {
@@ -436,6 +509,7 @@ mod unix {
         let deferred_active = false;
 
         TerminalUiSession {
+            progress,
             session_id,
             events,
             writer,
@@ -464,6 +538,7 @@ mod unix {
     }
 
     struct InactiveWaitContext<'a, Output> {
+        presentation: InactivePresentation<'a>,
         stdout: &'a Output,
         resize_signal: &'a mut Signal,
         cancellation_receiver: &'a mut watch::Receiver<Option<TerminalSignalCancellation>>,
@@ -481,8 +556,10 @@ mod unix {
     async fn await_while_inactive<T>(
         future: impl Future<Output = Result<T, CliError>>,
         context: InactiveWaitContext<'_, impl AsFd>,
+        output: &mut impl Write,
     ) -> Result<InactiveWait<T>, CliError> {
         let InactiveWaitContext {
+            mut presentation,
             stdout,
             resize_signal,
             cancellation_receiver,
@@ -496,81 +573,100 @@ mod unix {
             preserve_submitted_result,
             report_key_events,
         } = context;
+        // Fail the initial paint before polling an operation that can create a
+        // Session. Once submitted, subsequent paint failures retain its result.
+        presentation.present(output, presenter, *physical_size)?;
         tokio::pin!(future);
+        let mut pending_cancellation = None;
+        let mut input_open = true;
         loop {
-            host_colors.flush_commands(presenter, &mut io::stdout().lock())?;
-            let color_deadline = host_colors.deadline();
-            if prefix
-                .deadline()
-                .is_some_and(|deadline| Instant::now() >= deadline)
-            {
+            let now = Instant::now();
+            if pending_cancellation.is_none() {
+                host_colors.flush_commands(presenter, output)?;
+            }
+            let color_deadline = pending_cancellation
+                .is_none()
+                .then(|| host_colors.deadline())
+                .flatten();
+            if prefix.deadline().is_some_and(|deadline| now >= deadline) {
                 prefix.cancel();
-                continue;
             }
             let prefix_deadline = prefix.deadline();
-            tokio::select! {
+            let cancellation = tokio::select! {
                 biased;
-                result = &mut future => return result.map(InactiveWait::Ready),
-                cancellation = receive_terminal_cancellation(cancellation_receiver) => {
-                    let cancellation = InactiveCancellation::Signal(cancellation);
-                    if preserve_submitted_result {
-                        return finish_submitted_after_cancellation(&mut future, cancellation).await;
-                    }
-                    return Ok(InactiveWait::Cancelled(cancellation));
+                result = &mut future => return match pending_cancellation {
+                    Some(cancellation) => finish_submitted_after_cancellation(std::future::ready(result), cancellation).await,
+                    None => result.map(InactiveWait::Ready),
+                },
+                cancellation = receive_terminal_cancellation(cancellation_receiver), if pending_cancellation.is_none() => {
+                    Some(InactiveCancellation::Signal(cancellation))
                 }
+                () = presentation.changed() => None,
                 signal = resize_signal.recv() => {
                     if signal.is_none() {
-                        return Err(terminal_daemon_error(
-                            DomainErrorKind::Cancelled,
-                            "SIGWINCH handler closed",
-                        ));
+                        return Err(terminal_daemon_error(DomainErrorKind::Cancelled, "SIGWINCH handler closed"));
                     }
                     *physical_size = terminal_size(stdout)?;
+                    None
                 }
                 () = wait_for_prefix_deadline(prefix_deadline), if prefix_deadline.is_some() => {
                     prefix.cancel();
+                    None
                 }
-                () = wait_for_prefix_deadline(color_deadline), if color_deadline.is_some() => { host_colors.expire(Instant::now()); }
-                input = stdin_pump.recv() => {
+                () = wait_for_prefix_deadline(color_deadline), if color_deadline.is_some() => {
+                    host_colors.expire(Instant::now());
+                    None
+                }
+                input = stdin_pump.recv(), if input_open => {
                     match input {
-                        Some(StdinEvent::Bytes { epoch, bytes, .. }) =>
-                        {
-                            for event in input_codec.feed_for_epoch(&bytes, epoch, current_input_epoch)? {
-                                if let HostInputEvent::TerminalReply { reply, bytes } = event { host_colors.observe(reply, bytes, Instant::now()); continue; }
-                                for action in prefix.route(event, Instant::now(), report_key_events)? {
-                                    if let PrefixAction::Command(command) = action {
-                                        let cancellation = match command {
-                                            LocalCommand::Detach => InactiveCancellation::LocalDetach,
-                                        };
-                                        if preserve_submitted_result {
-                                            return finish_submitted_after_cancellation(
-                                                &mut future, cancellation,
-                                            ).await;
+                        Some(StdinEvent::Bytes { epoch, bytes, .. }) => {
+                            let mut cancellation = None;
+                            let decoded = match input_codec.feed_for_epoch(&bytes, epoch, current_input_epoch) {
+                                Ok(decoded) => decoded,
+                                Err(_) if pending_cancellation.is_some() => { input_open = false; continue; }
+                                Err(error) => return Err(error),
+                            };
+                            for event in decoded {
+                                if let HostInputEvent::TerminalReply { reply, bytes } = event {
+                                    host_colors.observe(reply, bytes, Instant::now());
+                                } else if pending_cancellation.is_none() {
+                                    for action in prefix.route(event, Instant::now(), report_key_events)? {
+                                        if let PrefixAction::Command(LocalCommand::Detach) = action {
+                                            cancellation = Some(InactiveCancellation::LocalDetach);
                                         }
-                                        return Ok(InactiveWait::Cancelled(cancellation));
                                     }
                                 }
                             }
+                            cancellation
                         }
                         Some(StdinEvent::Eof) | None => {
+                            input_open = false;
                             prefix.clear_pending();
-                            let cancellation = InactiveCancellation::LocalDetach;
-                            if preserve_submitted_result {
-                                return finish_submitted_after_cancellation(
-                                    &mut future,
-                                    cancellation,
-                                )
-                                .await;
-                            }
-                            return Ok(InactiveWait::Cancelled(cancellation));
+                            pending_cancellation.is_none().then_some(InactiveCancellation::LocalDetach)
                         }
-                        Some(StdinEvent::Error(detail)) => {
-                            return Err(CliError::Io(format!(
-                                "read terminal stdin: {detail}"
-                            )));
-                        }
+                        Some(StdinEvent::Error(_)) if pending_cancellation.is_some() => { input_open = false; None }
+                        Some(StdinEvent::Error(detail)) => return Err(CliError::Io(format!("read terminal stdin: {detail}"))),
                     }
                 }
+            };
+            if let Some(cancellation) = cancellation {
+                if !preserve_submitted_result {
+                    return Ok(InactiveWait::Cancelled(cancellation));
+                }
+                // Retain the submitted operation while continuing to paint and
+                // drain physical replies. Cancellation never creates an input epoch.
+                pending_cancellation = Some(cancellation);
+                prefix.clear_pending();
+                presentation.cancelling();
+            }
+            if let Err(error) = presentation.present(output, presenter, *physical_size) {
+                if preserve_submitted_result {
+                    let cancellation = pending_cancellation.unwrap_or_else(|| {
+                        InactiveCancellation::PresentationFailure(error.to_string())
+                    });
+                    return finish_submitted_after_cancellation(&mut future, cancellation).await;
+                }
+                return Err(error);
             }
         }
     }
@@ -785,10 +881,11 @@ mod unix {
         }
     }
 
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    #[derive(Clone, Debug, Eq, PartialEq)]
     enum InactiveCancellation {
         LocalDetach,
         Signal(TerminalSignalCancellation),
+        PresentationFailure(String),
     }
 
     enum InactiveWait<T> {
@@ -829,6 +926,14 @@ mod unix {
                 TerminalCompletion::PreparedThenDetached,
             )),
             InactiveCancellation::Signal(signal) => Err(signal.error(prepared_session)),
+            InactiveCancellation::PresentationFailure(detail) => {
+                Err(CliError::Io(prepared_session.map_or_else(
+                    || detail.clone(),
+                    |session_id| {
+                        format!("{detail}; session {session_id} was prepared and remains running")
+                    },
+                )))
+            }
         }
     }
 
@@ -1520,6 +1625,7 @@ mod unix {
     }
 
     struct StatusRenderer {
+        initial_synchronizing: bool,
         target: TerminalViewTarget,
         physical_size: TerminalSize,
         path: TerminalViewConnectionPath,
@@ -1529,6 +1635,7 @@ mod unix {
     impl StatusRenderer {
         fn new(target: TerminalViewTarget, physical_size: TerminalSize) -> Self {
             Self {
+                initial_synchronizing: false,
                 target,
                 physical_size,
                 path: TerminalViewConnectionPath::Unknown,
@@ -1570,6 +1677,14 @@ mod unix {
         fn composed_text(&self, transport_state: TerminalViewTransportState) -> Option<String> {
             if !self.enabled() {
                 return None;
+            }
+            if self.initial_synchronizing
+                && transport_state == TerminalViewTransportState::Synchronizing
+            {
+                return Some(format!(
+                    "Synchronizing terminal | {}",
+                    self.target.display_name()
+                ));
             }
             let device = self.target.display_name();
             if !self.is_remote() {
@@ -3523,6 +3638,11 @@ mod unix {
     }
 
     #[cfg(test)]
+    mod outer_terminal {
+        include!("../tests/support/outer_terminal.rs");
+    }
+
+    #[cfg(test)]
     mod tests {
         use std::fs::File;
         use std::io::Read;
@@ -3542,6 +3662,8 @@ mod unix {
         use nix::unistd::Pid;
 
         use super::*;
+
+        include!("terminal_ui/startup_tests.rs");
 
         #[derive(Default)]
         struct ViewportFrameWriter {
@@ -4441,12 +4563,14 @@ mod unix {
                 let mut input_codec = HostInputCodec::new();
                 let mut host_colors = HostColors::default();
                 let mut presenter = DesktopPresenter::default();
+                let mut output = Vec::new();
                 let wait = await_while_inactive(
                     async {
                         ready.await.expect("release initial operation");
                         Ok(())
                     },
                     InactiveWaitContext {
+                        presentation: InactivePresentation::None,
                         input_codec: &mut input_codec,
                         host_colors: &mut host_colors,
                         presenter: &mut presenter,
@@ -4460,6 +4584,7 @@ mod unix {
                         preserve_submitted_result,
                         report_key_events: false,
                     },
+                    &mut output,
                 );
                 let resize = async {
                     for (index, (rows, columns)) in [(50, 160), (42, 152)].into_iter().enumerate() {

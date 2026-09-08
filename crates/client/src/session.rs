@@ -203,6 +203,34 @@ impl SessionClient {
         viewport: Option<zterm_core::terminal::TerminalSize>,
         base_colors: TerminalColorProfile,
     ) -> Result<Self, DaemonError> {
+        Self::connect_with_progress(
+            connector,
+            target,
+            selector,
+            create_main,
+            takeover,
+            viewport,
+            base_colors,
+            crate::progress::ProgressObserver::default(),
+        )
+        .await
+    }
+
+    /// Opens the initial attachment with content-free startup observations.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Retains the existing attachment inputs plus an optional observation sink"
+    )]
+    pub async fn connect_with_progress(
+        connector: Arc<dyn AttachmentConnector>,
+        target: ResolvedSessionTarget,
+        selector: Option<SessionSelector>,
+        create_main: bool,
+        takeover: bool,
+        viewport: Option<zterm_core::terminal::TerminalSize>,
+        base_colors: TerminalColorProfile,
+        progress: crate::progress::ProgressObserver,
+    ) -> Result<Self, DaemonError> {
         let deadline = crate::protocol::control_deadline();
         let (session_id, session_name) = match selector {
             Some(SessionSelector::Id(session_id)) => (Some(session_id.into()), String::new()),
@@ -235,6 +263,7 @@ impl SessionClient {
         let mut transport = tokio::time::timeout_at(deadline, connector.open(target))
             .await
             .map_err(|_| crate::protocol::control_timeout())??;
+        progress.report(zterm_core::connection_progress::ConnectionStage::RequestingSession);
         if let Err(error) = transport.write_until(&bytes, deadline).await {
             return Err(if create_main {
                 create_main_outcome_unknown()
@@ -246,6 +275,8 @@ impl SessionClient {
         // The outer result owns post-write ambiguity. The inner result is
         // reserved for a decoded, correlated ServiceError, which is already a
         // definitive result and must retain its exact domain category.
+        progress
+            .report(zterm_core::connection_progress::ConnectionStage::ReceivingTerminalSnapshot);
         let response = tokio::time::timeout_at(deadline, async {
             let mut pre_snapshot_states = Vec::new();
             let mut pre_snapshot_paths = Vec::new();
@@ -336,7 +367,14 @@ impl SessionClient {
         .await;
 
         match response {
-            Ok(Ok(result)) => result,
+            Ok(Ok(result)) => {
+                if result.is_ok() {
+                    progress.report(
+                        zterm_core::connection_progress::ConnectionStage::TerminalSnapshotReceived,
+                    );
+                }
+                result
+            }
             Ok(Err(_)) if create_main => Err(create_main_outcome_unknown()),
             Ok(Err(error)) => Err(error),
             Err(_) if create_main => Err(create_main_outcome_unknown()),
@@ -2645,6 +2683,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_progress_precedes_opened_and_preserves_coalesced_tunnel_bytes() {
+        use crate::progress::ProgressObserver;
+        use zterm_core::connection_progress::ConnectionStage;
+        for chunk_size in [1, 4096] {
+            let (observer, history) = ProgressObserver::channel(|_| {});
+            let stages = [
+                ConnectionStage::LookingUpAddress,
+                ConnectionStage::ConnectingSecurely,
+                ConnectionStage::SessionChannelReady,
+            ];
+            let mut bytes = Vec::new();
+            for stage in stages {
+                bytes.extend(
+                    encode_message(
+                        WireKind::LocalConnectionProgress,
+                        1,
+                        0,
+                        &zterm_proto::connection_stage_to_message(stage)
+                            .expect("tunnel progress fixture"),
+                    )
+                    .expect("tunnel progress fixture"),
+                );
+            }
+            bytes.extend(
+                encode_message(
+                    WireKind::LocalSessionTunnelOpened,
+                    1,
+                    0,
+                    &v2::LocalSessionTunnelOpened {
+                        protocol_version: zterm_proto::LOCAL_SESSION_TUNNEL_VERSION,
+                    },
+                )
+                .expect("tunnel progress fixture"),
+            );
+            bytes.extend(tunnel_envelope(
+                WireKind::LocalSessionTunnelPath,
+                &v2::LocalSessionTunnelPath {
+                    path: v2::TerminalConnectionPath::Direct as i32,
+                    rtt_ms: Some(3),
+                },
+            ));
+            let (mut client, mut daemon) =
+                tokio::net::UnixStream::pair().expect("tunnel progress fixture");
+            let send = async {
+                for chunk in bytes.chunks(chunk_size) {
+                    daemon
+                        .write_all(chunk)
+                        .await
+                        .expect("tunnel progress fixture");
+                    tokio::task::yield_now().await;
+                }
+            };
+            let receive = async {
+                let first = read_tunnel_first(&mut client, observer)
+                    .await
+                    .expect("tunnel progress fixture");
+                assert_eq!(first.frame.kind, WireKind::LocalSessionTunnelOpened);
+                let mut transport = AttachmentTransport::new(UnixAttachmentTransport::Tunnel {
+                    stream: client,
+                    envelope_decoder: first.decoder,
+                    queued_envelopes: first.queued,
+                    session_decoder: FrameDecoder::new(),
+                    queued_session_frames: VecDeque::new(),
+                    remote_half_closed: false,
+                });
+                assert!(
+                    matches!(transport.read_item().await.expect("tunnel progress fixture"), AttachmentTransportItem::Path(path) if path.path == v2::TerminalConnectionPath::Direct as i32 && path.rtt_ms == Some(3))
+                );
+            };
+            tokio::join!(send, receive);
+            assert_eq!(
+                history
+                    .borrow()
+                    .after(0)
+                    .map(|(_, event)| event.stage)
+                    .collect::<Vec<_>>(),
+                stages
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn interrupted_outer_tunnel_frames_remain_retryable() {
         let opened = encode_message(
             WireKind::LocalSessionTunnelOpened,
@@ -2665,7 +2785,12 @@ mod tests {
             .shutdown()
             .await
             .expect("interrupt Opened envelope");
-        let error = match read_tunnel_first(&mut client_stream).await {
+        let error = match read_tunnel_first(
+            &mut client_stream,
+            crate::progress::ProgressObserver::default(),
+        )
+        .await
+        {
             Err(error) => error,
             Ok(_) => panic!("partial Opened envelope cannot establish a tunnel"),
         };

@@ -351,7 +351,7 @@ pub(super) fn normalize_composed_row(row: &mut Vec<TerminalCell>, width: usize) 
     }
 }
 
-fn text_cells(text: &str, width: usize, style: TerminalStyle) -> Vec<TerminalCell> {
+pub(super) fn text_cells(text: &str, width: usize, style: TerminalStyle) -> Vec<TerminalCell> {
     let mut cells = Vec::with_capacity(width);
     for character in text.chars() {
         let character_width = UnicodeWidthChar::width(character).unwrap_or(0);

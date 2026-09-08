@@ -2,6 +2,7 @@
 use std::{collections::VecDeque, path::Path, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use zeroize::Zeroizing;
+use zterm_client::progress::{LocalProgressDecoder, ProgressObserver};
 use zterm_client::transport::{
     AttachmentConnector, AttachmentIo, AttachmentTransport, AttachmentTransportItem,
     TransportFuture,
@@ -13,6 +14,7 @@ use zterm_client::{
     protocol::{DEFAULT_DEADLINE, attachment_cancelled, malformed, protocol_error, service_error},
 };
 use zterm_core::DomainErrorKind;
+use zterm_core::connection_progress::ConnectionStage;
 use zterm_proto::{DecodedFrame, FrameDecoder, WireKind, encode_message, v2};
 
 /// Concrete same-UID Session adapter, including opaque remote envelopes.
@@ -37,20 +39,27 @@ impl UnixAttachmentTransport {
     pub(super) async fn open(
         socket: &Path,
         target: ResolvedSessionTarget,
+        progress: &ProgressObserver,
     ) -> Result<Self, DaemonError> {
         tokio::time::timeout_at(
             zterm_client::protocol::control_deadline(),
-            Self::open_inner(socket, target),
+            Self::open_inner(socket, target, progress),
         )
         .await
         .map_err(|_| zterm_client::protocol::control_timeout())?
     }
 
-    async fn open_inner(socket: &Path, target: ResolvedSessionTarget) -> Result<Self, DaemonError> {
+    async fn open_inner(
+        socket: &Path,
+        target: ResolvedSessionTarget,
+        progress: &ProgressObserver,
+    ) -> Result<Self, DaemonError> {
+        progress.report(ConnectionStage::OpeningLocalChannel);
         let mut stream = tokio::net::UnixStream::connect(socket)
             .await
             .map_err(connect_error)?;
         let Some(target_device_id) = target.device_id() else {
+            progress.report(ConnectionStage::SessionChannelReady);
             return Ok(Self::Direct {
                 stream,
                 decoder: FrameDecoder::new(),
@@ -58,12 +67,14 @@ impl UnixAttachmentTransport {
             });
         };
 
+        progress.report(ConnectionStage::OpeningRemoteChannel);
         let request_id = 1;
         let open = encode_message(
             WireKind::LocalSessionTunnelOpenRequest,
             request_id,
             u32::try_from(DEFAULT_DEADLINE.as_millis()).unwrap_or(u32::MAX),
             &v2::LocalSessionTunnelOpenRequest {
+                report_progress: progress.is_active(),
                 protocol_version: zterm_proto::LOCAL_SESSION_TUNNEL_VERSION,
                 target_device_id: Some(target_device_id.into()),
             },
@@ -74,14 +85,17 @@ impl UnixAttachmentTransport {
             .await
             .map_err(|error| daemon_io("write local Session tunnel Open", error))?;
 
-        let first = tokio::time::timeout(DEFAULT_DEADLINE, read_tunnel_first(&mut stream))
-            .await
-            .map_err(|_| {
-                DaemonError::new(
-                    DomainErrorKind::DeadlineExceeded,
-                    "timed out opening remote Session tunnel",
-                )
-            })??;
+        let first = tokio::time::timeout(
+            DEFAULT_DEADLINE,
+            read_tunnel_first(&mut stream, progress.clone()),
+        )
+        .await
+        .map_err(|_| {
+            DaemonError::new(
+                DomainErrorKind::DeadlineExceeded,
+                "timed out opening remote Session tunnel",
+            )
+        })??;
         if first.frame.kind == WireKind::ServiceErrorResponse {
             if first.frame.request_id != request_id {
                 return Err(malformed(
@@ -319,7 +333,9 @@ fn tunnel_closed(reason: v2::LocalSessionTunnelCloseReason) -> DaemonError {
 /// Reads a tunnel Open result, retaining coalesced envelope bytes.
 pub(super) async fn read_tunnel_first(
     stream: &mut tokio::net::UnixStream,
+    progress: ProgressObserver,
 ) -> Result<FirstFrame, DaemonError> {
+    let mut progress = LocalProgressDecoder::new(1, progress);
     let mut decoder = FrameDecoder::new();
     let mut buffer = Zeroizing::new([0_u8; 16 * 1024]);
     loop {
@@ -337,7 +353,10 @@ pub(super) async fn read_tunnel_first(
             ));
         }
         let mut frames = VecDeque::from(decoder.feed(&buffer[..read]).map_err(protocol_error)?);
-        if let Some(frame) = frames.pop_front() {
+        while let Some(frame) = frames.pop_front() {
+            if progress.consume(&frame)? {
+                continue;
+            }
             return Ok(FirstFrame {
                 frame,
                 decoder,
@@ -409,6 +428,7 @@ pub(super) async fn read_frame_parts(
 
 /// Frozen desktop socket factory; aliases have already been resolved by the daemon.
 pub(crate) struct UnixAttachmentConnector {
+    progress: ProgressObserver,
     socket: std::path::PathBuf,
     remote_restarter: Option<Arc<dyn RemoteDaemonRestarter>>,
 }
@@ -425,8 +445,18 @@ impl UnixAttachmentConnector {
     pub fn new(socket: impl Into<std::path::PathBuf>) -> Self {
         Self {
             socket: socket.into(),
+            progress: ProgressObserver::default(),
             remote_restarter: None,
         }
+    }
+    pub(crate) fn progress(&self) -> ProgressObserver {
+        self.progress.clone()
+    }
+
+    /// Installs one startup-only observer; its retired clones ignore reconnect.
+    pub fn with_progress(mut self, progress: ProgressObserver) -> Self {
+        self.progress = progress;
+        self
     }
     /// Injects desktop lifecycle recovery without exposing it to the protocol owner.
     pub fn with_remote_restarter(mut self, restarter: Arc<dyn RemoteDaemonRestarter>) -> Self {
@@ -440,13 +470,13 @@ impl AttachmentConnector for UnixAttachmentConnector {
         target: ResolvedSessionTarget,
     ) -> TransportFuture<'_, Result<AttachmentTransport, DaemonError>> {
         Box::pin(async move {
-            let opened = UnixAttachmentTransport::open(&self.socket, target).await;
+            let opened = UnixAttachmentTransport::open(&self.socket, target, &self.progress).await;
             match (opened, &self.remote_restarter, target.device_id()) {
                 (Err(error), Some(restarter), Some(_))
                     if error.kind() == DomainErrorKind::DaemonStopped =>
                 {
                     restarter.ensure_running().await?;
-                    UnixAttachmentTransport::open(&self.socket, target).await
+                    UnixAttachmentTransport::open(&self.socket, target, &self.progress).await
                 }
                 (result, _, _) => result,
             }

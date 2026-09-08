@@ -5,6 +5,7 @@ use zterm_daemon::client::view::{TerminalViewCommandWriter, TerminalViewEventRea
 /// The presenter commits physical output; surface and viewport retain their own
 /// validated semantic and history states at that successful presentation boundary.
 pub(super) struct TerminalUiSession {
+    pub(super) progress: ProgressObserver,
     pub(super) session_id: SessionId,
     pub(super) events: TerminalViewEventReader,
     pub(super) writer: TerminalViewCommandWriter,
@@ -743,6 +744,9 @@ impl TerminalUiSession {
         if next != previous && next != TerminalViewTransportState::Active {
             self.selection.cancel();
         }
+        if next == TerminalViewTransportState::Active {
+            self.status_renderer.initial_synchronizing = false;
+        }
         let preserve_input = self.healthy_resize;
         let resume_input = if preserve_input { None } else { transition_transport_input_state(
             stdin,
@@ -780,6 +784,10 @@ impl TerminalUiSession {
         }
         self.healthy_resize = preserve_input && next == TerminalViewTransportState::Synchronizing;
         self.transport_state = next;
+        if next == TerminalViewTransportState::Active {
+            self.progress.report(ConnectionStage::TerminalReady);
+            self.progress.stop();
+        }
         Ok(())
     }
 }

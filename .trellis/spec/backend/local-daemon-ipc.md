@@ -87,6 +87,8 @@ ScrollbarGeometry::new(track_rows: u16, metrics: TerminalScrollMetrics)
 ComposedFrame::compose(...) -> Result<ComposedFrame, CliError>
 DesktopPresenter::present(writer: &mut impl Write, desired: ComposedFrame)
     -> Result<bool, CliError>
+DesktopPresenter::present_startup(writer: &mut impl Write, desired: ComposedFrame)
+    -> Result<bool, CliError>
 
 const MIN_VIEWPORT_PRESENT_INTERVAL: Duration = Duration::from_millis(16);
 
@@ -216,6 +218,24 @@ No new crate, background owner, or second Session interpreter is introduced.
   `operation_outcome_unknown`, is definitive. Outcome unknown poisons the
   cached lease; that logical mutation is not retried under a new lease, while a
   later independent operation may request one.
+- Same-UID tunnel Open and remote unary envelopes have an optional
+  `report_progress` boolean (field 3). When true, the daemon can send kind 31
+  `LocalConnectionProgress { stage }` before Opened/the final unary response.
+  The fixed enum contains broker admission/reuse/address/secure-connect/handshake/
+  selection/channel/retry observations only; no arbitrary text, target IDs,
+  addresses, timestamps or terminal payload. Each payload is capped at 64 bytes,
+  and each Open/unary response prefix at 64 events. Request ID matches the
+  originating request; deadline_ms is zero. Unspecified/unknown stages, wrong
+  correlation, unsolicited stages, excess records and any stage after the final
+  reply are malformed. Use `LocalProgressDecoder` and the existing incremental
+  frame decoder so fragmented/coalesced stages preserve following envelope bytes.
+  False/absent opt-in sends no sideband. Remote normal ALPN/Session frames never
+  carry startup progress. The same absolute request deadline and mutation/replay
+  owner remain; a progress write failure still awaits the submitted future.
+  The broker's existing per-peer journal/Notify records actual dialing boundaries.
+  Register the notification before reading state so forwarding a burst cannot
+  miss selection. An immediately available authenticated primary reports reuse
+  without replaying its old dialing history; progress never starts another dial.
 - `LocalSessionUnaryRequest` is an ordinary 1 MiB-bounded control payload which
   contains exactly one allowed preencoded Session unary frame. The daemon
   validates its frozen full target and correlation without using the payload as
@@ -367,12 +387,33 @@ No new crate, background owner, or second Session interpreter is introduced.
   projection clamps rows and columns to the shared `ResourceLimits` viewport
   maximum; the daemon and wire boundary still reject an independently supplied
   oversized viewport. Status placement uses the uncapped physical bottom row.
-  Local is exactly `<device> | local`, with no latency field. Remote is exactly
+  After initial synchronization, Local is exactly `<device> | local`, with no latency field. Remote is exactly
   `<device> | <direct|relay|--> | <integer ms|-->`. Both use theme-default
   reverse video across every cell, clip on display-cell boundaries, and
   save/reset/restore child cursor and style. Wheel/Page routing depends only on
   authoritative main/alternate, mouse, and alternate-scroll modes; there are
   no tmux/Herdr/application-name branches.
+- Before a Session surface exists, `StartupProgress` paints the target and the
+  latest chronological `ConnectionStage` observations, clipped to physical rows.
+  Show no elapsed/wall-clock time or detach-shortcut hint. A one-row terminal
+  keeps the latest stage; the unvalidated target is bounded to 256 non-control
+  characters. Draw before physical queries, then refresh on actual stage or
+  geometry changes without a periodic progress timer or inferred completion.
+  `InactivePresentation` shares both initial waits' scheduling/output owner.
+  `ProgressObserver` feeds the screen and the configured file recorder described
+  in [Logging](./logging-guidelines.md); this is not raw log streaming.
+  `DesktopPresenter::present_startup` commits physical coverage but leaves
+  `semantic_baseline` empty. Startup text must never become history fallback.
+  The first validated Session frame replaces it promptly; initial ACK waiting
+  uses `Synchronizing terminal | <device>` in the status row.
+  The first effective Active transition clears this initial-only indication,
+  reports `TerminalReady` after successful presentation/input fencing and retires
+  all observer clones (including a retained reconnect connector);
+  reconnect/resize/history synchronization must not bring back a startup screen.
+  Initial paint failure occurs before polling a stateful operation. Later paint
+  failure or cancellation preserves the submitted prepare result and reports its
+  exact Session ID when available; failed/cancelled output never admits an input
+  epoch. Physical replies may drain during cancellation, without new probe rounds.
 - On the main screen, usable widths greater than four reserve exactly the final
   column for Zterm chrome; the child receives `N-1` columns. Widths 1–4 and the
   alternate screen give the child the full usable width. The status row is
@@ -899,6 +940,21 @@ No new crate, background owner, or second Session interpreter is introduced.
   prepare/ack wait policies with controlled completion, real PTY size reads,
   SIGWINCH and queued input. Assert latest physical rows/columns are retained
   without applying Main chrome, and ordinary startup input is consumed locally.
+- `startup_output_is_readable_bounded_and_replaced_by_the_first_session` replays
+  actual emitted ANSI through the existing disposable Session fixture. Assert
+  stages, safe target, tiny geometry, initial sync and clean first-frame coverage,
+  with no startup text in semantic fallback and no time/shortcut labels. The shared replay fixture lives at
+  `crates/cli/tests/support/outer_terminal.rs`; add no frontend engine dependency.
+  The real local-daemon harness checks final status cells through the same replay,
+  before detach; incremental ANSI writes need not contain a contiguous full label.
+  It also asserts the exact file-stage order for that CLI PID, from `starting`
+  through `terminal_ready`, with no false remote stages on local attachment.
+- `pending_startup_keeps_progress_and_preserves_cancelled_session_results`
+  holds a real inactive wait pending, verifies observer-driven stage refresh (no
+  input/resize/timer required), chronological bursts, stage-only output and cancellation
+  feedback, and preserves the exact result through signal or output failure.
+  Initialize each test PTY's actual window size: process-wide SIGWINCH from a
+  concurrent test must read that fixture's own size, not a default zero-size PTY.
 - Real same-UID unary and duplex tests run on macOS/Linux; Linux CI includes a reachable
   cross-UID rejection harness. A helper executed as the foreign UID must live
   below one test-private directory whose parents are searchable by that UID;

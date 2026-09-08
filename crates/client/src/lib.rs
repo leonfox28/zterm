@@ -8,6 +8,7 @@ pub mod surface;
 pub mod pairing;
 
 pub mod model;
+pub mod progress;
 pub mod protocol;
 
 pub mod framing;

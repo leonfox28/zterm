@@ -4,7 +4,8 @@
 
 Apply this contract when adding daemon diagnostics, changing the tracing
 subscriber, or modifying `zterm logs`. Recording belongs to the existing
-Session/network/pairing owners and daemon process; reading belongs to
+Session/network/pairing owners and daemon process, plus explicitly scoped
+interactive startup and update recorders; reading belongs to
 `LocalRuntime`. There is no separate logging service or continuous reader.
 
 ## 2. Signatures and owners
@@ -14,6 +15,8 @@ zterm logs [-n|--lines <n>]
 LocalRuntime::log_tail(&self, requested_lines: usize) -> Result<Vec<String>, DaemonError>
 lifecycle::init_lifecycle_logging()
 NetworkReporter::update(update)
+LocalRuntime::connection_progress() -> (ProgressObserver, watch::Receiver<ProgressHistory>)
+LocalRuntime::with_connection_progress(progress: ProgressObserver) -> LocalRuntime
 ```
 
 `init_lifecycle_logging` installs the daemon's text tracing subscriber. The
@@ -51,7 +54,7 @@ subscriber or on the PTY that update may terminate.
   rotates at startup if the current file is at least 4 MiB, retaining one
   predecessor. This is not a runtime capacity limit. Do not add extra managed
   files, a logging service, remote upload, transcript or retention engine.
-- The explicit one-shot updater is the sole additional writer exception. It
+- The explicit one-shot updater is an additional writer exception. It
   validates existing state/log directories and uses `open_append` for each
   stage, so final completion after startup rotation reaches current daemon.log.
   Records contain timestamp, updater PID, authenticated target, acceptance,
@@ -60,6 +63,26 @@ subscriber or on the PTY that update may terminate.
   subsequent startup failure while retaining the new executable. Known log
   path errors fail before stop; later diagnostic failure must not roll back a
   successful operation. Before setup, update creates no log or identity state.
+- Interactive terminal startup is the other explicit writer exception. One
+  observer sends the same fixed stages to the bounded first-screen journal and
+  existing `daemon.log`. Records contain Unix milliseconds, severity, component
+  `connection_startup`, CLI PID, per-process invocation ordinal `connection`,
+  build version, stable `stage` code and typed `category`. Screen text has no
+  time or shortcut hint. No raw target/name, cwd, payload or error string belongs
+  in these records. Startup records are observations, not duplicate Session
+  lifecycle commits; ordering does not imply another stage succeeded.
+- The terminal recorder validates committed setup without creating state. It
+  validates existing state/log directories and reopens with `open_append` for
+  every record, so daemon startup rotation does not strand later stages in the
+  archive. Missing setup creates no log, directories, identity or daemon.
+  Diagnostic errors are best effort and never change connection outcomes or
+  remove screen observations. INFO covers stages, ready and ordinary cancellation;
+  WARN `stage=failed` includes a domain or explicit frontend failure category.
+  A Session that ends before Active records `session_ended`, not user cancellation.
+  Initial ready is emitted only after the effective Active input/presentation
+  fence, then all observer clones stop. Later reconnect/detach cannot append
+  another startup outcome. Early definitive failure/cancellation emits its final
+  typed event after terminal restoration through the existing CLI owner.
 - `logs` reads once without creating paths or starting a daemon: default 100
   lines, maximum 1,000 lines and 1 MiB. `-n` aliases `--lines`. Missing/empty logs
   get an English explanation; explicitly selecting zero lines remains empty.
@@ -78,7 +101,10 @@ subscriber or on the PTY that update may terminate.
 | Typed operation failure | Useful component/stage/category without payload text |
 | Update committed but daemon startup fails | CLI partial-completion error and updater partial-completion record; no false full success |
 | Configured updater's foreground PTY ends | existing log retains stages and final outcome independently |
-| Daemon startup rotates the log during update | final result reopens/appends current daemon.log |
+| Daemon startup rotates the log during update/startup | later stages reopen/append current daemon.log |
+| CLI startup ends before Active | final failure/cancellation/session-ended as observed; never false ready |
+| Log append fails or path is unsafe | screen continues; no external-path write or changed operation result |
+| Retained connector reconnects after initial Active | no further startup records |
 
 ## 5. Good / Base / Bad Cases
 
@@ -86,7 +112,8 @@ subscriber or on the PTY that update may terminate.
   a typed reason, without recording PTY bytes.
 - Base: `zterm logs -n 50` reads the last 50 available lines once.
 - Bad: adding a subscriber/recorder per command or logging raw network errors,
-  ticket DTOs or frame payloads for convenience.
+  ticket DTOs or frame payloads for convenience. An interactive startup observer
+  is explicitly scoped and retired; it does not install a tracing subscriber.
 
 ## 6. Tests Required
 
@@ -98,6 +125,13 @@ terminal/ticket/cwd content. The pair-create/replay fixture checks the actual
 returned ticket and one committed event. Do not modify the global subscriber for concurrent
 unrelated tests. Existing log-tail/no-autospawn tests own read limits and the
 empty output contract; no follow tests are needed.
+`configured_progress_logs_reopen_after_rotation_and_stop_at_ready` checks real
+configured file records, correlation, typed failure, no target sentinel, rotation,
+observer retirement, missing-setup no-creation and symlink refusal. The real
+`daemon_autospawn` outer-PTY fixture asserts the complete local startup stage
+sequence for its child PID; isolated progress wire fixtures cover remote stage
+forwarding without assuming a live network. Broker fresh/reuse integration
+assertions require the existing Linux real-Iroh fixture (ignored on macOS).
 The updater's process tests own outcome persistence across frontend loss,
 post-commit failure and startup rotation; no separate retention subsystem tests
 are needed.

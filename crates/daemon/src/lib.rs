@@ -12,6 +12,7 @@ pub mod bootstrap;
 pub mod client;
 pub mod config;
 pub mod connection_broker;
+mod connection_progress;
 pub mod device_directory;
 pub mod distribution;
 pub mod error;

@@ -7,6 +7,8 @@ use std::path::Path;
 #[cfg(unix)]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use zterm_client::progress::{ProgressHistory, ProgressObserver};
+use zterm_core::connection_progress::ConnectionStage;
 
 use zterm_core::terminal::TerminalSize;
 use zterm_core::{
@@ -397,6 +399,7 @@ fn require_identity_reset_session_force(
 /// Daemon-owned paths and launcher used by one CLI invocation.
 #[derive(Clone)]
 pub struct LocalRuntime {
+    progress: ProgressObserver,
     paths: UserPaths,
     launcher: DaemonLauncher,
 }
@@ -434,6 +437,7 @@ impl LocalRuntime {
     /// Resolves the effective user's product paths and current executable.
     pub fn current() -> Result<Self, DaemonError> {
         Ok(Self {
+            progress: ProgressObserver::default(),
             paths: crate::lifecycle::production_user_paths()?,
             launcher: DaemonLauncher::current()?,
         })
@@ -443,7 +447,31 @@ impl LocalRuntime {
     #[doc(hidden)]
     #[must_use]
     pub const fn for_test(paths: UserPaths, launcher: DaemonLauncher) -> Self {
-        Self { paths, launcher }
+        Self {
+            paths,
+            launcher,
+            progress: ProgressObserver::disabled(),
+        }
+    }
+
+    /// Creates a bounded startup journal and best-effort existing-log recorder.
+    pub fn connection_progress(
+        &self,
+    ) -> (
+        ProgressObserver,
+        tokio::sync::watch::Receiver<ProgressHistory>,
+    ) {
+        crate::connection_progress::recorder(&self.paths)
+    }
+
+    /// Scopes connection observations to this invocation's cloned runtime.
+    #[must_use]
+    pub fn with_connection_progress(&self, progress: ProgressObserver) -> Self {
+        Self {
+            paths: self.paths.clone(),
+            launcher: self.launcher.clone(),
+            progress,
+        }
     }
 
     /// Validates or creates setup and explicitly ensures one daemon.
@@ -671,12 +699,15 @@ impl LocalRuntime {
     /// Validates committed setup, then singleflights one daemon without
     /// exposing its socket or launcher to the public command layer.
     pub async fn ensure_configured_daemon(&self) -> Result<DaemonReadiness, DaemonError> {
-        match self.observe().await? {
-            ObservedState::NotConfigured => Err(not_setup_for_command()),
+        self.progress.report(ConnectionStage::CheckingLocalService);
+        let ready = match self.observe().await? {
+            ObservedState::NotConfigured => return Err(not_setup_for_command()),
             ObservedState::Running(_) | ObservedState::ConfiguredStopped(_) => {
-                self.launcher.ensure(&self.paths).await
+                self.launcher.ensure(&self.paths).await?
             }
-        }
+        };
+        self.progress.report(ConnectionStage::LocalServiceReady);
+        Ok(ready)
     }
 
     /// Creates a bounded one-time pairing ticket through the configured daemon.
@@ -859,10 +890,12 @@ impl LocalRuntime {
     ) -> Result<CreatedSession, DaemonError> {
         let name = parse_session_name(name)?;
         let (client, target) = self.configured_session_target(target).await?;
+        self.progress.report(ConnectionStage::CreatingSession);
         let summary = client
             .create_session_at_with_colors(target, &name, working_directory, viewport, base_colors)
             .await?
             .into();
+        self.progress.report(ConnectionStage::SessionCreated);
         Ok(CreatedSession { target, summary })
     }
 
@@ -1114,8 +1147,10 @@ impl LocalRuntime {
         selector: &str,
     ) -> Result<(LocalClient, ResolvedSessionTarget), DaemonError> {
         self.ensure_configured_daemon().await?;
-        let client = LocalClient::new(self.paths.socket());
+        let client = LocalClient::new(self.paths.socket()).with_progress(self.progress.clone());
+        self.progress.report(ConnectionStage::ResolvingTarget);
         let target = client.resolve_session_target(selector).await?;
+        self.progress.report(ConnectionStage::TargetResolved);
         Ok((client, target))
     }
 
@@ -1149,7 +1184,8 @@ impl LocalRuntime {
                 let status = LocalClient::new(self.paths.socket()).status().await?;
                 TerminalViewTarget::for_display(status.device_name, TerminalViewRoute::Local)
             };
-            let mut connector = UnixAttachmentConnector::new(self.paths.socket());
+            let mut connector = UnixAttachmentConnector::new(self.paths.socket())
+                .with_progress(self.progress.clone());
             if target.device_id().is_some() {
                 connector = connector.with_remote_restarter(Arc::new(RuntimeDaemonRestarter {
                     paths: self.paths.clone(),

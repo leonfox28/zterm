@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 25
+- **Total Sessions**: 26
 - **Last Active**: 2026-09-08
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~657 | Active |
+| `journal-1.md` | ~695 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 26 | 2026-09-08 | Desktop connection stages and persisted startup logs | `c0e1ba9` | `fix/desktop-connection-progress` |
 | 25 | 2026-09-08 | Fix Android terminal keyboard on task resume | `e6f5e6b` | `fix/android-keyboard-resume` |
 | 23 | 2026-09-08 | Android reconnect recovery and connection status | `b13ae75` | `perf/android-local-scroll` |
 | 22 | 2026-09-08 | Accept Android local scrolling and publish v0.1.28 | `022ffb7`, `4eef9a4` | `perf/android-local-scroll` |

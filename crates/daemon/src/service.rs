@@ -415,11 +415,26 @@ impl DaemonService {
     }
 
     /// Dispatches without blocking the daemon runtime thread.
-    #[cfg(unix)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn dispatch_until(
         &self,
         frame: DecodedFrame,
         deadline: Instant,
+    ) -> ServiceReply {
+        self.dispatch_until_with_progress(
+            frame,
+            deadline,
+            zterm_client::progress::ProgressObserver::default(),
+        )
+        .await
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn dispatch_until_with_progress(
+        &self,
+        frame: DecodedFrame,
+        deadline: Instant,
+        progress: zterm_client::progress::ProgressObserver,
     ) -> ServiceReply {
         if matches!(
             frame.kind,
@@ -436,7 +451,9 @@ impl DaemonService {
             return self.dispatch_device_until(frame, deadline).await;
         }
         if frame.kind == WireKind::LocalSessionUnaryRequest {
-            return self.dispatch_remote_session_until(frame, deadline).await;
+            return self
+                .dispatch_remote_session_until(frame, deadline, progress)
+                .await;
         }
         let request_id = frame.request_id;
         let service = self.clone();
@@ -460,6 +477,7 @@ impl DaemonService {
         &self,
         mut frame: DecodedFrame,
         deadline: Instant,
+        progress: zterm_client::progress::ProgressObserver,
     ) -> ServiceReply {
         let request_id = frame.request_id;
         let request = decode_request::<v2::LocalSessionUnaryRequest>(&frame);
@@ -485,7 +503,17 @@ impl DaemonService {
                 )
             })?;
             let response = remote_sessions
-                .forward_preencoded(target, request_id, &bytes, deadline)
+                .forward_preencoded_with_progress(
+                    target,
+                    request_id,
+                    &bytes,
+                    deadline,
+                    if request.report_progress {
+                        progress
+                    } else {
+                        zterm_client::progress::ProgressObserver::default()
+                    },
+                )
                 .await?;
             if response.request_id != request_id {
                 return Err(DaemonError::new(

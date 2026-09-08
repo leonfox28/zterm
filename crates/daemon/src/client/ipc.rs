@@ -32,6 +32,7 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(unix)]
 use zeroize::{Zeroize, Zeroizing};
+use zterm_client::progress::{LocalProgressDecoder, ProgressObserver};
 #[cfg(unix)]
 use zterm_client::unary::{SessionUnaryClient, SessionUnaryRequest, SessionUnaryTransport};
 #[cfg(unix)]
@@ -46,6 +47,7 @@ const PAIRING_DEADLINE: Duration = Duration::from_secs(15);
 
 /// Same-UID local daemon unary client. It never starts a daemon.
 pub struct LocalClient {
+    progress: ProgressObserver,
     socket: PathBuf,
     #[cfg(unix)]
     next_request_id: AtomicU64,
@@ -108,12 +110,18 @@ impl LocalClient {
     #[must_use]
     pub fn new(socket: impl Into<PathBuf>) -> Self {
         Self {
+            progress: ProgressObserver::default(),
             socket: socket.into(),
             #[cfg(unix)]
             next_request_id: AtomicU64::new(1),
             #[cfg(unix)]
             sessions: SessionUnaryClient::default(),
         }
+    }
+
+    pub(crate) fn with_progress(mut self, progress: ProgressObserver) -> Self {
+        self.progress = progress;
+        self
     }
 
     /// Returns the configured socket path without connecting.
@@ -391,6 +399,7 @@ impl LocalClient {
         request_class: LocalRemoteRequestClass,
     ) -> Result<DecodedFrame, DaemonError> {
         let mut envelope = v2::LocalSessionUnaryRequest {
+            report_progress: self.progress.is_active(),
             target_device_id: Some(target.into()),
             frame: bytes.to_vec(),
         };
@@ -444,7 +453,7 @@ impl LocalClient {
         absolute_deadline: Instant,
     ) -> Result<DecodedFrame, LocalRemoteAttemptError> {
         let frame = self
-            .request_remote_bytes_once(bytes, absolute_deadline)
+            .request_remote_bytes_once(bytes, request_id, absolute_deadline)
             .await?;
         match validate_session_unary_response(&frame, request_id, response_kind)
             .map_err(LocalRemoteAttemptError::PostWrite)?
@@ -460,6 +469,7 @@ impl LocalClient {
     async fn request_remote_bytes_once(
         &self,
         bytes: &[u8],
+        request_id: u64,
         absolute_deadline: Instant,
     ) -> Result<DecodedFrame, LocalRemoteAttemptError> {
         let remaining = absolute_deadline.saturating_duration_since(Instant::now());
@@ -538,15 +548,21 @@ impl LocalClient {
             })?;
 
         let remaining = absolute_deadline.saturating_duration_since(Instant::now());
-        tokio::time::timeout(remaining, read_one(&mut stream))
-            .await
-            .map_err(|_| {
-                LocalRemoteAttemptError::PostWrite(DaemonError::new(
-                    DomainErrorKind::DeadlineExceeded,
-                    "local forwarding response exceeded its deadline",
-                ))
-            })?
-            .map_err(LocalRemoteAttemptError::PostWrite)
+        tokio::time::timeout(
+            remaining,
+            read_one_with_progress(
+                &mut stream,
+                LocalProgressDecoder::new(request_id, self.progress.clone()),
+            ),
+        )
+        .await
+        .map_err(|_| {
+            LocalRemoteAttemptError::PostWrite(DaemonError::new(
+                DomainErrorKind::DeadlineExceeded,
+                "local forwarding response exceeded its deadline",
+            ))
+        })?
+        .map_err(LocalRemoteAttemptError::PostWrite)
     }
 
     #[cfg(unix)]
@@ -1110,6 +1126,18 @@ fn unsupported() -> DaemonError {
 
 #[cfg(unix)]
 async fn read_one(stream: &mut tokio::net::UnixStream) -> Result<DecodedFrame, DaemonError> {
+    read_one_with_progress(
+        stream,
+        LocalProgressDecoder::new(0, ProgressObserver::default()),
+    )
+    .await
+}
+
+#[cfg(unix)]
+async fn read_one_with_progress(
+    stream: &mut tokio::net::UnixStream,
+    mut progress: LocalProgressDecoder,
+) -> Result<DecodedFrame, DaemonError> {
     let mut decoder = FrameDecoder::new();
     let mut buffer = Zeroizing::new([0_u8; 16 * 1024]);
     let mut completed = None;
@@ -1127,15 +1155,15 @@ async fn read_one(stream: &mut tokio::net::UnixStream) -> Result<DecodedFrame, D
                 )
             });
         }
-        let frames = decoder.feed(&buffer[..read]).map_err(protocol_error)?;
-        if frames.len() > 1 || (completed.is_some() && !frames.is_empty()) {
-            return Err(DaemonError::new(
-                DomainErrorKind::MalformedFrame,
-                "one local connection may contain only one request",
-            ));
-        }
-        if let Some(frame) = frames.into_iter().next() {
-            completed = Some(frame);
+        for frame in decoder.feed(&buffer[..read]).map_err(protocol_error)? {
+            if completed.is_some() {
+                return Err(malformed(
+                    "one local connection may contain only one final response",
+                ));
+            }
+            if !progress.consume(&frame)? {
+                completed = Some(frame);
+            }
         }
     }
 }
@@ -1198,6 +1226,77 @@ impl SessionUnaryTransport for LocalClient {
 mod tests {
     use super::*;
     use zterm_core::DaemonIncarnation;
+    #[tokio::test]
+    async fn unary_progress_accepts_fragmented_prefix_but_rejects_stages_after_final_reply() {
+        use zterm_core::connection_progress::ConnectionStage;
+        for chunk_size in [1, 4096] {
+            for trailing_progress in [false, true] {
+                let (observer, history) = ProgressObserver::channel(|_| {});
+                let progress = encode_message(
+                    WireKind::LocalConnectionProgress,
+                    501,
+                    0,
+                    &zterm_proto::connection_stage_to_message(ConnectionStage::ReusingConnection)
+                        .expect("unary progress fixture"),
+                )
+                .expect("unary progress fixture");
+                let mut bytes = progress.clone();
+                bytes.extend(
+                    encode_message(
+                        WireKind::SessionMutateResponse,
+                        501,
+                        0,
+                        &v2::SessionMutateResponse {
+                            session: Some(fake_session_summary(0xa1)),
+                        },
+                    )
+                    .expect("unary progress fixture"),
+                );
+                if trailing_progress {
+                    bytes.extend(progress);
+                }
+                let (mut client, mut daemon) =
+                    tokio::net::UnixStream::pair().expect("unary progress fixture");
+                let send = async {
+                    for chunk in bytes.chunks(chunk_size) {
+                        daemon
+                            .write_all(chunk)
+                            .await
+                            .expect("unary progress fixture");
+                        tokio::task::yield_now().await;
+                    }
+                    daemon.shutdown().await.expect("unary progress fixture");
+                };
+                let receive =
+                    read_one_with_progress(&mut client, LocalProgressDecoder::new(501, observer));
+                let ((), result) = tokio::join!(send, receive);
+                if trailing_progress {
+                    assert_eq!(
+                        result
+                            .expect_err("trailing progress must be rejected")
+                            .kind(),
+                        DomainErrorKind::MalformedFrame
+                    );
+                } else {
+                    assert_eq!(
+                        result.expect("unary progress fixture").kind,
+                        WireKind::SessionMutateResponse
+                    );
+                }
+                assert_eq!(
+                    history
+                        .borrow()
+                        .after(0)
+                        .next()
+                        .expect("unary progress fixture")
+                        .1
+                        .stage,
+                    ConnectionStage::ReusingConnection
+                );
+            }
+        }
+    }
+
     #[test]
     fn local_client_and_mutation_state_debug_redact_private_owners() {
         let client = LocalClient::new("/private/tmp/SOCKET_SENTINEL");
