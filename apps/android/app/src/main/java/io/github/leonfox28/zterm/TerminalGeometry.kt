@@ -31,4 +31,5 @@ internal fun terminalPan(height: Float, cellHeight: Float, rows: Int, cursorRow:
 internal data class DrawnTerminalGeometry(
     val cellWidth: Float, val cellHeight: Float, val baseline: Float, val shift: Float,
     val width: Int, val height: Int, val screenX: Int, val screenY: Int, val version: Long,
+    val firstRow: Long,
 )

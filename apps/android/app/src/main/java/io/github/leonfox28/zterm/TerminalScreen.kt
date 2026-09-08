@@ -27,7 +27,7 @@ import io.github.leonfox28.zterm.nativebridge.NativeSession
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable internal fun TerminalScreen(state: AppState, repository: AppRepository) {
-    val frame by repository.frame.collectAsStateWithLifecycle()
+    val frame by repository.terminalStatus.collectAsStateWithLifecycle()
     var modifiers by remember { mutableIntStateOf(0) }
     var creating by remember { mutableStateOf(false) }
     var renaming by remember { mutableStateOf<NativeSession?>(null) }
@@ -67,7 +67,7 @@ import io.github.leonfox28.zterm.nativebridge.NativeSession
                     modifier = Modifier.fillMaxSize(), onRelease = { terminalView = null }, update = { view ->
                         view.imeAnimating = { imeAnimation.running }
                         view.pendingModifiers = { modifiers }; view.consumedModifiers = { modifiers = 0 }
-                        view.update(frame, state.saved.preferences.fontSize)
+                        view.update(repository.frame.value, state.saved.preferences.fontSize)
                     })
                 val terminalState = frame?.state
                 val error = state.error ?: frame?.error

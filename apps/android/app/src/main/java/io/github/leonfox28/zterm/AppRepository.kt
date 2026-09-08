@@ -9,6 +9,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 internal enum class Route { Home, Scanner, Terminal, Settings }
+internal data class TerminalStatus(val inputEpoch: ULong, val state: String, val error: String?, val notice: String?, val inputReady: Boolean)
 internal data class AppState(
     val saved: SavedState = SavedState(),
     val initialized: Boolean = false,
@@ -31,6 +32,9 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
     val state = mutable.asStateFlow()
     private val mutableFrame = MutableStateFlow<NativeFrame?>(null)
     val frame = mutableFrame.asStateFlow()
+    val terminalStatus = frame.map { it?.let { frame ->
+        TerminalStatus(frame.inputEpoch, frame.state, frame.error, frame.notice, frame.inputReady)
+    } }.distinctUntilChanged().stateIn(scope, SharingStarted.Eagerly, null)
     private val frameObservers = linkedSetOf<(NativeFrame?) -> Unit>()
     private var selectionVersion = 0L
     fun observeTerminalFrames(observer: (NativeFrame?) -> Unit): () -> Unit {
@@ -140,6 +144,11 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
         dark = value
         scope.launch { try { terminal?.setDark(value) } catch (error: Exception) { report(error) } }
     }
+    // Latest displayed intent is distinct from a one-row cache-edge probe.
+    var scrollIntent: Long? = null
+        private set
+    var scrollRequestGeneration = 0L
+        private set
     fun retireGeometry() { ++selectionVersion }
     fun measure(rows: Int, columns: Int) {
         val size = NativeViewport(rows.coerceIn(1, 80).toUShort(), columns.coerceIn(1, 240).toUShort())
@@ -221,12 +230,28 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
         // is no terminal for the size consumer yet. Reapply its latest intent
         // through that same consumer without overwriting newer measurements.
         if (viewport != requestedViewport) sizes.trySend(Unit)
-        publishFrame(attached.currentFrame())
+        // Metadata frames share an immutable row window. Resolve a replacement
+        // off Main, once, while retaining its exact native source until delivery.
+        var contentGeneration = 0uL
+        var contentRows: List<NativeRow> = emptyList()
+        suspend fun resolve(next: NativeFrame): NativeFrame {
+            val source = next.source ?: return next
+            try {
+                if (next.contentGeneration != contentGeneration) {
+                    contentRows = withContext(Dispatchers.Default) { source.presentationRows() }
+                    contentGeneration = next.contentGeneration
+                }
+                return next.copy(rows = contentRows)
+            } catch (error: Throwable) { source.close(); throw error }
+        }
+        val initial = resolve(attached.currentFrame())
+        if (mine != epoch) { initial.source?.close(); return }
+        publishFrame(initial)
         observation = scope.launch {
-            var generation = 0uL
+            var generation = initial.generation
             try {
                 while (isActive && mine == epoch) {
-                    val next = attached.waitForFrame(generation)
+                    val next = resolve(attached.waitForFrame(generation))
                     generation = next.generation
                     if (mine == epoch) publishFrame(next) else next.source?.close()
                 }
@@ -270,6 +295,7 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
     }
     private suspend fun retire(): Long {
         val mine = ++epoch
+        scrollIntent = null
         val observer = observation
         observation = null
         while (true) { val input = keys.tryReceive().getOrNull() ?: break; input.source?.close() }
@@ -314,10 +340,15 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
         if (!snapshot.inputReady || terminal == null) return false
         val accepted = keys.trySend(Input(epoch,snapshot.inputEpoch,action)).isSuccess
         if (!accepted) mutable.update { it.copy(error = "resource_limit") }
+        else { scrollIntent = 0; ++scrollRequestGeneration }
         return accepted
     }
-    fun scroll(offset: Long, older: Boolean, horizon: Int = 4) {
-        if (frame.value?.state == "active") scrolls.trySend(Scroll(epoch,offset.coerceAtLeast(0).toULong(),older,horizon.coerceIn(2,8).toUByte()))
+    fun scroll(offset: Long, older: Boolean, horizon: Int = 4, displayedOffset: Long? = null) {
+        if (frame.value?.state == "active") {
+            scrollIntent = (displayedOffset ?: offset).coerceAtLeast(0)
+            if (displayedOffset == null) ++scrollRequestGeneration
+            scrolls.trySend(Scroll(epoch,offset.coerceAtLeast(0).toULong(),older,horizon.coerceIn(2,8).toUByte()))
+        }
     }
     fun select(source: NativeFrameSource, row: Int, column: Int) { ++selectionVersion; localSource(source) { target, held -> target.beginSelection(held,row.toUShort(),column.toUShort()) } }
     fun extendSelection(source: NativeFrameSource, row: Int, column: Int, anchor: Boolean) { ++selectionVersion; localSource(source) { target, held -> target.extendSelection(held,row.toUShort(),column.toUShort(),anchor) } }

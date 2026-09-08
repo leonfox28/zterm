@@ -97,7 +97,7 @@ class TerminalUiTest {
                 await("$mode fixture ended") { content().contains("SCENE_DONE") }
             }
             ui.runOnIdle { assertTrue(repository.text("printf '\\033[2J\\033[H'; read -r unused\r")) }
-            await("legitimate final clear remains visible") { repository.frame.value?.rows?.all { row -> row.cells.all { it.text.isBlank() } } == true }
+            await("legitimate final clear remains visible") { repository.frame.value?.let { visibleRows(it) }?.all { row -> row.cells.all { it.text.isBlank() } } == true }
             captureContinuityGrid("final-clear").recycle()
             ui.runOnIdle { repository.text("\r") }
         } finally {
@@ -230,6 +230,12 @@ print('SCENE_DONE')
             val view = terminal()
             repeat(3) { gesture(view, .5f, .2f, .5f, .85f, 600); SystemClock.sleep(250) }
             await("touch scroll") { (repository.frame.value?.historyOffset ?: 0u) > 5u }
+            val olderOffset = repository.frame.value!!.historyOffset
+            val cachedHits = repository.frame.value!!.stats.cacheHits
+            gesture(view, .5f, .85f, .5f, .2f, 1200)
+            await("upward drag returns through cached history") {
+                repository.frame.value?.let { it.historyOffset < olderOffset && it.stats.cacheHits > cachedHits } == true
+            }
             val bottomEpoch = repository.frame.value!!.inputEpoch
             val bottomStates = linkedSetOf<String>()
             val stopBottomFrames = ui.runOnIdle { repository.observeTerminalFrames { it?.let { bottomStates.add(it.state) } } }
@@ -248,7 +254,7 @@ print('SCENE_DONE')
             val selectionFrame = repository.frame.value!!
             val selection = selectionFrame.selection!!
             val handleX = (selection.focusColumn.toInt()+1f) / selectionFrame.viewport.columns.toInt() + .012f
-            val handleY = (selection.focusRow-selectionFrame.firstRow+1f) / selectionFrame.viewport.rows.toInt() + .01f
+            val handleY = (selection.focusRow-(selectionFrame.firstRow+selectionFrame.windowOffset.toLong()-selectionFrame.historyOffset.toLong())+1f) / selectionFrame.viewport.rows.toInt() + .01f
             dragToEdge(view,handleX,handleY)
             await("continuous cross-screen handle selection") {
                 repository.frame.value?.selection?.let { kotlin.math.abs(it.focusRow-it.anchorRow) >= viewport.rows.toInt()*2 } == true
@@ -510,7 +516,7 @@ print('SCENE_DONE')
             ui.runOnIdle { repository.createSession(name, directory!!) }
             await("Herdr Session") { repository.frame.value?.state == "active" && repository.state.value.sessions.any { it.name == name } && !repository.state.value.busy }
             await("Herdr shell") { content().isNotBlank() && terminal().hasWindowFocus() }
-            ui.runOnIdle { repository.text("XDG_CONFIG_HOME='$directory/config' XDG_STATE_HOME='$directory/state' /opt/homebrew/bin/herdr --no-session\r") }
+            ui.runOnIdle { repository.text("env -u HERDR_ENV -u HERDR_SOCKET_PATH -u HERDR_PANE_ID -u HERDR_TAB_ID -u HERDR_WORKSPACE_ID -u HERDR_BIN_PATH XDG_CONFIG_HOME='$directory/config' XDG_STATE_HOME='$directory/state' /opt/homebrew/bin/herdr --no-session\r") }
             await("Herdr mouse capture") { repository.frame.value?.pointerMode == io.github.leonfox28.zterm.nativebridge.NativePointerMode.MOUSE }
             // Its pane shell must finish starting before sending the fixture.
             await("Herdr pane prompt") { content().contains("%") }
@@ -600,7 +606,7 @@ print('SCENE_DONE')
         touch(view,down,MotionEvent.ACTION_DOWN,x,y); touch(view,down,MotionEvent.ACTION_UP,x,y)
     }
 
-    private fun content() = repository.frame.value?.rows?.joinToString("\n") { row -> row.cells.joinToString("") { cell -> if (cell.width == 0.toUByte()) "" else cell.text.ifEmpty { " " } } }.orEmpty()
+    private fun content() = repository.frame.value?.let { visibleRows(it) }?.joinToString("\n") { row -> row.cells.joinToString("") { cell -> if (cell.width == 0.toUByte()) "" else cell.text.ifEmpty { " " } } }.orEmpty()
     private fun counter(name: String) = Regex("$name=(\\d+)").find(content())?.groupValues?.get(1)?.toInt() ?: 0
     private val pointerFixture = """
 import os, re, signal, termios, tty
@@ -728,5 +734,10 @@ finally:
         }
         return false
     }
-    private fun text(frame: io.github.leonfox28.zterm.nativebridge.NativeFrame) = frame.rows.joinToString("\n") { it.cells.joinToString("") { cell -> cell.text } }
+    private fun text(frame: io.github.leonfox28.zterm.nativebridge.NativeFrame) = visibleRows(frame).joinToString("\n") { it.cells.joinToString("") { cell -> cell.text } }
+}
+
+private fun visibleRows(frame: io.github.leonfox28.zterm.nativebridge.NativeFrame): List<io.github.leonfox28.zterm.nativebridge.NativeRow> {
+    val start = (frame.windowOffset - frame.historyOffset).toInt()
+    return frame.rows.drop(start).take(frame.viewport.rows.toInt())
 }

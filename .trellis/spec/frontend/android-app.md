@@ -84,6 +84,47 @@ source, not the next unpainted frame. ActionMode.TYPE_FLOATING supplies Copy;
 Android theme handle drawables and nearest-handle hit testing support edge drag.
 Only explicit Copy writes ClipData; no automatic success toast or remote Ctrl+C.
 
+`NativeFrame.firstRow` is the first row of a bounded presentation window,
+not necessarily the visible top. `windowOffset` is the reading offset at that
+window start; it can differ from `historyMaximum - firstRow` for a frozen epoch.
+For `n` available rows and `h` viewport rows, local pixel bounds are
+`[max(0, windowOffset - (n - h)), min(windowOffset, historyMaximum)] * cellHeight`.
+Set `offset = ceil(scrollPixels / cellHeight)`, draw logical top
+`firstRow + windowOffset - offset`, and add the fractional shift
+`scrollPixels - offset * cellHeight` in `[-cellHeight, 0]` to the independent IME
+pan. Cached pixels move immediately across multiple rows without actor delivery.
+
+Submit only changed integer targets through the existing conflated scroll owner.
+At an unavailable edge, stop inertia, discard excess distance and request the
+adjacent row; its arrival expands available bounds without replaying movement.
+Keep a still-valid drawn window when a late response after reversal does not
+cover the actual position. Edge replies must overlap a complete waiting viewport;
+see the multi-page query contract in `../backend/shared-client.md`. New output
+rebases the reading offset while preserving logical rows, including an older
+edge wait begun at zero. Stop the old-basis fling on that append.
+`AppRepository.scrollIntent` distinguishes the displayed offset from an edge
+probe; `scrollRequestGeneration` distinguishes explicit scroll/input return from
+View metadata acknowledgements. A late live frame must not erase local motion.
+
+Repository resolves `NativeFrameSource.presentationRows()` off Main only when
+attachment-local `contentGeneration` changes, then reuses the immutable row list.
+Compose observes only `TerminalStatus`; the direct View observer owns content
+frames. Kotlin row windows are bounded to three viewports plus one row, separately
+from native cache budgets. API 29+ hardware Canvas reuses `TerminalRowRenderer`
+RenderNodes for equal logical row/cell content, bounded to three viewports plus
+one entry. Font/width/geometry changes, background and detach discard lists.
+Check `hasDisplayList()` before reuse. API 26–28 and software Canvas use the same
+cell painter directly. Do not build a full-history bitmap or cache cursor,
+selection or preedit overlays into text nodes.
+
+After drawing, bind `viewportSource(actualFirstRow)` to the committed geometry.
+A moved logical top retires pending Copy; hit/selection coordinates use the bound
+source even while the native navigation offset lags. Never use the window's
+first row as the visible top. `TerminalRenderingTest` verifies actual Canvas
+pixels across multi-row motion, late/reversed deliveries, cache edges and output
+append; hardware PixelCopy verifies that changed cells update and other pixels
+remain identical, including A-B-A content restoration.
+
 `TerminalGridLayout` measures fixed header/divider/toolbar first, then derives
 one terminal height from the parent's remaining physical pixels. Stable height
 is `floor(available / cellHeight) * cellHeight`; place the subrow remainder
@@ -112,7 +153,7 @@ Keep measurement fenced through that final layout and clear the pending flag
 on detach. Native `requestLayout()` alone may not cause a same-size layout
 callback through Compose AndroidView, leaving the host at the old size. Commit `DrawnTerminalGeometry` with `drawnFrame`/`drawnSource` after drawing.
 Hit tests, selection handles and IME anchors consume those exact cell metrics,
-pan, bounds and screen origin. Pending frames/layout never silently change the
+pan, logical first row, bounds and screen origin. Pending frames/layout never silently change the
 coordinate source; local layout/font changes retire active gestures. Keep
 complete Canvas draws and explicit bounded pending/drawn handle ownership. Do not
 send a network resize per animation frame or substitute a debounce delay.
@@ -223,6 +264,15 @@ only their own Sessions and delete their own ticket/image fixtures.
 The local signing key stays outside Git. Record actual APK SHA-256/versionCode,
 signature and installation/update evidence. Build-only CI does not establish
 runtime or phone results; keep pending physical-phone rows explicit.
+
+`TerminalScrollProfileTest` is opt-in with `scrollProfile=1` and an explicit
+disposable `presentation-` host. It profiles real touchscreen injection, warmed
+history and system FrameMetrics; it is not a universal FPS gate. Inject touch
+through Android's input dispatcher from a separate thread. Direct dispatch from
+a Choreographer animation callback changes `postInvalidateOnAnimation` timing.
+Use actual Canvas pixels for delayed-row displacement correctness; a posted
+OnDraw observer can mix a new desired position with older committed geometry.
+Do not infer phone frame rates or natural content-stall counts from that sampling.
 
 ## 7. Wrong versus correct
 

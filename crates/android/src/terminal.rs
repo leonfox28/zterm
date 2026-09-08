@@ -87,8 +87,12 @@ pub struct NativeFrame {
     pub input_ready: bool,
     /// Local reading offset; no separate user-visible history mode.
     pub history_offset: u64,
-    /// Logical ordinal of the first drawn row for selection hit testing.
+    /// Reading offset represented by the first row of the source window.
+    pub window_offset: u64,
+    /// Logical ordinal of the first row in the contiguous presentation window.
     pub first_row: i64,
+    /// Attachment-local identity of source rows/colors; zero denotes eager rows.
+    pub content_generation: u64,
     /// Frozen selection endpoints in logical content coordinates.
     pub selection: Option<NativeSelection>,
     /// Monotonic local display version, independent of wire revision.
@@ -99,7 +103,8 @@ pub struct NativeFrame {
     pub error: Option<String>,
     /// Exact dimensions.
     pub viewport: NativeViewport,
-    /// Complete presentation.
+    /// Eager fallback when no source can be accounted. Otherwise load source rows
+    /// once per content_generation and reuse them across metadata-only frames.
     pub rows: Vec<NativeRow>,
     /// IME anchor row, retained even when cursor is hidden.
     pub cursor_row: u16,
@@ -143,6 +148,10 @@ pub struct NativeFrameSource {
     origin: Arc<()>,
     modes: TerminalModes,
     pointer_mode: NativePointerMode,
+    window: std::ops::Range<usize>,
+    colors: Arc<TerminalColorSnapshot>,
+    dark: bool,
+    content_generation: u64,
 }
 /// Child-declared touch behavior, separate from native long-press selection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
@@ -172,6 +181,45 @@ impl NativeFrameSource {
     /// Gives the View an independent handle while the repository replaces its frame.
     pub fn retained(&self) -> Arc<Self> {
         Arc::new(self.clone())
+    }
+    /// Resolves the bounded immutable row window, without an actor or network
+    /// round trip. Foreign clients call only when content_generation changes.
+    pub fn presentation_rows(&self) -> Vec<NativeRow> {
+        project_rows(
+            &self.page.rows[self.window.clone()],
+            &self.colors,
+            self.dark,
+        )
+    }
+    /// Binds coordinates to the actual locally drawn viewport within these rows.
+    /// Retains the same accounted page and all original epoch/geometry fences.
+    pub fn viewport_source(&self, first_row: i64) -> Result<Arc<Self>, NativeError> {
+        let first = self
+            .page
+            .first_ordinal()
+            .ok_or_else(|| failure("selection_changed"))?;
+        let start = first_row
+            .checked_sub(first)
+            .and_then(|row| usize::try_from(row).ok())
+            .ok_or_else(|| failure("selection_changed"))?;
+        let end = start.saturating_add(usize::from(self.page.anchor.viewport.rows));
+        if start < self.window.start || end > self.window.end {
+            return Err(failure("selection_changed"));
+        }
+        let offset = i64::try_from(self.page.anchor.max_offset_from_bottom)
+            .ok()
+            .and_then(|maximum| maximum.checked_sub(first_row))
+            .and_then(|offset| u64::try_from(offset).ok())
+            .ok_or_else(|| failure("selection_changed"))?;
+        if self.page.visible_rows(offset).is_none() {
+            return Err(failure("selection_changed"));
+        }
+        let mut source = self.clone();
+        source.offset = offset;
+        if offset != 0 {
+            source.pointer_mode = NativePointerMode::None;
+        }
+        Ok(Arc::new(source))
     }
 }
 
@@ -336,9 +384,11 @@ impl NativeTerminal {
     pub async fn wait_for_frame(&self, after_generation: u64) -> Result<NativeFrame, NativeError> {
         let mut receiver = self.frame.subscribe();
         loop {
-            let frame = receiver.borrow_and_update().clone();
-            if frame.generation > after_generation {
-                return Ok(frame);
+            {
+                let frame = receiver.borrow_and_update();
+                if frame.generation > after_generation {
+                    return Ok(frame.clone());
+                }
             }
             tokio::select! { biased; _ = self.cancel.cancelled() => {
                 // The actor publishes its final state before cancellation. A
@@ -727,7 +777,7 @@ async fn run(
             navigation.disconnected();
             input_epoch += 1;
         }
-        frame.send_replace(project_navigation(
+        let next = project_navigation(
             &surface,
             generation,
             state,
@@ -738,14 +788,16 @@ async fn run(
             geometry_generation,
             healthy_resize,
             &origin,
-        ));
+            Some(&frame.borrow()),
+        );
+        frame.send_replace(next);
         if error.is_some() || matches!(state, "ended" | "lease_lost") {
             break;
         }
     }
     if !matches!(state, "ended" | "lease_lost") {
         let error = frame.borrow().error.clone();
-        frame.send_replace(project_navigation(
+        let next = project_navigation(
             &surface,
             generation + 1,
             "closed",
@@ -756,7 +808,9 @@ async fn run(
             geometry_generation + 1,
             false,
             &origin,
-        ));
+            Some(&frame.borrow()),
+        );
+        frame.send_replace(next);
     }
     cancel.cancel();
 }
@@ -967,6 +1021,8 @@ fn project(
         geometry_generation: 1,
         input_ready: state == "active",
         history_offset: 0,
+        window_offset: 0,
+        content_generation: 0,
         first_row: surface
             .scroll_metrics
             .map_or(0, |metrics| metrics.max_offset_from_bottom as i64),
@@ -1054,7 +1110,58 @@ fn project_navigation(
     geometry_generation: u64,
     healthy_resize: bool,
     origin: &Arc<()>,
+    previous: Option<&NativeFrame>,
 ) -> NativeFrame {
+    let source = navigation.frame_source(surface).map(|(page, offset)| {
+        let visible_start = usize::try_from(-(offset as i64) - page.first_row_from_live_top)
+            .expect("navigation source contains its viewport");
+        let height = usize::from(page.anchor.viewport.rows);
+        let proposed = visible_start.saturating_sub(height)
+            ..visible_start
+                .saturating_add(height * 2 + 1)
+                .min(page.rows.len());
+        let old = previous
+            .and_then(|frame| frame.source.as_deref())
+            .filter(|old| {
+                Arc::ptr_eq(&old.page, &page)
+                    && old.colors.as_ref() == &surface.surface.colors
+                    && old.dark == dark
+            });
+        // Recenter before reaching the window edge, without shifting its identity
+        // for every row. A physical page edge cannot supply more rows yet.
+        let window = old
+            .filter(|old| {
+                visible_start >= old.window.start
+                    && visible_start + height <= old.window.end
+                    && (old.window.start == 0 || visible_start >= old.window.start + height / 2)
+                    && (old.window.end == page.rows.len()
+                        || visible_start + height + height / 2 < old.window.end)
+            })
+            .map_or(proposed, |old| old.window.clone());
+        let unchanged = old.filter(|old| old.window == window);
+        Arc::new(NativeFrameSource {
+            page,
+            offset,
+            window,
+            // Never mint usable input/selection authority from an inactive frame.
+            input_epoch: if state == "active" { input_epoch } else { 0 },
+            geometry_generation,
+            screen: surface.active_screen(),
+            origin: Arc::clone(origin),
+            modes: surface.modes(),
+            pointer_mode: if state == "active" && navigation.live() && !navigation.selected() {
+                NativePointerMode::for_surface(surface)
+            } else {
+                NativePointerMode::None
+            },
+            colors: old.map_or_else(
+                || Arc::new(surface.surface.colors.clone()),
+                |old| Arc::clone(&old.colors),
+            ),
+            dark,
+            content_generation: unchanged.map_or(generation, |old| old.content_generation),
+        })
+    });
     let frozen_rows = (!navigation.live()).then(|| navigation.rows()).flatten();
     let mut frame = project(
         surface,
@@ -1062,7 +1169,11 @@ fn project_navigation(
         state,
         error,
         dark,
-        frozen_rows.unwrap_or(&surface.surface.rows),
+        if source.is_some() {
+            &[]
+        } else {
+            frozen_rows.unwrap_or(&surface.surface.rows)
+        },
     );
     frame.input_epoch = input_epoch;
     frame.geometry_generation = geometry_generation;
@@ -1070,6 +1181,7 @@ fn project_navigation(
         || (state == "synchronizing" && (healthy_resize || navigation.returning()));
     frame.cursor_visible = surface.surface.cursor.visible && (state == "active" || healthy_resize);
     frame.history_offset = navigation.offset();
+    frame.window_offset = frame.history_offset;
     if state == "active" && navigation.live() && !navigation.selected() {
         frame.pointer_mode = NativePointerMode::for_surface(surface);
     }
@@ -1077,19 +1189,16 @@ fn project_navigation(
         frame.cursor_visible = false;
         frame.first_row = navigation.first_row().unwrap_or(frame.first_row);
     }
-    if state == "active"
-        && let Some((page, offset)) = navigation.frame_source(surface)
-    {
-        frame.source = Some(Arc::new(NativeFrameSource {
-            page,
-            offset,
-            input_epoch,
-            geometry_generation,
-            screen: surface.active_screen(),
-            origin: Arc::clone(origin),
-            modes: surface.modes(),
-            pointer_mode: frame.pointer_mode,
-        }));
+    if let Some(source) = source {
+        frame.first_row = source
+            .page
+            .first_ordinal()
+            .expect("validated source ordinal")
+            + source.window.start as i64;
+        let visible_first = source.page.anchor.max_offset_from_bottom as i64 - source.offset as i64;
+        frame.window_offset = frame.history_offset + (visible_first - frame.first_row) as u64;
+        frame.content_generation = source.content_generation;
+        frame.source = Some(source);
     }
     frame.selection = navigation
         .endpoints()

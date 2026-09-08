@@ -18,7 +18,8 @@ class NativeTerminalTest {
         val saved = store.load()
         assumeTrue("explicitly paired host retained for acceptance", saved.hosts.isNotEmpty())
         val hostIndex = InstrumentationRegistry.getArguments().getString("hostIndex")?.toIntOrNull() ?: 0
-        val host = saved.hosts[hostIndex]
+        val hostName = InstrumentationRegistry.getArguments().getString("hostName")
+        val host = if (hostName != null) saved.hosts.first { it.name == hostName } else saved.hosts[hostIndex]
         val seed = store.loadOrCreateSeed()
         try {
             NativeRuntime().use { runtime ->
@@ -106,16 +107,17 @@ class NativeTerminalTest {
     }
     private suspend fun awaitFrame(terminal: NativeTerminal, stage: String, predicate: (NativeFrame) -> Boolean): NativeFrame = withTimeout(15_000) {
         android.util.Log.i("ZtermAcceptance", "waiting: $stage")
-        var frame = terminal.currentFrame()
+        var frame = resolved(terminal.currentFrame())
         while (!predicate(frame)) {
             assertFalse("attachment failed: ${frame.error}", frame.state in setOf("closed","ended","lease_lost"))
             android.util.Log.i("ZtermAcceptance", "$stage frame=${frame.generation} state=${frame.state} rows=${frame.viewport.rows} columns=${frame.viewport.columns} retained=${frame.historyMaximum} offset=${frame.historyOffset} finalRow=${text(frame).contains("ROW_160")} ascii=${text(frame).contains("ANDROID_NATIVE_")} cjk=${text(frame).contains("中文")}")
             val generation = frame.generation
             frame.source?.close()
-            frame = terminal.waitForFrame(generation)
+            frame = resolved(terminal.waitForFrame(generation))
         }
         frame.source?.close()
         frame
     }
+    private fun resolved(frame: NativeFrame) = frame.source?.let { frame.copy(rows = it.presentationRows()) } ?: frame
     private fun text(frame: NativeFrame): String = frame.rows.joinToString("\n") { row -> row.cells.joinToString("") { it.text } }
 }

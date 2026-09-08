@@ -12,7 +12,7 @@
   "assignee": "leon",
   "createdAt": "2026-09-07",
   "completedAt": null,
-  "branch": "feat/terminal-presentation-continuity",
+  "branch": "perf/android-local-scroll",
   "base_branch": "main",
   "worktree_path": null,
   "commit": "cb19c754641d6c0a715ace9d02354b88c57abb2c",
@@ -21,6 +21,6 @@
   "children": [],
   "parent": "08-20-cross-platform-relay-terminal-mvp",
   "relatedFiles": [],
-  "notes": "Published immutable v0.1.27 on 2026-09-08 via PR #35; PR CI 34173146157, exact-main CI 34173688282 and signed release 34174373737 all passed. Keep keyboard-close blank/history refill and desktop visual acceptance open; release notes document the gap. No local daemon activation. See research/release-0.1.27.md.",
+  "notes": "Published immutable v0.1.27 via PR #35. User approved Android scroll optimization on 2026-09-08; implemented bounded native row windows, off-Main reusable projection, local pixel navigation/source rebinding, hardware row display lists, and multi-page physical-edge overlap. Full just check, Android lint/JVM/build, six pixel tests, native integration, keyboard/Chinese/Copy/Activity retention and isolated Herdr/child-pointer acceptance pass. Adjacent old/new emulator comparison: gesture draw p50 15.01 -> 1.79 ms, p95 20.11 -> 5.30 ms; manual drag/reversal frame timing is not uniformly improved, physical-phone acceptance remains open. Restored ordinary Dev 0.1.27 on the owned emulator, then updated the physical phone (1680fce0) on explicit user request; installed APK hash matches the tested 8c61cdf0 build. Phone visual/scrolling acceptance awaits user trial. Pending Phase 3.4 commit workflow; no new release or real daemon activation. Keep prior keyboard-close history refill and broader desktop/phone visual acceptance open. See research/android-scroll-optimization.md and research/android-scroll-handoff.md. User now accepts physical-phone scrolling (测试了一下非常棒) and explicitly authorizes all commits and v0.1.28 publication. Earlier phone-trial/commit-pending statements are superseded. Keep the separate keyboard-close and desktop visual gaps open.",
   "meta": {}
 }

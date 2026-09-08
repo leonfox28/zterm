@@ -1,5 +1,19 @@
 # Terminal presentation continuity implementation plan
 
+## Active Android scrolling extension — 2026-09-08
+
+- [x] Native accounted row windows, lazy projection identity and source rebasing.
+- [x] Repository off-Main projection/reuse and independent chrome observation.
+- [x] Local bounded scrolling, prefetch edge handling and exact drawn coordinates.
+- [x] Bounded RenderNode row reuse with the existing direct Canvas fallback.
+- [x] Native/pixel/source/cache tests and real-input emulator comparison.
+- [x] IME/selection/child-pointer smoke, full local gate, spec/evidence update.
+
+Extension acceptance: see [Android scrolling evidence](research/android-scroll-optimization.md).
+All local implementation/check items above are complete; physical-phone and
+broader presentation acceptance remain separate. The existing commit confirmation
+is still pending, and no new release was requested.
+
 Status: implementation and local quality checks complete on 2026-09-08.
 See `research/runtime-acceptance.md` for exact evidence. Desktop GUI visual acceptance
 is unavailable because the tool rejects access to iTerm. The user subsequently authorized release on 2026-09-08; commit and publish the
@@ -193,3 +207,33 @@ with this task and mark any unperformed checks explicitly when implementation is
 - [x] Keep the task open for visual continuity follow-up; do not claim flicker resolved.
 
 Publication authorization covers its normal GitHub operations, not local daemon activation.
+
+## Post-release upward-scroll correction — 2026-09-08
+
+- [x] Trace gesture intent, native row delivery and actual Canvas displacement;
+  classify the existing equality-guard reset as a local contract violation.
+- [x] Reproduce with production View/Canvas/touch tests before modifying the draw path.
+- [x] Resolve fractional translation against the actual frame offset and bound it
+  to the existing single-row overscan while rows are pending.
+- [x] Pass the three pixel regressions, Android build/lint, full `just check` and
+  real-host cached up/down scroll, selection/Copy and child pointer regressions.
+- [x] Record evidence, update Android spec and clean up only the disposable runtime.
+- [x] User confirms the follow-up commit and v0.1.28 release; execute the commit in `commit-plan.md`; no new release
+  or overall-task archival is implied by this correction.
+
+## Authorized emulator smoothness profiling — 2026-09-08
+
+- [x] Add one opt-in fixture on an explicit disposable host, with real injected
+  touches, cached history, slow/fast/reversed drags and verified fling coasting.
+- [x] Compare ordinary Dev and the same `.dev` code without debuggability;
+  collect system FrameMetrics and content-free native counters without recording.
+- [x] Reject unreliable asynchronous position sampling, retain exact Canvas
+  regressions as the displacement owner, and document measurement limits.
+- [x] Restore the default build; build/lint pass, three Canvas regressions pass,
+  and the profiling test skips when explicit opt-in arguments are absent.
+- [x] Record accepted results; leave row-window/render reuse unimplemented and
+  preserve the pending correctness commit and earlier visual follow-ups.
+
+
+Phone scrolling accepted by the user on 2026-09-08. Commit all task changes and
+release v0.1.28; retain earlier unrelated visual follow-ups.

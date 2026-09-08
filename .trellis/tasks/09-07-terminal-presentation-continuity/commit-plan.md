@@ -1,4 +1,6 @@
-# Proposed local commits
+# Commit records and pending follow-up
+
+## Completed v0.1.27 release commits
 
 Authorized by the user on 2026-09-08: “先走发布流程吧”.
 The canonical release workflow may commit, push, merge and publish v0.1.27.
@@ -65,3 +67,39 @@ The user authorized release before the remaining flicker work. The Android
 keyboard-close blank/history-refill issue remains open, along with full-transition
 visual acceptance. Keep this task active after publication. The canonical operator
 adds a separate two-file `chore: prepare v0.1.27 release` commit after these groups.
+
+## Authorized Android scrolling release — 2026-09-08
+
+The user approved optimization after the profiling discussion. The prior
+uncommitted ghosting correction is now included in the coherent row-window
+implementation; the earlier proposal is superseded by this file grouping.
+After testing the updated phone, the user confirmed “测试了一下非常棒，现在提交所有变更，然后走发布流程吧”. This authorizes the complete work commit, version preparation, push/PR/merge, normal protected signing approval and publication as v0.1.28. All paths below are task-owned; no unrecognized dirty files.
+
+`perf(android): scroll cached terminal rows locally`
+
+- `crates/android/src/terminal.rs`
+- `crates/android/src/terminal/navigation.rs`
+- `crates/core/src/viewport_cache.rs`
+- `apps/android/app/src/main/java/io/github/leonfox28/zterm/AppRepository.kt`
+- `apps/android/app/src/main/java/io/github/leonfox28/zterm/TerminalGeometry.kt`
+- `apps/android/app/src/main/java/io/github/leonfox28/zterm/TerminalScreen.kt`
+- `apps/android/app/src/main/java/io/github/leonfox28/zterm/TerminalView.kt`
+- `apps/android/app/src/main/java/io/github/leonfox28/zterm/TerminalRowRenderer.kt`
+- `apps/android/app/src/androidTest/java/io/github/leonfox28/zterm/NativeTerminalTest.kt`
+- `apps/android/app/src/androidTest/java/io/github/leonfox28/zterm/TerminalUiTest.kt`
+- `apps/android/app/src/androidTest/java/io/github/leonfox28/zterm/TerminalRenderingTest.kt`
+- `apps/android/app/src/androidTest/java/io/github/leonfox28/zterm/TerminalScrollProfileTest.kt`
+- `.trellis/spec/backend/shared-client.md`
+- `.trellis/spec/frontend/android-app.md`
+- `.trellis/tasks/09-07-terminal-presentation-continuity/commit-plan.md`
+- `.trellis/tasks/09-07-terminal-presentation-continuity/design.md`
+- `.trellis/tasks/09-07-terminal-presentation-continuity/implement.md`
+- `.trellis/tasks/09-07-terminal-presentation-continuity/prd.md`
+- `.trellis/tasks/09-07-terminal-presentation-continuity/progress.md`
+- `.trellis/tasks/09-07-terminal-presentation-continuity/task.json`
+- `.trellis/tasks/09-07-terminal-presentation-continuity/research/android-scroll-handoff.md`
+- `.trellis/tasks/09-07-terminal-presentation-continuity/research/android-scroll-optimization.md`
+
+Validation and remaining visual boundaries are in
+[scrolling acceptance](research/android-scroll-optimization.md). Keep the task
+active for prior keyboard-close/history-refill and broader desktop visual checks. Phone scrolling acceptance is now confirmed.
