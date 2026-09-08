@@ -548,3 +548,43 @@ Published immutable v0.1.26 through PR #33 and the canonical release operator. A
 ### Status
 
 [OK] **Completed**
+
+
+## Session 21: Publish v0.1.27 terminal presentation continuity
+<!-- trellis-session: v=2 fp=64ece5bbe3976780 -->
+
+**Date**: 2026-09-08
+**Task**: Publish v0.1.27 terminal presentation continuity
+**Branch**: `feat/terminal-presentation-continuity`
+
+### Summary
+
+Published immutable v0.1.27 through PR #35 and the canonical exact-main candidate/signing workflow; visual continuity follow-up remains open.
+
+### Main Changes
+
+- Shipped coherent DEC 2026 publication, healthy resize input/IME lifetime, Android integral geometry and desktop final-cell coverage.
+- Published all 11 assets; release notes disclose the remaining keyboard-close blank/history refill and incomplete desktop GUI/Herdr visual acceptance.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `ed7c170` | feat(terminal): publish synchronized output at coherent boundaries |
+| `a0065d9` | feat(client): preserve presentation and input across resize |
+| `807fd41` | chore: prepare v0.1.27 release |
+| `cb19c75` | Merge pull request #35 from leonfox28/feat/terminal-presentation-continuity |
+
+### Testing
+
+- [OK] Local full gate and focused Android/emulator checks passed before release; PR CI 34173146157 and exact-main CI 34173688282 passed.
+- [OK] Signed release 34174373737 passed APK signing, three native HTTPS installer proofs, roundtrip verification, attestation and immutable publication; metadata source/version/certificate/hash checks passed.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- Keep terminal-presentation-continuity active to fix Android keyboard-close blank/history refill and complete controlled whole-transition/desktop visual acceptance.
+- No real Mac main Session was touched and no local daemon was restarted or updated.

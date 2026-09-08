@@ -20,8 +20,8 @@ See `research/runtime-acceptance.md` for exact timings/artifacts and limits. Des
 GUI visual capture was denied by the tool; no visual pass or quantitative jank claim.
 
 The disposable daemon was gracefully stopped after its last owned Session was closed;
-only emulator-5556 was shut down. Next: review the concrete Phase 3.4 commit plan. Nothing is committed or published. Archive/journal must wait
-until work commits are approved and desktop acceptance gap is handled accurately.
+only emulator-5556 was shut down. The user subsequently authorized commits and
+publication while retaining the visual acceptance gap below.
 
 User follow-up evidence review: endpoint pixel equality does not prove absence of
 transient flicker. The new keyboard-close recording still shows an empty top area
@@ -29,6 +29,8 @@ before history refill. Do not report flicker as resolved or archive the task; re
 this issue and whole-transition acceptance as open. See acceptance follow-up section.
 
 Release steering: the user authorized “先走发布流程吧” after the above disclosure.
-Proceeding with v0.1.27; local doctor passes, origin/main still equals baseline,
-previous full gate plus final owner checks are green. Keep the visual follow-up
-open, and do not activate the release on the running Mac daemon.
+v0.1.27 is published through PR #35 at merge source `cb19c754641d6c0a715ace9d02354b88c57abb2c`.
+PR CI, exact-main CI/candidate and formal signed release all passed. The stable,
+immutable release has all 11 expected assets and notes the known visual issue.
+See `research/release-0.1.27.md` for source/run/tag/metadata evidence. Keep the
+visual follow-up open; no release was activated on the running Mac daemon.

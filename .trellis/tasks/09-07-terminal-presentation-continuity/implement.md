@@ -185,11 +185,11 @@ with this task and mark any unperformed checks explicitly when implementation is
 
 - [x] User authorizes publication despite the documented remaining visual transition.
 - [x] Confirm current upstream main, latest v0.1.26, local quality evidence and doctor.
-- [ ] Commit the two reviewed implementation groups, then canonical v0.1.27 version commit.
-- [ ] Review the exact PR diff and document known visual limitations in its body.
-- [ ] Run `just release 0.1.27 <PR>` through required PR/main CI, candidate, tag,
+- [x] Commit the two reviewed implementation groups, then canonical v0.1.27 version commit.
+- [x] Review the exact PR diff and document known visual limitations in its body.
+- [x] Run `just release 0.1.27 35` through required PR/main CI, candidate, tag,
   normal protected-environment approval, signatures, final installer proofs and publication.
-- [ ] Verify the immutable release inventory and record exact source/run/tag evidence.
-- [ ] Keep the task open for visual continuity follow-up; do not claim flicker resolved.
+- [x] Verify the immutable release inventory and record exact source/run/tag evidence.
+- [x] Keep the task open for visual continuity follow-up; do not claim flicker resolved.
 
 Publication authorization covers its normal GitHub operations, not local daemon activation.

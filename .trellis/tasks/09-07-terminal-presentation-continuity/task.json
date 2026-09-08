@@ -15,12 +15,12 @@
   "branch": "feat/terminal-presentation-continuity",
   "base_branch": "main",
   "worktree_path": null,
-  "commit": null,
-  "pr_url": null,
+  "commit": "cb19c754641d6c0a715ace9d02354b88c57abb2c",
+  "pr_url": "https://github.com/leonfox28/zterm/pull/35",
   "subtasks": [],
   "children": [],
   "parent": "08-20-cross-platform-relay-terminal-mvp",
   "relatedFiles": [],
-  "notes": "User authorized release on 2026-09-08 after reviewing the incomplete flicker evidence. Publishing v0.1.27 via canonical PR/main/candidate/signing workflow; keep keyboard-close blank/history refill and desktop visual acceptance open. No local daemon activation.",
+  "notes": "Published immutable v0.1.27 on 2026-09-08 via PR #35; PR CI 34173146157, exact-main CI 34173688282 and signed release 34174373737 all passed. Keep keyboard-close blank/history refill and desktop visual acceptance open; release notes document the gap. No local daemon activation. See research/release-0.1.27.md.",
   "meta": {}
 }
