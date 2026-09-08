@@ -633,3 +633,25 @@ Completed stale-session/default-main recovery, typed unary error retirement, and
 ### Status
 
 [OK] **Completed**
+
+
+## Session 25: Fix Android terminal keyboard on task resume
+<!-- trellis-session: v=2 fp=7773d6006f10b5fd -->
+
+**Date**: 2026-09-08
+**Task**: Fix Android terminal keyboard on task resume
+**Branch**: `fix/android-keyboard-resume`
+
+### Summary
+
+Scoped SOFT_INPUT_STATE_UNCHANGED to Terminal while preserving editor focus, explicit IME controls and window resize flags. Added regression and Android contract. New regression fails before the fix; all four focused emulator instrumentation methods have passing final runs. Debug app/test builds and Debug/Release lint pass; manual same-Activity cross-app and dialog checks pass. Isolated API 36 emulator only; physical hardware not tested. User authorized commit/push/PR; opened https://github.com/leonfox28/zterm/pull/38 and archived the completed task.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `e6f5e6b` | fix(android): preserve terminal keyboard visibility on resume |
+
+### Status
+
+[OK] **Completed**
