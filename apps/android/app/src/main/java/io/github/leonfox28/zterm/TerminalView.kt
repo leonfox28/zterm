@@ -38,6 +38,10 @@ internal class TerminalView(context: Context) : View(context) {
         }
     private var unobserve: (() -> Unit)? = null
     private var drawnFrame: NativeFrame? = null
+    private var drawnGeometry: DrawnTerminalGeometry? = null
+    private var geometryVersion = 0L
+    var onCellHeightChanged: (Int) -> Unit = {}
+    val gridCellHeight: Int get() = cellHeight.toInt()
     private var drawnSource: NativeFrameSource? = null
     private var pendingSource: NativeFrameSource? = null
     private var disposing = false
@@ -59,7 +63,6 @@ internal class TerminalView(context: Context) : View(context) {
     var imeAnimating: () -> Boolean = { false }
     private var animatedInsets = false
     private var imeMeasurePending = false
-    private var gridBottomGap = 0f
     fun updateImeAnimation(running: Boolean) {
         if (animatedInsets == running) return
         animatedInsets = running
@@ -164,7 +167,7 @@ internal class TerminalView(context: Context) : View(context) {
         updateMetrics()
     }
     fun update(frame: NativeFrame?, size: Int) {
-        if (font != size) { font = size; updateMetrics(); measureGrid(); invalidate() }
+        if (font != size) { font = size; updateMetrics(); requestLayout(); invalidate() }
         observeFrames()
         if (unobserve == null) acceptFrame(frame)
     }
@@ -178,8 +181,7 @@ internal class TerminalView(context: Context) : View(context) {
             if (frame == null) { drawnSource?.close(); drawnSource = null; drawnFrame = null }
             val previous = current
             current = frame
-            if (previous?.inputEpoch != frame?.inputEpoch || gestureMode != frame?.pointerMode) releaseGestureSource()
-            if (previous?.viewport != frame?.viewport && !imeAnimating()) gridBottomGap = height % cellHeight
+            if (previous?.inputEpoch != frame?.inputEpoch || previous?.geometryGeneration != frame?.geometryGeneration || gestureMode != frame?.pointerMode) invalidateCoordinates()
             if (previous?.inputEpoch != frame?.inputEpoch) {
                 composing.clear(); consumedModifiers(); manager.restartInput(this)
                 scroller.forceFinished(true); scrollPixels = (frame?.historyOffset?.toLong() ?: 0) * cellHeight
@@ -201,8 +203,16 @@ internal class TerminalView(context: Context) : View(context) {
         val metrics = paint.fontMetrics
         cellHeight = kotlin.math.ceil((metrics.descent - metrics.ascent).toDouble()).toFloat().coerceAtLeast(1f)
         baseline = -metrics.ascent
+        invalidateCoordinates()
+        onCellHeightChanged(gridCellHeight)
     }
-    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) { measureGrid(); updateAnchor() }
+    private fun invalidateCoordinates() {
+        ++geometryVersion
+        repository?.retireGeometry()
+        releaseGestureSource(); childGesture = false; draggingHandle = null
+        removeCallbacks(autoScroll)
+    }
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) { invalidateCoordinates(); measureGrid() }
     override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) { measureGrid() }
     private fun measureGrid() {
         if (width <= 0 || height <= 0 || animatedInsets || imeMeasurePending || imeAnimating()) return
@@ -212,13 +222,11 @@ internal class TerminalView(context: Context) : View(context) {
     override fun onDraw(canvas: Canvas) {
         val frame = current ?: return
         canvas.clipRect(0, 0, width, height)
-        if (drawnFrame !== frame) {
-            drawnSource?.close(); drawnSource = pendingSource; pendingSource = null
-            drawnFrame = frame
-            if (draggingHandle != null) post { extendHandle() }
-        }
+        val shift = drawShift(frame)
+        val location = IntArray(2); getLocationOnScreen(location)
+        val geometry = DrawnTerminalGeometry(cellWidth, cellHeight, baseline, shift, width, height,
+            location[0], location[1], geometryVersion)
         canvas.drawColor(frame.background.toInt())
-        val shift = drawShift()
         canvas.save(); canvas.translate(0f, shift)
         frame.rows.forEachIndexed { row, line ->
             val top = row * cellHeight
@@ -268,7 +276,7 @@ internal class TerminalView(context: Context) : View(context) {
                 }
             }
         }
-        drawSelection(canvas, frame)
+        drawSelection(canvas, frame, geometry)
         val cursorX = frame.cursorColumn.toInt() * cellWidth
         val cursorY = frame.cursorRow.toInt() * cellHeight
         if (frame.cursorVisible) {
@@ -284,17 +292,21 @@ internal class TerminalView(context: Context) : View(context) {
             canvas.drawLine(cursorX,cursorY+cellHeight-1,cursorX+extent,cursorY+cellHeight-1,paint)
         }
         canvas.restore()
+        if (drawnFrame !== frame) {
+            drawnSource?.close(); drawnSource = pendingSource; pendingSource = null
+        }
+        drawnFrame = frame
+        drawnGeometry = geometry
+        updateAnchor()
+        actionMode?.invalidateContentRect()
+        if (draggingHandle != null) post { extendHandle() }
     }
     private fun geometryShift(frame: NativeFrame): Float {
-        if (frame.historyOffset != 0uL || frame.selection != null) return 0f
-        val difference = height - (frame.viewport.rows.toInt() * cellHeight + gridBottomGap)
-        // Consume blank rows before panning the cursor up. During expansion,
-        // reserve room for the history the host can pull back above the grid.
-        val minimum = minOf(0f, height - (frame.cursorRow.toInt()+1) * cellHeight - gridBottomGap)
-        return difference.coerceIn(minimum, frame.historyMaximum.toLong() * cellHeight)
+        if (frame.historyOffset != 0uL || frame.selection != null || !frame.cursorVisible) return 0f
+        if (frame.viewport.columns.toInt() != floor(width / cellWidth).toInt().coerceIn(1, 240)) return 0f
+        return terminalPan(minOf(height.toFloat(), 80 * cellHeight), cellHeight, frame.viewport.rows.toInt(), frame.cursorRow.toInt(), frame.historyMaximum.toLong())
     }
-    private fun drawShift(): Float {
-        val frame = drawnFrame ?: current ?: return 0f
+    private fun drawShift(frame: NativeFrame): Float {
         val geometry = geometryShift(frame)
         val target = kotlin.math.ceil(scrollPixels / cellHeight).toLong()
         if (frame.historyOffset.toLong() != target) return geometry
@@ -302,8 +314,9 @@ internal class TerminalView(context: Context) : View(context) {
     }
     private fun hit(x: Float, y: Float): Pair<Int,Int> {
         val frame = drawnFrame
-        return floor((y-drawShift()) / cellHeight).toInt().coerceIn(0,(frame?.viewport?.rows?.toInt() ?: 1)-1) to
-            floor(x / cellWidth).toInt().coerceIn(0,(frame?.viewport?.columns?.toInt() ?: 1)-1)
+        val geometry = drawnGeometry ?: return 0 to 0
+        return floor((y-geometry.shift) / geometry.cellHeight).toInt().coerceIn(0,(frame?.viewport?.rows?.toInt() ?: 1)-1) to
+            floor(x / geometry.cellWidth).toInt().coerceIn(0,(frame?.viewport?.columns?.toInt() ?: 1)-1)
     }
     private fun moveScroll(value: Float) {
         val frame = current ?: return
@@ -321,15 +334,22 @@ internal class TerminalView(context: Context) : View(context) {
     override fun computeScroll() {
         if (scroller.computeScrollOffset()) { moveScroll(scroller.currY.toFloat()); postInvalidateOnAnimation() }
     }
-    private fun handlePosition(anchor: Boolean): Pair<Float,Float>? {
-        val frame = drawnFrame ?: return null
+    private fun handlePosition(anchor: Boolean, frame: NativeFrame? = drawnFrame, geometry: DrawnTerminalGeometry? = drawnGeometry): Pair<Float,Float>? {
+        frame ?: return null
+        geometry ?: return null
         val selection = frame.selection ?: return null
         val row = (if (anchor) selection.anchorRow else selection.focusRow) - frame.firstRow
         if (row !in 0 until frame.viewport.rows.toLong()) return null
         val column = if (anchor) selection.anchorColumn.toInt() else selection.focusColumn.toInt()+1
-        return (column * cellWidth).coerceIn(handleRadius,width-handleRadius) to (row+1) * cellHeight + drawShift()
+        return (column * geometry.cellWidth).coerceIn(handleRadius, maxOf(handleRadius,geometry.width-handleRadius)) to (row+1) * geometry.cellHeight + geometry.shift
     }
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (drawnGeometry?.version != geometryVersion || drawnFrame?.geometryGeneration != current?.geometryGeneration || imeAnimating()) return true
+        val geometry = drawnGeometry ?: return true
+        val frame = drawnFrame ?: return true
+        if (event.actionMasked == MotionEvent.ACTION_DOWN &&
+            (event.x >= frame.viewport.columns.toInt() * geometry.cellWidth || event.y < geometry.shift ||
+             event.y - geometry.shift >= frame.viewport.rows.toInt() * geometry.cellHeight)) return true
         touchX = event.x; touchY = event.y
         if (event.actionMasked == MotionEvent.ACTION_DOWN) {
             draggingHandle = listOf(true,false).mapNotNull { anchor ->
@@ -359,7 +379,7 @@ internal class TerminalView(context: Context) : View(context) {
         val (row,column) = hit(touchX,touchY-cellHeight*.5f)
         repository?.extendSelection(source,row,column,anchor)
     }
-    private fun drawSelection(canvas: Canvas, frame: NativeFrame) {
+    private fun drawSelection(canvas: Canvas, frame: NativeFrame, geometry: DrawnTerminalGeometry) {
         val selection = frame.selection ?: return
         val a = selection.anchorRow to selection.anchorColumn.toInt()
         val b = selection.focusRow to selection.focusColumn.toInt()
@@ -375,12 +395,12 @@ internal class TerminalView(context: Context) : View(context) {
             }
         }
         paint.alpha = 255
-        for (anchor in listOf(true,false)) handlePosition(anchor)?.let { (x,y) ->
+        for (anchor in listOf(true,false)) handlePosition(anchor, frame, geometry)?.let { (x,y) ->
             handles[if (anchor) 0 else 1]?.let { handle ->
                 val w = handle.intrinsicWidth.coerceAtLeast(1)
                 val h = handle.intrinsicHeight.coerceAtLeast(1)
                 val left = (x - if (anchor) w*.75f else w*.25f).toInt().coerceIn(0,(width-w).coerceAtLeast(0))
-                val top = (y-drawShift()).toInt()
+                val top = (y-geometry.shift).toInt()
                 handle.setBounds(left,top,left+w,top+h); handle.draw(canvas)
             }
         }
@@ -423,7 +443,7 @@ internal class TerminalView(context: Context) : View(context) {
         releaseGestureSource()
         unobserve?.invoke(); unobserve = null
         pendingSource?.close(); pendingSource = null
-        drawnSource?.close(); drawnSource = null; drawnFrame = null; current = null
+        drawnSource?.close(); drawnSource = null; drawnFrame = null; drawnGeometry = null; current = null
         scroller.forceFinished(true); draggingHandle = null; removeCallbacks(autoScroll)
         repository?.terminalVisible(false)
         super.onDetachedFromWindow()
@@ -444,21 +464,24 @@ internal class TerminalView(context: Context) : View(context) {
         outAttrs.privateImeOptions = "com.google.android.inputmethod.latin.noMicrophoneKey"
         return TerminalInputConnection().also { ime = it }
     }
-    private fun commit(value: String, paste: Boolean = false) {
-        if (current?.inputReady != true) return
-        repository?.text(value, pendingModifiers(), paste)
+    private fun commit(value: String, paste: Boolean = false): Boolean {
+        if (current?.inputReady != true || repository?.text(value, pendingModifiers(), paste) != true) return false
         if (value.isNotEmpty()) consumedModifiers()
         composing.clear(); manager.updateSelection(this,0,0,-1,-1); updateAnchor(); invalidate()
+        return true
     }
     private fun updateAnchor() {
-        val frame = current ?: return
+        val frame = drawnFrame ?: return
+        val geometry = drawnGeometry ?: return
+        if (geometry.version != geometryVersion || frame.inputEpoch != current?.inputEpoch) return
         if (!frame.inputReady || frame.historyOffset != 0uL || frame.selection != null) return
-        val location = IntArray(2); getLocationOnScreen(location)
-        val matrix = Matrix().apply { setTranslate(location[0].toFloat(), location[1].toFloat()) }
-        val x = frame.cursorColumn.toInt() * cellWidth
-        val y = frame.cursorRow.toInt() * cellHeight + geometryShift(frame)
+        val matrix = Matrix().apply { setTranslate(geometry.screenX.toFloat(), geometry.screenY.toFloat()) }
+        val x = frame.cursorColumn.toInt() * geometry.cellWidth
+        val y = frame.cursorRow.toInt() * geometry.cellHeight + geometry.shift
+        val visible = x in 0f..geometry.width.toFloat() && y >= 0f && y + geometry.cellHeight <= geometry.height
+        val flags = if (visible) CursorAnchorInfo.FLAG_HAS_VISIBLE_REGION else CursorAnchorInfo.FLAG_HAS_INVISIBLE_REGION
         val builder = CursorAnchorInfo.Builder().setMatrix(matrix).setSelectionRange(composing.length, composing.length)
-            .setInsertionMarkerLocation(x,y,y+baseline,y+cellHeight,CursorAnchorInfo.FLAG_HAS_VISIBLE_REGION)
+            .setInsertionMarkerLocation(x,y,y+geometry.baseline,y+geometry.cellHeight,flags)
         if (composing.isNotEmpty()) builder.setComposingText(0,composing)
         manager.updateCursorAnchorInfo(this,builder.build())
     }
@@ -471,8 +494,8 @@ internal class TerminalView(context: Context) : View(context) {
             if (!ready() || (text?.length ?: 0) > 524288) return false
             composing.replace(0,composing.length,text ?: ""); updateAnchor(); invalidate(); return true
         }
-        override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean { if (!ready()) return false; commit(text?.toString().orEmpty()); return true }
-        override fun finishComposingText(): Boolean { if (!ready()) return false; if (composing.isNotEmpty()) commit(composing.toString()); return true }
+        override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean = ready() && commit(text?.toString().orEmpty())
+        override fun finishComposingText(): Boolean = ready() && (composing.isEmpty() || commit(composing.toString()))
         override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean = delete(beforeLength,afterLength,false)
         override fun deleteSurroundingTextInCodePoints(beforeLength: Int, afterLength: Int): Boolean = delete(beforeLength,afterLength,true)
         private fun delete(before: Int, after: Int, codePoints: Boolean): Boolean {
@@ -484,20 +507,18 @@ internal class TerminalView(context: Context) : View(context) {
                 if (start > 0 && start < composing.length && Character.isLowSurrogate(composing[start])) start--
                 composing.delete(start,composing.length); updateAnchor(); invalidate()
             } else {
-                repeat(before) { repository?.key(NativeKey.Backspace, pendingModifiers()) }
-                repeat(after) { repository?.key(NativeKey.Delete, pendingModifiers()) }
+                if (repository?.deleteKeys(before, after, pendingModifiers()) != true) return false
                 if (before + after > 0) consumedModifiers()
             }
             return true
         }
-        override fun performEditorAction(actionCode: Int): Boolean { if (!ready()) return false; repository?.key(NativeKey.Enter, pendingModifiers()); consumedModifiers(); return true }
+        override fun performEditorAction(actionCode: Int): Boolean { if (!ready() || repository?.key(NativeKey.Enter, pendingModifiers()) != true) return false; consumedModifiers(); return true }
         override fun requestCursorUpdates(cursorUpdateMode: Int): Boolean { if (!ready()) return false; updateAnchor(); return true }
         override fun sendKeyEvent(event: KeyEvent): Boolean = ready() && handleKey(event)
         override fun performContextMenuAction(id: Int): Boolean {
             if (!ready() || id != android.R.id.paste) return false
             val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
-            clipboard.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString()?.let { commit(it,true) }
-            return true
+            return clipboard.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString()?.let { commit(it,true) } ?: false
         }
     }
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean = handleKey(event) || super.onKeyDown(keyCode,event)
@@ -518,7 +539,7 @@ internal class TerminalView(context: Context) : View(context) {
             (if (event.isCtrlPressed) 4 else 0) or (if (event.isMetaPressed) 8 else 0) or pendingModifiers()
         val scalar = event.unicodeChar
         val text = if (scalar in 32..0x10ffff && scalar !in 0x7f..0x9f && scalar !in 0xd800..0xdfff) String(Character.toChars(scalar)) else ""
-        repository?.key(key,modifiers,if (event.action == KeyEvent.ACTION_UP) 3 else if (event.repeatCount > 0) 2 else 1,text)
+        if (repository?.key(key,modifiers,if (event.action == KeyEvent.ACTION_UP) 3 else if (event.repeatCount > 0) 2 else 1,text) != true) return false
         if (event.action != KeyEvent.ACTION_UP) consumedModifiers()
         return true
     }

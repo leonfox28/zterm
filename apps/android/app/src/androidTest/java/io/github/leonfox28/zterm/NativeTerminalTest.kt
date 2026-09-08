@@ -64,11 +64,19 @@ class NativeTerminalTest {
                             assertTrue("three screens of exact Unicode text", copied.count { it == '\n' } >= 70 && copied.contains("中文é"))
                             terminal.commitText(terminal.currentFrame().let { frame -> frame.source?.close(); frame.inputEpoch }, "printf 'AFTER_RETURN_%s\\n' 'ok'\r",0u,false)
                             awaitFrame(terminal,"first input after history") { it.historyOffset == 0uL && text(it).contains("AFTER_RETURN_ok") }
-                            val oldEpoch = terminal.currentFrame().let { frame -> frame.source?.close(); frame.inputEpoch }
+                            val beforeResize = terminal.currentFrame()
+                            val oldEpoch = beforeResize.inputEpoch
                             terminal.resize(NativeViewport(20u,70u))
+                            terminal.commitText(oldEpoch,"printf 'RESIZE_INPUT_%s\\n' '中文'\r",0u,false)
                             awaitFrame(terminal, "resize") { it.state == "active" && it.viewport.rows == 20.toUShort() && it.viewport.columns == 70.toUShort() }
-                            val retired = runCatching { terminal.commitText(oldEpoch,"NEVER_SEND_RETIRED_INPUT",0u,false) }.exceptionOrNull()
-                            assertTrue("input captured before synchronization is rejected", retired is NativeException.RequestFailed && retired.code == "input_not_ready")
+                            awaitFrame(terminal,"healthy resize preserves ordered input") { text(it).contains("RESIZE_INPUT_中文") }
+                            terminal.resize(beforeResize.viewport)
+                            val restored = awaitFrame(terminal,"A-B-A resize") { it.state == "active" && it.viewport == beforeResize.viewport }
+                            assertEquals("keyboard lifetime survives resize",oldEpoch,restored.inputEpoch)
+                            assertTrue(restored.geometryGeneration > beforeResize.geometryGeneration)
+                            val retired = runCatching { terminal.beginSelection(requireNotNull(beforeResize.source),0u,0u) }.exceptionOrNull()
+                            beforeResize.source?.close()
+                            assertTrue("A-B-A does not revive old coordinates",retired is NativeException.RequestFailed && retired.code == "selection_changed")
                             for (alternate in listOf(false,true)) {
                                 val enter = if (alternate) "\\033[?1049h" else ""
                                 val leave = if (alternate) "\\033[?1049l" else ""

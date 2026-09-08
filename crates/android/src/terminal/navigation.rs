@@ -740,6 +740,52 @@ mod tests {
     }
 
     #[test]
+    fn healthy_resize_retains_input_but_retires_coordinates_even_after_a_b_a() {
+        let live = surface(1, 1, 100);
+        let origin = Arc::new(());
+        let mut nav = Navigation::new(&live);
+        let initial = super::super::project_navigation(
+            &live, 1, "active", None, true, &mut nav, 7, 1, false, &origin,
+        );
+        let source = initial.source.expect("drawn source");
+        assert!(source.valid_for(&origin, 7, 1, &live));
+        let resizing = super::super::project_navigation(
+            &live,
+            2,
+            "synchronizing",
+            None,
+            true,
+            &mut nav,
+            7,
+            2,
+            true,
+            &origin,
+        );
+        assert!(resizing.input_ready);
+        assert_eq!(resizing.cursor_visible, live.surface.cursor.visible);
+        assert!(resizing.source.is_none(), "no pointer source during resize");
+        assert!(
+            !source.valid_for(&origin, 7, 3, &live),
+            "same dimensions do not revive old coordinates"
+        );
+        let reconnected = super::super::project_navigation(
+            &live,
+            3,
+            "reconnecting",
+            None,
+            true,
+            &mut nav,
+            8,
+            3,
+            false,
+            &origin,
+        );
+        assert!(!reconnected.input_ready);
+        assert!(!source.valid_for(&origin, 8, 1, &live));
+        assert!(!source.valid_for(&Arc::new(()), 7, 1, &live));
+    }
+
+    #[test]
     fn clearing_live_selection_restores_latest_pixels_without_sync() {
         for alternate in [false, true] {
             let mut live = surface(1, 1, 100);
@@ -760,7 +806,7 @@ mod tests {
             assert_eq!(nav.copy().expect("captured text").as_str(), "0");
             let origin = Arc::new(());
             let frozen = super::super::project_navigation(
-                &next, 1, "active", None, true, &mut nav, 7, &origin,
+                &next, 1, "active", None, true, &mut nav, 7, 1, false, &origin,
             );
             assert_eq!(
                 frozen.rows[0].cells[0].text, "0",
@@ -779,7 +825,7 @@ mod tests {
             );
             assert!(nav.rows().is_none(), "release frozen display");
             let restored = super::super::project_navigation(
-                &next, 2, "active", None, true, &mut nav, 7, &origin,
+                &next, 2, "active", None, true, &mut nav, 7, 1, false, &origin,
             );
             assert_eq!(
                 restored.rows[0].cells[0].text, "x",

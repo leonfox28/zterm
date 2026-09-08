@@ -13,6 +13,7 @@ pub(super) struct TerminalUiSession {
     pub(super) stdin_pump: StdinPump,
     pub(super) prefix: CommandMode,
     pub(super) transport_state: TerminalViewTransportState,
+    pub(super) healthy_resize: bool,
     pub(super) resize_coalescer: ResizeCoalescer,
     pub(super) physical_size: TerminalSize,
     pub(super) surface: AttachmentSurface,
@@ -53,7 +54,7 @@ impl TerminalUiSession {
             self.host_colors
                 .flush_commands(&mut self.presenter, &mut stdout.lock())?;
             if matches!(
-                self.transport_state,
+                presentation_state(self.transport_state, self.healthy_resize),
                 TerminalViewTransportState::Active | TerminalViewTransportState::Reconnecting
             ) && let Some(profile) = self.host_colors.take_update()
             {
@@ -67,7 +68,7 @@ impl TerminalUiSession {
                     &mut self.presenter,
                     &mut self.viewport,
                     &self.status_renderer,
-                    self.transport_state,
+                    presentation_state(self.transport_state, self.healthy_resize),
                     &mut self.viewport_pacer,
                     CachedPresentationRequest { now, force: false },
                 ) {
@@ -101,6 +102,7 @@ impl TerminalUiSession {
                         Ok(size) => size,
                         Err(error) => break Err(error),
                     };
+                    if self.physical_size != latest_physical { self.input_epoch.invalidate_geometry(); }
                     self.physical_size = latest_physical;
                     let layout = ChromeLayout::new(
                         latest_physical,
@@ -122,13 +124,14 @@ impl TerminalUiSession {
                         &mut self.presenter,
                         &self.viewport,
                         &self.status_renderer,
-                        self.transport_state,
+                        presentation_state(self.transport_state, self.healthy_resize),
                     ) {
                         break Err(error);
                     }
                     self.viewport.observe_presentation();
                     self.viewport_pacer.mark_presented(Instant::now());
                     if let Some(size) = self.resize_coalescer.observe(latest, self.transport_state) {
+                        self.healthy_resize = self.viewport.is_live();
                         if let Err(error) = self.writer.resize(size).await {
                             break Err(error.into());
                         }
@@ -149,7 +152,7 @@ impl TerminalUiSession {
                         &mut self.presenter,
                         &mut self.viewport,
                         &self.status_renderer,
-                        self.transport_state,
+                        presentation_state(self.transport_state, self.healthy_resize),
                         &mut self.viewport_pacer,
                         CachedPresentationRequest { now, force: false },
                     ) {
@@ -176,7 +179,7 @@ impl TerminalUiSession {
                 () = wait_for_prefix_deadline(color_deadline), if color_deadline.is_some() => { self.host_colors.expire(Instant::now()); }
                 input = self.stdin_pump.recv() => {
                     match input {
-                        Some(StdinEvent::Bytes { epoch, bytes }) =>
+                        Some(StdinEvent::Bytes { epoch, geometry, bytes }) =>
                         {
                             // A paced history frame may have committed a new
                             // source since the preceding pointer event. Retire
@@ -188,7 +191,7 @@ impl TerminalUiSession {
                                 &self.surface,
                                 &mut self.presenter,
                             );
-                            let mut host_events = match self.input_codec.feed_for_epoch(&bytes, epoch, self.current_input_epoch) {
+                            let mut host_events = match self.input_codec.feed_for_lifetimes(&bytes, epoch, self.current_input_epoch, geometry, self.input_epoch.geometry()) {
                                 Ok(events) => VecDeque::from(events),
                                 Err(error) => break 'terminal Err(error),
                             };
@@ -232,13 +235,13 @@ impl TerminalUiSession {
                                                 &self.surface,
                                                 &mut self.presenter,
                                                 &self.status_renderer,
-                                                self.transport_state,
+                                                presentation_state(self.transport_state, self.healthy_resize),
                                                 &mut self.viewport_pacer,
                                             ) {
                                                 break 'terminal Err(error);
                                             }
                                             if self.viewport.is_live()
-                                                && self.transport_state == TerminalViewTransportState::Active
+                                                && (self.transport_state == TerminalViewTransportState::Active || self.healthy_resize)
                                             {
                                                 self.writer.write_input(bytes).await?;
                                             } else if !self.viewport.is_live() {
@@ -296,7 +299,7 @@ impl TerminalUiSession {
                                                                 &self.surface,
                                                                 &mut self.presenter,
                                                                 &self.status_renderer,
-                                                                self.transport_state,
+                                                                presentation_state(self.transport_state, self.healthy_resize),
                                                                 &mut self.viewport_pacer,
                                                             )
                                                     {
@@ -325,14 +328,13 @@ impl TerminalUiSession {
                                                 &self.surface,
                                                 &mut self.presenter,
                                                 &self.status_renderer,
-                                                self.transport_state,
+                                                presentation_state(self.transport_state, self.healthy_resize),
                                                 &mut self.viewport_pacer,
                                             ) {
                                                 break 'terminal Err(error);
                                             }
                                             if self.viewport.is_live()
-                                                && self.transport_state
-                                                    == TerminalViewTransportState::Active
+                                                && (self.transport_state == TerminalViewTransportState::Active || self.healthy_resize)
                                             {
                                                 if let Err(error) = self.writer.write_input(bytes).await {
                                                     break 'terminal Err(error.into());
@@ -349,7 +351,7 @@ impl TerminalUiSession {
                                                 &self.surface,
                                                 &mut self.presenter,
                                                 &self.status_renderer,
-                                                self.transport_state,
+                                                presentation_state(self.transport_state, self.healthy_resize),
                                                 &mut self.viewport_pacer,
                                             ) {
                                                 break 'terminal Err(error);
@@ -442,7 +444,7 @@ impl TerminalUiSession {
                                 &mut self.presenter,
                                 &mut self.viewport,
                                 &self.status_renderer,
-                                self.transport_state,
+                                presentation_state(self.transport_state, self.healthy_resize),
                                 &mut self.viewport_pacer,
                                 CachedPresentationRequest {
                                     now: Instant::now(),
@@ -488,12 +490,15 @@ impl TerminalUiSession {
                     &mut self.presenter,
                     &self.viewport,
                     &self.status_renderer,
-                    self.transport_state,
+                    presentation_state(self.transport_state, self.healthy_resize),
                 )?;
                 self.viewport.observe_presentation();
                 self.viewport_pacer.mark_presented(Instant::now());
             }
             TerminalViewEvent::Snapshot(snapshot) => {
+                if snapshot.surface.size != self.surface.surface.size || snapshot.surface.active_screen != self.surface.active_screen() {
+                    self.input_epoch.invalidate_geometry();
+                }
                 self.viewport_pacer.cancel();
                 self.selection.cancel();
                 reconcile_presenter_selection(
@@ -522,7 +527,7 @@ impl TerminalUiSession {
                     &snapshot,
                     &mut self.viewport,
                     &self.status_renderer,
-                    self.transport_state,
+                    presentation_state(self.transport_state, self.healthy_resize),
                 )?;
                 let _ = self
                     .resize_coalescer
@@ -530,7 +535,7 @@ impl TerminalUiSession {
                 let history_refill = self.viewport.refetch_history_window();
                 self.viewport.observe_presentation();
                 self.viewport_pacer.mark_presented(Instant::now());
-                self.prefix.clear_pending();
+                if !self.healthy_resize { self.prefix.clear_pending(); }
                 self.sync_requested = false;
                 self.writer.revision_applied(snapshot.revision);
                 self.writer.snapshot_applied(snapshot.revision).await?;
@@ -548,6 +553,7 @@ impl TerminalUiSession {
                 if rendered_live {
                     self.viewport_pacer.cancel();
                 }
+                let geometry_changed = delta.size != self.surface.surface.size || delta.active_screen != self.surface.active_screen();
                 let delta_result = apply_delta_stdout(
                     &mut self.surface,
                     &mut self.presenter,
@@ -555,11 +561,12 @@ impl TerminalUiSession {
                     &mut self.viewport,
                     &mut self.selection,
                     &self.status_renderer,
-                    self.transport_state,
+                    presentation_state(self.transport_state, self.healthy_resize),
                     resume_barrier,
                 );
                 match delta_result {
                     Ok(DeltaRender::Applied) => {
+                        if geometry_changed { self.input_epoch.invalidate_geometry(); }
                         self.sync_requested = false;
                         self.writer.revision_applied(delta.to_revision);
                         if rendered_live {
@@ -569,6 +576,7 @@ impl TerminalUiSession {
                                 .resize_coalescer
                                 .observe(self.viewport.content_size(), self.transport_state);
                             if let Some(size) = mode_resize {
+                                self.healthy_resize = self.viewport.is_live();
                                 self.writer.resize(size).await?;
                                 self.transition_transport(
                                     stdin,
@@ -587,6 +595,11 @@ impl TerminalUiSession {
                         }
                     }
                     Ok(DeltaRender::Gap) => {
+                        if self.healthy_resize {
+                            self.healthy_resize = false;
+                            transition_input_state(stdin, &self.input_epoch, &mut self.current_input_epoch,
+                                &mut self.stdin_pump, &mut self.prefix, TerminalViewTransportState::Synchronizing)?;
+                        }
                         self.viewport_pacer.cancel();
                         self.selection.cancel();
                         reconcile_presenter_selection(
@@ -640,7 +653,7 @@ impl TerminalUiSession {
                         &mut self.presenter,
                         &self.viewport,
                         &self.status_renderer,
-                        self.transport_state,
+                        presentation_state(self.transport_state, self.healthy_resize),
                     )?;
                 }
                 reconcile_presenter_selection(
@@ -664,7 +677,7 @@ impl TerminalUiSession {
                     &self.surface,
                     &mut self.presenter,
                 );
-                self.viewport.observe_sync_required();
+                if !self.healthy_resize { self.viewport.observe_sync_required(); }
                 if self.transport_state != TerminalViewTransportState::Synchronizing {
                     self.transport_state = TerminalViewTransportState::Synchronizing;
                 }
@@ -702,7 +715,7 @@ impl TerminalUiSession {
             &mut self.presenter,
             &self.writer,
             &self.status_renderer,
-            self.transport_state,
+            presentation_state(self.transport_state, self.healthy_resize),
             &mut self.viewport_pacer,
             force,
         )
@@ -722,6 +735,7 @@ impl TerminalUiSession {
         self.viewport_pacer.cancel();
         let (next, pending_resize) = self.resize_coalescer.enter_transport_state(next);
         if next == TerminalViewTransportState::Reconnecting {
+            self.healthy_resize = false;
             self.host_colors.request_refresh();
             self.viewport.reset_presentation_for_reconnect();
             self.status_renderer.reset_for_reconnect();
@@ -729,7 +743,8 @@ impl TerminalUiSession {
         if next != previous && next != TerminalViewTransportState::Active {
             self.selection.cancel();
         }
-        let resume_input = transition_transport_input_state(
+        let preserve_input = self.healthy_resize;
+        let resume_input = if preserve_input { None } else { transition_transport_input_state(
             stdin,
             &self.input_epoch,
             &mut self.current_input_epoch,
@@ -738,7 +753,7 @@ impl TerminalUiSession {
             previous,
             next,
             &mut self.viewport,
-        )?;
+        )? };
         reconcile_presenter_selection(
             &mut self.selection,
             &self.viewport,
@@ -750,7 +765,7 @@ impl TerminalUiSession {
             &mut self.presenter,
             &self.viewport,
             &self.status_renderer,
-            next,
+            presentation_state(next, preserve_input),
         )? {
             self.viewport.observe_presentation();
             self.viewport_pacer.mark_presented(Instant::now());
@@ -763,9 +778,14 @@ impl TerminalUiSession {
         {
             self.writer.write_input(bytes).await?;
         }
+        self.healthy_resize = preserve_input && next == TerminalViewTransportState::Synchronizing;
         self.transport_state = next;
         Ok(())
     }
+}
+
+fn presentation_state(state: TerminalViewTransportState, healthy_resize: bool) -> TerminalViewTransportState {
+    if healthy_resize { TerminalViewTransportState::Active } else { state }
 }
 
 #[cfg(test)]

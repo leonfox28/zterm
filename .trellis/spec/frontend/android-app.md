@@ -84,16 +84,37 @@ source, not the next unpainted frame. ActionMode.TYPE_FLOATING supplies Copy;
 Android theme handle drawables and nearest-handle hit testing support edge drag.
 Only explicit Copy writes ClipData; no automatic success toast or remote Ctrl+C.
 
+`TerminalGridLayout` measures fixed header/divider/toolbar first, then derives
+one terminal height from the parent's remaining physical pixels. Stable height
+is `floor(available / cellHeight) * cellHeight`; place the subrow remainder
+below the toolbar, inside already consumed navigation/IME insets. Paint supplies
+the integer ceil font height through `gridCellHeight`. Never derive remainder
+from an already rounded child height or add padding above the toolbar.
+The 80-row cap retains neutral excess area; exclude that area from cell hits and
+pan calculations. Subcell windows keep one clipped row, not a zero-height view.
+
 During IME animation, `imePadding` moves chrome and clips/pans the existing grid
-locally. An Activity-owned `WindowInsetsAnimationCompat.Callback` on the decor
+locally. `terminalBottomRemainder` interpolates the endpoint remainders using
+source/current/target consumed bottom insets; do not round every animation frame
+to whole rows. Stable 17 px cells at available 1000/600 px give grids 986/595 px
+and bottom padding 14/5 px; cursor row 39 pans to row 34 with no 9 px handoff. An Activity-owned `WindowInsetsAnimationCompat.Callback` on the decor
 View tracks every prepared IME animation until its matching end. Register above
 Compose, whose inset consumer stops descendant animation dispatch. Unrelated
 bar animations cannot release the IME fence. Neither a conflated size channel
-nor equality of Compose animation source/target insets is a lifetime fence. On completion use `OneShotPreDrawListener` to commit the settled View once.
+nor equality of Compose animation source/target insets is a lifetime fence.
+Deliver prepare/end edges directly through `ImeAnimationState.observe`, registered
+for the Compose-owned TerminalView lifetime. Recomposition can conflate both edges
+and is not an event delivery mechanism. Read the live animation owner inside the
+layout measurement so intermediate frames interpolate instead of stepping by rows.
+`imeCompletionSurvivesCoalescedCompositionAndOverlappingAnimations` covers synchronous
+edges, overlap and observer disposal. On completion use `OneShotPreDrawListener` to commit the settled View once.
 Keep measurement fenced through that final layout and clear the pending flag
 on detach. Native `requestLayout()` alone may not cause a same-size layout
-callback through Compose AndroidView, leaving the host at the old size. Share the local
-drawing transform across text, cursor/preedit, hit testing and IME anchors. Do not
+callback through Compose AndroidView, leaving the host at the old size. Commit `DrawnTerminalGeometry` with `drawnFrame`/`drawnSource` after drawing.
+Hit tests, selection handles and IME anchors consume those exact cell metrics,
+pan, bounds and screen origin. Pending frames/layout never silently change the
+coordinate source; local layout/font changes retire active gestures. Keep
+complete Canvas draws and explicit bounded pending/drawn handle ownership. Do not
 send a network resize per animation frame or substitute a debounce delay.
 
 `TerminalView.onSingleTapUp` never requests IME visibility, including in a
@@ -129,8 +150,14 @@ captures its creation input epoch; old callbacks and editable buffers cannot
 commit into a newer synchronized attachment. Copy captures the Repository
 selection version and attachment epoch, rechecking after FFI extraction before
 any clipboard effect. Cancel/geometry/navigation changes retire pending Copy.
-Resize input is
-suspended until synchronization completes. App background visibility only stops
+Healthy resize from Active Live preserves the native input epoch, existing
+InputConnection, preedit and shortcut readiness; it shows no reconnect spinner.
+Its independent geometry generation retires stale pointer/selection/Copy work,
+including A-B-A. Initial attach, reconnect, lease loss/end and history-return
+retain their real fences. Repository text/key/delete queue admission returns
+Boolean: InputConnection reports false and retains preedit on queue rejection;
+admitted same-attachment stale-epoch work reports `input_not_ready`. Never clear
+composition or claim success merely because a fire-and-forget enqueue ran. App background visibility only stops
 gesture animation/speculation, not the application connection. Navigate Home by
 explicit detach; fence asynchronous attach/create/list results with their owning
 navigation/attachment epoch so Back cannot be undone by a late response.
@@ -217,3 +244,11 @@ Gradle tracks source authority as an input to avoid stale generated metadata or
 native libraries. Public package/certificate match prior acceptance builds;
 development `.dev` uses its separate debug signer. See `docs/releasing.md` and
 backend distribution-lifecycle.md for the complete authenticated asset inventory.
+
+Presentation evidence owners: `AttachGeometryTest.integralEndpointsPreserveCursorAndInterpolateBelowToolbarRemainder`
+asserts endpoint arithmetic, smooth interpolation and the clipped minimum;
+`NativeTerminalTest` checks retained input plus stale A-B-A coordinates;
+`TerminalUiTest` checks real keyboard/IME/selection behavior. Select a disposable
+host with `hostName` and an explicit emulator serial; build success is not visual
+or Chinese-composition acceptance. `presentation_fixture` creates independent
+host state and refuses to discover/autostart the user's daemon.

@@ -179,14 +179,17 @@ impl DesktopPresenter {
             return Ok(false);
         }
         let baseline = self.baseline.as_ref().filter(|baseline| {
-            baseline.physical_size == desired.physical_size && baseline.layout == desired.layout
+            baseline.physical_size == desired.physical_size
         });
         let mut frame = Vec::new();
         frame.extend_from_slice(HOST_SYNC_BEGIN);
-        if baseline.is_none() {
-            frame.extend_from_slice(b"\x1b[0m\x1b[2J");
-        }
         let mut row_indices = BTreeMap::new();
+        // An unknown outer-terminal mapping requires truthful final coverage,
+        // including neutral space beyond the capped child grid. Never expose
+        // an intermediate erase-screen before the replacement is written.
+        if baseline.is_none() {
+            for row in 0..desired.physical_size.rows { row_indices.insert(row, ()); }
+        }
         if let Some(baseline) = baseline {
             for row in baseline.rows.keys() {
                 row_indices.insert(*row, ());
@@ -198,7 +201,7 @@ impl DesktopPresenter {
         for row in row_indices.keys().copied() {
             let before = baseline.and_then(|baseline| baseline.rows.get(&row));
             let after = desired.rows.get(&row);
-            if before == after {
+            if baseline.is_some() && before == after {
                 continue;
             }
             let width = before
@@ -206,18 +209,25 @@ impl DesktopPresenter {
                 .unwrap_or(0)
                 .max(after.map(Vec::len).unwrap_or(0))
                 .min(usize::from(desired.physical_size.columns));
-            if width == 0 || row >= desired.physical_size.rows {
+            if row >= desired.physical_size.rows {
                 continue;
             }
             let mut complete = after.cloned().unwrap_or_default();
             normalize_composed_row(&mut complete, width);
             let mut previous = before.cloned().unwrap_or_default();
             normalize_composed_row(&mut previous, width);
-            for (start, end) in semantic_dirty_runs(&previous, &complete) {
+            let runs = if baseline.is_none() && width != 0 {
+                vec![(0, width)]
+            } else { semantic_dirty_runs(&previous, &complete) };
+            for (start, end) in runs {
                 write!(frame, "\x1b[{};{}H", row + 1, start + 1)
                     .map_err(|error| terminal_io("compose semantic terminal row", error))?;
                 encode_semantic_row(&mut frame, &complete[start..end])
                     .map_err(|error| terminal_io("compose semantic terminal row", error))?;
+            }
+            if baseline.is_none() && width < usize::from(desired.physical_size.columns) {
+                write!(frame, "\x1b[{};{}H\x1b[0m\x1b[K", row + 1, width + 1)
+                    .map_err(|error| terminal_io("cover neutral terminal cells", error))?;
             }
         }
         write_terminal_modes(&mut frame, desired_input_modes)
@@ -648,6 +658,32 @@ mod color_tests {
             colors: TerminalColorSnapshot::default(),
         }
     }
+    #[test]
+    fn unknown_mapping_covers_blank_cells_and_retired_rows_without_preclear() {
+        let mut desired = frame();
+        desired.cursor.visible = false;
+        desired.rows.insert(0, vec![TerminalCell::default(); 3]);
+        desired.rows.remove(&1);
+        let mut presenter = DesktopPresenter::default();
+        let mut bytes = Vec::new();
+        presenter.present(&mut bytes, desired.clone(), None).expect("blank coverage");
+        let text = String::from_utf8(bytes.clone()).expect("ANSI text");
+        assert!(!text.contains("\x1b[2J"));
+        assert!(text.contains("\x1b[1;1H\x1b[0;39;49m   "), "unknown blank cells must overwrite old glyphs");
+        assert!(text.contains("\x1b[2;1H\x1b[0m\x1b[K"), "retired chrome/neutral rows are covered too");
+        bytes.clear();
+        assert!(!presenter.present(&mut bytes, desired.clone(), None).expect("unchanged"));
+        assert!(bytes.is_empty());
+        desired.rows.get_mut(&0).expect("row")[2].contents = "X".into();
+        presenter.present(&mut bytes, desired.clone(), None).expect("one cell");
+        assert!(String::from_utf8_lossy(&bytes).contains("\x1b[1;3H"));
+        bytes.clear();
+        desired.rows.get_mut(&0).expect("row")[2] = TerminalCell::default();
+        presenter.present(&mut bytes, desired, None).expect("legitimate final clear");
+        assert!(String::from_utf8_lossy(&bytes).contains("\x1b[1;3H\x1b[0;39;49m "));
+        assert!(!String::from_utf8_lossy(&bytes).contains("\x1b[1;1H\x1b[0;39;49m"));
+    }
+
     #[test]
     fn palette_resolution_preserves_semantics_and_leaves_chrome_on_outer_colors() {
         let mut desired = frame();

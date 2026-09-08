@@ -12,13 +12,65 @@ import org.junit.Test
 
 /** Run alone so the first Repository load uses only the disposable resume target. */
 class AttachGeometryTest {
+    @Test fun integralEndpointsPreserveCursorAndInterpolateBelowToolbarRemainder() {
+        for (cell in listOf(17, 23, 29, 41)) {
+            val start = 1000
+            val end = 600
+            var previousGrid = start - start % cell
+            for (bottom in 0..400) {
+                val available = start - bottom
+                val remainder = terminalBottomRemainder(available, cell, bottom, 0, 400, true)
+                val grid = available - remainder
+                assertTrue(remainder in 0 until cell)
+                assertTrue("animation has no whole-row steps", previousGrid - grid in 0..2)
+                previousGrid = grid
+                if (bottom == 0 || bottom == 400) assertEquals(0, grid % cell)
+            }
+            assertEquals(end - end % cell, previousGrid)
+            assertEquals(start % cell, terminalBottomRemainder(start, cell, 0, 400, 0, false))
+        }
+        val rows = 1000 / 17
+        val target = 600 / 17
+        assertEquals(0f, terminalPan(target * 17f, 17f, rows, 10, 0), 0f)
+        val middlePan = terminalPan(target * 17f, 17f, rows, 39, 0)
+        assertEquals(-85f, middlePan, 0f)
+        assertEquals(34 * 17f, 39 * 17f + middlePan, 0f)
+        assertEquals(-(rows - target) * 17f, terminalPan(target * 17f, 17f, rows, rows - 1, 0), 0f)
+        assertEquals(0, terminalBottomRemainder(0, 17, 0, 0, 400, false))
+        assertEquals(0, terminalBottomRemainder(3, 17, 0, 0, 400, false))
+    }
+
+    @Test fun imeCompletionSurvivesCoalescedCompositionAndOverlappingAnimations() {
+        val owner = ImeAnimationState()
+        val events = mutableListOf<Boolean>()
+        val stop = owner.observe { events.add(it) }
+        val ime = androidx.core.view.WindowInsetsCompat.Type.ime()
+        val first = androidx.core.view.WindowInsetsAnimationCompat(ime, null, 160)
+        val second = androidx.core.view.WindowInsetsAnimationCompat(ime, null, 160)
+        val bar = androidx.core.view.WindowInsetsAnimationCompat(androidx.core.view.WindowInsetsCompat.Type.navigationBars(), null, 160)
+        owner.onPrepare(first)
+        owner.onPrepare(second)
+        owner.onPrepare(bar)
+        owner.onEnd(first)
+        owner.onEnd(bar)
+        assertTrue(owner.running)
+        owner.onEnd(second)
+        assertEquals(listOf(false, true, false), events)
+        // No Compose frame runs between these edges, but both events survive.
+        owner.onPrepare(first); owner.onEnd(first)
+        assertEquals(listOf(false, true, false, true, false), events)
+        stop()
+        owner.onPrepare(first); owner.onEnd(first)
+        assertEquals(5, events.size)
+    }
+
     @Test fun measurementsDuringAttachReachTheNewTerminal() = runBlocking {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         assumeTrue("explicit attach fixture", InstrumentationRegistry.getArguments().getString("attachGeometry") == "1")
         val application = ApplicationProvider.getApplicationContext<ZtermApplication>()
         val store = AppStore(application)
         val saved = store.load()
-        val host = saved.hosts.first { it.name == "my-mac" }
+        val host = saved.hosts.first { it.name == (InstrumentationRegistry.getArguments().getString("hostName") ?: "my-mac") }
         val runtime = application.runtime
         val seed = store.loadOrCreateSeed()
         try { runtime.initialize(seed,PlatformNetwork(application) {}.current(),saved.hosts.map { it.native() }) }

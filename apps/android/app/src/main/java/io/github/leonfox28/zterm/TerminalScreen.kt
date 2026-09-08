@@ -10,6 +10,9 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.Layout
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -30,18 +33,22 @@ import io.github.leonfox28.zterm.nativebridge.NativeSession
     var renaming by remember { mutableStateOf<NativeSession?>(null) }
     var deleting by remember { mutableStateOf<NativeSession?>(null) }
     var taking by remember { mutableStateOf<String?>(null) }
+    var cellHeight by remember { mutableIntStateOf(1) }
     var terminalView by remember { mutableStateOf<TerminalView?>(null) }
     val session = state.sessions.firstOrNull { it.sessionId == state.sessionId }
     val host = state.saved.hosts.firstOrNull { it.id == state.hostId }
     val imeVisible = WindowInsets.isImeVisible
     val imeAnimation = LocalImeAnimation.current
-    val imeAnimating = imeAnimation.running
+    DisposableEffect(terminalView, imeAnimation) {
+        val stop = terminalView?.let { imeAnimation.observe(it::updateImeAnimation) }
+        onDispose { stop?.invoke() }
+    }
     BackHandler(enabled = state.panel || !imeVisible) { if (state.panel) repository.closePanel() else repository.goHome() }
     LaunchedEffect(state.needsSession) { if (state.needsSession) { creating = true; repository.sessionPromptShown() } }
     LaunchedEffect(frame?.inputEpoch, state.sessionId) { modifiers = 0 }
     BoxWithConstraints(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().imePadding()) {
         val panelHeight = (maxHeight * .65f).coerceAtMost(420.dp)
-        Column(Modifier.fillMaxSize()) {
+        TerminalGridLayout(cellHeight, imeAnimation, Modifier.fillMaxSize()) {
             Row(Modifier.fillMaxWidth().height(48.dp), verticalAlignment = Alignment.CenterVertically) {
                 IconAction("back", stringResource(R.string.back)) { repository.goHome() }
                 Row(Modifier.weight(1f).fillMaxHeight().clickable { repository.togglePanel() }, verticalAlignment = Alignment.CenterVertically) {
@@ -52,11 +59,13 @@ import io.github.leonfox28.zterm.nativebridge.NativeSession
                     LineIcon("down", Modifier.padding(horizontal = 12.dp).size(20.dp))
                 }
             }
-            Box(Modifier.weight(1f).fillMaxWidth()) {
-                AndroidView(factory = { context -> TerminalView(context).apply { this.repository = repository; terminalView = this } },
+            Box(Modifier.fillMaxWidth()) {
+                AndroidView(factory = { context -> TerminalView(context).apply {
+                        this.repository = repository; terminalView = this
+                        onCellHeightChanged = { cellHeight = it }; onCellHeightChanged(gridCellHeight)
+                    } },
                     modifier = Modifier.fillMaxSize(), onRelease = { terminalView = null }, update = { view ->
                         view.imeAnimating = { imeAnimation.running }
-                        view.updateImeAnimation(imeAnimating)
                         view.pendingModifiers = { modifiers }; view.consumedModifiers = { modifiers = 0 }
                         view.update(frame, state.saved.preferences.fontSize)
                     })
@@ -81,7 +90,7 @@ import io.github.leonfox28.zterm.nativebridge.NativeSession
                         }
                     }
                 }
-                if (terminalState in setOf("synchronizing", "reconnecting")) {
+                if (terminalState == "reconnecting" || terminalState == "synchronizing" && frame?.inputReady != true) {
                     LinearProgressIndicator(Modifier.align(Alignment.TopCenter).fillMaxWidth())
                 }
                 val notice = state.error ?: frame?.notice
@@ -171,6 +180,32 @@ import io.github.leonfox28.zterm.nativebridge.NativeSession
         val name = state.sessions.firstOrNull { it.sessionId == id }?.name
         ConfirmDialog(stringResource(R.string.takeover), name?.let { "$it\n" }.orEmpty() + stringResource(R.string.takeover_message), stringResource(R.string.takeover), { taking = null }) {
             taking = null; repository.selectSession(id,true)
+        }
+    }
+}
+/** The fifth, unoccupied area is below the fixed toolbar, inside the already consumed insets. */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable private fun TerminalGridLayout(cellHeight: Int, imeAnimation: ImeAnimationState, modifier: Modifier, content: @Composable () -> Unit) {
+    val density = LocalDensity.current
+    val ime = WindowInsets.ime
+    val start = WindowInsets.imeAnimationSource
+    val end = WindowInsets.imeAnimationTarget
+    val navigation = WindowInsets.navigationBars
+    Layout(content = content, modifier = modifier) { children, constraints ->
+        val chromeConstraints = constraints.copy(minHeight = 0)
+        val header = children[0].measure(chromeConstraints)
+        val divider = children[2].measure(chromeConstraints)
+        val toolbar = children[3].measure(chromeConstraints)
+        val available = (constraints.maxHeight - header.height - divider.height - toolbar.height).coerceAtLeast(0)
+        val nav = navigation.getBottom(density)
+        val remainder = terminalBottomRemainder(available, cellHeight, maxOf(nav, ime.getBottom(density)),
+            maxOf(nav, start.getBottom(density)), maxOf(nav, end.getBottom(density)), imeAnimation.running)
+        val terminal = children[1].measure(Constraints.fixed(constraints.maxWidth, available - remainder))
+        layout(constraints.maxWidth, constraints.maxHeight) {
+            header.placeRelative(0, 0)
+            terminal.placeRelative(0, header.height)
+            divider.placeRelative(0, header.height + terminal.height)
+            toolbar.placeRelative(0, header.height + terminal.height + divider.height)
         }
     }
 }

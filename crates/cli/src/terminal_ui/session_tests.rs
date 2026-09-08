@@ -102,6 +102,7 @@ async fn queued_delta_resize_case(trigger: ResizeTrigger) {
         input_epoch,
         prefix: CommandMode::new(),
         transport_state: TerminalViewTransportState::Active,
+        healthy_resize: false,
         resize_coalescer: ResizeCoalescer::new(layout.child),
         physical_size,
         surface: AttachmentSurface::from_snapshot(&snapshot)
@@ -203,9 +204,12 @@ async fn queued_delta_resize_case(trigger: ResizeTrigger) {
                 .resize(size)
                 .await
                 .expect("synchronization fixture operation succeeds");
+            ui.healthy_resize = true;
+            let epoch = ui.current_input_epoch;
             ui.transition_transport(&pty.slave, TerminalViewTransportState::Synchronizing)
                 .await
                 .expect("synchronization fixture operation succeeds");
+            assert_eq!(ui.current_input_epoch, epoch, "resize keeps the input reader/epoch");
             Some(queued)
         }
         ResizeTrigger::DeferredSnapshot => {
@@ -248,6 +252,13 @@ async fn queued_delta_resize_case(trigger: ResizeTrigger) {
     } else {
         Some(next_snapshot(&mut ui).await)
     };
+    if matches!(trigger, ResizeTrigger::Physical) {
+        ui.handle_event(&pty.slave, TerminalViewEvent::SyncRequired { latest_revision: replacement.as_ref().expect("resize snapshot").revision })
+            .await.expect("healthy sync marker");
+        assert!(ui.viewport.is_live(), "healthy resize must not start a replay queue");
+        assert!(ui.healthy_resize);
+        ui.writer.write_input(b"DURING-RESIZE\n".to_vec()).await.expect("input before ACK");
+    }
     if let Some(queued) = queued {
         ui.handle_event(&pty.slave, TerminalViewEvent::Delta(queued))
             .await

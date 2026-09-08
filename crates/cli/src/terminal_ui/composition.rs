@@ -182,6 +182,9 @@ impl ComposedFrame {
             .map(|live| live.scroll_metrics)
             .unwrap_or_else(|| viewport.scroll_metrics());
         let is_live = live.is_some() || viewport.is_live();
+        let pan_rows = if is_live && surface.cursor.visible && content_size.columns == surface.size.columns {
+            surface.cursor.row.saturating_add(1).saturating_sub(content_size.rows)
+        } else { 0 };
         let mut rows = BTreeMap::new();
         let height = usize::from(content_size.rows);
         let width = usize::from(content_size.columns);
@@ -196,7 +199,7 @@ impl ComposedFrame {
             let mut row = if is_live {
                 surface
                     .rows
-                    .get(row_index)
+                    .get(row_index + usize::from(pan_rows))
                     .map(|row| row.cells.clone())
                     .unwrap_or_default()
             } else if let Some(history) = history_source {
@@ -273,11 +276,11 @@ impl ComposedFrame {
         // A hidden cursor still anchors the outer terminal's IME candidate window.
         let cursor = if transport_state == TerminalViewTransportState::Active
             && is_live
-            && surface.cursor.row < content_size.rows
+            && surface.cursor.row.saturating_sub(pan_rows) < content_size.rows
             && surface.cursor.column < content_size.columns
         {
             ComposedCursor {
-                row: surface.cursor.row,
+                row: surface.cursor.row.saturating_sub(pan_rows),
                 column: surface.cursor.column,
                 visible: surface.cursor.visible,
                 style: surface.cursor.style,

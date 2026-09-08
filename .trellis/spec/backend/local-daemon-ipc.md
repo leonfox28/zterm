@@ -315,8 +315,8 @@ No new crate, background owner, or second Session interpreter is introduced.
   result. Exact success reports the stable SessionId and detaches only the
   view; create-then-attach failure preserves `CreatedSessionAttach`; an
   unprovable post-submit result remains `operation_outcome_unknown`.
-- Each non-`Active` terminal transition advances the input epoch and clears the
-  prefix. Returning to `Active` first joins the old stdin reader, retains queued
+- Initial/recovery/reconnect transitions advance the input epoch and clear the
+  prefix. Returning to `Active` after those transitions first joins the old stdin reader, retains queued
   bytes and drains at most 64 KiB kernel input under the old epoch, advances the
   epoch, installs the replacement reader, and only
   then accepts input. The persistent codec retains physical-reply framing and
@@ -326,7 +326,15 @@ No new crate, background owner, or second Session interpreter is introduced.
   `Synchronizing`, coalesces only the latest observation, and sends no further
   resize until an authoritative `Active` event. If that event finds a different
   pending size, the owner submits it and remains `Synchronizing`; only an
-  `Active` event with no changed pending size reopens input. The owner tracks
+  `Active` event with no changed pending size ends the geometry transition.
+  A local resize from a healthy Active Live attachment sets `healthy_resize`:
+  retain the input reader, keyboard epoch, prefix and ordinary ordered input
+  through Synchronizing/ACK/Active. Do not enter history ResumePending solely
+  for that resize, queue/replay keys, hide its cursor or paint a reconnect state.
+  Real reconnect/gap clears this exception. InputEpoch also tracks an independent
+  geometry generation; stdin reads and fragmented mouse controls retain it so
+  A-B-A can discard stale mouse coordinates without dropping keyboard/paste.
+  The owner tracks
   the last submitted size and suppresses identical repeated signals because a
   semantic no-op need not produce another replacement snapshot or completion
   barrier. Because server output can begin another snapshot after the client
@@ -349,8 +357,8 @@ No new crate, background owner, or second Session interpreter is introduced.
   updates remain `Delta` even across queued resize/sync/Active transitions.
   Full snapshots and explicit resume deltas ACK their exact revision once after
   successful application/presentation. Ordinary deltas only advance the applied
-  revision. `Synchronizing` still fences input and coalesces resize; it grants no
-  ACK authority. No wire-format change, server tolerance, route/application
+  revision. `Synchronizing` coalesces resize and fences input except for the
+  explicit healthy-live resize/return contracts; it grants no ACK authority. No wire-format change, server tolerance, route/application
   branch, retry, or delay participates in this distinction.
 - The raw-terminal UI distinguishes physical size from child size: every local
   and remote view reserves the physical bottom row when rows are at least two;
@@ -474,7 +482,13 @@ No new crate, background owner, or second Session interpreter is introduced.
   flush failure clears the presenter's physical baseline while preserving its
   semantic fallback, makes a best-effort
   DEC 2026 end while preserving the original error, and forces the next retry
-  to perform a full clear plus complete repaint. Raw-mode cleanup begins by
+  to cover every owned final cell, including blanks, retired chrome and neutral
+  physical rows beyond the capped child. Unknown mapping never invents a blank
+  baseline and never emits ED2 before replacement. Same physical coordinates
+  retain resolved-cell diff across layout changes; physical size/reflow changes
+  use full final coverage. Row tails/neutral rows are cleared only as their final
+  result. For equal-width live visible-cursor height shrink, compose the minimum
+  cursor-preserving row pan before comparing final positions. Raw-mode cleanup begins by
   ending DEC 2026, then disables capture/restores the user's terminal on normal
   exit, signal, error, and panic.
 - An Active live `ComposedFrame` preserves in-bounds child cursor row, column,
@@ -724,7 +738,7 @@ No new crate, background owner, or second Session interpreter is introduced.
 | remote tunnel read/write resets or peer connection is lost | one `TransportLost` Closed best effort; frontend emits Reconnecting and independently resumes its attachment |
 | replacement remote tunnel cannot open because the viewer daemon stopped | lifecycle-singleflight `ensure` the same configured viewer daemon, then retry with the frozen SessionId/ResumeViewId/revision/viewport; surface launch failure; local views never auto-restart |
 | initial or replacement snapshot acknowledgement loses its tunnel write | remain Reconnecting/Synchronizing; never emit Active for the dead epoch |
-| entry-Active delta changes Main/Alternate geometry and submits resize | present it and enter Synchronizing, but do not acknowledge the old delta as the new resize epoch |
+| entry-Active live delta changes Main/Alternate geometry and submits resize | present it, enter healthy geometry synchronization and retain input; never ACK the ordinary delta as a resize snapshot |
 | ordinary delta consumed while Synchronizing (including snapshot -> Active -> deferred resize) | apply and record `to_revision`; never send snapshot ACK |
 | correlated ResumeDelta | present the valid contiguous candidate, mark resume presentation ready, ACK exact `to_revision` once; Active completes the input fence |
 | request deadline expires before dispatch | `deadline_exceeded`, no effect begins |
@@ -855,7 +869,8 @@ No new crate, background owner, or second Session interpreter is introduced.
   are suppressed without reordering later Direct/Relay/Unknown transitions.
 - **Bad:** derive chrome from the most recently received coalesced frame, clear
   the gutter while a replacement snapshot is pending, or retain metrics across
-  a resize/reconnect merely because the old terminal pixels are still visible.
+  a reconnect/recovery merely because old terminal pixels are still visible;
+  healthy local resize needs the explicit same-live-attachment exception.
 - **Bad:** append stale-gutter spaces after an Alternate child's full-width
   snapshot, infer the old gutter from an unpresented intermediate layout, or
   commit gutter presentation state while merely building a frame.
@@ -1222,11 +1237,12 @@ runtime.block_on(serve_local(...))?;
 The duplex branch retains the same decoder leftovers and uses bounded control
 state plus latest-only watches instead of a per-revision queue.
 
-A viewport observation is not an Active input fence. Do not send a resize and
-then immediately inject a one-shot input or detach. Keep exact reader-fence
-ordering in pure tests; a process fixture may use bounded idempotent readiness
-probes and must keep resize/signal restoration in a separate deterministic
-phase when their synchronization can race input.
+A viewport observation does not prove recovery has completed. For initial attach,
+reconnect and history return, keep exact reader-fence ordering in pure tests; a
+process fixture may use bounded idempotent readiness probes. Healthy live resize
+is the explicit exception: keyboard input remains valid during the resize, while
+coordinate events require the new geometry generation. Test immediate text once
+in that path; do not add replay or infer recovery readiness from a new size.
 
 The same rule applies before measuring stale-socket shutdown:
 

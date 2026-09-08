@@ -81,7 +81,9 @@ pub struct NativeFrame {
     pub notice: Option<String>,
     /// Input epoch changes only when synchronized admission becomes invalid.
     pub input_epoch: u64,
-    /// Same-attachment return-to-bottom may admit bounded input before its ACK.
+    /// Invalidates coordinates independently of keyboard/IME admission.
+    pub geometry_generation: u64,
+    /// Healthy resize and same-attachment return may admit input before their ACK.
     pub input_ready: bool,
     /// Local reading offset; no separate user-visible history mode.
     pub history_offset: u64,
@@ -136,6 +138,7 @@ pub struct NativeFrameSource {
     page: Arc<zterm_core::viewport_cache::CachedViewportWindow<TerminalSurfaceRow>>,
     offset: u64,
     input_epoch: u64,
+    geometry_generation: u64,
     screen: ActiveScreen,
     origin: Arc<()>,
     modes: TerminalModes,
@@ -574,6 +577,8 @@ async fn run(
     let mut state = "synchronizing";
     let mut generation = 1;
     let mut input_epoch = 1;
+    let mut geometry_generation = 1;
+    let mut healthy_resize = false;
     let mut desired_size = surface.surface.size;
     let mut navigation = Navigation::new(&surface);
     let origin = Arc::new(());
@@ -592,25 +597,31 @@ async fn run(
                     Action::ClearNotice => { navigation.notice = None; Ok(()) },
                     Action::Visible(value) => { navigation.visible = value; prefetch = value; Ok(()) },
                     Action::Resize(viewport) => match viewport.size() {
-                        Ok(size) => { desired_size = size;
-                            if size != surface.surface.size {
-                                navigation.disconnected(); input_epoch += 1;
-                                if state == "active" { state = "synchronizing"; writer.resize(size).await.map_err(Into::into) } else { Ok(()) }
-                            } else { Ok(()) } },
+                        Ok(size) => {
+                            if desired_size != size { geometry_generation += 1; }
+                            desired_size = size;
+                            if size != surface.surface.size && state == "active" {
+                                healthy_resize = navigation.live() && !navigation.selected();
+                                if healthy_resize { navigation.reset(); }
+                                else { navigation.disconnected(); input_epoch += 1; }
+                                state = "synchronizing";
+                                writer.resize(size).await.map_err(Into::into)
+                            } else { Ok(()) }
+                        },
                         Err(error) => Err(error),
                     },
                     Action::Colors(value) => { dark = value;
                         if state == "active" { writer.update_colors(base_colors(value)).await.map_err(Into::into) } else { Ok(()) } },
                     Action::Select { source, row, column } if state == "active" => {
-                        if !source.valid_for(&origin, input_epoch, &surface) { Err(failure("selection_changed")) }
+                        if !source.valid_for(&origin, input_epoch, geometry_generation, &surface) { Err(failure("selection_changed")) }
                         else { navigation.select_source(Arc::clone(&source.page), source.offset, row, column) }
                     },
                     Action::Extend { source, row, column, anchor } if state == "active" => {
-                        if !source.valid_for(&origin, input_epoch, &surface) { Err(failure("selection_changed")) }
+                        if !source.valid_for(&origin, input_epoch, geometry_generation, &surface) { Err(failure("selection_changed")) }
                         else { navigation.extend_source(&source.page, source.offset, row, column, anchor) }
                     },
                     Action::Pointer { source, row, column, wheel_lines } if state == "active" && navigation.live() && !navigation.selected() => {
-                        if !source.valid_for(&origin, input_epoch, &surface) || source.modes != surface.modes()
+                        if !source.valid_for(&origin, input_epoch, geometry_generation, &surface) || source.modes != surface.modes()
                             || source.pointer_mode == NativePointerMode::None || row >= surface.surface.size.rows || column >= surface.surface.size.columns {
                             Err(failure("input_not_ready"))
                         } else {
@@ -623,7 +634,7 @@ async fn run(
                             Ok(request) => { query = request; prefetch = offset != 0; Ok(()) }, Err(error) => Err(error),
                         }
                     },
-                    action @ (Action::Text { .. } | Action::Key { .. }) if (state == "active" || navigation.returning()) && command.input_epoch == input_epoch => {
+                    action @ (Action::Text { .. } | Action::Key { .. }) if (state == "active" || healthy_resize || navigation.returning()) && command.input_epoch == input_epoch => {
                         let bytes = encode_action(action, surface.modes());
                         if bytes.len() > zterm_client::input::RESUME_INPUT_BOUND { Err(failure("resource_limit")) }
                         else if bytes.is_empty() { Ok(()) }
@@ -646,18 +657,25 @@ async fn run(
                     TerminalViewEvent::TransportState(value) => {
                         state = match value { TerminalViewTransportState::Active => "active",
                             TerminalViewTransportState::Reconnecting => "reconnecting", _ => "synchronizing" };
-                        if state == "reconnecting" { navigation.disconnected(); input_epoch += 1; }
+                        if state == "reconnecting" { healthy_resize = false; navigation.disconnected(); input_epoch += 1; }
                         if state == "active" {
+                            healthy_resize = false;
                             if let Some(bytes) = navigation.active() && !bytes.is_empty()
                                 && writer.write_input(bytes).await.is_err() { navigation.reset(); input_epoch += 1; state = "reconnecting"; }
-                            if desired_size != surface.surface.size { state = "synchronizing"; let _ = writer.resize(desired_size).await; }
+                            if state == "active" && desired_size != surface.surface.size {
+                                healthy_resize = navigation.live() && !navigation.selected();
+                                state = "synchronizing";
+                                let _ = writer.resize(desired_size).await;
+                            }
                             let _ = writer.update_colors(base_colors(dark)).await;
                             prefetch = true;
                         }
                         Ok(())
                     },
                     TerminalViewEvent::Snapshot(snapshot) => match AttachmentSurface::from_snapshot(&snapshot) {
-                        Ok(next) => { surface = next; navigation.observe(&surface);
+                        Ok(next) => {
+                            if next.surface.size != surface.surface.size || next.active_screen() != surface.active_screen() { geometry_generation += 1; }
+                            surface = next; navigation.observe(&surface);
                             navigation.snapshot_installed(); writer.snapshot_applied(surface.revision()).await.map_err(Into::into) },
                         Err(_) => Err(failure("malformed_frame")),
                     },
@@ -668,9 +686,11 @@ async fn run(
                             _ => unreachable!("matched delta event"),
                         };
                         match surface.candidate_after_delta(&delta) {
-                            Ok(Some(next)) => { surface = next; navigation.observe(&surface); writer.revision_applied(surface.revision()); prefetch = state == "active";
+                            Ok(Some(next)) => {
+                                if next.surface.size != surface.surface.size || next.active_screen() != surface.active_screen() { geometry_generation += 1; }
+                                surface = next; navigation.observe(&surface); writer.revision_applied(surface.revision()); prefetch = state == "active";
                                 if barrier { navigation.snapshot_installed(); writer.snapshot_applied(surface.revision()).await.map_err(Into::into) } else { Ok(()) } },
-                            Ok(None) => { state = "synchronizing"; writer.request_sync(surface.revision()).await.map_err(Into::into) },
+                            Ok(None) => { healthy_resize = false; input_epoch += 1; state = "synchronizing"; writer.request_sync(surface.revision()).await.map_err(Into::into) },
                             Err(_) => Err(failure("malformed_frame")),
                         }
                     },
@@ -678,8 +698,8 @@ async fn run(
                         Ok(request) => { query = request; prefetch = true; Ok(()) }, Err(error) => Err(error),
                     },
                     TerminalViewEvent::SyncRequired { .. } => { state = "synchronizing"; Ok(()) },
-                    TerminalViewEvent::LeaseLost { .. } => { navigation.disconnected(); input_epoch += 1; state = "lease_lost"; Ok(()) },
-                    TerminalViewEvent::SessionEnded(_) => { navigation.disconnected(); input_epoch += 1; state = "ended"; Ok(()) },
+                    TerminalViewEvent::LeaseLost { .. } => { healthy_resize = false; navigation.disconnected(); input_epoch += 1; state = "lease_lost"; Ok(()) },
+                    TerminalViewEvent::SessionEnded(_) => { healthy_resize = false; navigation.disconnected(); input_epoch += 1; state = "ended"; Ok(()) },
                     TerminalViewEvent::ConnectionStatus(_) | TerminalViewEvent::ClipboardWrite(_) => Ok(()),
                 },
                 Ok(None) => break,
@@ -703,6 +723,7 @@ async fn run(
         });
         if error.is_some() {
             state = "closed";
+            healthy_resize = false;
             navigation.disconnected();
             input_epoch += 1;
         }
@@ -714,6 +735,8 @@ async fn run(
             dark,
             &mut navigation,
             input_epoch,
+            geometry_generation,
+            healthy_resize,
             &origin,
         ));
         if error.is_some() || matches!(state, "ended" | "lease_lost") {
@@ -730,6 +753,8 @@ async fn run(
             dark,
             &mut navigation,
             input_epoch + 1,
+            geometry_generation + 1,
+            false,
             &origin,
         ));
     }
@@ -939,6 +964,7 @@ fn project(
         notice: None,
         source: None,
         input_epoch: 1,
+        geometry_generation: 1,
         input_ready: state == "active",
         history_offset: 0,
         first_row: surface
@@ -1025,6 +1051,8 @@ fn project_navigation(
     dark: bool,
     navigation: &mut Navigation,
     input_epoch: u64,
+    geometry_generation: u64,
+    healthy_resize: bool,
     origin: &Arc<()>,
 ) -> NativeFrame {
     let frozen_rows = (!navigation.live()).then(|| navigation.rows()).flatten();
@@ -1037,7 +1065,10 @@ fn project_navigation(
         frozen_rows.unwrap_or(&surface.surface.rows),
     );
     frame.input_epoch = input_epoch;
-    frame.input_ready = state == "active" || (state == "synchronizing" && navigation.returning());
+    frame.geometry_generation = geometry_generation;
+    frame.input_ready = state == "active"
+        || (state == "synchronizing" && (healthy_resize || navigation.returning()));
+    frame.cursor_visible = surface.surface.cursor.visible && (state == "active" || healthy_resize);
     frame.history_offset = navigation.offset();
     if state == "active" && navigation.live() && !navigation.selected() {
         frame.pointer_mode = NativePointerMode::for_surface(surface);
@@ -1046,13 +1077,14 @@ fn project_navigation(
         frame.cursor_visible = false;
         frame.first_row = navigation.first_row().unwrap_or(frame.first_row);
     }
-    if frame.input_ready
+    if state == "active"
         && let Some((page, offset)) = navigation.frame_source(surface)
     {
         frame.source = Some(Arc::new(NativeFrameSource {
             page,
             offset,
             input_epoch,
+            geometry_generation,
             screen: surface.active_screen(),
             origin: Arc::clone(origin),
             modes: surface.modes(),
@@ -1073,9 +1105,16 @@ fn project_navigation(
 }
 
 impl NativeFrameSource {
-    fn valid_for(&self, origin: &Arc<()>, input_epoch: u64, surface: &AttachmentSurface) -> bool {
+    fn valid_for(
+        &self,
+        origin: &Arc<()>,
+        input_epoch: u64,
+        geometry_generation: u64,
+        surface: &AttachmentSurface,
+    ) -> bool {
         Arc::ptr_eq(&self.origin, origin)
             && self.input_epoch == input_epoch
+            && self.geometry_generation == geometry_generation
             && self.screen == surface.active_screen()
             && self.page.anchor.viewport == surface.surface.size
     }
