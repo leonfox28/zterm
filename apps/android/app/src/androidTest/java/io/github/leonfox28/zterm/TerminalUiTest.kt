@@ -160,7 +160,7 @@ print('SCENE_DONE')
             ui.waitUntil { repository.state.value.saved.preferences.language == "en" && !repository.state.value.busy }
             ui.onAllNodesWithText(host.name).onLast().performClick()
             ui.waitUntil(20_000) { repository.state.value.route == Route.Terminal && !repository.state.value.busy }
-            if (!repository.state.value.needsSession && !repository.state.value.panel) {
+            if (!repository.state.value.panel) {
                 ui.onAllNodesWithText(host.name).onFirst().performClick()
             }
             if (ui.onAllNodesWithText("Name").fetchSemanticsNodes().isEmpty()) ui.onNodeWithText("New session").performClick()

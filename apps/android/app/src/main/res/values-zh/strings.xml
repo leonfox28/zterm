@@ -45,6 +45,8 @@
     <string name="retry">重试</string>
     <string name="connecting">连接中…</string>
     <string name="reconnecting">重连中…</string>
+    <string name="connected">已连接</string>
+    <string name="disconnected">已断开</string>
     <string name="session_ended">会话已结束</string>
     <string name="lease_lost">已在其他设备连接</string>
     <string name="allow_camera">允许相机</string>

@@ -3,6 +3,7 @@ package io.github.leonfox28.zterm
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.platform.app.InstrumentationRegistry
 import io.github.leonfox28.zterm.nativebridge.NativeViewport
+import io.github.leonfox28.zterm.nativebridge.NativeException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -75,7 +76,17 @@ class AttachGeometryTest {
         val seed = store.loadOrCreateSeed()
         try { runtime.initialize(seed,PlatformNetwork(application) {}.current(),saved.hosts.map { it.native() }) }
         finally { seed.fill(0) }
-        runtime.listSessions(host.id)
+        // Cold endpoint discovery can outlast one read-only request. Wait for
+        // fixture reachability before measuring attach; never retry creation.
+        withTimeout(20_000) {
+            while (true) {
+                try { runtime.listSessions(host.id); break }
+                catch (error: NativeException.RequestFailed) {
+                    if (error.code !in setOf("deadline_exceeded", "transport_unavailable")) throw error
+                    delay(100)
+                }
+            }
+        }
         val owned = runtime.createSession(host.id,"android-attach-size-${System.nanoTime()}",null,NativeViewport(39u,140u),true)
         try {
             store.save(saved.copy(hosts = saved.hosts.map { if (it.id == host.id) it.copy(lastSession = owned.sessionId) else it }))

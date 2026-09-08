@@ -37,8 +37,17 @@ keys. Existing release updates retain their applicationId and signing identity.
 Home has a Settings button, a conditional exact recent-Session card, saved hosts
 and Add host. A host tap goes to Terminal. No Session route exists. Title expansion
 overlays a bounded Session list without resizing the grid; row menus contain
-Rename/Delete only. Creation, destructive deletion and occupied takeover remain
-explicit. Terminal has no overflow, app-bar keyboard button or history/live/line
+Rename/Delete only. Named creation, destructive deletion and occupied takeover
+remain explicit. Machine entry (host/recent/pairing) and Retry first list live
+Sessions. Reuse the remembered ID if present; after authoritative absence, clear
+matching saved references and attach one unoccupied Session, offer selection for
+multiple/occupied Sessions, or call `connectDefaultTerminal` for an empty list.
+Only default attachment may create reserved `main`; ordinary named creation
+cannot. Store `NativeTerminal.sessionId()` as the authoritative result. Timeout,
+authorization, occupancy and ambiguous outcomes never prove absence. SessionEnded
+alone never triggers replacement; explicit row selection remains exact. Fence
+all suspended selection/default-attach results by navigation epoch.
+Terminal has no overflow, app-bar keyboard button or history/live/line
 count banners. Eight shortcuts and a rightmost keyboard show/hide button stay
 above IME/insets during scroll and selection. Use the same TextButton, zero
 content padding and equal-width 48 dp row slot for every control, including the
@@ -109,8 +118,15 @@ View metadata acknowledgements. A late live frame must not erase local motion.
 Repository resolves `NativeFrameSource.presentationRows()` off Main only when
 attachment-local `contentGeneration` changes, then reuses the immutable row list.
 Compose observes only `TerminalStatus`; the direct View observer owns content
-frames. Kotlin row windows are bounded to three viewports plus one row, separately
-from native cache budgets. API 29+ hardware Canvas reuses `TerminalRowRenderer`
+frames. Include typed `connectionPath` and nullable `rttMs` in that metadata
+projection. The fixed 48 dp header keeps title and host, reserves subtitle space
+for connection state/latency and ellipsizes long host names. `Direct` and `Relay`
+are non-translatable English resources in every app/system locale. Other states
+are localized; unknown RTT is `— ms`. Initial synchronization without a known
+path shows Connecting; healthy synchronization retains established route/RTT.
+
+Kotlin row windows are bounded to three viewports plus one row, separately from
+native cache budgets. API 29+ hardware Canvas reuses `TerminalRowRenderer`
 RenderNodes for equal logical row/cell content, bounded to three viewports plus
 one entry. Font/width/geometry changes, background and detach discard lists.
 Check `hasDisplayList()` before reuse. API 26–28 and software Canvas use the same
@@ -227,7 +243,9 @@ release diagnostic UI is added.
 | Manual invalid credentials | Keep editable field; close/Back/outside dismiss |
 | Storage failure | No successful saved-host claim or regenerated seed |
 | More than 32 hosts / state above 256 KiB | Reject before replacing valid stored document |
-| Actual disconnection | No queued input replay; preserve last complete pixels |
+| Actual disconnection | No queued input replay; preserve last complete pixels; clear route/RTT |
+| Missing saved Session, successful empty list | Default attach main, persist returned ID |
+| Failed Session list or unknown mutation outcome | Show failure; no blind default creation |
 | Theme/locale recreation | Keep application identity, Session and unchanged-geometry selection |
 | Different APK signature | Android rejects update; do not silently uninstall user data |
 
@@ -235,15 +253,21 @@ release diagnostic UI is added.
 
 Good: long-press a glyph, drag through three screens, use native Copy and preserve
 exact Unicode; background/recreate the Activity and resume the same Session.
-Base: initial settings follow system, and a host with no saved Session offers
-explicit creation. Bad: app-owned album UI, tapping a host silently creating a
-Session, rebuilding the native runtime on rotation or calling clipboard APIs
+Base: initial settings follow system, and entering a host with an empty live
+list opens default main. Bad: creating on a failed list request, taking over an
+occupied Session implicitly, rebuilding the native runtime on rotation or calling clipboard APIs
 merely when the scanner opens.
 
 ## 6. Tests and assertion points
 
 Run Android lint/JVM checks, bridge/identity instrumentation and focused real-host
-tests. `TerminalUiTest` drives production IME/gestures, edge selection and system
+tests. `ReconnectRecoveryTest` uses a fresh ticket/disposable host with
+`reconnectFixture=1`; optional `daemonRestart=1` coordinates `reconnect-ready` /
+`reconnect-restarted` cache markers. It checks stale recent/default creation,
+actual restart/Retry, saved identity, live reuse, one/multiple/occupied candidates,
+input and Back fencing. `ConnectionStatusUiTest` checks fixed English route labels
+in all language settings, narrow layout and connecting/unknown/reconnect/end/sync
+projection. Do not treat a compiled APK as runtime evidence. `TerminalUiTest` drives production IME/gestures, edge selection and system
 Copy, verifies three measured screens, all nine locale/theme pairs, persistence,
 overlay dimensions, cache resource bounds and Activity retention. IME geometry
 acceptance requires a full software keyboard: Gboard's physical-keyboard side
@@ -279,6 +303,10 @@ Do not infer phone frame rates or natural content-stall counts from that samplin
 Wrong: release frame-source objects whenever Compose skips a frame, before the
 native View has retained what it drew. Correct: Repository synchronous observers
 and independent pending/drawn handles define explicit ownership.
+
+Wrong: retry a remembered missing ID forever or treat a network error as an empty
+host. Correct: resolve existence from a successful live list and use the shared
+default-main attachment only for an empty result.
 
 Wrong: copy every `.so` left in Cargo's target directory. Correct: copy only the
 current bridge artifact, then verify every packaged library's ELF/zip alignment.

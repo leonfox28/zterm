@@ -659,6 +659,7 @@ mod tests {
             ));
             let (commands, _receiver) = mpsc::channel(1);
             let terminal = NativeTerminal {
+                session_id: zterm_core::SessionId::from_array([1; 16]),
                 commands,
                 frame,
                 cancel: CancellationToken::new(),

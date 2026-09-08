@@ -30,15 +30,25 @@ system picker at the lower left, or open the manual dialog at the lower right.
 An image containing several valid tickets offers a device choice. Successful
 pairing saves the known host before opening its terminal.
 
-A saved host restores its last exact Session. An ended Session stays ended;
-the app does not silently create or take over another Session. Without a saved
-Session, one available Session opens directly, while zero/multiple Sessions
-offer explicit creation or selection. Tap the terminal title to expand the
+A saved host or recent card restores its remembered Session when it is still
+live. If it has ended (including after a daemon restart), the app checks the
+host's live Sessions: one available Session opens directly, multiple or occupied
+Sessions offer selection, and an empty host opens a new default `main`. The
+terminal's Retry button follows the same rule. An ended terminal remains ended
+until you retry or enter the host again. Taking over another controller still
+requires confirmation. Tap the terminal title to expand the
 Session list. Each row offers Rename and Delete; confirmed deletion ends its
 remote processes. Back to Home detaches and leaves the remote Session running.
 Long-pressing a saved host removes only that device's local saved connection.
 
 ## Terminal
+
+The subtitle shows the machine name, selected connection route and round-trip
+latency, for example `my-mac · Direct · 23 ms`. `Direct` and `Relay` always stay
+English, regardless of language settings. Connecting, reconnecting and ended
+states use the app language; unavailable latency is shown as `— ms`. A real
+disconnect clears old route/latency measurements, while a healthy resize retains
+them. The estimate comes from the selected QUIC path, not terminal history queries.
 
 Swipe and fling to read retained output. Nearby history pages are cached and
 prefetched; there is no separate history screen. Scrolling back to the bottom

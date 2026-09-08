@@ -169,6 +169,7 @@ class TerminalRenderingTest {
     private fun frame(offset: Int, windowOffset: Int, count: Int, maximum: Int = 1000, marker: Int = 995): NativeFrame {
         val first = maximum - windowOffset
         return NativeFrame(
+            connectionPath = NativeConnectionPath.UNKNOWN, rttMs = null,
             pointerMode = NativePointerMode.NONE, source = null,
             stats = NativeNavigationStats(0u, 0u, 0u, 0u, 0u, 0u, 0u), notice = null,
             inputEpoch = 1u, geometryGeneration = 1u, inputReady = true,
