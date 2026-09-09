@@ -5687,7 +5687,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zterm-android"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "iroh",
  "tokio",
@@ -5701,7 +5701,7 @@ dependencies = [
 
 [[package]]
 name = "zterm-cli"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "arboard",
  "base64",
@@ -5724,7 +5724,7 @@ dependencies = [
 
 [[package]]
 name = "zterm-client"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "futures-util",
  "iroh",
@@ -5740,7 +5740,7 @@ dependencies = [
 
 [[package]]
 name = "zterm-core"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "ring",
  "semver",
@@ -5751,7 +5751,7 @@ dependencies = [
 
 [[package]]
 name = "zterm-daemon"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "anyhow",
  "flate2",
@@ -5785,7 +5785,7 @@ dependencies = [
 
 [[package]]
 name = "zterm-platform"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "nix 0.28.0",
  "portable-pty",
@@ -5795,7 +5795,7 @@ dependencies = [
 
 [[package]]
 name = "zterm-proto"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "base64",
  "prost",
@@ -5807,7 +5807,7 @@ dependencies = [
 
 [[package]]
 name = "zterm-release-tool"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "anyhow",
  "flate2",
@@ -5822,7 +5822,7 @@ dependencies = [
 
 [[package]]
 name = "zterm-terminal"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "alacritty_terminal",
  "base64",
@@ -5832,7 +5832,7 @@ dependencies = [
 
 [[package]]
 name = "zterm-uniffi-bindgen"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "uniffi",
 ]
