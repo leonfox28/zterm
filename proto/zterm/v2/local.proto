@@ -121,6 +121,7 @@ message LocalConnectionProgress {
 // authorization, and service-stream admission have all succeeded.
 message LocalSessionTunnelOpened {
   uint32 protocol_version = 1;
+  optional uint64 remote_capabilities = 2;
 }
 
 // Opaque target Session bytes. Chunk boundaries have no Session meaning.

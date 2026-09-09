@@ -82,6 +82,7 @@ pub fn endpoint_builder(secret: SecretKey, dns: iroh::dns::DnsResolver) -> iroh:
 
 #[derive(Clone)]
 struct NormalConnection {
+    capabilities: zterm_core::Capabilities,
     connection: Connection,
     generation: AuthGeneration,
     verified_relay: Option<RelayHint>,
@@ -447,7 +448,7 @@ impl IrohController {
                 let welcome = controller_handshake(connection, &self.inner.identity,
                     ConnectionAttemptId::from_array(random_bytes()?),
                     self.inner.limits.max_pair_hello_frame_bytes, deadline).await?;
-                let normal = NormalConnection { connection: guard.0.take().expect("validated connection remains present"), generation: welcome.accepted_authorization_generation(), verified_relay: relay };
+                let normal = NormalConnection { capabilities: welcome.capabilities(), connection: guard.0.take().expect("validated connection remains present"), generation: welcome.accepted_authorization_generation(), verified_relay: relay };
                 *slot = Some(normal.clone());
                 Ok(normal)
             }) => result?,
@@ -459,6 +460,31 @@ impl IrohController {
         peer: &Arc<Peer>,
         deadline: Instant,
     ) -> Result<IrohSessionIo, ClientError> {
+        let (normal, permit, send, recv) = self.admitted_stream(remote, peer, deadline).await?;
+        Ok(IrohSessionIo {
+            connection: normal.connection,
+            last_path: None,
+            send,
+            recv,
+            decoder: FrameDecoder::new(),
+            queued: VecDeque::new(),
+            _permit: permit,
+        })
+    }
+    async fn admitted_stream(
+        &self,
+        remote: DeviceId,
+        peer: &Arc<Peer>,
+        deadline: Instant,
+    ) -> Result<
+        (
+            NormalConnection,
+            OwnedSemaphorePermit,
+            SendStream,
+            RecvStream,
+        ),
+        ClientError,
+    > {
         let normal = self.normal(remote, peer, deadline).await?;
         let permit = timeout_until(deadline, Arc::clone(&peer.streams).acquire_owned())
             .await?
@@ -469,15 +495,7 @@ impl IrohController {
         if peer.cancelled.is_cancelled() {
             return Err(attachment_cancelled());
         }
-        Ok(IrohSessionIo {
-            connection: normal.connection,
-            last_path: None,
-            send,
-            recv,
-            decoder: FrameDecoder::new(),
-            queued: VecDeque::new(),
-            _permit: permit,
-        })
+        Ok((normal, permit, send, recv))
     }
     /// Pairs a validated one-time ticket and resolves ambiguity on the normal ALPN.
     /// The caller must persist the returned host before reporting success to the UI.
@@ -705,6 +723,32 @@ struct IrohSessionIo {
     decoder: FrameDecoder,
     queued: VecDeque<DecodedFrame>,
     _permit: OwnedSemaphorePermit,
+}
+impl crate::upload::UploadConnector for IrohController {
+    fn open_upload(
+        &self,
+        target: ResolvedSessionTarget,
+    ) -> TransportFuture<'_, Result<crate::upload::UploadConnection, ClientError>> {
+        Box::pin(async move {
+            let remote = require_remote(target)?;
+            let peer = self.peer(remote, None)?;
+            let (normal, permit, send, recv) = self
+                .admitted_stream(
+                    remote,
+                    &peer,
+                    Instant::now() + crate::protocol::DEFAULT_DEADLINE,
+                )
+                .await?;
+            Ok(crate::upload::UploadConnection {
+                capabilities: normal.capabilities,
+                reader: Box::new(crate::upload::FramedUploadReader::new(
+                    recv,
+                    (normal.connection, permit),
+                )),
+                writer: Box::new(crate::upload::AsyncUploadWriter(send)),
+            })
+        })
+    }
 }
 impl AttachmentIo for IrohSessionIo {
     fn queued_session_count(&self) -> usize {

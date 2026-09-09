@@ -7,7 +7,6 @@ use std::future::Future;
 use std::future::pending;
 #[cfg(unix)]
 use std::pin::Pin;
-#[cfg(unix)]
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -380,6 +379,7 @@ enum CandidateSide {
 }
 
 struct Candidate {
+    remote_capabilities: OnceLock<zterm_core::Capabilities>,
     key: ConnectionCandidateKey,
     remote: DeviceId,
     connection: Connection,
@@ -666,6 +666,16 @@ impl fmt::Debug for AuthenticatedBiStream {
 }
 
 impl AuthenticatedBiStream {
+    /// Handshake capabilities of the exact candidate selected for this stream.
+    #[cfg(unix)]
+    pub fn remote_capabilities(&self) -> zterm_core::Capabilities {
+        self.candidate_observer
+            .candidate
+            .remote_capabilities
+            .get()
+            .copied()
+            .unwrap_or_default()
+    }
     /// Remote device whose receiver admitted this host.
     #[must_use]
     pub const fn remote(&self) -> DeviceId {
@@ -1954,6 +1964,7 @@ impl ConnectionBroker {
                 deadline,
             )
             .await?;
+            let _ = candidate.remote_capabilities.set(welcome.capabilities());
             {
                 let mut state = slot.state.lock().await;
                 state.remote_acceptance = Some(welcome.accepted_authorization_generation());
@@ -2033,6 +2044,7 @@ impl ConnectionBroker {
             self.inner.limits,
         )?;
         let slot = self.peer_slot(remote);
+        let _ = candidate.remote_capabilities.set(hello.capabilities());
         self.register_candidate(&slot, Arc::clone(&candidate))
             .await?;
 
@@ -2477,6 +2489,7 @@ impl Candidate {
         let metric = ConnectionMetricGuard::new(Arc::clone(&metrics))?;
         let (cancel, _) = watch::channel(false);
         Ok(Arc::new(Self {
+            remote_capabilities: OnceLock::new(),
             key,
             remote,
             connection,
@@ -3132,7 +3145,8 @@ fn protocol_error(error: zterm_proto::ProtocolError) -> DaemonError {
         | ProtocolError::InvalidTerminalSize { .. }
         | ProtocolError::InvalidTerminalSurface(_)
         | ProtocolError::InvalidLocalConnectionStage
-        | ProtocolError::InvalidTerminalSemanticField(_) => DomainErrorKind::MalformedFrame,
+        | ProtocolError::InvalidTerminalSemanticField(_)
+        | ProtocolError::InvalidUpload(_) => DomainErrorKind::MalformedFrame,
     };
     DaemonError::new(kind, error.to_string())
 }

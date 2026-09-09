@@ -16,6 +16,60 @@ pub struct FirstFrame {
     pub queued: VecDeque<DecodedFrame>,
 }
 
+/// Cancellation-safe framed reader reused by independent streaming services.
+pub struct FrameReader<R> {
+    reader: R,
+    decoder: FrameDecoder,
+    queued: VecDeque<DecodedFrame>,
+}
+
+impl<R: AsyncRead + Unpin> FrameReader<R> {
+    /// Starts framing a fresh stream.
+    pub fn new(reader: R) -> Self {
+        Self {
+            reader,
+            decoder: FrameDecoder::new(),
+            queued: VecDeque::new(),
+        }
+    }
+
+    /// Continues after a dispatcher consumed the first frame.
+    pub fn after_first(reader: R, first: FirstFrame) -> Self {
+        Self {
+            reader,
+            decoder: first.decoder,
+            queued: first.queued,
+        }
+    }
+
+    /// Reads one frame, retaining partial and coalesced bytes across cancellation.
+    pub async fn read(&mut self) -> Result<DecodedFrame, ClientError> {
+        loop {
+            if let Some(frame) = self.queued.pop_front() {
+                return Ok(frame);
+            }
+            let mut bytes = [0_u8; 16 * 1024];
+            let length = self.reader.read(&mut bytes).await.map_err(|_| {
+                ClientError::new(
+                    DomainErrorKind::TransportUnavailable,
+                    "service stream read failed",
+                )
+            })?;
+            if length == 0 {
+                return Err(ClientError::new(
+                    DomainErrorKind::TransportUnavailable,
+                    "service stream closed",
+                ));
+            }
+            self.queued.extend(
+                self.decoder
+                    .feed(&bytes[..length])
+                    .map_err(protocol_error)?,
+            );
+        }
+    }
+}
+
 /// Reads exactly through the first complete frame while retaining decoder
 /// state and any additional frames received by the same bounded read.
 pub async fn read_first<Reader>(reader: &mut Reader) -> Result<FirstFrame, ClientError>

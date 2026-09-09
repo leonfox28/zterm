@@ -25,6 +25,9 @@ confidence-threshold = 0.8
 # Keep non-baseline licenses scoped to the exact transitive crates introduced by
 # pinned Iroh and UniFFI instead of allowing them for future dependencies globally.
 exceptions = [
+    # Pinned arboard's target-specific clipboard support uses the Boost license.
+    { crate = "clipboard-win@5.4.1", allow = ["BSL-1.0"] },
+    { crate = "error-code@3.4.0", allow = ["BSL-1.0"] },
     { crate = "uniffi@0.32.0", allow = ["MPL-2.0"] },
     { crate = "uniffi_bindgen@0.32.0", allow = ["MPL-2.0"] },
     { crate = "uniffi_core@0.32.0", allow = ["MPL-2.0"] },

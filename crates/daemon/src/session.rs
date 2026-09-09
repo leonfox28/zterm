@@ -88,6 +88,26 @@ pub enum AttachmentLifecycle {
     SessionEnded(SessionEndReason),
 }
 
+/// Read-only upload authority; dropping it never detaches a terminal.
+#[cfg(unix)]
+pub(crate) struct UploadAdmission {
+    pub(crate) generation: u64,
+    pub(crate) lifecycle: watch::Receiver<AttachmentLifecycle>,
+    pub(crate) detached: Arc<AtomicBool>,
+}
+
+#[cfg(unix)]
+impl UploadAdmission {
+    pub(crate) fn is_current(&self) -> bool {
+        !self.detached.load(Ordering::Acquire)
+            && match *self.lifecycle.borrow() {
+                AttachmentLifecycle::Active { generation } => generation == self.generation,
+                AttachmentLifecycle::AwaitingSnapshot { .. } => true,
+                _ => false,
+            }
+    }
+}
+
 /// One latest terminal update for a synchronized attachment.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AttachmentUpdate {
@@ -770,6 +790,26 @@ impl SessionService {
             takeover: request.takeover,
             base_colors: request.base_colors,
             resume: Some(request.resume),
+            reply,
+        })
+    }
+
+    /// Checks existing controller authority without creating an attachment or lease.
+    #[cfg(unix)]
+    pub(crate) fn admit_upload_until(
+        &self,
+        principal: AttachmentPrincipal,
+        binding: zterm_core::upload::UploadBinding,
+        deadline: Instant,
+    ) -> Result<UploadAdmission, DaemonError> {
+        if !matches!(principal, AttachmentPrincipal::RemoteEndpoint { .. }) {
+            return Err(principal_mismatch());
+        }
+        let actor = self.resolve(&SessionSelector::Id(binding.session_id))?;
+        actor.request(deadline, |meta, reply| SessionCommand::AdmitUpload {
+            meta,
+            principal,
+            attachment_id: binding.attachment_id,
             reply,
         })
     }
@@ -2710,6 +2750,13 @@ enum SessionCommand {
         attachment_id: AttachmentId,
         reply: SyncSender<Result<(), DaemonError>>,
     },
+    #[cfg(unix)]
+    AdmitUpload {
+        meta: CommandMeta,
+        principal: AttachmentPrincipal,
+        attachment_id: AttachmentId,
+        reply: SyncSender<Result<UploadAdmission, DaemonError>>,
+    },
     WriteInput {
         meta: CommandMeta,
         attachment_id: AttachmentId,
@@ -3392,6 +3439,27 @@ fn dispatch_command(
             reply,
         } => respond(actor, meta, reply, || {
             require_existing_visual_sync_controller(runtime, attachment_id).map(|_| ())
+        }),
+        #[cfg(unix)]
+        SessionCommand::AdmitUpload {
+            meta,
+            principal,
+            attachment_id,
+            reply,
+        } => respond(actor, meta, reply, || {
+            let generation = require_existing_visual_sync_controller(runtime, attachment_id)?;
+            let attachment = runtime
+                .attachments
+                .get(&attachment_id)
+                .ok_or_else(lease_lost)?;
+            if attachment.principal != principal || attachment.detached.load(Ordering::Acquire) {
+                return Err(principal_mismatch());
+            }
+            Ok(UploadAdmission {
+                generation,
+                lifecycle: attachment.lifecycle.subscribe(),
+                detached: Arc::clone(&attachment.detached),
+            })
         }),
         SessionCommand::WriteInput {
             meta,

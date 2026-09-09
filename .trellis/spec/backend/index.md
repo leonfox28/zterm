@@ -19,6 +19,7 @@ explicit future task requests them; see [Distribution](./distribution-lifecycle.
 | Guide | Description | Status |
 |-------|-------------|--------|
 | [Shared Client and Android Bridge](./shared-client.md) | Shared outbound protocol ownership, mobile source/input epochs, bounded pages and validation | Active |
+| [Single-file Upload](./file-upload.md) | Shared upload wire/storage, desktop clipboard and mobile picker/input lifetime | Active |
 | [Directory Structure](./directory-structure.md) | Module organization and file layout | To fill |
 | [Database Guidelines](./database-guidelines.md) | ORM patterns, queries, migrations | To fill |
 | [Error Handling](./error-handling.md) | Error types, handling strategies | To fill |

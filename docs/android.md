@@ -56,9 +56,25 @@ uses the locally maintained live surface without another synchronization wait.
 Taking control on another device resizes the same host PTY/terminal to the new
 controller's measured rows and columns after synchronization. Terminal programs
 can redraw and wrapped output can reflow; the shell process and Session ID remain.
-The eight shortcut keys remain
-visible above the system IME. Keyboard animation pans/clips locally and submits
+The eight shortcut keys remain visible above the system IME. The four direction
+arrows use the same 18 dp vector size and stroke as the upload and keyboard icons;
+Esc, Tab, Ctrl and Alt remain text labels. Keyboard animation pans/clips locally and submits
 one final terminal size after the animation settles.
+
+The first two toolbar buttons are **Upload image** (photo icon) and **Upload file**
+(paperclip icon). Each opens its system picker directly, with one selection per
+upload. System Back cancels selection and returns to the same terminal. All file types are
+accepted up to **50 MB (50,000,000 bytes)**; original bytes are preserved. A dialog
+shows preparation, upload progress, file size and speed. Cancel or Back stops the
+operation; tapping outside the dialog does not dismiss it. Failures offer Retry
+and Close, and success restores terminal focus without forcing the keyboard open.
+
+While selecting/preparing/uploading, new child input is discarded and unsubmitted
+IME composition is retained. Output and connection updates continue. Uploads
+survive Activity recreation and backgrounding while this app process remains
+alive; leaving the terminal or losing its attachment cancels the upload. After
+success the private remote path is inserted once without Enter. The host must
+support uploads; storage and retention follow the [desktop upload behavior](./remote-cli.md).
 
 On the live grid, mouse-enabled programs such as Herdr receive completed taps
 and vertical swipes as clicks and wheel input. Programs declaring alternate-scroll

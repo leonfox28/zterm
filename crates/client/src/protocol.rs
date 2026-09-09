@@ -23,6 +23,7 @@ pub fn protocol_error(error: zterm_proto::ProtocolError) -> ClientError {
         | ProtocolError::InvalidTerminalSurface(_)
         | ProtocolError::InvalidLocalConnectionStage
         | ProtocolError::InvalidTerminalSemanticField(_) => DomainErrorKind::MalformedFrame,
+        ProtocolError::InvalidUpload(kind) => kind,
     };
     ClientError::new(kind, error.to_string())
 }

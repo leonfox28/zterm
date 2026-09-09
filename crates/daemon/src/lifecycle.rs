@@ -278,7 +278,13 @@ fn run_daemon_with_network_mode(
             authorization.preload(authorizations)?;
             let directory = DeviceDirectory::new(store_handle.clone());
             let connection_identity =
-                ConnectionIdentity::product(setup.device_id, setup.config.device_name.clone())?;
+                ConnectionIdentity::product(setup.device_id, setup.config.device_name.clone())?
+                    .with_capabilities(zterm_core::Capabilities::from_bits_retain(
+                        zterm_core::Capabilities::LOCAL_LIFECYCLE
+                            | zterm_core::Capabilities::SESSION_SERVICE
+                            | zterm_core::Capabilities::TERMINAL_SERVICE
+                            | zterm_core::Capabilities::FILE_UPLOAD_SERVICE,
+                    ));
             let profile = InfrastructureProfile::from_validated(&setup.config.infrastructure);
             let limits = zterm_core::TransportLimits::default();
             let (network_startup, network_handle) = NetworkStartup::prepare(

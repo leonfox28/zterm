@@ -263,3 +263,10 @@ replaying old dial stages for an existing connection, or retaining the observer
 through later reconnect. Tests must check actual fragmented/coalesced local
 prefixes, unchanged final responses, burst retention and clone retirement; a
 copied list of labels alone is not evidence.
+
+## Upload ownership
+
+`zterm-client::upload` owns one bounded, non-replayed upload over `UploadConnector`.
+The terminal driver captures `UploadOrigin` and validates it again for final input;
+a stale upload-input error is local and must not close a replacement driver.
+See [Single-file Upload](./file-upload.md) for signatures and queue/IME fences.

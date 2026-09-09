@@ -51,15 +51,21 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
         // releases its predecessor. Unobserved frames never wait for JVM GC.
         frameObservers.toList().forEach { it(next) }
         mutableFrame.value = next
+        uploads.authorityChanged()
         if (previous !== next) previous?.source?.close()
     }
     private var terminal: NativeTerminal? = null
     private var observation: Job? = null
     private var operation: Job? = null
     private var epoch = 0L
+    val uploads = TerminalUploads(context.applicationContext, scope) {
+        val target = terminal
+        val snapshot = frame.value
+        if (target != null && snapshot?.inputReady == true && state.value.route == Route.Terminal) target to snapshot.inputEpoch else null
+    }
     private var viewport = NativeViewport(24u, 80u)
     private var dark = true
-    private data class Input(val attachment: Long, val nativeEpoch: ULong, val action: suspend (NativeTerminal, ULong) -> Unit, val source: NativeFrameSource? = null)
+    private data class Input(val attachment: Long, val nativeEpoch: ULong, val action: suspend (NativeTerminal, ULong) -> Unit, val source: NativeFrameSource? = null, val uploadVersion: Long)
     private val keys = Channel<Input>(32)
     private data class Scroll(val attachment: Long, val offset: ULong, val older: Boolean, val horizon: UByte)
     private val scrolls = Channel<Scroll>(Channel.CONFLATED)
@@ -74,6 +80,7 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
                 try {
                     val target = terminal ?: continue
                     if (input.attachment != epoch) continue
+                    if (uploads.paused || input.uploadVersion != uploads.inputVersion) continue
                     if (input.nativeEpoch != frame.value?.inputEpoch) {
                         mutable.update { it.copy(error = "input_not_ready") }; continue
                     }
@@ -301,6 +308,7 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
         mutable.update { it.copy(route = Route.Home, hostId = null, sessionId = null, sessions = emptyList()) }
     }
     private suspend fun retire(): Long {
+        uploads.retire()
         val mine = ++epoch
         scrollIntent = null
         val observer = observation
@@ -317,6 +325,7 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
         return mine
     }
     fun goHome() {
+        uploads.retire()
         ++epoch
         mutable.update { it.copy(route = Route.Home) }
         scope.launch {
@@ -325,7 +334,7 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
         }
     }
     fun text(text: String, modifiers: Int = 0, paste: Boolean = false): Boolean {
-        if (text.isEmpty()) return frame.value?.inputReady == true
+        if (text.isEmpty()) return frame.value?.inputReady == true && !uploads.paused
         return enqueue { target, admitted -> target.commitText(admitted, text, modifiers.toUByte(), paste) }
     }
     fun key(key: NativeKey, modifiers: Int = 0, kind: Int = 1, text: String = ""): Boolean {
@@ -336,16 +345,18 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
         repeat(after) { target.sendKey(admitted, NativeKey.Delete, modifiers.toUByte(), 1u, "") }
     }
     fun pointer(source: NativeFrameSource, row: Int, column: Int, wheelLines: Int = 0) {
+        if (uploads.paused) return
         val snapshot = frame.value ?: return
         if (snapshot.state != "active" || snapshot.pointerMode == NativePointerMode.NONE) return
         val held = source.retained()
-        val input = Input(epoch, snapshot.inputEpoch, { target, _ -> target.sendPointer(held, row.toUShort(), column.toUShort(), wheelLines.toShort()) }, held)
+        val input = Input(epoch, snapshot.inputEpoch, { target, _ -> target.sendPointer(held, row.toUShort(), column.toUShort(), wheelLines.toShort()) }, held, uploads.inputVersion)
         if (!keys.trySend(input).isSuccess) { held.close(); mutable.update { it.copy(error = "resource_limit") } }
     }
     private fun enqueue(action: suspend (NativeTerminal, ULong) -> Unit): Boolean {
+        if (uploads.paused) return false
         val snapshot = frame.value ?: return false
         if (!snapshot.inputReady || terminal == null) return false
-        val accepted = keys.trySend(Input(epoch,snapshot.inputEpoch,action)).isSuccess
+        val accepted = keys.trySend(Input(epoch,snapshot.inputEpoch,action, uploadVersion = uploads.inputVersion)).isSuccess
         if (!accepted) mutable.update { it.copy(error = "resource_limit") }
         else { scrollIntent = 0; ++scrollRequestGeneration }
         return accepted

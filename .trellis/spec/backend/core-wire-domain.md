@@ -328,3 +328,10 @@ surface for physical output.
   treating stream loss as an uncorrelated/sentinel response.
 - Re-executing an operation below the replay low-water mark or under a new lease
   after an outcome-unknown result.
+
+## Upload service wire
+
+Upload kinds 400–407 and bit-3 hosting capability use typed DTO validation in
+`zterm-proto::upload`. Chunk frames have a 64 KiB payload plus framing allowance;
+global frame/control caps stay unchanged. See [Single-file Upload](./file-upload.md)
+for state order, correlation, flow control and error contracts.

@@ -48,11 +48,15 @@ authorization, occupancy and ambiguous outcomes never prove absence. SessionEnde
 alone never triggers replacement; explicit row selection remains exact. Fence
 all suspended selection/default-attach results by navigation epoch.
 Terminal has no overflow, app-bar keyboard button or history/live/line
-count banners. Eight shortcuts and a rightmost keyboard show/hide button stay
+count banners. Two upload icons (photo, paperclip), eight shortcuts and a
+rightmost keyboard show/hide button stay
 above IME/insets during scroll and selection. Use the same TextButton, zero
 content padding and equal-width 48 dp row slot for every control, including the
-keyboard icon. Its 18 dp glyph inherits the button content color, so enabled,
-disabled and pressed styling follows the neighboring shortcuts.
+keyboard icon. Image, attachment, four direction arrows and keyboard use 18 dp
+LineIcon vectors with the shared stroke and inherited button content color.
+Keep Esc/Tab/Ctrl/Alt as 13 sp monospace text. Direction vectors have localized
+content descriptions; do not render them as font-dependent arrow characters.
+Enabled, disabled and pressed styling follows the neighboring shortcuts.
 
 `AppState.sessionId` is the exact selected/retry target, not proof of controller
 ownership. Mark a row Current only when its ID matches and the retained native
@@ -345,3 +349,31 @@ asserts endpoint arithmetic, smooth interpolation and the clipped minimum;
 host with `hostName` and an explicit emulator serial; build success is not visual
 or Chinese-composition acceptance. `presentation_fixture` creates independent
 host state and refuses to discover/autostart the user's daemon.
+
+## Retained file uploads
+
+`TerminalUploads` is Application/Repository-owned, reserves native input pause
+before Image/File selection, stages one ContentResolver stream into private cache,
+and observes metadata-only `NativeUploadState`. `TerminalUploadUi` owns only the
+launcher/dialog presentation, with first photo and second paperclip buttons
+opening the respective picker directly. Saved launcher IDs prevent duplicate relaunch after
+Activity recreation; observer startup includes already-published completion.
+Pause uses a separate Repository input version and native odd/even generation,
+not a NativeFrame input epoch change. Preserve IME preedit and healthy resize.
+See [Single-file Upload](../backend/file-upload.md) for limits, errors, cancellation,
+API signatures and `UploadUiTest`/`NativeUploadTest` assertion points.
+
+`UploadPickerUiTest` takes `uploadPickerHost=upload-...` for a test-owned saved
+host. It drives both actual OS pickers, Back cancellation, repeated launch and
+same-Session/IME-epoch retention. Advance Compose's test clock with `ui.waitUntil`
+when waiting for the launcher LaunchedEffect; coroutine sleep alone can leave
+the effect unexecuted in an otherwise healthy app. Preview restarts must not
+leave external picker Activities pointing at a destroyed parent Activity.
+
+Distinguish Android `KEYCODE_BACK` injection from the emulator sidebar's hardware
+Back route. Ask which input was used when a user reports Back failure and preserve
+the current task stack before restarting. With VirtioInput, an AVD configured
+with `hw.keyboard=no` has no virtual keyboard to receive sidebar key events.
+Enable the AVD keyboard device and cold boot for a hardware-key preview, keeping
+`show_ime_with_hard_keyboard=1` for software IME checks. Verify the sidebar itself
+and guest input events; a passing instrumentation test cannot prove this path.

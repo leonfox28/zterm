@@ -693,3 +693,29 @@ Fixed Ghostty palette-query leakage and added actual connection-stage presentati
 
 - Create the PR, wait for required CI including Linux real-Iroh fresh/reuse tests, and merge as requested.
 - Corrected Ghostty and real remote manual smoke remain disclosed follow-up; no live daemon or installed executable was replaced.
+
+
+## Session 27: Remote file uploads and Android toolbar review
+<!-- trellis-session: v=2 fp=38c01e833e022e18 -->
+
+**Date**: 2026-09-09
+**Task**: Remote file uploads and Android toolbar review
+**Branch**: `feat/remote-file-upload`
+
+### Summary
+
+Implemented and user-reviewed desktop clipboard and Android single-file uploads, bounded transfer/storage and original-input authority, progress UI, direct photo/attachment buttons and vector arrows. Full just check and Android checks passed. Resolved emulator sidebar Back by enabling its virtual keyboard device. User authorized v0.1.31 publication through the canonical release operator.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `bce839b` | feat: add remote file uploads for desktop and Android |
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- Prepare v0.1.31 in the feature PR, then complete protected PR/main CI, signing and immutable publication.

@@ -335,7 +335,7 @@ print('SCENE_DONE')
             repeat(3) { gesture(view, .5f, .2f, .5f, .85f, 600); SystemClock.sleep(250) }
             await("scroll again for selection") { (repository.frame.value?.historyOffset ?: 0u) > 5u }
             ui.onNodeWithText("Esc").assertIsDisplayed()
-            ui.onNodeWithText("→").assertIsDisplayed()
+            ui.onNodeWithContentDescription("Right arrow").assertIsDisplayed()
             SystemClock.sleep(350) // Finish the platform fling before placing the long press.
             longPress(view, .15f, .25f)
             await("native selection") { repository.frame.value?.selection != null }

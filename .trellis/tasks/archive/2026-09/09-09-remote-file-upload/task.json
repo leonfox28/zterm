@@ -1,0 +1,30 @@
+{
+  "id": "remote-file-upload",
+  "name": "remote-file-upload",
+  "title": "桌面端与 Android 单文件上传并插入路径",
+  "description": "规划 Ctrl+] v 剪贴板上传、Android 图片/文件单选、50 MB 上限及两端进度展示",
+  "status": "completed",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "leon",
+  "assignee": "leon",
+  "createdAt": "2026-09-09",
+  "completedAt": "2026-09-09",
+  "branch": "feat/remote-file-upload",
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [
+    "09-09-file-upload-service",
+    "09-09-desktop-file-upload",
+    "09-09-android-file-upload"
+  ],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "Implementation and UI review accepted by the user on 2026-09-09; release flow authorized for v0.1.31. Preserve the documented runtime acceptance boundaries in research/validation.md. Complete the work commit and Trellis bookkeeping before canonical release preparation, PR/main CI, signing and immutable publication.",
+  "meta": {}
+}

@@ -91,8 +91,28 @@ import java.util.Locale
             "close" -> { line(6f,6f,18f,18f); line(18f,6f,6f,18f) }
             "down" -> { line(6f,9f,12f,15f); line(12f,15f,18f,9f) }
             "plus" -> { line(12f,5f,12f,19f); line(5f,12f,19f,12f) }
+            "arrow-left" -> { line(21f,12f,3f,12f); line(3f,12f,10f,5f); line(3f,12f,10f,19f) }
+            "arrow-down" -> { line(12f,3f,12f,21f); line(12f,21f,5f,14f); line(12f,21f,19f,14f) }
+            "arrow-up" -> { line(12f,21f,12f,3f); line(12f,3f,5f,10f); line(12f,3f,19f,10f) }
+            "arrow-right" -> { line(3f,12f,21f,12f); line(21f,12f,14f,5f); line(21f,12f,14f,19f) }
             "more" -> for (y in listOf(5f,12f,19f)) drawCircle(color, 1.5f*factor, Offset(12f*factor,y*factor))
             "terminal" -> { line(4f,6f,10f,12f); line(10f,12f,4f,18f); line(13f,18f,21f,18f) }
+            "attachment" -> {
+                val path = Path().apply {
+                    moveTo(21f*factor, 11f*factor)
+                    lineTo(12f*factor, 20f*factor)
+                    cubicTo(9.8f*factor,22.2f*factor,6.2f*factor,22.2f*factor,4f*factor,20f*factor)
+                    cubicTo(1.8f*factor,17.8f*factor,1.8f*factor,14.2f*factor,4f*factor,12f*factor)
+                    lineTo(13f*factor, 3f*factor)
+                    cubicTo(14.4f*factor,1.6f*factor,16.6f*factor,1.6f*factor,18f*factor,3f*factor)
+                    cubicTo(19.4f*factor,4.4f*factor,19.4f*factor,6.6f*factor,18f*factor,8f*factor)
+                    lineTo(9f*factor,17f*factor)
+                    cubicTo(8.3f*factor,17.7f*factor,7.2f*factor,17.7f*factor,6.5f*factor,17f*factor)
+                    cubicTo(5.8f*factor,16.3f*factor,5.8f*factor,15.2f*factor,6.5f*factor,14.5f*factor)
+                    lineTo(15f*factor,6f*factor)
+                }
+                drawPath(path,color,style=Stroke(stroke, cap=androidx.compose.ui.graphics.StrokeCap.Round, join=androidx.compose.ui.graphics.StrokeJoin.Round))
+            }
             "keyboard" -> {
                 drawRoundRect(color, Offset(2f*factor,5f*factor), androidx.compose.ui.geometry.Size(20f*factor,14f*factor), androidx.compose.ui.geometry.CornerRadius(2f*factor), style=Stroke(stroke))
                 for (y in listOf(9f,12f)) for (x in listOf(6f,10f,14f,18f)) line(x,y,x+.5f,y)
@@ -243,6 +263,11 @@ private fun Modifier.semanticsDescription(label: String): Modifier = this.then(M
     "operation_outcome_unknown", "pair_outcome_unknown" -> R.string.outcome_unknown
     "resource_limit", "resource_exhausted" -> R.string.resource_limit
     "input_not_ready" -> R.string.input_unavailable
+    "upload_too_large" -> R.string.upload_too_large
+    "upload_source_invalid", "upload_already_started" -> R.string.upload_source_invalid
+    "upload_storage_failed" -> R.string.upload_storage_failed
+    "upload_outcome_unknown" -> R.string.upload_outcome_unknown
+    "service_not_implemented" -> R.string.upload_upgrade
     "no_qr" -> R.string.no_qr
     "selection_changed" -> R.string.selection_changed
     "history_unavailable" -> R.string.history_unavailable

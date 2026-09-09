@@ -32,6 +32,7 @@ import io.github.leonfox28.zterm.nativebridge.NativeSession
 @OptIn(ExperimentalLayoutApi::class)
 @Composable internal fun TerminalScreen(state: AppState, repository: AppRepository) {
     val frame by repository.terminalStatus.collectAsStateWithLifecycle()
+    val upload by repository.uploads.state.collectAsStateWithLifecycle()
     var modifiers by remember { mutableIntStateOf(0) }
     var creating by remember { mutableStateOf(false) }
     var renaming by remember { mutableStateOf<NativeSession?>(null) }
@@ -120,16 +121,28 @@ import io.github.leonfox28.zterm.nativebridge.NativeSession
             }
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
             Row(Modifier.fillMaxWidth().height(48.dp).padding(horizontal = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+                UploadToolbarButtons(repository.uploads, frame?.inputReady == true,
+                    Modifier.weight(1f).fillMaxHeight()) { terminalView?.requestFocus() }
                 val keys = listOf("Esc" to NativeKey.Escape, "Tab" to NativeKey.Tab, "Ctrl" to null, "Alt" to null,
                     "←" to NativeKey.Left, "↓" to NativeKey.Down, "↑" to NativeKey.Up, "→" to NativeKey.Right)
                 keys.forEach { (label,key) ->
                     val bit = when(label) { "Ctrl" -> 4; "Alt" -> 2; else -> 0 }
+                    val arrow = when (key) {
+                        NativeKey.Left -> "arrow-left" to R.string.key_left
+                        NativeKey.Down -> "arrow-down" to R.string.key_down
+                        NativeKey.Up -> "arrow-up" to R.string.key_up
+                        NativeKey.Right -> "arrow-right" to R.string.key_right
+                        else -> null
+                    }
+                    val description = arrow?.let { stringResource(it.second) }
                     TextButton(onClick = {
                         if (bit != 0) modifiers = modifiers xor bit
                         else if (key != null) { repository.key(key,modifiers); repository.key(key,modifiers,3); modifiers = 0 }
-                    }, enabled = frame?.inputReady == true, modifier = Modifier.weight(1f).fillMaxHeight(), contentPadding = PaddingValues(0.dp),
+                    }, enabled = frame?.inputReady == true && upload?.active != true,
+                        modifier = Modifier.weight(1f).fillMaxHeight().semantics { if (description != null) contentDescription = description }, contentPadding = PaddingValues(0.dp),
                         colors = ButtonDefaults.textButtonColors(containerColor = if (bit != 0 && modifiers and bit != 0) MaterialTheme.colorScheme.primaryContainer else androidx.compose.ui.graphics.Color.Transparent)) {
-                        Text(label, fontSize = 13.sp, fontFamily = FontFamily.Monospace)
+                        if (arrow != null) LineIcon(arrow.first, Modifier.size(18.dp))
+                        else Text(label, fontSize = 13.sp, fontFamily = FontFamily.Monospace)
                     }
                 }
                 val keyboardLabel = stringResource(if (imeVisible) R.string.hide_keyboard else R.string.show_keyboard)

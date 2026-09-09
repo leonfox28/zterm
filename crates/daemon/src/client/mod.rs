@@ -18,6 +18,14 @@ pub use session::{LocalAttachmentEvent, LocalTakeoverRetryToken, SessionClient};
 #[cfg(unix)]
 pub(crate) use transport::{RemoteDaemonRestarter, UnixAttachmentConnector};
 
+/// Creates a desktop upload connector using the existing opaque daemon tunnel.
+#[cfg(unix)]
+pub fn upload_connector(
+    socket: impl Into<std::path::PathBuf>,
+) -> std::sync::Arc<dyn zterm_client::upload::UploadConnector> {
+    std::sync::Arc::new(transport::UnixAttachmentConnector::new(socket))
+}
+
 #[cfg(unix)]
 pub(super) use zterm_client::protocol::{
     decode_response, malformed, resource_error, service_error,

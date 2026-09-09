@@ -434,6 +434,12 @@ impl fmt::Debug for LocalRuntime {
 }
 
 impl LocalRuntime {
+    /// Opens upload streams through this runtime's existing local daemon socket.
+    #[cfg(unix)]
+    pub fn upload_connector(&self) -> Arc<dyn zterm_client::upload::UploadConnector> {
+        crate::client::upload_connector(self.paths.socket())
+    }
+
     /// Resolves the effective user's product paths and current executable.
     pub fn current() -> Result<Self, DaemonError> {
         Ok(Self {
