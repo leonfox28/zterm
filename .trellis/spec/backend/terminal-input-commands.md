@@ -25,10 +25,14 @@ CommandMode::route(event: HostInputEvent, now: Instant, report_events: bool)
 PrefixAction::Input(HostInputEvent)
 PrefixAction::Command(LocalCommand)
 LocalCommand::Detach
+LocalCommand::Upload
+LocalCommand::CancelUpload
 ```
 
-`prefix.rs` owns the static `BINDINGS` table. Currently only `.` maps to
-`Detach`. Add future zterm controls to this table and the command executor;
+`prefix.rs` owns the static `BINDINGS` table: `.` maps to `Detach`, `v` to
+`Upload`, and `c` to `CancelUpload`. See [Single-file Upload](./file-upload.md)
+for the upload pause, retained key-release ownership and path insertion contract.
+Add future zterm controls to this table and the command executor;
 do not add suffix checks to the decoder or another prefix parser.
 
 ## 3. Contracts
@@ -68,8 +72,8 @@ do not add suffix checks to the decoder or another prefix parser.
   child/selection-driven policy; add no reporting query, override or IME
   mapping. Pure Chinese U+3002 text is an unknown command, not `.`. Text without
   a reported key identity cannot establish ownership of a physical-key release.
-- Detach closes only the view; the Session and child PTY survive. Transport,
-  wire, storage and environment configuration gain no new fields.
+- Detach closes only the view and cancels its upload; the Session and child PTY
+  survive. Ctrl+V and Ctrl+C retain their ordinary roles outside local command mode.
 
 ## 4. Validation & Error Matrix
 

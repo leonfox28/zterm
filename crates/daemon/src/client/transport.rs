@@ -27,11 +27,8 @@ pub(super) enum UnixAttachmentTransport {
     },
     Tunnel {
         stream: tokio::net::UnixStream,
-        envelope_decoder: FrameDecoder,
-        queued_envelopes: VecDeque<DecodedFrame>,
-        session_decoder: FrameDecoder,
-        queued_session_frames: VecDeque<DecodedFrame>,
-        remote_half_closed: bool,
+        remote_capabilities: zterm_core::Capabilities,
+        decoder: TunnelDecoder,
     },
 }
 
@@ -123,21 +120,23 @@ impl UnixAttachmentTransport {
         }
         Ok(Self::Tunnel {
             stream,
-            envelope_decoder: first.decoder,
-            queued_envelopes: first.queued,
-            session_decoder: FrameDecoder::new(),
-            queued_session_frames: VecDeque::new(),
-            remote_half_closed: false,
+            remote_capabilities: zterm_core::Capabilities::from_bits_retain(
+                opened.remote_capabilities.unwrap_or_default(),
+            ),
+            decoder: TunnelDecoder {
+                envelope_decoder: first.decoder,
+                queued_envelopes: first.queued,
+                session_decoder: FrameDecoder::new(),
+                queued_session_frames: VecDeque::new(),
+                remote_half_closed: false,
+            },
         })
     }
 
     pub(super) fn queued_session_count(&self) -> usize {
         match self {
             Self::Direct { queued, .. } => queued.len(),
-            Self::Tunnel {
-                queued_session_frames,
-                ..
-            } => queued_session_frames.len(),
+            Self::Tunnel { decoder, .. } => decoder.queued_session_frames.len(),
         }
     }
 
@@ -147,24 +146,25 @@ impl UnixAttachmentTransport {
                 .write_all(bytes)
                 .await
                 .map_err(local_attachment_command_error),
-            Self::Tunnel { stream, .. } => {
-                for chunk in bytes.chunks(zterm_proto::MAX_LOCAL_SESSION_TUNNEL_DATA_BYTES) {
-                    let envelope = encode_message(
-                        WireKind::LocalSessionTunnelData,
-                        0,
-                        0,
-                        &v2::LocalSessionTunnelData {
-                            bytes: chunk.to_vec(),
-                        },
-                    )
-                    .map_err(protocol_error)?;
-                    stream
-                        .write_all(&envelope)
-                        .await
-                        .map_err(local_attachment_command_error)?;
-                }
-                Ok(())
-            }
+            Self::Tunnel { stream, .. } => write_tunnel_bytes(stream, bytes).await,
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)] // Used by the shared client's included desktop-adapter fixtures.
+    pub(super) fn tunnel_after_first(
+        stream: tokio::net::UnixStream,
+        first: Option<FirstFrame>,
+    ) -> Self {
+        let decoder = first.map_or_else(TunnelDecoder::default, |first| TunnelDecoder {
+            envelope_decoder: first.decoder,
+            queued_envelopes: first.queued,
+            ..TunnelDecoder::default()
+        });
+        Self::Tunnel {
+            stream,
+            remote_capabilities: zterm_core::Capabilities::default(),
+            decoder,
         }
     }
 
@@ -178,90 +178,8 @@ impl UnixAttachmentTransport {
                 .await
                 .map(AttachmentTransportItem::Session),
             Self::Tunnel {
-                stream,
-                envelope_decoder,
-                queued_envelopes,
-                session_decoder,
-                queued_session_frames,
-                remote_half_closed,
-            } => {
-                if let Some(frame) = queued_session_frames.pop_front() {
-                    return Ok(AttachmentTransportItem::Session(frame));
-                }
-                loop {
-                    let envelope =
-                        read_tunnel_frame_parts(stream, envelope_decoder, queued_envelopes).await?;
-                    if envelope.request_id != 0 || envelope.deadline_ms != 0 {
-                        return Err(malformed(
-                            "remote Session tunnel stream frame used a request ID or deadline",
-                        ));
-                    }
-                    match envelope.kind {
-                        WireKind::LocalSessionTunnelData => {
-                            if *remote_half_closed {
-                                return Err(malformed(
-                                    "remote Session tunnel returned Data after HalfClose",
-                                ));
-                            }
-                            let data: v2::LocalSessionTunnelData = envelope
-                                .decode_message(WireKind::LocalSessionTunnelData)
-                                .map_err(protocol_error)?;
-                            validate_tunnel_data(&data.bytes)?;
-                            queued_session_frames
-                                .extend(session_decoder.feed(&data.bytes).map_err(protocol_error)?);
-                            if let Some(frame) = queued_session_frames.pop_front() {
-                                return Ok(AttachmentTransportItem::Session(frame));
-                            }
-                        }
-                        WireKind::LocalSessionTunnelPath => {
-                            let path: v2::LocalSessionTunnelPath = envelope
-                                .decode_message(WireKind::LocalSessionTunnelPath)
-                                .map_err(protocol_error)?;
-                            validate_tunnel_path(&path)?;
-                            return Ok(AttachmentTransportItem::Path(path));
-                        }
-                        WireKind::LocalSessionTunnelHalfClose => {
-                            if *remote_half_closed {
-                                return Err(malformed(
-                                    "remote Session tunnel returned HalfClose more than once",
-                                ));
-                            }
-                            let _: v2::LocalSessionTunnelHalfClose = envelope
-                                .decode_message(WireKind::LocalSessionTunnelHalfClose)
-                                .map_err(protocol_error)?;
-                            *remote_half_closed = true;
-                        }
-                        WireKind::LocalSessionTunnelClosed => {
-                            let closed: v2::LocalSessionTunnelClosed = envelope
-                                .decode_message(WireKind::LocalSessionTunnelClosed)
-                                .map_err(protocol_error)?;
-                            let reason = v2::LocalSessionTunnelCloseReason::try_from(closed.reason)
-                                .map_err(|_| {
-                                    malformed("unknown remote Session tunnel close reason")
-                                })?;
-                            if reason == v2::LocalSessionTunnelCloseReason::RemoteEof {
-                                if !*remote_half_closed {
-                                    return Err(malformed(
-                                        "remote Session tunnel reported RemoteEof without HalfClose",
-                                    ));
-                                }
-                                std::mem::replace(session_decoder, FrameDecoder::new())
-                                    .finish()
-                                    .map_err(protocol_error)?;
-                            } else {
-                                // A non-clean tunnel loss may split an otherwise valid inner
-                                // Session frame. Discard that epoch's decoder state so the close
-                                // reason remains retryable instead of being masked as malformed.
-                                *session_decoder = FrameDecoder::new();
-                            }
-                            return Err(tunnel_closed(reason));
-                        }
-                        _ => {
-                            return Err(malformed("invalid envelope from remote Session tunnel"));
-                        }
-                    }
-                }
-            }
+                stream, decoder, ..
+            } => decoder.read_item(stream).await,
         }
     }
 
@@ -286,6 +204,125 @@ impl UnixAttachmentTransport {
                 stream.shutdown().await.map_err(|error| {
                     local_attachment_io("finish remote Session tunnel detach", error)
                 })
+            }
+        }
+    }
+}
+
+async fn write_tunnel_bytes<W: tokio::io::AsyncWrite + Unpin>(
+    stream: &mut W,
+    bytes: &[u8],
+) -> Result<(), DaemonError> {
+    for chunk in bytes.chunks(zterm_proto::MAX_LOCAL_SESSION_TUNNEL_DATA_BYTES) {
+        let envelope = encode_message(
+            WireKind::LocalSessionTunnelData,
+            0,
+            0,
+            &v2::LocalSessionTunnelData {
+                bytes: chunk.to_vec(),
+            },
+        )
+        .map_err(protocol_error)?;
+        stream
+            .write_all(&envelope)
+            .await
+            .map_err(local_attachment_command_error)?;
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+pub(super) struct TunnelDecoder {
+    envelope_decoder: FrameDecoder,
+    queued_envelopes: VecDeque<DecodedFrame>,
+    session_decoder: FrameDecoder,
+    queued_session_frames: VecDeque<DecodedFrame>,
+    remote_half_closed: bool,
+}
+impl TunnelDecoder {
+    async fn read_item<R: tokio::io::AsyncRead + Unpin>(
+        &mut self,
+        stream: &mut R,
+    ) -> Result<AttachmentTransportItem, DaemonError> {
+        let Self {
+            envelope_decoder,
+            queued_envelopes,
+            session_decoder,
+            queued_session_frames,
+            remote_half_closed,
+        } = self;
+        if let Some(frame) = queued_session_frames.pop_front() {
+            return Ok(AttachmentTransportItem::Session(frame));
+        }
+        loop {
+            let envelope =
+                read_tunnel_frame_parts(stream, envelope_decoder, queued_envelopes).await?;
+            if envelope.request_id != 0 || envelope.deadline_ms != 0 {
+                return Err(malformed(
+                    "remote Session tunnel stream frame used a request ID or deadline",
+                ));
+            }
+            match envelope.kind {
+                WireKind::LocalSessionTunnelData => {
+                    if *remote_half_closed {
+                        return Err(malformed(
+                            "remote Session tunnel returned Data after HalfClose",
+                        ));
+                    }
+                    let data: v2::LocalSessionTunnelData = envelope
+                        .decode_message(WireKind::LocalSessionTunnelData)
+                        .map_err(protocol_error)?;
+                    validate_tunnel_data(&data.bytes)?;
+                    queued_session_frames
+                        .extend(session_decoder.feed(&data.bytes).map_err(protocol_error)?);
+                    if let Some(frame) = queued_session_frames.pop_front() {
+                        return Ok(AttachmentTransportItem::Session(frame));
+                    }
+                }
+                WireKind::LocalSessionTunnelPath => {
+                    let path: v2::LocalSessionTunnelPath = envelope
+                        .decode_message(WireKind::LocalSessionTunnelPath)
+                        .map_err(protocol_error)?;
+                    validate_tunnel_path(&path)?;
+                    return Ok(AttachmentTransportItem::Path(path));
+                }
+                WireKind::LocalSessionTunnelHalfClose => {
+                    if *remote_half_closed {
+                        return Err(malformed(
+                            "remote Session tunnel returned HalfClose more than once",
+                        ));
+                    }
+                    let _: v2::LocalSessionTunnelHalfClose = envelope
+                        .decode_message(WireKind::LocalSessionTunnelHalfClose)
+                        .map_err(protocol_error)?;
+                    *remote_half_closed = true;
+                }
+                WireKind::LocalSessionTunnelClosed => {
+                    let closed: v2::LocalSessionTunnelClosed = envelope
+                        .decode_message(WireKind::LocalSessionTunnelClosed)
+                        .map_err(protocol_error)?;
+                    let reason = v2::LocalSessionTunnelCloseReason::try_from(closed.reason)
+                        .map_err(|_| malformed("unknown remote Session tunnel close reason"))?;
+                    if reason == v2::LocalSessionTunnelCloseReason::RemoteEof {
+                        if !*remote_half_closed {
+                            return Err(malformed(
+                                "remote Session tunnel reported RemoteEof without HalfClose",
+                            ));
+                        }
+                        std::mem::replace(session_decoder, FrameDecoder::new())
+                            .finish()
+                            .map_err(protocol_error)?;
+                    } else {
+                        // A non-clean tunnel loss may split an otherwise valid inner
+                        // Session frame. Discard that epoch's decoder state so the close
+                        // reason remains retryable instead of being masked as malformed.
+                        *session_decoder = FrameDecoder::new();
+                    }
+                    return Err(tunnel_closed(reason));
+                }
+                _ => {
+                    return Err(malformed("invalid envelope from remote Session tunnel"));
+                }
             }
         }
     }
@@ -366,8 +403,8 @@ pub(super) async fn read_tunnel_first(
     }
 }
 
-async fn read_tunnel_frame_parts(
-    stream: &mut tokio::net::UnixStream,
+async fn read_tunnel_frame_parts<R: tokio::io::AsyncRead + Unpin>(
+    stream: &mut R,
     decoder: &mut FrameDecoder,
     queued: &mut VecDeque<DecodedFrame>,
 ) -> Result<DecodedFrame, DaemonError> {
@@ -496,6 +533,60 @@ impl AttachmentIo for UnixAttachmentTransport {
     }
     fn shutdown(&mut self) -> TransportFuture<'_, Result<(), DaemonError>> {
         Box::pin(self.shutdown_inner())
+    }
+}
+
+impl zterm_client::upload::UploadConnector for UnixAttachmentConnector {
+    fn open_upload(
+        &self,
+        target: ResolvedSessionTarget,
+    ) -> TransportFuture<'_, Result<zterm_client::upload::UploadConnection, DaemonError>> {
+        Box::pin(async move {
+            let transport =
+                UnixAttachmentTransport::open(&self.socket, target, &ProgressObserver::default())
+                    .await?;
+            let UnixAttachmentTransport::Tunnel {
+                stream,
+                remote_capabilities,
+                decoder,
+            } = transport
+            else {
+                return Err(DaemonError::new(
+                    DomainErrorKind::ServiceNotImplemented,
+                    "file upload requires a remote session",
+                ));
+            };
+            let (reader, writer) = stream.into_split();
+            Ok(zterm_client::upload::UploadConnection {
+                capabilities: remote_capabilities,
+                reader: Box::new(TunnelUploadReader { reader, decoder }),
+                writer: Box::new(TunnelUploadWriter(writer)),
+            })
+        })
+    }
+}
+
+struct TunnelUploadReader {
+    reader: tokio::net::unix::OwnedReadHalf,
+    decoder: TunnelDecoder,
+}
+impl zterm_client::upload::UploadReader for TunnelUploadReader {
+    fn read(&mut self) -> TransportFuture<'_, Result<DecodedFrame, DaemonError>> {
+        Box::pin(async move {
+            loop {
+                if let AttachmentTransportItem::Session(frame) =
+                    self.decoder.read_item(&mut self.reader).await?
+                {
+                    return Ok(frame);
+                }
+            }
+        })
+    }
+}
+struct TunnelUploadWriter(tokio::net::unix::OwnedWriteHalf);
+impl zterm_client::upload::UploadWriter for TunnelUploadWriter {
+    fn write<'a>(&'a mut self, bytes: &'a [u8]) -> TransportFuture<'a, Result<(), DaemonError>> {
+        Box::pin(write_tunnel_bytes(&mut self.0, bytes))
     }
 }
 

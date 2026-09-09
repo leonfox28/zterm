@@ -6,6 +6,9 @@
 //! SessionService and framing owner.
 
 #[cfg(unix)]
+mod upload;
+
+#[cfg(unix)]
 use std::collections::VecDeque;
 #[cfg(unix)]
 use std::path::PathBuf;
@@ -501,6 +504,9 @@ impl SessionWireServer {
         };
         let request_id = first.frame.request_id;
         let request_deadline = limits.request_deadline_from(started, first.frame.deadline_ms);
+        if first.frame.kind == WireKind::UploadBegin {
+            return self.handle_upload(stream, first, context).await;
+        }
         if first.frame.kind == WireKind::TerminalAttachRequest {
             return self
                 .handle_attachment(stream, first, context, limits, request_deadline)
@@ -1977,6 +1983,7 @@ fn daemon_io(operation: &str, error: std::io::Error) -> DaemonError {
 
 #[cfg(all(test, unix))]
 mod tests {
+    mod upload_tests;
     use std::fs;
     use std::future::Future;
     use std::path::{Path, PathBuf};

@@ -31,6 +31,7 @@ zterm-proto.workspace = true
 zterm-terminal.workspace = true
 
 [dev-dependencies]
+tokio-util.workspace = true
 anyhow.workspace = true
 futures-util.workspace = true
 tempfile.workspace = true

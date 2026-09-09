@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+pub mod upload;
+
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use prost::Message;
@@ -529,6 +531,22 @@ pub enum WireKind {
     TerminalClipboardWrite = 322,
     /// Current controller base-color observations.
     TerminalBaseColors = 324,
+    /// Starts an attachment-bound upload on a separate service stream.
+    UploadBegin = 400,
+    /// Host admission and unique transfer identity.
+    UploadReady = 401,
+    /// Bounded in-order file bytes.
+    UploadChunk = 402,
+    /// Acknowledges bytes written by the host.
+    UploadProgress = 403,
+    /// Requests publication after exact byte completion.
+    UploadFinish = 404,
+    /// Published safe absolute path.
+    UploadCompleted = 405,
+    /// Explicit cancellation before publication.
+    UploadCancel = 406,
+    /// Confirms incomplete staging was removed.
+    UploadCancelled = 407,
 }
 
 impl WireKind {
@@ -569,6 +587,8 @@ impl WireKind {
             // ceiling. This makes a one-byte-oversized canonical Data message
             // fail before it can enter the tunnel adapter.
             MAX_LOCAL_SESSION_TUNNEL_DATA_BYTES + 4
+        } else if matches!(self, Self::UploadChunk) {
+            zterm_core::upload::UPLOAD_CHUNK_BYTES + 64
         } else {
             MAX_CONTROL_PAYLOAD_BYTES
         }
@@ -643,6 +663,14 @@ impl TryFrom<u32> for WireKind {
             318 => Self::TerminalSemanticHistoryWindowFrame,
             322 => Self::TerminalClipboardWrite,
             324 => Self::TerminalBaseColors,
+            400 => Self::UploadBegin,
+            401 => Self::UploadReady,
+            402 => Self::UploadChunk,
+            403 => Self::UploadProgress,
+            404 => Self::UploadFinish,
+            405 => Self::UploadCompleted,
+            406 => Self::UploadCancel,
+            407 => Self::UploadCancelled,
             unknown => return Err(ProtocolError::UnknownKind(unknown)),
         };
         Ok(kind)
@@ -735,6 +763,8 @@ pub enum ProtocolError {
     InvalidTerminalSemanticField(&'static str),
     /// A same-UID connection observation was unspecified or unsupported.
     InvalidLocalConnectionStage,
+    /// An upload field violated its shared domain contract.
+    InvalidUpload(zterm_core::DomainErrorKind),
 }
 
 impl fmt::Display for ProtocolError {
@@ -771,6 +801,7 @@ impl fmt::Display for ProtocolError {
             Self::InvalidLocalConnectionStage => {
                 write!(formatter, "invalid local connection progress stage")
             }
+            Self::InvalidUpload(kind) => write!(formatter, "invalid upload: {}", kind.code()),
             Self::InvalidTerminalSemanticField(field) => {
                 write!(formatter, "invalid semantic terminal field {field}")
             }

@@ -5,6 +5,8 @@ use zterm_daemon::client::view::{TerminalViewCommandWriter, TerminalViewEventRea
 /// The presenter commits physical output; surface and viewport retain their own
 /// validated semantic and history states at that successful presentation boundary.
 pub(super) struct TerminalUiSession {
+    pub(super) upload: Option<upload::DesktopUpload>,
+    pub(super) upload_connector: Arc<dyn zterm_client::upload::UploadConnector>,
     pub(super) progress: ProgressObserver,
     pub(super) session_id: SessionId,
     pub(super) events: TerminalViewEventReader,
@@ -41,6 +43,7 @@ impl TerminalUiSession {
         let result = self
             .run_loop(stdin, stdout, resize_signal, cancellation_receiver)
             .await;
+        self.upload.take();
         finish_terminal_view(result, &mut self.stdin_pump, &self.writer).await
     }
 
@@ -51,6 +54,8 @@ impl TerminalUiSession {
         resize_signal: &mut Signal,
         cancellation_receiver: &mut watch::Receiver<Option<TerminalSignalCancellation>>,
     ) -> Result<TerminalCompletion, CliError> {
+        let mut upload_tick = tokio::time::interval(zterm_core::upload::UPLOAD_PROGRESS_INTERVAL);
+        upload_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         'terminal: loop {
             self.host_colors
                 .flush_commands(&mut self.presenter, &mut stdout.lock())?;
@@ -88,6 +93,9 @@ impl TerminalUiSession {
             let prefix_deadline = self.prefix.deadline();
             let viewport_deadline = self.viewport_pacer.deadline();
             tokio::select! {
+                _ = upload_tick.tick(), if self.status_renderer.upload.is_some() => {
+                    self.poll_upload(stdin).await?;
+                }
                 cancellation = receive_terminal_cancellation(cancellation_receiver) => {
                     self.viewport_pacer.cancel();
                     break Err(cancellation.error(Some(self.session_id)));
@@ -218,15 +226,29 @@ impl TerminalUiSession {
                                     )?
                                 };
                                 for action in actions {
+                                    if self.upload.is_none() && self.status_renderer.upload.as_ref().is_some_and(upload::UploadStatus::is_error) {
+                                        self.status_renderer.upload = None;
+                                        self.paint_upload_status()?;
+                                    }
                                     let host_event = match action {
                                         PrefixAction::Input(event) => event,
                                         PrefixAction::Command(command) => {
-                                            self.viewport_pacer.cancel();
-                                            break 'terminal Ok(match command {
-                                                LocalCommand::Detach => TerminalCompletion::Detached,
-                                            });
+                                            match command {
+                                                LocalCommand::Detach => {
+                                                    self.viewport_pacer.cancel();
+                                                    break 'terminal Ok(TerminalCompletion::Detached);
+                                                }
+                                                LocalCommand::Upload => self.begin_upload().await?,
+                                                LocalCommand::CancelUpload => {
+                                                    if let Some(upload) = &self.upload { upload.cancel(); }
+                                                }
+                                            }
+                                            continue;
                                         }
                                     };
+                                    if self.upload.is_some() && !copy_owned
+                                        && !matches!(host_event, HostInputEvent::Mouse(_) | HostInputEvent::PageUp | HostInputEvent::PageDown)
+                                    { continue; }
                                     match host_event {
                                         HostInputEvent::TerminalReply { .. } => {},
                                         HostInputEvent::Bytes(bytes) | HostInputEvent::ForwardedBytes(bytes) | HostInputEvent::Opaque(bytes) => {
@@ -360,7 +382,7 @@ impl TerminalUiSession {
                                             let older = matches!(host_event, HostInputEvent::PageUp);
                                             let raw = if older { PAGE_UP } else { PAGE_DOWN };
                                             if self.viewport.is_resume_pending() {
-                                                self.viewport.retain_resume_input(raw)?;
+                                                if self.upload.is_none() { self.viewport.retain_resume_input(raw)?; }
                                             } else if self.viewport.is_history()
                                                 || live_history_navigation_allowed(self.transport_state)
                                                     && history_owns_gestures(
@@ -377,6 +399,7 @@ impl TerminalUiSession {
                                                 self.apply_viewport(effect, true).await?;
                                             } else if self.transport_state
                                                 == TerminalViewTransportState::Active
+                                                && self.upload.is_none()
                                                 && let Err(error) = self.writer.write_input(raw.to_vec()).await
                                             {
                                                 break 'terminal Err(error.into());
@@ -405,12 +428,13 @@ impl TerminalUiSession {
                                                     self.apply_viewport(effect, true).await?;
                                                 }
                                                 PointerRoute::Child(bytes)
-                                                    if self.viewport.is_resume_pending() =>
+                                                    if self.upload.is_none() && self.viewport.is_resume_pending() =>
                                                 {
                                                     self.viewport.retain_resume_input(&bytes)?;
                                                 }
                                                 PointerRoute::Child(bytes)
                                                     if self.viewport.is_live()
+                                                        && self.upload.is_none()
                                                         && self.transport_state
                                                             == TerminalViewTransportState::Active =>
                                                 {
@@ -497,7 +521,9 @@ impl TerminalUiSession {
                 self.viewport_pacer.mark_presented(Instant::now());
             }
             TerminalViewEvent::Snapshot(snapshot) => {
-                if snapshot.surface.size != self.surface.surface.size || snapshot.surface.active_screen != self.surface.active_screen() {
+                if snapshot.surface.size != self.surface.surface.size
+                    || snapshot.surface.active_screen != self.surface.active_screen()
+                {
                     self.input_epoch.invalidate_geometry();
                 }
                 self.viewport_pacer.cancel();
@@ -536,7 +562,9 @@ impl TerminalUiSession {
                 let history_refill = self.viewport.refetch_history_window();
                 self.viewport.observe_presentation();
                 self.viewport_pacer.mark_presented(Instant::now());
-                if !self.healthy_resize { self.prefix.clear_pending(); }
+                if !self.healthy_resize {
+                    self.prefix.clear_pending();
+                }
                 self.sync_requested = false;
                 self.writer.revision_applied(snapshot.revision);
                 self.writer.snapshot_applied(snapshot.revision).await?;
@@ -554,7 +582,8 @@ impl TerminalUiSession {
                 if rendered_live {
                     self.viewport_pacer.cancel();
                 }
-                let geometry_changed = delta.size != self.surface.surface.size || delta.active_screen != self.surface.active_screen();
+                let geometry_changed = delta.size != self.surface.surface.size
+                    || delta.active_screen != self.surface.active_screen();
                 let delta_result = apply_delta_stdout(
                     &mut self.surface,
                     &mut self.presenter,
@@ -567,7 +596,9 @@ impl TerminalUiSession {
                 );
                 match delta_result {
                     Ok(DeltaRender::Applied) => {
-                        if geometry_changed { self.input_epoch.invalidate_geometry(); }
+                        if geometry_changed {
+                            self.input_epoch.invalidate_geometry();
+                        }
                         self.sync_requested = false;
                         self.writer.revision_applied(delta.to_revision);
                         if rendered_live {
@@ -598,8 +629,14 @@ impl TerminalUiSession {
                     Ok(DeltaRender::Gap) => {
                         if self.healthy_resize {
                             self.healthy_resize = false;
-                            transition_input_state(stdin, &self.input_epoch, &mut self.current_input_epoch,
-                                &mut self.stdin_pump, &mut self.prefix, TerminalViewTransportState::Synchronizing)?;
+                            transition_input_state(
+                                stdin,
+                                &self.input_epoch,
+                                &mut self.current_input_epoch,
+                                &mut self.stdin_pump,
+                                &mut self.prefix,
+                                TerminalViewTransportState::Synchronizing,
+                            )?;
                         }
                         self.viewport_pacer.cancel();
                         self.selection.cancel();
@@ -678,7 +715,9 @@ impl TerminalUiSession {
                     &self.surface,
                     &mut self.presenter,
                 );
-                if !self.healthy_resize { self.viewport.observe_sync_required(); }
+                if !self.healthy_resize {
+                    self.viewport.observe_sync_required();
+                }
                 if self.transport_state != TerminalViewTransportState::Synchronizing {
                     self.transport_state = TerminalViewTransportState::Synchronizing;
                 }
@@ -702,6 +741,124 @@ impl TerminalUiSession {
             }
         }
         Ok(None)
+    }
+
+    async fn begin_upload(&mut self) -> Result<(), CliError> {
+        if self.upload.is_some() {
+            return Ok(());
+        }
+        let problem = if !self.status_renderer.is_remote() {
+            Some("File upload requires a remote session")
+        } else if !self.status_renderer.enabled() {
+            Some("Enlarge the terminal to show upload progress")
+        } else if self.transport_state != TerminalViewTransportState::Active && !self.healthy_resize
+        {
+            Some("Wait for the remote terminal to reconnect")
+        } else {
+            None
+        };
+        if let Some(problem) = problem {
+            self.status_renderer.upload = Some(upload::UploadStatus::notice(problem.into(), false));
+            return self.paint_upload_status();
+        }
+        match self.writer.upload_origin().await {
+            Ok(origin) => {
+                self.current_input_epoch = self.input_epoch.advance();
+                self.prefix.cancel();
+                self.upload = Some(upload::DesktopUpload::start(
+                    Arc::clone(&self.upload_connector),
+                    origin,
+                    self.current_input_epoch,
+                ));
+                self.status_renderer.upload = Some(upload::UploadStatus::preparing());
+            }
+            Err(error) => {
+                self.status_renderer.upload =
+                    Some(upload::UploadStatus::notice(error.detail().into(), false))
+            }
+        }
+        self.paint_upload_status()
+    }
+
+    async fn poll_upload(&mut self, stdin: &impl AsFd) -> Result<(), CliError> {
+        if let Some(operation) = &self.upload {
+            if operation.epoch != self.current_input_epoch {
+                operation.cancel();
+            }
+            if let Some(status) = &mut self.status_renderer.upload {
+                status.observe(*operation.progress.borrow());
+            }
+        }
+        if self
+            .upload
+            .as_ref()
+            .is_some_and(|operation| operation.task.is_finished())
+        {
+            let mut operation = self.upload.take().expect("finished upload remains owned");
+            let result = (&mut operation.task).await.unwrap_or_else(|_| {
+                Err(DaemonError::new(
+                    DomainErrorKind::Cancelled,
+                    "Upload cancelled",
+                ))
+            });
+            let result = if operation.epoch != self.current_input_epoch || operation.is_cancelled()
+            {
+                Err(DaemonError::new(
+                    DomainErrorKind::Cancelled,
+                    "Upload cancelled: terminal connection changed",
+                ))
+            } else {
+                result
+            };
+            let result = match result {
+                Ok(file) => {
+                    let bytes = zterm_client::upload::paste_bytes(&file, &self.surface.modes());
+                    self.writer
+                        .write_upload_input(operation.origin, bytes)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            self.status_renderer.upload = Some(match result {
+                Ok(()) => upload::UploadStatus::notice("Uploaded — path inserted".into(), true),
+                Err(error) => upload::UploadStatus::notice(
+                    error.detail().into(),
+                    error.kind() == DomainErrorKind::Cancelled,
+                ),
+            });
+            // Drain the paused interval under its old epoch; fragmented paste and
+            // key units remain owned by the persistent codec and cannot replay.
+            let mut fence_prefix = CommandMode::new();
+            self.stdin_pump.replace_after_active_fence(
+                stdin,
+                &self.input_epoch,
+                &mut self.current_input_epoch,
+                &mut fence_prefix,
+            )?;
+            self.prefix.finish_upload_pause();
+        }
+        if self
+            .status_renderer
+            .upload
+            .as_ref()
+            .is_some_and(upload::UploadStatus::expired)
+        {
+            self.status_renderer.upload = None;
+        }
+        self.paint_upload_status()
+    }
+
+    fn paint_upload_status(&mut self) -> Result<(), CliError> {
+        present_surface_stdout(
+            &self.surface,
+            &mut self.presenter,
+            &self.viewport,
+            &self.status_renderer,
+            presentation_state(self.transport_state, self.healthy_resize),
+        )?;
+        self.viewport.observe_presentation();
+        self.viewport_pacer.mark_presented(Instant::now());
+        Ok(())
     }
 
     async fn apply_viewport(
@@ -736,6 +893,9 @@ impl TerminalUiSession {
         self.viewport_pacer.cancel();
         let (next, pending_resize) = self.resize_coalescer.enter_transport_state(next);
         if next == TerminalViewTransportState::Reconnecting {
+            if let Some(upload) = &self.upload {
+                upload.cancel();
+            }
             self.healthy_resize = false;
             self.host_colors.request_refresh();
             self.viewport.reset_presentation_for_reconnect();
@@ -748,16 +908,20 @@ impl TerminalUiSession {
             self.status_renderer.initial_synchronizing = false;
         }
         let preserve_input = self.healthy_resize;
-        let resume_input = if preserve_input { None } else { transition_transport_input_state(
-            stdin,
-            &self.input_epoch,
-            &mut self.current_input_epoch,
-            &mut self.stdin_pump,
-            &mut self.prefix,
-            previous,
-            next,
-            &mut self.viewport,
-        )? };
+        let resume_input = if preserve_input {
+            None
+        } else {
+            transition_transport_input_state(
+                stdin,
+                &self.input_epoch,
+                &mut self.current_input_epoch,
+                &mut self.stdin_pump,
+                &mut self.prefix,
+                previous,
+                next,
+                &mut self.viewport,
+            )?
+        };
         reconcile_presenter_selection(
             &mut self.selection,
             &self.viewport,
@@ -792,8 +956,15 @@ impl TerminalUiSession {
     }
 }
 
-fn presentation_state(state: TerminalViewTransportState, healthy_resize: bool) -> TerminalViewTransportState {
-    if healthy_resize { TerminalViewTransportState::Active } else { state }
+fn presentation_state(
+    state: TerminalViewTransportState,
+    healthy_resize: bool,
+) -> TerminalViewTransportState {
+    if healthy_resize {
+        TerminalViewTransportState::Active
+    } else {
+        state
+    }
 }
 
 #[cfg(test)]

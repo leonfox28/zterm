@@ -1378,3 +1378,11 @@ can deliver the authoritative lifecycle LeaseLost event; it must not close the
 stream first. Request/input authorization still rejects the old controller.
 `stale_color_sync_notification_cannot_hide_takeover_lease_loss` proves this
 ordering without timing sleeps. An unchanged base publishes no revision wake.
+
+## Upload stream metadata
+
+`LocalSessionTunnelOpened.remote_capabilities` (optional uint64 field 2) reflects
+the actual selected broker candidate, from inbound Hello or outbound Welcome.
+Missing metadata disables uploads. The Unix upload adapter reuses opaque tunnel
+envelopes and opens a separate stream without attaching another terminal. See
+[Single-file Upload](./file-upload.md) for admission and frontend behavior.

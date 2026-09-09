@@ -14,6 +14,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "transport.proto",
         "session.proto",
         "terminal.proto",
+        "upload.proto",
     ]
     .map(|name| proto_root.join("zterm/v2").join(name));
     let protoc = protoc_bin_vendored::protoc_bin_path()?;
@@ -31,6 +32,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     // package-wide.
     config.skip_debug([
         ".zterm.v2.WireFrame",
+        ".zterm.v2.UploadChunk",
+        ".zterm.v2.UploadCompleted",
         ".zterm.v2.PairTicketV1",
         ".zterm.v2.PairBegin",
         ".zterm.v2.PairChallenge",

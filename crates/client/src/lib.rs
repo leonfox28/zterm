@@ -14,6 +14,7 @@ pub mod protocol;
 pub mod framing;
 pub mod session;
 pub mod transport;
+pub mod upload;
 pub mod view;
 
 // Compile the exact desktop adapter only for the moved owner tests. This keeps

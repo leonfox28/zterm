@@ -82,6 +82,13 @@ impl ConnectionIdentity {
         )
     }
 
+    /// Adds services at the host composition boundary, without changing controllers.
+    #[must_use]
+    pub fn with_capabilities(mut self, capabilities: Capabilities) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
     /// Stable public device ID.
     #[must_use]
     pub const fn device_id(&self) -> DeviceId {

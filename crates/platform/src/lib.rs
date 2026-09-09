@@ -4,6 +4,8 @@ pub mod account;
 #[cfg(unix)]
 pub mod local_unix;
 pub mod pty;
+#[cfg(unix)]
+pub mod upload;
 pub mod user_state;
 
 /// Platform facts safe to expose from the side-effect-free Foundation probe.

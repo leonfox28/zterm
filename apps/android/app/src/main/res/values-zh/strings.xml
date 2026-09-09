@@ -75,4 +75,24 @@
     <string name="history_unavailable">暂时无法读取内容</string>
     <string name="show_keyboard">展开键盘</string>
     <string name="hide_keyboard">收起键盘</string>
+    <string name="key_left">向左</string>
+    <string name="key_down">向下</string>
+    <string name="key_up">向上</string>
+    <string name="key_right">向右</string>
+    <string name="upload">上传</string>
+    <string name="upload_image">上传图片</string>
+    <string name="upload_file">上传文件</string>
+    <string name="upload_failed">上传失败</string>
+    <string name="upload_selected_file">所选文件</string>
+    <string name="upload_size">文件大小：%1$.2f MB</string>
+    <string name="upload_size_unknown">文件大小待确认</string>
+    <string name="upload_preparing">正在准备文件…</string>
+    <string name="upload_percent">%1$d%%</string>
+    <string name="upload_speed">上传速度：%1$.2f MB/s</string>
+    <string name="upload_finishing">正在完成上传并插入路径…</string>
+    <string name="upload_too_large">请选择一个不超过 50 MB 的文件。</string>
+    <string name="upload_source_invalid">无法读取文件，请重新选择。</string>
+    <string name="upload_storage_failed">远程服务器无法保存文件。</string>
+    <string name="upload_outcome_unknown">文件可能已上传，但结果丢失。重试会创建一个新文件。</string>
+    <string name="upload_upgrade">请升级远程服务器上的 zterm 以使用文件上传。</string>
 </resources>

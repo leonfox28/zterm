@@ -63,6 +63,11 @@ macro_rules! fixed_id {
 }
 
 fixed_id!(DeviceId, 32, "Stable public identity of one zterm device.");
+fixed_id!(
+    TransferId,
+    16,
+    "Host-generated identity of one non-resumable file upload."
+);
 
 impl DeviceId {
     /// Number of lowercase hexadecimal ASCII bytes in the canonical text form.
@@ -499,6 +504,8 @@ impl Capabilities {
     pub const SESSION_SERVICE: u64 = 1 << 1;
     /// Terminal attach/snapshot/delta RPCs.
     pub const TERMINAL_SERVICE: u64 = 1 << 2;
+    /// Single-file uploads bound to the current terminal controller.
+    pub const FILE_UPLOAD_SERVICE: u64 = 1 << 3;
     /// Future device status notifications.
     pub const DEVICE_EVENTS: u64 = 1 << 16;
     /// Future dedicated Agent status and notification events.
@@ -773,6 +780,14 @@ pub enum DomainErrorKind {
     OutboundDirectionDenied,
     /// The selected device has no local record.
     DeviceNotFound,
+    /// The upload exceeds the single-file byte limit.
+    UploadTooLarge,
+    /// The source is unavailable or changed during upload.
+    UploadSourceInvalid,
+    /// The host could not stage or publish an upload.
+    UploadStorageFailed,
+    /// Publication may have occurred but its response was lost.
+    UploadOutcomeUnknown,
 }
 
 impl DomainErrorKind {
@@ -833,6 +848,10 @@ impl DomainErrorKind {
             Self::InvalidTargetSelector => "invalid_target_selector",
             Self::OutboundDirectionDenied => "outbound_direction_denied",
             Self::DeviceNotFound => "device_not_found",
+            Self::UploadTooLarge => "upload_too_large",
+            Self::UploadSourceInvalid => "upload_source_invalid",
+            Self::UploadStorageFailed => "upload_storage_failed",
+            Self::UploadOutcomeUnknown => "upload_outcome_unknown",
         }
     }
 
@@ -893,6 +912,10 @@ impl DomainErrorKind {
             "invalid_target_selector" => Self::InvalidTargetSelector,
             "outbound_direction_denied" => Self::OutboundDirectionDenied,
             "device_not_found" => Self::DeviceNotFound,
+            "upload_too_large" => Self::UploadTooLarge,
+            "upload_source_invalid" => Self::UploadSourceInvalid,
+            "upload_storage_failed" => Self::UploadStorageFailed,
+            "upload_outcome_unknown" => Self::UploadOutcomeUnknown,
             _ => return None,
         })
     }

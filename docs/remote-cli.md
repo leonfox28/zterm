@@ -247,15 +247,37 @@ guessing missing output. SIGWINCH updates are coalesced.
 The fixed local command prefix is `Ctrl+]`:
 
 - `Ctrl+] .` detaches only this view. It does not close or signal the Session.
+- `Ctrl+] v` uploads one copied file or clipboard image in a remote view.
+- `Ctrl+] c` cancels that upload. `Ctrl+V` remains ordinary paste.
 - `Ctrl+] Ctrl+]` sends one literal Ctrl+] key using the existing child encoding.
 - An unknown command or a one-second timeout cancels locally. The attempted
   command is not replayed to the Session.
 - Legacy and already-reported enhanced keys use the same command dispatcher.
   Prefix handling does not change the terminal's keyboard-reporting mode.
 - Input-method text is not remapped to a physical key: a Chinese `。` does not
-  trigger the period command. Clipboard and normal input behavior are unchanged.
+  trigger the period command.
 
 The former `--escape` customization/disable option has been removed.
+
+For file upload, copy exactly one regular file in the system file manager, or
+copy an image, then press `Ctrl+]` followed by plain `v`. Text containing a path
+or URL is not an upload source. Files of any type are accepted up to **50 MB
+(50,000,000 bytes)**. Original file bytes are preserved; a raw clipboard image
+is saved as PNG. The remote host and the local daemon must both support uploads.
+
+Progress, size and speed appear on the right of the bottom status row. Input to
+the child is paused and discarded during upload; terminal output and local
+navigation continue. After publication the absolute path is pasted once at the
+cursor, using bracketed paste when enabled, without pressing Enter. Detaching,
+disconnecting or losing control cancels the operation and prevents delayed input
+from reaching another attachment. A single-row terminal must be enlarged first.
+
+Uploads are private to the host's effective user under
+`/tmp/zterm-<uid>/<session>/<transfer>/file[.ext]`. Successful files are retained
+without a zterm age or cumulative-size cleanup policy; normal host `/tmp` cleanup
+may still remove them. An uncertain result can mean a file remains on the host;
+retrying is an explicit new upload. The AI tool decides how to interpret the
+inserted path and supported file format.
 
 Because the terminal is raw, ordinary keyboard `Ctrl-C`, `Ctrl-Z`, and similar
 control bytes go to the active host PTY. A separately delivered process signal

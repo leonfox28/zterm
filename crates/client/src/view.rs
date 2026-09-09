@@ -498,6 +498,28 @@ impl fmt::Debug for TerminalViewCommandWriter {
 }
 
 impl TerminalViewCommandWriter {
+    /// Captures the current resolved upload destination at the terminal driver.
+    #[cfg(unix)]
+    pub async fn upload_origin(&self) -> Result<crate::upload::UploadOrigin, DaemonError> {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        self.submit(TerminalDriverCommand::UploadOrigin { reply })
+            .await?;
+        result
+            .await
+            .map_err(|_| terminal_command_outcome_unavailable())?
+    }
+
+    /// Writes a completed upload's paste only if the original attachment still owns this driver.
+    #[cfg(unix)]
+    pub async fn write_upload_input(
+        &self,
+        origin: crate::upload::UploadOrigin,
+        bytes: Vec<u8>,
+    ) -> Result<(), DaemonError> {
+        self.submit(TerminalDriverCommand::UploadInput { origin, bytes })
+            .await
+    }
+
     /// Records the exact revision successfully installed by the frontend.
     /// This is local state for remote resume and sends no Session frame.
     pub fn revision_applied(&self, revision: Revision) {
@@ -651,6 +673,13 @@ struct PendingTerminalCommand {
 
 #[cfg(unix)]
 enum TerminalDriverCommand {
+    UploadOrigin {
+        reply: tokio::sync::oneshot::Sender<Result<crate::upload::UploadOrigin, DaemonError>>,
+    },
+    UploadInput {
+        origin: crate::upload::UploadOrigin,
+        bytes: Vec<u8>,
+    },
     Colors {
         profile: zterm_core::terminal::TerminalColorProfile,
     },
@@ -1002,6 +1031,16 @@ async fn handle_terminal_driver_command(
         let _ = response.send(Err(crate::protocol::control_timeout()));
         return TerminalDriverCommandResult::Continue;
     }
+    if let TerminalDriverCommand::UploadInput { origin, .. } = &command {
+        let current = client.upload_origin();
+        if !current.is_ok_and(|current| current == *origin) {
+            let _ = response.send(Err(DaemonError::new(
+                DomainErrorKind::LeaseLost,
+                "upload belongs to a retired attachment",
+            )));
+            return TerminalDriverCommandResult::Continue;
+        }
+    }
     let success = match command {
         TerminalDriverCommand::SnapshotApplied { .. } => {
             TerminalDriverCommandResult::SnapshotApplied
@@ -1011,6 +1050,11 @@ async fn handle_terminal_driver_command(
     };
     let result = tokio::time::timeout_at(deadline, async {
         match command {
+            TerminalDriverCommand::UploadOrigin { reply } => {
+                let _ = reply.send(client.upload_origin());
+                Ok(())
+            }
+            TerminalDriverCommand::UploadInput { bytes, .. } => client.write_input(bytes).await,
             TerminalDriverCommand::SnapshotApplied { revision } => {
                 client.snapshot_applied(revision).await
             }
@@ -1193,6 +1237,49 @@ mod tests {
     use zterm_core::DeviceId;
     #[cfg(unix)]
     use zterm_proto::{DecodedFrame, FrameDecoder, WireKind, encode_message, v2};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upload_paste_is_rejected_at_driver_when_attachment_changed() {
+        let target = ResolvedSessionTarget::device(DeviceId::from_array([0xe1; 32]));
+        let (client, mut peer) = SessionClient::terminal_driver_test_pair(
+            target,
+            SessionId::from_array([0xe2; 16]),
+            AttachmentId::from_array([0xe3; 16]),
+        );
+        let (events, writer) = spawn_terminal_driver(
+            client,
+            TerminalViewTransportState::Active,
+            TerminalViewRoute::Remote,
+            false,
+        )
+        .split();
+        let origin = writer
+            .upload_origin()
+            .await
+            .expect("capture current driver origin");
+        assert_eq!(origin.target, target);
+        let stale = crate::upload::UploadOrigin {
+            binding: zterm_core::upload::UploadBinding {
+                attachment_id: AttachmentId::from_array([0xe4; 16]),
+                ..origin.binding
+            },
+            ..origin
+        };
+        let error = writer
+            .write_upload_input(stale, b"/tmp/zterm-1/file.png".to_vec())
+            .await
+            .expect_err("retired attachment cannot receive upload input");
+        assert_eq!(error.kind(), DomainErrorKind::LeaseLost);
+        let mut bytes = [0; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), peer.read(&mut bytes))
+                .await
+                .is_err(),
+            "stale paste sends no command or replay-lease request"
+        );
+        drop(events);
+    }
 
     #[cfg(unix)]
     #[tokio::test(start_paused = true)]

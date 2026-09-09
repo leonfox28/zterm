@@ -14,7 +14,7 @@ zeroize.workspace = true
 zterm-client.workspace = true
 zterm-core.workspace = true
 zterm-proto.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs"] }
 tokio-util.workspace = true
 uniffi = { workspace = true, features = ["tokio"] }
 

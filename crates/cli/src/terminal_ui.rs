@@ -87,6 +87,10 @@ mod unix {
     }
     use ui_session::TerminalUiSession;
 
+    mod upload {
+        include!("terminal_ui/upload.rs");
+    }
+
     mod attachment_surface {
         include!("terminal_ui/surface.rs");
     }
@@ -509,6 +513,8 @@ mod unix {
         let deferred_active = false;
 
         TerminalUiSession {
+            upload: None,
+            upload_connector: runtime.upload_connector(),
             progress,
             session_id,
             events,
@@ -1625,6 +1631,7 @@ mod unix {
     }
 
     struct StatusRenderer {
+        upload: Option<upload::UploadStatus>,
         initial_synchronizing: bool,
         target: TerminalViewTarget,
         physical_size: TerminalSize,
@@ -1635,6 +1642,7 @@ mod unix {
     impl StatusRenderer {
         fn new(target: TerminalViewTarget, physical_size: TerminalSize) -> Self {
             Self {
+                upload: None,
                 initial_synchronizing: false,
                 target,
                 physical_size,
@@ -1675,6 +1683,24 @@ mod unix {
         }
 
         fn composed_text(&self, transport_state: TerminalViewTransportState) -> Option<String> {
+            let left = self.left_text(transport_state)?;
+            let Some(upload) = &self.upload else {
+                return Some(left);
+            };
+            let width = usize::from(
+                self.physical_size
+                    .columns
+                    .min(zterm_core::ResourceLimits::default().max_viewport_columns),
+            );
+            let right = upload.text(width);
+            let right_width = unicode_width::UnicodeWidthStr::width(right.as_str());
+            let left = upload::truncate(&left, width.saturating_sub(right_width + 1));
+            let padding = width
+                .saturating_sub(unicode_width::UnicodeWidthStr::width(left.as_str()) + right_width);
+            Some(format!("{left}{}{right}", " ".repeat(padding)))
+        }
+
+        fn left_text(&self, transport_state: TerminalViewTransportState) -> Option<String> {
             if !self.enabled() {
                 return None;
             }
@@ -4997,6 +5023,42 @@ mod unix {
                 local.composed_text(TerminalViewTransportState::Active),
                 None
             );
+        }
+
+        #[test]
+        fn upload_status_stays_right_aligned_without_changing_child_geometry() {
+            use zterm_core::upload::{UploadPhase, UploadProgress};
+            for width in [4, 12, 24, 80, 120] {
+                for screen in [ActiveScreen::Main, ActiveScreen::Alternate] {
+                    let physical = TerminalSize::new(24, width);
+                    let original = ChromeLayout::new(physical, screen);
+                    let mut status = StatusRenderer::new(
+                        TerminalViewTarget::for_display(
+                            "服务器e\u{301}-long-name",
+                            TerminalViewRoute::Remote,
+                        ),
+                        physical,
+                    );
+                    let mut upload = upload::UploadStatus::preparing();
+                    upload.observe(UploadProgress {
+                        phase: UploadPhase::Uploading,
+                        accepted_bytes: 25_000_000,
+                        total_bytes: Some(50_000_000),
+                    });
+                    let suffix = upload.text(usize::from(width));
+                    status.upload = Some(upload);
+                    let text = status
+                        .composed_text(TerminalViewTransportState::Active)
+                        .expect("status row");
+                    assert_eq!(
+                        unicode_width::UnicodeWidthStr::width(text.as_str()),
+                        usize::from(width)
+                    );
+                    assert!(text.ends_with(&suffix));
+                    assert!(text.contains("50%"));
+                    assert_eq!(ChromeLayout::new(physical, screen).child, original.child);
+                }
+            }
         }
 
         #[test]

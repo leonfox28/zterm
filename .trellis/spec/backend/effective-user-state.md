@@ -65,3 +65,10 @@ identity, SQLite state, setup, and managed files.
   nodes. Cover omitted-profile defaults and repeated self-hosted setup without
   identity or configuration drift.
 - Doctor tests cover missing/unsafe managed paths without creating them.
+
+## Temporary uploads
+
+`zterm-platform::upload::StagedUpload` publishes private files under the canonical
+system `/tmp` alias with an effective-UID namespace. This is separate from the
+managed identity/config inventory and is not age/capacity cleaned by zterm.
+See [Single-file Upload](./file-upload.md) for path/mode/collision/publication rules.

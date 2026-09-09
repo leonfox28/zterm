@@ -1,12 +1,15 @@
 //! Application-owned native terminal reducer. UI observers only read complete frames.
 mod navigation;
+pub mod upload;
 use navigation::Navigation;
+use upload::{ActiveUpload, NativeUpload};
 
 use crate::{
     NativeError, NativeRuntime,
     network::{parse_device, require_network},
 };
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use zterm_client::{
@@ -324,12 +327,17 @@ impl NativeKey {
 /// One attachment retained by the Application, not by an Activity's subscription.
 #[derive(uniffi::Object)]
 pub struct NativeTerminal {
+    upload_input_generation: Arc<AtomicU64>,
     session_id: SessionId,
     commands: mpsc::Sender<Command>,
     frame: watch::Sender<NativeFrame>,
     cancel: CancellationToken,
 }
 enum Action {
+    ReserveUpload(
+        oneshot::Sender<Result<Arc<NativeUpload>, NativeError>>,
+        CancellationToken,
+    ),
     Pointer {
         source: Arc<NativeFrameSource>,
         row: u16,
@@ -372,12 +380,24 @@ enum Action {
     Detach,
 }
 struct Command {
+    upload_input_generation: u64,
     input_epoch: u64,
     action: Action,
     reply: oneshot::Sender<Result<(), NativeError>>,
 }
 #[uniffi::export]
 impl NativeTerminal {
+    /// Reserves the single upload/input pause before launching an Android picker.
+    pub async fn reserve_upload(&self, input_epoch: u64) -> Result<Arc<NativeUpload>, NativeError> {
+        let (reply, result) = oneshot::channel();
+        let cancellation = self.cancel.child_token();
+        let guard = cancellation.clone().drop_guard();
+        self.submit_at(input_epoch, Action::ReserveUpload(reply, cancellation))
+            .await?;
+        let handle = result.await.map_err(|_| NativeError::Closed)??;
+        guard.disarm();
+        Ok(handle)
+    }
     /// Authoritative Session ID, including a newly created default main.
     pub fn session_id(&self) -> String {
         self.session_id.to_string()
@@ -560,9 +580,19 @@ impl NativeTerminal {
         self.submit_at(epoch, action).await
     }
     async fn submit_at(&self, input_epoch: u64, action: Action) -> Result<(), NativeError> {
+        let upload_input_generation = self.upload_input_generation.load(Ordering::Acquire);
+        if upload_input_generation % 2 == 1
+            && matches!(
+                action,
+                Action::Text { .. } | Action::Key { .. } | Action::Pointer { .. }
+            )
+        {
+            return Err(failure("input_not_ready"));
+        }
         let (reply, result) = oneshot::channel();
         self.commands
             .try_send(Command {
+                upload_input_generation,
                 input_epoch,
                 action,
                 reply,
@@ -627,7 +657,7 @@ impl NativeRuntime {
         self.on_executor(async move {
             let controller = require_network(&network)?.controller.clone();
             let client = SessionClient::connect(
-                Arc::new(controller),
+                Arc::new(controller.clone()),
                 ResolvedSessionTarget::device(host),
                 session.map(SessionSelector::Id),
                 session.is_none(),
@@ -657,13 +687,25 @@ impl NativeRuntime {
             let (reader, writer) = io.split();
             let (commands, receiver) = mpsc::channel(32);
             let cancel = closed.child_token();
+            let upload_input_generation = Arc::new(AtomicU64::new(0));
             let terminal = Arc::new(NativeTerminal {
+                upload_input_generation: Arc::clone(&upload_input_generation),
                 session_id,
                 commands,
                 frame: frame.clone(),
                 cancel: cancel.clone(),
             });
-            tokio::spawn(run(surface, reader, writer, receiver, frame, cancel, dark));
+            tokio::spawn(run(
+                surface,
+                reader,
+                writer,
+                receiver,
+                frame,
+                cancel,
+                dark,
+                Arc::new(controller),
+                upload_input_generation,
+            ));
             // Attach's viewport is only a creation hint on the host. A retained
             // Session still has its previous controller's dimensions. Install
             // the requested size through the actor before exposing this handle;
@@ -674,6 +716,7 @@ impl NativeRuntime {
         .await
     }
 }
+#[allow(clippy::too_many_arguments)]
 async fn run(
     mut surface: AttachmentSurface,
     mut reader: zterm_client::view::TerminalViewEventReader,
@@ -682,6 +725,8 @@ async fn run(
     frame: watch::Sender<NativeFrame>,
     cancel: CancellationToken,
     mut dark: bool,
+    upload_connector: Arc<dyn zterm_client::upload::UploadConnector>,
+    upload_input_generation: Arc<AtomicU64>,
 ) {
     let mut state = "synchronizing";
     let mut connection = None;
@@ -692,15 +737,51 @@ async fn run(
     let mut desired_size = surface.surface.size;
     let mut navigation = Navigation::new(&surface);
     let origin = Arc::new(());
+    let mut active_upload: Option<ActiveUpload> = None;
     loop {
         let mut query = None;
         let mut prefetch = false;
         let result: Result<(), NativeError> = tokio::select! {
+            result = upload::wait_result(&mut active_upload), if active_upload.is_some() => {
+                let operation = active_upload.take().expect("completed upload remains owned");
+                let result = if operation.input_epoch != input_epoch || operation.handle.cancelled()
+                    || !(state == "active" || healthy_resize) { Err(failure("cancelled")) } else { result };
+                let result = match result {
+                    Ok(file) => {
+                        operation.handle.inserting();
+                        writer.write_upload_input(operation.origin, zterm_client::upload::paste_bytes(&file, &surface.modes())).await.map_err(Into::into)
+                    }
+                    Err(error) => Err(error),
+                };
+                operation.handle.finish(result);
+                upload_input_generation.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            }
             _ = cancel.cancelled() => { let _ = writer.detach().await; break; }
             command = commands.recv() => {
                 let Some(command) = command else { let _ = writer.detach().await; break; };
                 let detach = matches!(command.action, Action::Detach);
                 let result: Result<(), NativeError> = match command.action {
+                    Action::ReserveUpload(reply, reservation) => {
+                        let result = if reservation.is_cancelled() || command.input_epoch != input_epoch || !(state == "active" || healthy_resize) {
+                            Err(failure("input_not_ready"))
+                        } else if let Some(operation) = &active_upload {
+                            Ok(Arc::clone(&operation.handle))
+                        } else {
+                            match writer.upload_origin().await {
+                                Ok(upload_origin) => {
+                                    let operation = ActiveUpload::new(Arc::clone(&upload_connector), upload_origin, input_epoch, &reservation);
+                                    let handle = Arc::clone(&operation.handle);
+                                    active_upload = Some(operation);
+                                    upload_input_generation.fetch_add(1, Ordering::AcqRel);
+                                    Ok(handle)
+                                }
+                                Err(error) => Err(error.into()),
+                            }
+                        };
+                        let _ = reply.send(result);
+                        Ok(())
+                    },
                     Action::Detach => writer.detach().await.map_err(Into::into),
                     Action::Copy(reply) => { let _ = reply.send(navigation.copy().map(TerminalClipboardWrite::into_string)); Ok(()) },
                     Action::ClearSelection => { navigation.clear_selection(); Ok(()) },
@@ -730,7 +811,7 @@ async fn run(
                         if !source.valid_for(&origin, input_epoch, geometry_generation, &surface) { Err(failure("selection_changed")) }
                         else { navigation.extend_source(&source.page, source.offset, row, column, anchor) }
                     },
-                    Action::Pointer { source, row, column, wheel_lines } if state == "active" && navigation.live() && !navigation.selected() => {
+                    Action::Pointer { source, row, column, wheel_lines } if active_upload.is_none() && command.upload_input_generation == upload_input_generation.load(Ordering::Acquire) && state == "active" && navigation.live() && !navigation.selected() => {
                         if !source.valid_for(&origin, input_epoch, geometry_generation, &surface) || source.modes != surface.modes()
                             || source.pointer_mode == NativePointerMode::None || row >= surface.surface.size.rows || column >= surface.surface.size.columns {
                             Err(failure("input_not_ready"))
@@ -744,7 +825,7 @@ async fn run(
                             Ok(request) => { query = request; prefetch = offset != 0; Ok(()) }, Err(error) => Err(error),
                         }
                     },
-                    action @ (Action::Text { .. } | Action::Key { .. }) if (state == "active" || healthy_resize || navigation.returning()) && command.input_epoch == input_epoch => {
+                    action @ (Action::Text { .. } | Action::Key { .. }) if active_upload.is_none() && command.upload_input_generation == upload_input_generation.load(Ordering::Acquire) && (state == "active" || healthy_resize || navigation.returning()) && command.input_epoch == input_epoch => {
                         let bytes = encode_action(action, surface.modes());
                         if bytes.len() > zterm_client::input::RESUME_INPUT_BOUND { Err(failure("resource_limit")) }
                         else if bytes.is_empty() { Ok(()) }
@@ -841,6 +922,12 @@ async fn run(
         if matches!(state, "reconnecting" | "ended" | "lease_lost" | "closed") {
             connection = None;
         }
+        if let Some(operation) = &active_upload
+            && (operation.input_epoch != input_epoch
+                || matches!(state, "reconnecting" | "ended" | "lease_lost" | "closed"))
+        {
+            operation.handle.cancel();
+        }
         let mut next = project_navigation(
             &surface,
             generation,
@@ -883,6 +970,9 @@ async fn run(
             Some(&frame.borrow()),
         );
         frame.send_replace(next);
+    }
+    if let Some(operation) = active_upload.take() {
+        operation.handle.finish(Err(failure("cancelled")));
     }
     cancel.cancel();
 }

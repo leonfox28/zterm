@@ -91,6 +91,8 @@ async fn queued_delta_resize_case(trigger: ResizeTrigger) {
     let pty = openpty(None, None).expect("synchronization fixture operation succeeds");
     let input_epoch = InputEpoch::new();
     let mut ui = TerminalUiSession {
+        upload: None,
+        upload_connector: runtime.upload_connector(),
         progress: ProgressObserver::default(),
         host_colors: Default::default(),
 

@@ -193,6 +193,22 @@ impl fmt::Debug for SessionClient {
 }
 
 impl SessionClient {
+    pub(crate) fn upload_origin(&self) -> Result<crate::upload::UploadOrigin, DaemonError> {
+        if self.reconnect_pending || self.target.is_local() {
+            return Err(DaemonError::new(
+                DomainErrorKind::NotSynchronized,
+                "upload requires a connected remote attachment",
+            ));
+        }
+        Ok(crate::upload::UploadOrigin {
+            target: self.target,
+            binding: zterm_core::upload::UploadBinding {
+                session_id: self.session_id,
+                attachment_id: self.attachment_id,
+            },
+        })
+    }
+
     /// Opens an attachment using the injected transport and exact target.
     pub async fn connect(
         connector: Arc<dyn AttachmentConnector>,
@@ -1900,14 +1916,7 @@ mod tests {
     }
 
     fn tunnel_transport(stream: tokio::net::UnixStream) -> AttachmentTransport {
-        AttachmentTransport::new(UnixAttachmentTransport::Tunnel {
-            stream,
-            envelope_decoder: FrameDecoder::new(),
-            queued_envelopes: VecDeque::new(),
-            session_decoder: FrameDecoder::new(),
-            queued_session_frames: VecDeque::new(),
-            remote_half_closed: false,
-        })
+        AttachmentTransport::new(UnixAttachmentTransport::tunnel_after_first(stream, None))
     }
 
     fn tunnel_envelope<Message: prost::Message>(kind: WireKind, message: &Message) -> Vec<u8> {
@@ -1976,6 +1985,7 @@ mod tests {
                     first.frame.request_id,
                     0,
                     &v2::LocalSessionTunnelOpened {
+                        remote_capabilities: None,
                         protocol_version: zterm_proto::LOCAL_SESSION_TUNNEL_VERSION,
                     },
                 )
@@ -2712,6 +2722,7 @@ mod tests {
                     1,
                     0,
                     &v2::LocalSessionTunnelOpened {
+                        remote_capabilities: None,
                         protocol_version: zterm_proto::LOCAL_SESSION_TUNNEL_VERSION,
                     },
                 )
@@ -2740,14 +2751,9 @@ mod tests {
                     .await
                     .expect("tunnel progress fixture");
                 assert_eq!(first.frame.kind, WireKind::LocalSessionTunnelOpened);
-                let mut transport = AttachmentTransport::new(UnixAttachmentTransport::Tunnel {
-                    stream: client,
-                    envelope_decoder: first.decoder,
-                    queued_envelopes: first.queued,
-                    session_decoder: FrameDecoder::new(),
-                    queued_session_frames: VecDeque::new(),
-                    remote_half_closed: false,
-                });
+                let mut transport = AttachmentTransport::new(
+                    UnixAttachmentTransport::tunnel_after_first(client, Some(first)),
+                );
                 assert!(
                     matches!(transport.read_item().await.expect("tunnel progress fixture"), AttachmentTransportItem::Path(path) if path.path == v2::TerminalConnectionPath::Direct as i32 && path.rtt_ms == Some(3))
                 );
@@ -2771,6 +2777,7 @@ mod tests {
             1,
             0,
             &v2::LocalSessionTunnelOpened {
+                remote_capabilities: None,
                 protocol_version: zterm_proto::LOCAL_SESSION_TUNNEL_VERSION,
             },
         )
@@ -2858,6 +2865,7 @@ mod tests {
                 first.frame.request_id,
                 0,
                 &v2::LocalSessionTunnelOpened {
+                    remote_capabilities: None,
                     protocol_version: zterm_proto::LOCAL_SESSION_TUNNEL_VERSION,
                 },
             )
@@ -3810,6 +3818,7 @@ mod tests {
                             first.frame.request_id,
                             0,
                             &v2::LocalSessionTunnelOpened {
+                                remote_capabilities: None,
                                 protocol_version: zterm_proto::LOCAL_SESSION_TUNNEL_VERSION,
                             },
                         )

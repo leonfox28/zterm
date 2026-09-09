@@ -9,6 +9,7 @@ pub mod release;
 pub mod terminal;
 pub mod terminal_selection;
 pub mod transport;
+pub mod upload;
 pub mod viewport_cache;
 
 pub use authorization::{AuthGeneration, AuthorizationSnapshot, AuthorizationStatus};

@@ -777,7 +777,7 @@ fn atomic_write_inner(
     sync_directory(parent)
 }
 
-fn create_or_validate_directory(path: &Path, uid: u32) -> Result<(), PathError> {
+pub(crate) fn create_or_validate_directory(path: &Path, uid: u32) -> Result<(), PathError> {
     ensure_absolute(path)?;
     match fs::symlink_metadata(path) {
         Ok(_) => validate_node(path, uid, ManagedType::Directory),
@@ -817,7 +817,7 @@ fn open_managed_file(path: &Path, uid: u32, create: bool, append: bool) -> Resul
     Ok(file)
 }
 
-fn create_new_file(path: &Path) -> Result<File, PathError> {
+pub(crate) fn create_new_file(path: &Path) -> Result<File, PathError> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     configure_secure_open(&mut options);

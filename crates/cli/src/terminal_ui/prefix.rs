@@ -10,10 +10,16 @@ const HELD_COMMAND_KEYS: usize = 64;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum LocalCommand {
     Detach,
+    Upload,
+    CancelUpload,
 }
 
 // New zterm controls extend this table and the command executor, not decoding.
-const BINDINGS: &[(Shortcut, LocalCommand)] = &[(Shortcut::plain('.'), LocalCommand::Detach)];
+const BINDINGS: &[(Shortcut, LocalCommand)] = &[
+    (Shortcut::plain('.'), LocalCommand::Detach),
+    (Shortcut::plain('v'), LocalCommand::Upload),
+    (Shortcut::plain('c'), LocalCommand::CancelUpload),
+];
 
 #[derive(Eq, PartialEq)]
 pub(super) enum PrefixAction {
@@ -77,6 +83,12 @@ impl CommandMode {
     pub(super) fn clear_pending(&mut self) {
         self.cancel();
         self.owned_keys.clear();
+        self.cancelled_utf8_tail = 0;
+    }
+
+    /// Retires paused text while still consuming releases of locally owned keys.
+    pub(super) fn finish_upload_pause(&mut self) {
+        self.cancel();
         self.cancelled_utf8_tail = 0;
     }
 
@@ -266,6 +278,59 @@ impl CommandMode {
 mod tests {
     use super::super::{HostInputCodec, PAGE_DOWN, PAGE_UP};
     use super::*;
+
+    #[test]
+    fn upload_and_cancel_use_plain_prefix_suffix_and_keep_ctrl_v_unchanged() {
+        for input in [
+            b"\x1dv\x1dc".as_slice(),
+            b"\x1b[93;5u\x1b[118u\x1b[118;1:2u\x1b[118;1:3u\x1b[93;5u\x1b[99u",
+        ] {
+            for chunk_size in [1, input.len()] {
+                assert_eq!(
+                    run(input, chunk_size),
+                    (
+                        vec![LocalCommand::Upload, LocalCommand::CancelUpload],
+                        Vec::new()
+                    )
+                );
+            }
+        }
+        assert_eq!(run(b"\x16", 1), (Vec::new(), vec![0x16]));
+        assert_eq!(
+            run(b"\x1b[118;5u", 1),
+            (Vec::new(), b"\x1b[118;5u".to_vec())
+        );
+    }
+
+    #[test]
+    fn upload_completion_keeps_owned_releases_but_clears_pending_suffix() {
+        let mut codec = HostInputCodec::new();
+        let mut mode = CommandMode::new();
+        for event in codec.feed(b"\x1b[93;5u\x1b[118u").expect("decode presses") {
+            let _ = mode
+                .route(event, Instant::now(), true)
+                .expect("route presses");
+        }
+        mode.finish_upload_pause();
+        for event in codec
+            .feed(b"\x1b[118;1:2u\x1b[118;1:3u\x1b[93;1:3u")
+            .expect("decode held keys")
+        {
+            assert!(
+                mode.route(event, Instant::now(), true)
+                    .expect("route held keys")
+                    .is_empty()
+            );
+        }
+        for event in codec.feed(b"v").expect("decode new text") {
+            assert!(matches!(
+                mode.route(event, Instant::now(), true)
+                    .expect("route new text")
+                    .as_slice(),
+                [PrefixAction::Input(_)]
+            ));
+        }
+    }
 
     fn run(input: &[u8], chunk_size: usize) -> (Vec<LocalCommand>, Vec<u8>) {
         let mut codec = HostInputCodec::new();

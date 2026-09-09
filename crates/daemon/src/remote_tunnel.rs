@@ -66,6 +66,7 @@ where
             return Err(error);
         }
     };
+    let capabilities = remote.remote_capabilities().bits();
     let observer = remote.candidate_observer();
     let result = pump_tunnel(
         local_stream,
@@ -73,6 +74,7 @@ where
         first,
         limits,
         deadline,
+        Some(capabilities),
         move || observer.selected_path_observation(),
     )
     .await;
@@ -87,6 +89,7 @@ async fn pump_tunnel<LocalStream, RemoteStream, ObservePath>(
     first: FirstFrame,
     limits: SessionWireLimits,
     deadline: Instant,
+    remote_capabilities: Option<u64>,
     observe_path: ObservePath,
 ) -> Result<(), DaemonError>
 where
@@ -105,6 +108,7 @@ where
         request_id,
         &v2::LocalSessionTunnelOpened {
             protocol_version: LOCAL_SESSION_TUNNEL_VERSION,
+            remote_capabilities,
         },
         deadline,
     )
@@ -691,6 +695,7 @@ mod tests {
             first,
             SessionWireLimits::default(),
             deadline,
+            None,
             SelectedPathObservation::default,
         ));
 
@@ -785,6 +790,7 @@ mod tests {
             first_with_queued(&queued),
             SessionWireLimits::default(),
             deadline,
+            None,
             SelectedPathObservation::default,
         ));
 
@@ -839,6 +845,7 @@ mod tests {
             first_with_queued(&bad_data),
             SessionWireLimits::default(),
             deadline,
+            None,
             SelectedPathObservation::default,
         ));
         let good_task = tokio::spawn(pump_tunnel(
@@ -847,6 +854,7 @@ mod tests {
             first_with_queued(&good_data),
             SessionWireLimits::default(),
             deadline,
+            None,
             SelectedPathObservation::default,
         ));
 
