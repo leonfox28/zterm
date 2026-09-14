@@ -56,6 +56,7 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
     }
     private var terminal: NativeTerminal? = null
     private var observation: Job? = null
+    private val frameClock = TerminalFrameClock()
     private var operation: Job? = null
     private var epoch = 0L
     val uploads = TerminalUploads(context.applicationContext, scope) {
@@ -244,29 +245,9 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
         // is no terminal for the size consumer yet. Reapply its latest intent
         // through that same consumer without overwriting newer measurements.
         if (viewport != requestedViewport) sizes.trySend(Unit)
-        // Metadata frames share an immutable row window. Resolve a replacement
-        // off Main, once, while retaining its exact native source until delivery.
-        var contentGeneration = 0uL
-        var contentRows: List<NativeRow> = emptyList()
-        suspend fun resolve(next: NativeFrame): NativeFrame {
-            val source = next.source ?: return next
-            try {
-                if (next.contentGeneration != contentGeneration) {
-                    contentRows = withContext(Dispatchers.Default) { source.presentationRows() }
-                    contentGeneration = next.contentGeneration
-                }
-                return next.copy(rows = contentRows)
-            } catch (error: Throwable) { source.close(); throw error }
-        }
-        val initial = resolve(attached.currentFrame())
-        if (mine != epoch) { initial.source?.close(); return }
-        publishFrame(initial)
         observation = scope.launch {
-            var generation = initial.generation
             try {
-                while (isActive && mine == epoch) {
-                    val next = resolve(attached.waitForFrame(generation))
-                    generation = next.generation
+                collectTerminalFrames(attached::currentFrame, attached::waitForFrame, frameClock) { next ->
                     if (mine == epoch) publishFrame(next) else next.source?.close()
                 }
             } catch (_: NativeException.Closed) { /* Final complete frame is retained. */ }
@@ -379,7 +360,10 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
             if (selected == selectionVersion && attachment == epoch) copy(text)
         }
     }
-    fun terminalVisible(visible: Boolean) = localTerminal { it.setVisible(visible) }
+    fun terminalVisible(visible: Boolean) {
+        frameClock.visible = visible
+        localTerminal { it.setVisible(visible) }
+    }
     private fun localSource(source: NativeFrameSource, action: suspend (NativeTerminal, NativeFrameSource) -> Unit) {
         val target = terminal ?: return
         val mine = epoch

@@ -1,0 +1,133 @@
+--- a/apps/android/app/src/androidTest/java/io/github/leonfox28/zterm/TerminalRenderingTest.kt
++++ b/apps/android/app/src/androidTest/java/io/github/leonfox28/zterm/TerminalRenderingTest.kt
+@@ -15,6 +15,8 @@
+ import androidx.compose.foundation.layout.*
+ import androidx.compose.material3.HorizontalDivider
+ import androidx.compose.ui.Modifier
++import androidx.compose.ui.layout.onGloballyPositioned
++import androidx.compose.ui.layout.boundsInWindow
+ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.viewinterop.AndroidView
+ import io.github.leonfox28.zterm.nativebridge.*
+@@ -286,10 +288,44 @@
+             var requests = 0
+             var started = false
+             var stop: (() -> Unit)? = null
++            val probe = mutableListOf<String>()
++            var phase = "initial"
++            var progressBottom = 0
++            var fraction = 0f
++            var toolbarTop = 0f
++            var toolbarBottom = 0f
++            var readInsets: () -> String = { "unavailable" }
++            var fixtureGeneration = 1uL
++            fun deliverSizedFrame(rows: Int, columns: Int) {
++                fixtureGeneration++
++                view.update(frame(0, 0, rows, maximum = 0).copy(
++                    activeScreen = NativeActiveScreen.ALTERNATE,
++                    viewport = NativeViewport(rows.toUShort(), columns.toUShort()),
++                    cursorVisible = true, cursorRow = (rows - 3).coerceAtLeast(0).toUShort(),
++                    generation = fixtureGeneration, geometryGeneration = fixtureGeneration,
++                    contentGeneration = fixtureGeneration), 12)
++            }
+             scenario.onActivity {
+                 activity = it
+                 val owner = ImeAnimationState()
+-                androidx.core.view.ViewCompat.setWindowInsetsAnimationCallback(it.window.decorView, owner)
++                androidx.core.view.ViewCompat.setWindowInsetsAnimationCallback(it.window.decorView,
++                    object : androidx.core.view.WindowInsetsAnimationCompat.Callback(DISPATCH_MODE_CONTINUE_ON_SUBTREE) {
++                        override fun onPrepare(animation: androidx.core.view.WindowInsetsAnimationCompat) {
++                            phase = "prepare"; owner.onPrepare(animation)
++                        }
++                        override fun onProgress(insets: androidx.core.view.WindowInsetsCompat,
++                            animations: MutableList<androidx.core.view.WindowInsetsAnimationCompat>): androidx.core.view.WindowInsetsCompat {
++                            phase = "progress"
++                            progressBottom = insets.getInsets(androidx.core.view.WindowInsetsCompat.Type.ime()).bottom
++                            fraction = animations.firstOrNull { animation ->
++                                animation.typeMask and androidx.core.view.WindowInsetsCompat.Type.ime() != 0
++                            }?.interpolatedFraction ?: -1f
++                            return owner.onProgress(insets, animations)
++                        }
++                        override fun onEnd(animation: androidx.core.view.WindowInsetsAnimationCompat) {
++                            phase = "end"; owner.onEnd(animation)
++                        }
++                    })
+                 view = TerminalView(it).apply {
+                     update(frame(0, 0, 12, maximum = 0).copy(activeScreen = NativeActiveScreen.ALTERNATE), 12)
+                     addOnLayoutChangeListener { _, left, top, right, bottom, _, _, _, _ ->
+@@ -301,7 +337,23 @@
+                     if (running) started = true else if (started) finished.countDown()
+                 }
+                 val cell = view.gridCellHeight
++                it.window.decorView.viewTreeObserver.addOnDrawListener {
++                    if (probe.size < 4096) {
++                        val location = IntArray(2); view.getLocationOnScreen(location)
++                        val root = IntArray(2); it.window.decorView.getLocationOnScreen(root)
++                        probe.add("t=${SystemClock.uptimeMillis()} show=$showing phase=$phase running=${owner.running} " +
++                            "progressIme=$progressBottom fraction=$fraction insets=${readInsets()} " +
++                            "rootY=${root[1]} rootH=${it.window.decorView.height} viewY=${location[1]} viewH=${view.height} " +
++                            "cell=$cell toolbar=$toolbarTop,$toolbarBottom")
++                    }
++                }
+                 it.setContent {
++                    val density = androidx.compose.ui.platform.LocalDensity.current
++                    val ime = WindowInsets.ime
++                    val source = WindowInsets.imeAnimationSource
++                    val target = WindowInsets.imeAnimationTarget
++                    val nav = WindowInsets.navigationBars
++                    readInsets = { "${ime.getBottom(density)},${source.getBottom(density)},${target.getBottom(density)},${nav.getBottom(density)}" }
+                     Box(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().imePadding()) {
+                         TerminalGridLayout(cell, owner, Modifier.fillMaxSize(), onImeTarget = { width, height ->
+                             if (view.prepareImeViewport(width, height)) {
+@@ -310,12 +362,22 @@
+                                 targetRows = height / cell
+                                 requests++
+                                 targetReported.countDown()
++                                val measuringPaint = android.graphics.Paint().apply {
++                                    typeface = android.graphics.Typeface.MONOSPACE
++                                    textSize = android.util.TypedValue.applyDimension(android.util.TypedValue.COMPLEX_UNIT_SP,
++                                        12f, activity.resources.displayMetrics)
++                                }
++                                val columns = (width / measuringPaint.measureText("M")).toInt()
++                                view.post { deliverSizedFrame(height / cell, columns) }
+                             }
+                         }) {
+                             Box(Modifier.fillMaxWidth().height(48.dp))
+                             AndroidView(factory = { view }, modifier = Modifier.fillMaxSize())
+                             HorizontalDivider()
+-                            Box(Modifier.fillMaxWidth().height(48.dp))
++                            Box(Modifier.fillMaxWidth().height(48.dp).onGloballyPositioned { coordinates ->
++                                val bounds = coordinates.boundsInWindow()
++                                toolbarTop = bounds.top; toolbarBottom = bounds.bottom
++                            })
+                         }
+                     }
+                 }
+@@ -334,9 +396,19 @@
+                     if (!served) SystemClock.sleep(25)
+                 }
+                 assertTrue("terminal owns a served editor before requesting IME", served)
++                scenario.onActivity {
++                    val measuringPaint = android.graphics.Paint().apply {
++                        typeface = android.graphics.Typeface.MONOSPACE
++                        textSize = android.util.TypedValue.applyDimension(android.util.TypedValue.COMPLEX_UNIT_SP,
++                            12f, activity.resources.displayMetrics)
++                    }
++                    deliverSizedFrame(view.height / view.gridCellHeight, (view.width / measuringPaint.measureText("M")).toInt())
++                }
++                hardwarePixels(activity, view).recycle()
+                 for (show in listOf(true, false)) {
+                     scenario.onActivity {
+                         showing = show; started = false; early = false; requests = 0
++                        phase = "request"
+                         targetReported = CountDownLatch(1); finished = CountDownLatch(1)
+                         view.setKeyboardVisible(show)
+                     }
+@@ -348,6 +420,7 @@
+                     assertEquals("early target matches settled layout (show=$show)", targetRows, view.height / view.gridCellHeight)
+                 }
+             } finally {
++                probe.forEach { android.util.Log.i("ZtermImeEnd", it) }
+                 scenario.onActivity { view.setKeyboardVisible(false); stop?.invoke() }
+             }
+         }

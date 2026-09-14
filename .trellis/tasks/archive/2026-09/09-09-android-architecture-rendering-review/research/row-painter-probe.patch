@@ -1,0 +1,84 @@
+--- a/apps/android/app/src/androidTest/java/io/github/leonfox28/zterm/TerminalRenderingTest.kt
++++ b/apps/android/app/src/androidTest/java/io/github/leonfox28/zterm/TerminalRenderingTest.kt
+@@ -26,6 +26,81 @@
+ /** Draw real cells and dispatch real gestures, with native frame delivery held at a row boundary. */
+ class TerminalRenderingTest {
+     private val instrumentation = InstrumentationRegistry.getInstrumentation()
++
++    @Test fun profileRowPainter() {
++        val args = InstrumentationRegistry.getArguments()
++        org.junit.Assume.assumeTrue(args.getString("rowPaintProfile") == "1")
++        val label = requireNotNull(args.getString("profileLabel"))
++        require(label in listOf("before", "after"))
++        val output = org.json.JSONArray()
++        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
++            lateinit var activity: MainActivity
++            scenario.onActivity { activity = it }
++            for (scene in listOf("sparse", "dense", "decorated")) {
++                val rows = List(44) { row -> NativeRow(List(40) { column ->
++                    val text = when {
++                        scene == "dense" -> ('A'.code + (column + row) % 26).toChar().toString()
++                        column < 12 -> "ROW_%03d_ABC ".format(row)[column].toString()
++                        scene == "decorated" && column == 36 -> " \u0301"
++                        else -> " "
++                    }
++                    NativeCell(text, 1u, Color.WHITE.toUInt(), (if (column % 7 == 0) Color.BLUE else Color.DKGRAY).toUInt(),
++                        (column % 8).toUByte(), (if (scene == "decorated") column % 6 else 0).toUByte(), Color.CYAN.toUInt())
++                }, false) }
++                val frame = frame(0, 0, 44, 0).copy(rows = rows, viewport = NativeViewport(44u, 40u),
++                    activeScreen = NativeActiveScreen.ALTERNATE, cursorRow = 41u)
++                lateinit var view: TerminalView
++                scenario.onActivity {
++                    view = liveView(frame, it)
++                    it.setContentView(android.widget.FrameLayout(it).apply {
++                        addView(view, android.widget.FrameLayout.LayoutParams(view.width, view.height))
++                    })
++                }
++                val hardware = hardwarePixels(activity, view)
++                java.io.File(instrumentation.targetContext.cacheDir, "row-paint-$label-$scene.png").outputStream().use {
++                    hardware.compress(Bitmap.CompressFormat.PNG, 100, it)
++                }
++                hardware.recycle()
++                instrumentation.runOnMainSync {
++                    val bitmap = Bitmap.createBitmap(view.width, view.height, Bitmap.Config.ARGB_8888)
++                    var texts = 0
++                    var spaces = 0
++                    val counted = object : Canvas(bitmap) {
++                        override fun drawText(text: String, x: Float, y: Float, paint: android.graphics.Paint) {
++                            texts++; if (text == " ") spaces++
++                            super.drawText(text, x, y, paint)
++                        }
++                    }
++                    view.draw(counted)
++                    bitmap.recycle()
++                    val node = android.graphics.RenderNode("row-paint-profile")
++                    val width = view.width
++                    val height = view.height
++                    val samples = mutableListOf<Long>()
++                    var recordings = 0L
++                    repeat(300) { iteration ->
++                        view.layout(0, 0, width + iteration % 2, height)
++                        val before = view.rowRecordingCount
++                        val canvas = node.beginRecording(view.width, height)
++                        val start = System.nanoTime()
++                        view.draw(canvas)
++                        val duration = System.nanoTime() - start
++                        node.endRecording()
++                        if (iteration >= 200) {
++                            samples.add(duration)
++                            recordings += view.rowRecordingCount - before
++                        }
++                    }
++                    node.discardDisplayList()
++                    val sorted = samples.sorted()
++                    output.put(org.json.JSONObject().put("scene", scene).put("textCalls", texts).put("spaceCalls", spaces)
++                        .put("recordings", recordings).put("samples", samples.size).put("medianNs", sorted[50])
++                        .put("p95Ns", sorted[95]).put("meanNs", samples.average()).put("sampleNs", org.json.JSONArray(samples)))
++                }
++            }
++        }
++        java.io.File(instrumentation.targetContext.cacheDir, "row-paint-$label.json").writeText(output.toString())
++    }
+
+     @Test fun blankCellsKeepBackgroundsDecorationsAndAdjacentGlyphs() {
+         instrumentation.runOnMainSync {

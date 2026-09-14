@@ -14,6 +14,14 @@ import org.junit.Test
 /** Run alone so the first Repository load uses only the disposable resume target. */
 class AttachGeometryTest {
     @Test fun integralEndpointsPreserveCursorAndInterpolateBelowToolbarRemainder() {
+        for (bottom in 0..400) {
+            assertEquals("opening target stays constant", 600,
+                terminalImeTargetHeight(1000 - bottom, bottom, 0, 400, true))
+            assertEquals("closing target stays constant", 1000,
+                terminalImeTargetHeight(1000 - bottom, bottom, 400, 0, true))
+        }
+        assertNull("unknown endpoint uses final measurement", terminalImeTargetHeight(800, 200, 200, 200, true))
+        assertNull("stale endpoint outside animation cannot submit", terminalImeTargetHeight(600, 400, 0, 400, false))
         for (cell in listOf(17, 23, 29, 41)) {
             val start = 1000
             val end = 600
@@ -32,11 +40,17 @@ class AttachGeometryTest {
         }
         val rows = 1000 / 17
         val target = 600 / 17
-        assertEquals(0f, terminalPan(target * 17f, 17f, rows, 10, 0), 0f)
-        val middlePan = terminalPan(target * 17f, 17f, rows, 39, 0)
-        assertEquals(-85f, middlePan, 0f)
-        assertEquals(34 * 17f, 39 * 17f + middlePan, 0f)
-        assertEquals(-(rows - target) * 17f, terminalPan(target * 17f, 17f, rows, rows - 1, 0), 0f)
+        assertEquals("top edge bounds upward movement", -10 * 17f, terminalPan(target * 17f, 17f, rows, 10), 0f)
+        val middlePan = terminalPan(target * 17f, 17f, rows, 39)
+        assertEquals(-(rows - target) * 17f, middlePan, 0f)
+        assertEquals((39 - (rows - target)) * 17f, 39 * 17f + middlePan, 0f)
+        assertEquals(-(rows - target) * 17f, terminalPan(target * 17f, 17f, rows, rows - 1), 0f)
+        assertEquals("hidden caret uses the grid edge", -(rows - target) * 17f,
+            terminalPan(target * 17f, 17f, rows, null), 0f)
+        assertEquals("unknown exposed rows do not stop local grid movement", 51f,
+            terminalPan((target + 3) * 17f, 17f, target, null), 0f)
+        assertEquals("visible caret uses the same height difference on growth", 51f,
+            terminalPan((target + 3) * 17f, 17f, target, target - 1), 0f)
         assertEquals(0, terminalBottomRemainder(0, 17, 0, 0, 400, false))
         assertEquals(0, terminalBottomRemainder(3, 17, 0, 0, 400, false))
     }

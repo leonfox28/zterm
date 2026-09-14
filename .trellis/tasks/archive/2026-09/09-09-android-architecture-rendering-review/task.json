@@ -1,0 +1,28 @@
+{
+  "id": "android-architecture-rendering-review",
+  "name": "android-architecture-rendering-review",
+  "title": "Android 架构、实现与终端 diff 渲染审查",
+  "description": "重新审视 Android app 架构、实现缺陷、终端渲染与 TUI 显示，验证现有 diff 链路并比较改进方案。",
+  "status": "completed",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "leon",
+  "assignee": "leon",
+  "createdAt": "2026-09-09",
+  "completedAt": "2026-09-14",
+  "branch": "codex/android-tui-row-reuse",
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {
+    "review_baseline": "a2b518e61544642bb4537935e8fd6c192dff607b"
+  }
+}

@@ -110,7 +110,7 @@ impl TerminalColorSnapshot {
 }
 
 /// Semantic underline shape, independent of any font renderer.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub enum TerminalUnderline {
     /// No underline.
     #[default]

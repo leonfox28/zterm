@@ -1,0 +1,235 @@
+--- a/apps/android/app/src/main/java/io/github/leonfox28/zterm/TerminalView.kt
++++ b/apps/android/app/src/main/java/io/github/leonfox28/zterm/TerminalView.kt
+@@ -48,6 +48,9 @@
+     var consumedModifiers: () -> Unit = {}
+     private var current: NativeFrame? = null
+     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { typeface = Typeface.MONOSPACE }
++    private val runPaint = Paint()
++    private val runText = CharArray(240)
++    private val runGlyphs = BooleanArray(128)
+     private val rowRenderer = TerminalRowRenderer()
+     internal val rowRecordingCount: Long get() = rowRenderer.recordingCount
+     private val underlinePath = Path()
+@@ -256,6 +259,16 @@
+         rowRenderer.clear()
+         paint.textSize = android.util.TypedValue.applyDimension(android.util.TypedValue.COMPLEX_UNIT_SP, font.toFloat(), resources.displayMetrics)
+         cellWidth = paint.measureText("M").coerceAtLeast(1f)
++        runPaint.set(paint)
++        // Independent terminal cells must not acquire ligatures or kerning when batched.
++        runPaint.fontFeatureSettings = "'liga' 0, 'clig' 0, 'calt' 0, 'kern' 0"
++        val bounds = Rect()
++        for (code in 33..126) {
++            val text = code.toChar().toString()
++            runPaint.getTextBounds(text, 0, 1, bounds)
++            runGlyphs[code] = runPaint.measureText(text) == cellWidth &&
++                bounds.left > 0 && bounds.right < cellWidth
++        }
+         val metrics = paint.fontMetrics
+         cellHeight = kotlin.math.ceil((metrics.descent - metrics.ascent).toDouble()).toFloat().coerceAtLeast(1f)
+         baseline = -metrics.ascent
+@@ -364,11 +377,22 @@
+     }
+     private fun drawRow(canvas: Canvas, line: NativeRow) {
+         val top = 0f
+-        line.cells.forEachIndexed { column, cell ->
+-            if (cell.width == 0.toUByte()) return@forEachIndexed
++        var column = 0
++        var nextRun = 0
++        while (column < line.cells.size) {
++            val cell = line.cells[column]
++            if (cell.width == 0.toUByte()) { column++; continue }
+             val x = column * cellWidth
+             val right = x + cellWidth * cell.width.toInt()
+-            if (x >= width) return@forEachIndexed
++            if (x >= width) break
++            if (column >= nextRun && cell.text.isNotEmpty() && cell.text != " " &&
++                cell.attributes.toInt() and 5 == 0 && cell.underline == 0.toUByte()) {
++                nextRun = textRunEnd(line, column)
++                if (nextRun - column >= 4) {
++                    drawTextRun(canvas, cell, column, nextRun)
++                    column = nextRun; continue
++                }
++            }
+             paint.color = cell.background.toInt(); paint.alpha = 255
+             canvas.drawRect(x, top, right, top + cellHeight, paint)
+             // A plain space has no glyph ink; its background and decorations still draw.
+@@ -408,7 +432,41 @@
+                     }
+                 }
+             }
+-        }
++            column++
++        }
++    }
++    /** Only glyphs with exact cell advances and no ink outside their cells can share a clip. */
++    private fun runCompatible(cell: NativeCell): Boolean = cell.width == 1.toUByte() &&
++        cell.attributes.toInt() and 5 == 0 && cell.underline == 0.toUByte() &&
++        cell.text.length == 1 && cell.text[0] > ' ' && cell.text[0].code < runGlyphs.size && runGlyphs[cell.text[0].code]
++
++    private fun textRunEnd(line: NativeRow, start: Int): Int {
++        val first = line.cells[start]
++        if (!runCompatible(first)) return start + 1
++        var end = start
++        while (end < line.cells.size && end - start < runText.size && end * cellWidth < width) {
++            val cell = line.cells[end]
++            if (!runCompatible(cell) || cell.foreground != first.foreground ||
++                cell.background != first.background || cell.attributes != first.attributes) break
++            runText[end - start] = cell.text[0]
++            end++
++        }
++        return end
++    }
++
++    private fun drawTextRun(canvas: Canvas, first: NativeCell, start: Int, end: Int) {
++        paint.color = first.background.toInt(); paint.alpha = 255
++        // Keep individual background rectangles: merging changes fractional-edge coverage.
++        for (column in start until end) {
++            val x = column * cellWidth
++            canvas.drawRect(x, 0f, x + cellWidth, cellHeight, paint)
++        }
++        runPaint.color = first.foreground.toInt()
++        runPaint.alpha = if (first.attributes.toInt() and 2 != 0) 150 else 255
++        val count = end - start
++        canvas.save(); canvas.clipRect(start * cellWidth, 0f, end * cellWidth, cellHeight)
++        canvas.drawTextRun(runText, 0, count, 0, count, start * cellWidth, baseline, false, runPaint)
++        canvas.restore()
+     }
+     private fun geometryShift(frame: NativeFrame): Float {
+         if (scrollPixels != 0f || frame.historyOffset != 0uL || frame.selection != null) return 0f
+--- a/apps/android/app/src/androidTest/java/io/github/leonfox28/zterm/TerminalRenderingTest.kt
++++ b/apps/android/app/src/androidTest/java/io/github/leonfox28/zterm/TerminalRenderingTest.kt
+@@ -26,6 +26,134 @@
+ /** Draw real cells and dispatch real gestures, with native frame delivery held at a row boundary. */
+ class TerminalRenderingTest {
+     private val instrumentation = InstrumentationRegistry.getInstrumentation()
++
++    @Test fun profileCompatibleTextRuns() {
++        val args = InstrumentationRegistry.getArguments()
++        org.junit.Assume.assumeTrue(args.getString("textRunProfile") == "1")
++        val label = requireNotNull(args.getString("profileLabel"))
++        require(label in listOf("before", "after"))
++        val output = org.json.JSONArray()
++        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
++            lateinit var activity: MainActivity
++            scenario.onActivity { activity = it }
++            for (scene in listOf("ascii", "sparse", "decorated")) for (font in listOf(8, 12, 16)) {
++                val rows = List(40) { row -> NativeRow(List(40) { column ->
++                    var text = when {
++                        scene == "ascii" -> (' '.code + (column + row * 40) % 95).toChar().toString()
++                        column < 12 -> "ROW_%03d_AB ".format(row).padEnd(12)[column].toString()
++                        else -> " "
++                    }
++                    if (scene == "decorated") text = when (column) {
++                        18 -> "界"; 19 -> ""; 20 -> "e\u0301"; 21 -> " \u0301"; else -> text
++                    }
++                    NativeCell(text, (if (scene == "decorated" && column == 18) 2 else if (scene == "decorated" && column == 19) 0 else 1).toUByte(),
++                        Color.WHITE.toUInt(), (if (row % 7 == 0) Color.BLUE else Color.DKGRAY).toUInt(),
++                        (if (scene == "decorated") column % 8 else 0).toUByte(),
++                        (if (scene == "decorated") column % 6 else 0).toUByte(), Color.CYAN.toUInt())
++                }, false) }
++                val frame = frame(0, 0, 40, 0).copy(rows = rows, viewport = NativeViewport(40u, 40u),
++                    activeScreen = NativeActiveScreen.ALTERNATE, cursorRow = 38u)
++                lateinit var view: TerminalView
++                scenario.onActivity {
++                    view = liveView(frame, it)
++                    view.update(frame, font)
++                    val metrics = android.graphics.Paint().apply {
++                        typeface = android.graphics.Typeface.MONOSPACE
++                        textSize = android.util.TypedValue.applyDimension(android.util.TypedValue.COMPLEX_UNIT_SP, font.toFloat(), view.resources.displayMetrics)
++                    }
++                    view.layout(0, 0, kotlin.math.ceil(metrics.measureText("M") * 40).toInt(), 40 * view.gridCellHeight)
++                    it.setContentView(android.widget.FrameLayout(it).apply {
++                        addView(view, android.widget.FrameLayout.LayoutParams(view.width, view.height))
++                    })
++                }
++                val hardware = hardwarePixels(activity, view)
++                java.io.File(instrumentation.targetContext.cacheDir, "text-runs-$label-$scene-$font.png").outputStream().use {
++                    hardware.compress(Bitmap.CompressFormat.PNG, 100, it)
++                }
++                hardware.recycle()
++                if (font == 12) instrumentation.runOnMainSync {
++                    val bitmap = Bitmap.createBitmap(view.width, view.height, Bitmap.Config.ARGB_8888)
++                    var texts = 0; var runs = 0
++                    val counted = object : Canvas(bitmap) {
++                        override fun drawText(text: String, x: Float, y: Float, paint: android.graphics.Paint) {
++                            texts++; super.drawText(text, x, y, paint)
++                        }
++                        override fun drawTextRun(text: CharArray, index: Int, count: Int, contextIndex: Int, contextCount: Int,
++                                                 x: Float, y: Float, isRtl: Boolean, paint: android.graphics.Paint) {
++                            runs++; super.drawTextRun(text, index, count, contextIndex, contextCount, x, y, isRtl, paint)
++                        }
++                    }
++                    view.draw(counted); bitmap.recycle()
++                    val node = android.graphics.RenderNode("text-run-profile")
++                    val width = view.width; val height = view.height
++                    val samples = mutableListOf<Long>()
++                    val cpuSamples = mutableListOf<Long>()
++                    repeat(300) { iteration ->
++                        view.layout(0, 0, width + iteration % 2, height)
++                        val canvas = node.beginRecording(view.width, height)
++                        val start = System.nanoTime()
++                        val cpuStart = android.os.Debug.threadCpuTimeNanos()
++                        view.draw(canvas)
++                        val elapsed = System.nanoTime() - start
++                        val cpuElapsed = android.os.Debug.threadCpuTimeNanos() - cpuStart
++                        node.endRecording()
++                        if (iteration >= 200) { samples.add(elapsed); cpuSamples.add(cpuElapsed) }
++                    }
++                    node.discardDisplayList()
++                    val sorted = samples.sorted()
++                    output.put(org.json.JSONObject().put("scene", scene).put("texts", texts).put("runs", runs)
++                        .put("medianNs", sorted[50]).put("p95Ns", sorted[95]).put("samples", org.json.JSONArray(samples))
++                        .put("cpuMedianNs", cpuSamples.sorted()[50]).put("cpuP95Ns", cpuSamples.sorted()[95])
++                        .put("cpuSamples", org.json.JSONArray(cpuSamples)))
++                }
++            }
++        }
++        java.io.File(instrumentation.targetContext.cacheDir, "text-runs-$label.json").writeText(output.toString())
++    }
++
++    @Test fun compatibleTextRunsMatchIndependentCellPaintingAtEveryFontSize() {
++        instrumentation.runOnMainSync {
++            val rows = List(4) { row -> NativeRow(List(40) { column ->
++                var text = (' '.code + (row * 40 + column) % 95).toChar().toString()
++                if (row == 3) text = when (column) { 20 -> "界"; 21 -> ""; 22 -> "e\u0301"; 23 -> " \u0301"; else -> text }
++                NativeCell(text, (if (row == 3 && column == 20) 2 else if (row == 3 && column == 21) 0 else 1).toUByte(),
++                    (if (column < 30) Color.WHITE else Color.CYAN).toUInt(),
++                    (if (row % 2 == 0) Color.DKGRAY else Color.BLUE).toUInt(),
++                    (if (row % 2 == 0) 0 else 2).toUByte(), 0u, Color.WHITE.toUInt())
++            }, false) }
++            val frame = frame(0, 0, 4, 0).copy(rows = rows, viewport = NativeViewport(4u, 40u))
++            for (font in 8..16) {
++                val view = liveView(frame)
++                view.update(frame, font)
++                val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
++                    typeface = android.graphics.Typeface.MONOSPACE
++                    textSize = android.util.TypedValue.applyDimension(android.util.TypedValue.COMPLEX_UNIT_SP,
++                        font.toFloat(), view.resources.displayMetrics)
++                }
++                val cellWidth = paint.measureText("M")
++                val cellHeight = view.gridCellHeight.toFloat()
++                view.layout(0, 0, kotlin.math.ceil(cellWidth * 40).toInt(), 4 * view.gridCellHeight)
++                val actual = pixels(view)
++                val expected = Bitmap.createBitmap(view.width, view.height, Bitmap.Config.ARGB_8888)
++                val canvas = Canvas(expected)
++                canvas.drawColor(frame.background.toInt())
++                rows.forEachIndexed { row, line -> line.cells.forEachIndexed { column, cell ->
++                    if (cell.width != 0.toUByte()) {
++                        val x = column * cellWidth; val y = row * cellHeight
++                        val right = x + cellWidth * cell.width.toInt()
++                        paint.color = cell.background.toInt(); paint.alpha = 255
++                        canvas.drawRect(x, y, right, y + cellHeight, paint)
++                        paint.color = cell.foreground.toInt()
++                        paint.alpha = if (cell.attributes.toInt() and 2 != 0) 150 else 255
++                        canvas.save(); canvas.clipRect(x, y, right, y + cellHeight)
++                        canvas.drawText(cell.text, x, y - paint.fontMetrics.ascent, paint); canvas.restore()
++                    }
++                } }
++                try { assertTrue("batched text retains exact independent-cell pixels at $font sp", actual.sameAs(expected)) }
++                finally { actual.recycle(); expected.recycle() }
++            }
++        }
++    }
+
+     @Test fun blankCellsKeepBackgroundsDecorationsAndAdjacentGlyphs() {
+         instrumentation.runOnMainSync {

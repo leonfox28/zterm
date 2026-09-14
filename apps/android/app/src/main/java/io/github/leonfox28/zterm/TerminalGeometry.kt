@@ -2,6 +2,12 @@ package io.github.leonfox28.zterm
 
 import kotlin.math.roundToInt
 
+/** A known consumed-inset endpoint gives one final usable height throughout the animation. */
+internal fun terminalImeTargetHeight(
+    available: Int, currentBottom: Int, startBottom: Int, endBottom: Int, animating: Boolean,
+): Int? = if (animating && startBottom != endBottom)
+    (available + currentBottom - endBottom).coerceAtLeast(0) else null
+
 /** One-way allocation from the parent's available pixels, never the child's rounded height. */
 internal fun terminalBottomRemainder(
     available: Int, cellHeight: Int, currentBottom: Int, startBottom: Int, endBottom: Int,
@@ -20,11 +26,10 @@ internal fun terminalBottomRemainder(
         .roundToInt().coerceIn(0, height)
 }
 
-/** Cursor-preserving clip/pan; integral grid endpoints make the host handoff exact. */
-internal fun terminalPan(height: Float, cellHeight: Float, rows: Int, cursorRow: Int, history: Long): Float {
+/** Move the live grid with its bottom edge, stopping before a visible caret leaves the top. */
+internal fun terminalPan(height: Float, cellHeight: Float, rows: Int, cursorRow: Int?): Float {
     val difference = height - rows * cellHeight
-    val minimum = minOf(0f, height - (cursorRow + 1) * cellHeight)
-    return difference.coerceIn(minimum, history * cellHeight)
+    return if (cursorRow == null) difference else difference.coerceAtLeast(-cursorRow * cellHeight)
 }
 
 /** Committed together with the drawn semantic source. Pending layout cannot change hit tests. */

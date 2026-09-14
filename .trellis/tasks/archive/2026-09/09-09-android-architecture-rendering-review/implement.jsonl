@@ -1,0 +1,7 @@
+{"file": ".trellis/spec/frontend/android-app.md", "reason": "Android presentation, source ownership, gesture and API compatibility contracts"}
+{"file": ".trellis/spec/backend/shared-client.md", "reason": "Shared protocol ownership, native frames, cache budgets and input fences"}
+{"file": ".trellis/spec/backend/terminal-model.md", "reason": "Host publication, semantic deltas, synchronized output and supported styles"}
+{"file": ".trellis/tasks/09-09-android-architecture-rendering-review/research/review.md", "reason": "Baseline review findings, evidence limits and prioritized follow-ups"}
+{"file": ".trellis/tasks/09-09-android-architecture-rendering-review/research/unified-ime.md", "reason": "Latest approved common live-screen IME policy, host compatibility boundary and emulator evidence"}
+{"file": ".trellis/spec/frontend/android-frame-preparation.md", "reason": "Exact source-relative bridge mapping, display cadence, source lifetime and text-run contracts"}
+{"file": ".trellis/tasks/09-09-android-architecture-rendering-review/research/peer-adoption.md", "reason": "Approved three-part adoption scope, current evidence and boundaries"}

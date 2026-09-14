@@ -26,7 +26,6 @@ import android.view.inputmethod.InputMethodManager
 import androidx.core.view.OneShotPreDrawListener
 import io.github.leonfox28.zterm.nativebridge.*
 import kotlin.math.floor
-import kotlin.math.max
 
 /** Pure semantic Canvas renderer and native IME endpoint. There is no ANSI parser here. */
 internal class TerminalView(context: Context) : View(context) {
@@ -50,6 +49,7 @@ internal class TerminalView(context: Context) : View(context) {
     private var current: NativeFrame? = null
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { typeface = Typeface.MONOSPACE }
     private val rowRenderer = TerminalRowRenderer()
+    internal val rowRecordingCount: Long get() = rowRenderer.recordingCount
     private val underlinePath = Path()
     private val dotted = android.graphics.DashPathEffect(floatArrayOf(resources.displayMetrics.density,resources.displayMetrics.density*2),0f)
     private val dashed = android.graphics.DashPathEffect(floatArrayOf(resources.displayMetrics.density*3,resources.displayMetrics.density*2),0f)
@@ -191,7 +191,7 @@ internal class TerminalView(context: Context) : View(context) {
             scrollPixels = (frame?.historyOffset?.toLong() ?: 0) * cellHeight
             lastScrollTarget = null; waitingEdge = 0
             invalidateCoordinates()
-            rowRenderer.clear()
+            if (epochChanged) rowRenderer.clear()
         } else if ((scrollPixels > 0f || waitingEdge > 0) && growth > 0) {
             // Preserve the logical reading position as live output appends.
             scrollPixels += growth * cellHeight
@@ -269,15 +269,51 @@ internal class TerminalView(context: Context) : View(context) {
         releaseGestureSource(); childGesture = false; draggingHandle = null
         removeCallbacks(autoScroll)
     }
-    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) { rowRenderer.clear(); invalidateCoordinates(); measureGrid() }
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        if (w != oldw) rowRenderer.clear()
+        invalidateCoordinates()
+        measureGrid()
+    }
     override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) { measureGrid() }
     private fun measureGrid() {
         if (width <= 0 || height <= 0 || animatedInsets || imeMeasurePending || imeAnimating()) return
-        val size = max(1, floor(height / cellHeight).toInt()) to max(1, floor(width / cellWidth).toInt())
-        if (size != lastSize) { lastSize = size; repository?.measure(size.first, size.second) }
+        submitGrid(width, height)
+    }
+    /** Submit a known final live viewport without forwarding intermediate animation sizes. */
+    internal fun prepareImeViewport(width: Int, height: Int): Boolean {
+        val frame = current ?: return false
+        if (!(animatedInsets || imeAnimating()) || !frame.inputReady || frame.selection != null ||
+            frame.historyOffset != 0uL || scrollPixels != 0f) return false
+        return submitGrid(width, height)
+    }
+    private fun submitGrid(width: Int, height: Int): Boolean {
+        if (width <= 0 || height <= 0) return false
+        val size = floor(height / cellHeight).toInt().coerceIn(1, 80) to floor(width / cellWidth).toInt().coerceIn(1, 240)
+        if (size == lastSize) return false
+        lastSize = size
+        repository?.measure(size.first, size.second)
+        return true
+    }
+    private fun frameForDraw(): NativeFrame? {
+        val candidate = current ?: return null
+        val displayed = drawnFrame ?: return candidate
+        val waitingForSize = lastSize?.let {
+            candidate.viewport.rows.toInt() != it.first || candidate.viewport.columns.toInt() != it.second
+        } == true
+        if (!(animatedInsets || imeMeasurePending || imeAnimating() || waitingForSize) ||
+            candidate.viewport == displayed.viewport || candidate.inputEpoch != displayed.inputEpoch ||
+            !candidate.inputReady || !displayed.inputReady ||
+            candidate.activeScreen != displayed.activeScreen ||
+            candidate.viewport.columns != displayed.viewport.columns || drawnGeometry?.width != width ||
+            drawnGeometry?.cellWidth != cellWidth || drawnGeometry?.cellHeight != cellHeight ||
+            candidate.selection != null || displayed.selection != null || candidate.historyOffset != 0uL ||
+            displayed.historyOffset != 0uL || scrollPixels != 0f) return candidate
+        // Keep the actual moved baseline while the newest remote geometry is
+        // prepared. Its resize-only image is not the child's completed repaint.
+        return displayed
     }
     override fun onDraw(canvas: Canvas) {
-        val frame = current ?: return
+        val frame = frameForDraw() ?: return
         canvas.clipRect(0, 0, width, height)
         val offset = kotlin.math.ceil(scrollPixels / cellHeight).toLong()
         val firstRow = frame.firstRow + frame.windowOffset.toLong() - offset
@@ -315,10 +351,10 @@ internal class TerminalView(context: Context) : View(context) {
         canvas.restore()
         if (drawnFrame !== frame || drawnGeometry?.firstRow != firstRow) {
             if (drawnGeometry?.firstRow != firstRow) repository?.retireGeometry()
-            val base = pendingSource ?: drawnSource
+            val base = if (frame === current) pendingSource ?: drawnSource else drawnSource
             val source = try { base?.viewportSource(firstRow) } catch (_: NativeException.RequestFailed) { null }
             drawnSource?.close(); drawnSource = source
-            pendingSource?.close(); pendingSource = null
+            if (frame === current) { pendingSource?.close(); pendingSource = null }
         }
         drawnFrame = frame
         drawnGeometry = geometry
@@ -335,15 +371,16 @@ internal class TerminalView(context: Context) : View(context) {
             if (x >= width) return@forEachIndexed
             paint.color = cell.background.toInt(); paint.alpha = 255
             canvas.drawRect(x, top, right, top + cellHeight, paint)
-            paint.color = cell.foreground.toInt()
-            paint.alpha = if (cell.attributes.toInt() and 2 != 0) 150 else 255
-            paint.isFakeBoldText = cell.attributes.toInt() and 1 != 0
-            paint.textSkewX = if (cell.attributes.toInt() and 4 != 0) -.2f else 0f
-            if (cell.text.isNotEmpty()) {
+            // A plain space has no glyph ink; its background and decorations still draw.
+            if (cell.text.isNotEmpty() && cell.text != " ") {
+                paint.color = cell.foreground.toInt()
+                paint.alpha = if (cell.attributes.toInt() and 2 != 0) 150 else 255
+                paint.isFakeBoldText = cell.attributes.toInt() and 1 != 0
+                paint.textSkewX = if (cell.attributes.toInt() and 4 != 0) -.2f else 0f
                 canvas.save(); canvas.clipRect(x, top, right, top + cellHeight)
                 canvas.drawText(cell.text, x, top + baseline, paint); canvas.restore()
+                paint.isFakeBoldText = false; paint.textSkewX = 0f; paint.alpha = 255
             }
-            paint.isFakeBoldText = false; paint.textSkewX = 0f; paint.alpha = 255
             if (cell.underline.toInt() != 0) {
                 paint.color = cell.underlineColor.toInt(); paint.strokeWidth = resources.displayMetrics.density
                 val y = top + cellHeight - paint.strokeWidth
@@ -374,9 +411,10 @@ internal class TerminalView(context: Context) : View(context) {
         }
     }
     private fun geometryShift(frame: NativeFrame): Float {
-        if (scrollPixels != 0f || frame.historyOffset != 0uL || frame.selection != null || !frame.cursorVisible) return 0f
+        if (scrollPixels != 0f || frame.historyOffset != 0uL || frame.selection != null) return 0f
         if (frame.viewport.columns.toInt() != floor(width / cellWidth).toInt().coerceIn(1, 240)) return 0f
-        return terminalPan(minOf(height.toFloat(), 80 * cellHeight), cellHeight, frame.viewport.rows.toInt(), frame.cursorRow.toInt(), frame.historyMaximum.toLong())
+        return terminalPan(minOf(height.toFloat(), 80 * cellHeight), cellHeight, frame.viewport.rows.toInt(),
+            frame.cursorRow.toInt().takeIf { frame.cursorVisible })
     }
     private fun scrollBounds(frame: NativeFrame): ClosedFloatingPointRange<Float> {
         val maximum = minOf(frame.windowOffset.toLong(), frame.historyMaximum.toLong())

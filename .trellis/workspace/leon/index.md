@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 27
-- **Last Active**: 2026-09-09
+- **Total Sessions**: 28
+- **Last Active**: 2026-09-14
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~721 | Active |
+| `journal-1.md` | ~743 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 28 | 2026-09-14 | Android IME and row preparation release handoff | `ca454d1` | `codex/android-tui-row-reuse` |
 | 27 | 2026-09-09 | Remote file uploads and Android toolbar review | `bce839b` | `feat/remote-file-upload` |
 | 26 | 2026-09-08 | Desktop connection stages and persisted startup logs | `c0e1ba9` | `fix/desktop-connection-progress` |
 | 25 | 2026-09-08 | Fix Android terminal keyboard on task resume | `e6f5e6b` | `fix/android-keyboard-resume` |
