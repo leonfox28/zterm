@@ -119,9 +119,12 @@ edge wait begun at zero. Stop the old-basis fling on that append.
 probe; `scrollRequestGeneration` distinguishes explicit scroll/input return from
 View metadata acknowledgements. A late live frame must not erase local motion.
 
-Repository resolves `NativeFrameSource.presentationRows()` off Main only when
-attachment-local `contentGeneration` changes, then reuses the immutable row list.
-Compose observes only `TerminalStatus`; the direct View observer owns content
+Repository uses `TerminalFrameProjection` to resolve source-relative changed rows
+off Main and preserve equal Kotlin row objects, including moved rows. Metadata-only
+frames reuse the full list. `collectTerminalFrames` paces compatible content bursts
+with a cancellable display clock; native installation/ACK stays independent. Read
+[Frame preparation](./android-frame-preparation.md) for exact mapping,
+lifetime and visibility contracts. Compose observes only `TerminalStatus`; the direct View observer owns content
 frames. Include typed `connectionPath` and nullable `rttMs` in that metadata
 projection. The fixed 48 dp header keeps title and host, reserves subtitle space
 for connection state/latency and ellipsizes long host names. `Direct` and `Relay`
@@ -131,11 +134,32 @@ path shows Connecting; healthy synchronization retains established route/RTT.
 
 Kotlin row windows are bounded to three viewports plus one row, separately from
 native cache budgets. API 29+ hardware Canvas reuses `TerminalRowRenderer`
-RenderNodes for equal logical row/cell content, bounded to three viewports plus
-one entry. Font/width/geometry changes, background and detach discard lists.
-Check `hasDisplayList()` before reuse. API 26–28 and software Canvas use the same
-cell painter directly. Do not build a full-history bitmap or cache cursor,
-selection or preedit overlays into text nodes.
+RenderNodes by immutable resolved cell content and recording width/height,
+independently of source row ordinals and soft-wrap metadata. A bounded ordinal
+binding avoids repeated hashing/allocation for unchanged row objects; both maps
+are limited to three viewports plus one entry. Hash equality alone is insufficient.
+Each hardware node uses `setUseCompositingLayer(true, null)` to retain its text-row
+pixels: a display list alone still replays glyph/background commands on
+RenderThread. This is Android-managed per-row storage under the same cache bound,
+not another history cache. Count its GPU allocations when profiling; display-list
+recording counts do not measure replay cost. Fractional movement can resample
+cached text; integer placement must match the direct painter and row joins must
+retain their declared backgrounds.
+Font/width changes, input-epoch changes, background visibility and detach discard
+lists. Height-only layout and geometry-generation changes still retire coordinates
+but preserve compatible text. Check `hasDisplayList()` before reuse: Android may
+discard drawing that left the displayed scene. API 26–28 and software Canvas use
+the same cell painter directly. Compose a complete frame from background, reused
+or updated text and current overlays; do not depend on old Canvas pixels surviving.
+Do not build a full-history bitmap or cache cursor, selection or preedit in nodes.
+
+The cell painter omits only glyph submission/foreground setup for an empty string
+or exactly one ASCII space. Always paint the cell background and declared underline;
+do not skip the whole blank cell, use generic whitespace detection, or trim its
+semantic text. A space followed by a combining mark still needs glyph drawing.
+Retain clipping and bold/dim/italic state restoration for actual glyphs. This
+reduces cold row-recording work, including when Android discarded offscreen lists,
+without introducing another cache or changing source/Copy authority.
 
 After drawing, bind `viewportSource(actualFirstRow)` to the committed geometry.
 A moved logical top retires pending Copy; hit/selection coordinates use the bound
@@ -153,12 +177,32 @@ the integer ceil font height through `gridCellHeight`. Never derive remainder
 from an already rounded child height or add padding above the toolbar.
 The 80-row cap retains neutral excess area; exclude that area from cell hits and
 pan calculations. Subcell windows keep one clipped row, not a zero-height view.
+Use an ordinary `Box` below the terminal screen's inset padding. Only the visible
+session panel needs `BoxWithConstraints` to cap its height at 65% / 420 dp; putting
+the whole terminal in that scope repeats subcomposition as IME constraints change.
+Keep animated inset reads in `TerminalGridLayout` measurement. Recomposition
+counts, row recording and Android FrameMetrics measure different work; fewer
+compositions alone do not establish a device FPS improvement.
 
 During IME animation, `imePadding` moves chrome and clips/pans the existing grid
-locally. `terminalBottomRemainder` interpolates the endpoint remainders using
+locally. `terminalPan(height, cellHeight, rows, cursorRow: Int?)` applies the same
+signed `height - rows * cellHeight` movement on both live screens, in both
+directions. A visible caret supplies only a top-edge constraint: clamp upward
+movement at `-cursorRow * cellHeight`. It does not pull the caret to the toolbar
+or discard footer/pane space below it. Hidden cursors supply null and do not
+limit movement. History extent does not limit growth; newly exposed unknown
+area stays background. Main/alternate is not a shell/TUI classifier. Keep the
+authoritative screen for source compatibility and actual screen-switch fences.
+Frozen history/selection retain their reading owner, incompatible widths bypass pan,
+and the 80-row cap still limits its effective height. Incoming content compares
+against that moved presentation; different source ordinals do not force recording
+equal rows. Source/geometry commit and input fences advance even when pixels match.
+`terminalBottomRemainder` interpolates the endpoint remainders using
 source/current/target consumed bottom insets; do not round every animation frame
 to whole rows. Stable 17 px cells at available 1000/600 px give grids 986/595 px
-and bottom padding 14/5 px; cursor row 39 pans to row 34 with no 9 px handoff. An Activity-owned `WindowInsetsAnimationCompat.Callback` on the decor
+and bottom padding 14/5 px. The old 58-row grid moves by -23 rows (cursor row 39
+lands on row 16); there is no extra 9 px remainder correction at handoff. A
+different remote layout still replaces those row positions. An Activity-owned `WindowInsetsAnimationCompat.Callback` on the decor
 View tracks every prepared IME animation until its matching end. Register above
 Compose, whose inset consumer stops descendant animation dispatch. Unrelated
 bar animations cannot release the IME fence. Neither a conflated size channel
@@ -177,6 +221,45 @@ pan, logical first row, bounds and screen origin. Pending frames/layout never si
 coordinate source; local layout/font changes retire active gestures. Keep
 complete Canvas draws and explicit bounded pending/drawn handle ownership. Do not
 send a network resize per animation frame or substitute a debounce delay.
+
+For an input-ready live screen, `TerminalGridLayout` also calls
+`terminalImeTargetHeight(available, currentBottom, startBottom, endBottom, animating)`.
+A known differing endpoint yields `available + currentBottom - endBottom`; all
+bottom values include the already consumed navigation inset. An unknown endpoint
+or an inactive animation yields no early target. `TerminalView.prepareImeViewport`
+submits that final grid through the same `submitGrid`/repository owner as ordinary
+measurement, capped at 80 rows / 240 columns. Equal targets send nothing; final
+pre-draw verifies/corrects the early target, including cancelled/reversed motion.
+Frozen-reading scheduling retains final measurement; screen type does not
+determine early-target eligibility.
+The signed endpoint calculation applies to both opening (smaller grid) and
+closing (larger grid). `productionLayoutReportsTheTargetBeforeTheSystemImeFinishes`
+drives the real system IME in both directions on both screens with the production grid layout:
+assert one early final target before the View reaches its new height, and equality
+with settled layout. A pure endpoint-math test alone cannot prove callback timing.
+
+`current`/`pendingSource` are the latest prepared candidate; `drawnFrame`/
+`drawnSource` remain the actual presentation. During IME/final-layout fencing,
+`frameForDraw` retains the drawn compatible live geometry on either screen when
+a differently sized candidate arrives. It also retains that baseline when a late
+candidate does not match the latest requested grid. Same-size updates can continue.
+Epoch loss, input suspension, a change of active screen, width/font incompatibility and selection /
+history bypass retention. Do not bind or release the candidate source as though
+it supplied the retained drawing; adopt it only when that candidate is drawn.
+Use only the existing drawn and newest pending handles, with complete Canvas draws.
+
+Host resize can publish caret-anchored rows before the TUI repaints: a 12-to-9
+row shrink with the cursor on row 10 first produces old rows 02–10, whereas the
+local bottom anchor displays 03–11. Exact diff still shows the one-row jump if
+that intermediate image is admitted. Early scheduling plus retained animation
+presentation overlaps this work with IME. Neither dimensions nor Active nor the
+first output proves child-layout completion; do not add blank-content guesses or
+an output debounce, and do not claim late/unmarked redraws are always atomic.
+The same applies to a main-screen shell that performs no child redraw: 24 to 12
+rows with cursor row 3 locally clamps at -3 rows, while the host retains rows
+0..11. Final handoff must adopt the host rows/cursor even though their positions
+differ. On growth the host restores available main history and otherwise adds
+blank rows below; local bottom anchoring cannot redefine those semantics.
 
 `TerminalView.onSingleTapUp` never requests IME visibility, including in a
 plain shell, mouse mode and alternate-scroll mode. The bottom button calls
@@ -267,6 +350,11 @@ release diagnostic UI is added.
 | Failed Session list or unknown mutation outcome | Show failure; no blind default creation |
 | Theme/locale recreation | Keep application identity, Session and unchanged-geometry selection |
 | Different APK signature | Android rejects update; do not silently uninstall user data |
+| Known live IME endpoint on either screen | Submit changed final grid early; verify it at settled layout |
+| Differently sized candidate during IME / obsolete resize target | Retain compatible drawn frame/source; native installation and ACK still progress |
+| Visible caret would move above the top | Clamp the common upward pan at the caret's top edge |
+| Candidate changes active screen or input authority | Bypass retention; never carry old-screen presentation into the new authority |
+| Unknown IME endpoint / incompatible retained source | Use final measurement / ordinary current-frame drawing |
 
 ## 5. Good, base and bad cases
 
@@ -317,7 +405,73 @@ Use actual Canvas pixels for delayed-row displacement correctness; a posted
 OnDraw observer can mix a new desired position with older committed geometry.
 Do not infer phone frame rates or natural content-stall counts from that sampling.
 
+`TerminalRenderingTest.hiddenCursorGridMovesLocallyAndMatchesDelayedResizeInBothDirections`
+holds remote frames while changing View height, checks actual moved pixels and
+delayed A-B-A handoffs. `liveScreensKeepContentBelowVisibleCursorAboveToolbar`
+checks a visible caret with two footer rows at intermediate/final local heights
+and pixel-identical delayed resize on both screens.
+`visibleCaretNeverLeavesTheTopEdgeOnEitherScreen` includes high carets, reversal
+and a subcell clipped View. Its hardware row-content and both-screen height tests verify
+zero new recordings for equal moved rows, one for a changed row, complete-frame
+pixel equivalence and dimension/cache-loss invalidation. `rowRecordingCount` is a
+cumulative local display-list count for these checks, not a physical refresh/FPS
+metric. Newly exposed rows or content actually changed since its last display
+may need recording again; a previously cached offscreen node is not guaranteed
+to survive. Keep whole-IME/real-TUI visual acceptance separate from these fixtures.
+
+`blankCellsKeepBackgroundsDecorationsAndAdjacentGlyphs` compares styled ASCII
+spaces with empty glyphs at 8/12/16 sp, including all underline modes and adjacent
+wide/combining text. It also requires a combining mark attached to a space to
+remain visible. Painter microbenchmarks need matching warmup and a dense-text
+control; a faster fresh-process sample alone does not establish a device speedup.
+
+`hardwareRowLayersMatchDirectPaintingAndKeepSharedRowsSeamless` compares direct
+hardware painting and the production row renderer in the same frame. Check styled,
+wide/combining and blank cells at integer shifts, repeated equal rows sharing a
+single entry, one changed row, explicit clear/recovery and solid fractional row
+joins. Do not use antialiased direct rectangle seams as the fractional background
+oracle. Pair animation-scoped RenderThread timings with foreground GPU memory;
+stopped-window cache dumps and whole-process cumulative jank counters are not
+comparable live animation measurements.
+
+`resizeSnapshotCannotInterruptEitherMovingScreen` includes the actual
+caret-anchored resize-only row sequence before the final repaint on both screens. The hardware
+height-change test checks unchanged pixels/recordings across that intermediate
+candidate and final adoption. `knownImeTargetSubmitsEarlyOnceAndFinalLayoutCorrectsIt`
+checks deduplication, intermediate-measurement fencing, correction and reversal.
+`reversedImeKeepsTheDrawnGridUntilTheLatestTargetArrives` holds an obsolete-size
+candidate after a settled reversal, then verifies current changed content resumes
+when the requested size arrives.
+`authoritativeResizeStillWinsWhenTheFinalLayoutDiffers` separately checks actual
+host high/bottom-caret resize sequences and growth with/without history. Hold the
+early intermediate while animating, then require equality with a freshly drawn
+authoritative frame; do not assert equal local/final pixels when layouts differ.
+`imeRetentionNeverCrossesScreenOrInputAuthority` checks both screen-switch
+directions, input-epoch replacement and suspended input during a pending resize.
+`productionLayoutReportsTheTargetBeforeTheSystemImeFinishes` uses the production
+Compose grid, native View, decor animation owner and actual system IME; assert
+the target is submitted while the visible grid is still larger and equals the
+final measured rows. It does not claim remote TUI completion within that interval.
+
 ## 7. Wrong versus correct
+
+Wrong: infer that unchanged display lists avoid all glyph work or that low
+`rowRecordingCount` proves smooth movement. Correct: measure RenderThread replay,
+retain bounded row pixels where justified, and verify actual pixels and GPU cost.
+
+Wrong: count reused text nodes and infer that resize cannot visibly jump.
+Correct: include the resize-only semantic snapshot in the complete presentation
+sequence, preserve the moved baseline during IME and adopt the latest prepared
+source only with its actual drawing.
+
+Wrong: use alternate screen as a proxy for TUI when selecting keyboard movement
+or early resize. Correct: apply one live-screen policy, preserve explicit
+screen-change fences, and distinguish local movement from authoritative layout.
+
+Wrong: skip local movement when a TUI hides its cursor, or clear text nodes whenever
+geometry changes. Correct: move the retained live grid using its explicit anchor,
+reuse equal content across row positions, and retire only the appropriate coordinate
+authority. Source/Copy correctness never comes from cached visual equality.
 
 Wrong: release frame-source objects whenever Compose skips a frame, before the
 native View has retained what it drew. Correct: Repository synchronous observers

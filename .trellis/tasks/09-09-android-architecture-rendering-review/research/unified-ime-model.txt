@@ -1,0 +1,16 @@
+Main cursor=0: local shift=0, host shift=-0, host rows=0..11
+  growth restores 0 history rows, appends 12 blanks
+Main cursor=3: local shift=-3, host shift=-0, host rows=0..11
+  growth restores 0 history rows, appends 12 blanks
+Main cursor=21: local shift=-12, host shift=-10, host rows=10..21
+  growth restores 10 history rows, appends 2 blanks
+Main cursor=23: local shift=-12, host shift=-12, host rows=12..23
+  growth restores 12 history rows, appends 0 blanks
+Alternate cursor=0: local shift=0, host shift=-0, host rows=0..11
+  growth restores 0 history rows, appends 12 blanks
+Alternate cursor=3: local shift=-3, host shift=-0, host rows=0..11
+  growth restores 0 history rows, appends 12 blanks
+Alternate cursor=21: local shift=-12, host shift=-10, host rows=10..21
+  growth restores 0 history rows, appends 12 blanks
+Alternate cursor=23: local shift=-12, host shift=-12, host rows=12..23
+  growth restores 0 history rows, appends 12 blanks

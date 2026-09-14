@@ -80,6 +80,18 @@ new connection through duplicate arbitration, even with valid authorization.
   Metadata-only frames carry no row DTOs. `source.presentation_rows()` resolves
   at most three viewports plus one row; `first_row` is its logical window start
   and `window_offset` locates it in the current reading-offset basis.
+  `presentation_rows_from(previous)` exports `NativeRowUpdate::Reuse { index }`
+  references into that exact previous window or `Replace { row }` cell payloads.
+  Full semantic equality confirms bounded borrowed hash lookup; compatible origin
+  and color context are required. Kotlin retains the paired baseline source/list
+  and always adopts new frame authority. See the complete signature/lifetime/test
+  contract in [Android frame preparation](../frontend/android-frame-preparation.md).
+- `NativeFrame.active_screen: NativeActiveScreen` (Main/Alternate) directly
+  projects `AttachmentSurface`'s authoritative screen, including healthy resize
+  and cursor-only frames. The exported frame and its captured source agree on
+  screen selection. Cursor visibility and pointer mode remain independent; the
+  Android View uses screen identity to fence incompatible presentation handoff,
+  not as a shell/TUI classifier. Live IME movement and scheduling are shared.
 - `source.viewport_source(first_row)` rebinds O(1) to a full viewport contained
   in that same exported window. It retains the accounted page and original
   origin/input/geometry/screen fences; an out-of-window request returns
@@ -190,6 +202,7 @@ do not hardcode a public resolver or replace the controller identity on changes.
 | Default attach with a concurrent existing main | Host reuses its reserved main; no implicit takeover |
 | Reconnect/end/closed frame | Unknown path and absent RTT; old metrics never revive on Active |
 | Healthy same-attachment synchronization | Preserve selected path/RTT and unchanged content identity |
+| Main/alternate transition, cursor-only frame or healthy resize | Export the authoritative active screen independently of caret/mouse policy |
 | Welcome read deadline / reset | `deadline_exceeded` / `transport_unavailable`, never infer Unauthorized |
 | Authenticated peer explicitly closes with 0x100 | `unauthorized`; no authorized connection cached |
 | Explicit runtime shutdown then immediate same-identity restart | Await endpoint closure before executor disposal; new handshake succeeds |
@@ -218,7 +231,10 @@ Live and its adjacent row share a valid exported window. Source-window tests
 check stable content IDs across metadata/row steps, changed color identity,
 rebased selection coordinates and retained origin/input/geometry fences. Native navigation tests cover old rendered
 source identity, cross-page exact copy, missing joins, trim, healthy-return ACK
-barriers and disconnection invalidation. Native emulator integration verifies
+barriers and disconnection invalidation.
+`frame_keeps_declared_screen_through_cursor_changes_and_healthy_resize` verifies
+main/alternate/main transitions, visible/hidden cursors, healthy synchronization
+and agreement with the captured frame source. Native emulator integration verifies
 a sleeping subscriber receiving its final lease_lost/ended/closed frame before
 cancellation, plus actual host Session creation, Unicode input, scrolling, copy, resize, rename,
 detach/cleanup and explicit stale input rejection. Report actual direct/relay
@@ -236,6 +252,11 @@ chooses a separate default-attach operation and stores the returned identity.
 
 Wrong: retain selection pixels but free/unaccount their semantic source. Correct:
 explicit frame-source handles pin pages inside the existing core cache budget.
+
+Wrong: infer application layout from cursor visibility, mouse reporting or the
+active screen. Correct: project the existing active-screen enum for history/input
+semantics and screen-change fences; Android applies a common live IME policy
+with a visible-caret top boundary, including content below the caret.
 
 
 ## Initial connection observations

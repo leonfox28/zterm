@@ -871,6 +871,185 @@ mod tests {
     }
 
     #[test]
+    fn relative_projection_reuses_exact_rows_across_content_and_geometry_changes() {
+        use super::super::{NativeFrameSource, NativeRowUpdate, project_navigation};
+        fn capture(
+            live: &AttachmentSurface,
+            generation: u64,
+            dark: bool,
+            origin: &Arc<()>,
+        ) -> Arc<NativeFrameSource> {
+            project_navigation(
+                live,
+                generation,
+                "active",
+                None,
+                dark,
+                &mut Navigation::new(live),
+                7,
+                generation,
+                false,
+                origin,
+                None,
+            )
+            .source
+            .expect("accounted source")
+        }
+        fn check(next: &NativeFrameSource, old: &Arc<NativeFrameSource>, replacements: usize) {
+            let previous = old.presentation_rows();
+            let updates = next.presentation_rows_from(Some(Arc::clone(old)));
+            assert_eq!(
+                updates
+                    .iter()
+                    .filter(|row| matches!(row, NativeRowUpdate::Replace { .. }))
+                    .count(),
+                replacements
+            );
+            let actual: Vec<_> = updates
+                .into_iter()
+                .map(|row| match row {
+                    NativeRowUpdate::Reuse { index } => previous[index as usize].clone(),
+                    NativeRowUpdate::Replace { row } => row,
+                })
+                .collect();
+            assert!(
+                actual == next.presentation_rows(),
+                "relative and complete projection must agree exactly"
+            );
+        }
+        let origin = Arc::new(());
+        let live = surface(1, 1, 0);
+        let old = capture(&live, 1, true, &origin);
+        assert!(
+            old.presentation_rows_from(None)
+                .iter()
+                .all(|row| matches!(row, NativeRowUpdate::Replace { .. }))
+        );
+        check(&capture(&live, 2, true, &origin), &old, 0);
+
+        let mut changed = surface(2, 1, 0);
+        changed.surface.rows[1].cells[4].contents = "e\u{301}".into();
+        check(&capture(&changed, 2, true, &origin), &old, 1);
+        changed.surface.rows = vec![
+            live.surface.rows[2].clone(),
+            live.surface.rows[3].clone(),
+            changed.surface.rows[1].clone(),
+            live.surface.rows[1].clone(),
+        ];
+        let moved = capture(&changed, 3, true, &origin);
+        check(&moved, &old, 1);
+        assert!(matches!(
+            moved.presentation_rows_from(Some(Arc::clone(&old)))[0],
+            NativeRowUpdate::Reuse { index: 2 }
+        ));
+
+        let mut styled = surface(2, 1, 0);
+        let row = &mut styled.surface.rows[0];
+        row.wrapped = true;
+        row.cells[1].contents = "界".into();
+        row.cells[1].wide = true;
+        row.cells[2].contents.clear();
+        row.cells[2].wide_continuation = true;
+        row.cells[3].contents = " \u{301}".into();
+        for (index, cell) in row.cells.iter_mut().enumerate() {
+            cell.style = TerminalStyle {
+                foreground: TerminalColor::Indexed(index as u8),
+                background: TerminalColor::Rgb(1, 2, 3),
+                bold: true,
+                dim: true,
+                italic: true,
+                inverse: true,
+                underline: TerminalUnderline::Curly,
+                underline_color: TerminalColor::Rgb(4, 5, 6),
+            };
+        }
+        check(&capture(&styled, 2, true, &origin), &old, 1);
+        let mut wrapped = surface(2, 1, 0);
+        wrapped.surface.rows[0].wrapped = true;
+        check(&capture(&wrapped, 2, true, &origin), &old, 1);
+        let mut dense = surface(2, 1, 0);
+        for row in &mut dense.surface.rows {
+            row.cells[0].contents = "Z".into();
+        }
+        check(&capture(&dense, 2, true, &origin), &old, 4);
+
+        let mut resized = surface(2, 2, 0);
+        resized.surface.size.rows = 2;
+        resized.surface.rows = live.surface.rows[2..].to_vec();
+        resized
+            .surface
+            .scroll_metrics
+            .as_mut()
+            .expect("main-screen fixture metrics")
+            .viewport_rows = 2;
+        let small = capture(&resized, 2, true, &origin);
+        check(&small, &old, 0);
+        assert!(
+            !old.valid_for(&origin, 7, 2, &resized),
+            "row reuse must not revive old geometry"
+        );
+        assert!(small.valid_for(&origin, 7, 2, &resized));
+        check(&capture(&live, 3, true, &origin), &small, 2);
+        check(&capture(&live, 2, false, &origin), &old, 4);
+        check(&capture(&live, 2, true, &Arc::new(())), &old, 4);
+        let mut palette = surface(2, 1, 0);
+        palette.surface.colors.profile.values[COLOR_FOREGROUND] =
+            TerminalColorValue::Rgb(11, 12, 13);
+        check(&capture(&palette, 2, true, &origin), &old, 4);
+    }
+
+    #[test]
+    fn frame_keeps_declared_screen_through_cursor_changes_and_healthy_resize() {
+        use super::super::{NativeActiveScreen, NativePointerMode, project_navigation};
+        let mut live = surface(1, 1, 0);
+        let mut nav = Navigation::new(&live);
+        let origin = Arc::new(());
+        let mut previous = None;
+        for (generation, (screen, expected, visible)) in [
+            (ActiveScreen::Main, NativeActiveScreen::Main, true),
+            (ActiveScreen::Alternate, NativeActiveScreen::Alternate, true),
+            (
+                ActiveScreen::Alternate,
+                NativeActiveScreen::Alternate,
+                false,
+            ),
+            (ActiveScreen::Main, NativeActiveScreen::Main, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            live.surface.active_screen = screen;
+            live.surface.cursor.visible = visible;
+            live.surface.scroll_metrics = if screen == ActiveScreen::Main {
+                surface(1, 1, 0).surface.scroll_metrics
+            } else {
+                None
+            };
+            nav.observe(&live);
+            for state in ["active", "synchronizing"] {
+                let frame = project_navigation(
+                    &live,
+                    generation as u64 + 1,
+                    state,
+                    None,
+                    true,
+                    &mut nav,
+                    7,
+                    2,
+                    true,
+                    &origin,
+                    previous.as_ref(),
+                );
+                assert_eq!(frame.active_screen, expected);
+                assert_eq!(frame.source.as_ref().expect("drawn source").screen, screen);
+                assert_eq!(frame.cursor_visible, visible);
+                assert_eq!(frame.pointer_mode, NativePointerMode::None);
+                previous = Some(frame);
+            }
+        }
+    }
+
+    #[test]
     fn healthy_resize_retains_input_but_retires_coordinates_even_after_a_b_a() {
         let live = surface(1, 1, 100);
         let origin = Arc::new(());

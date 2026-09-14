@@ -14,6 +14,7 @@ This directory contains guidelines for frontend development. Fill in each file w
 
 | Guide | Description | Status |
 |-------|-------------|--------|
+| [Android Frame Preparation](./android-frame-preparation.md) | Source-relative row projection, display cadence and source ownership | Active |
 | [Android Application](./android-app.md) | Compose/native View, durable identity, scanner/IME, source lifetime and APK checks | Active |
 | [Directory Structure](./directory-structure.md) | Module organization and file layout | To fill |
 | [Component Guidelines](./component-guidelines.md) | Component patterns, props, composition | To fill |

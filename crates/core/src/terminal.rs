@@ -136,7 +136,7 @@ pub enum ActiveScreen {
 }
 
 /// A terminal color independent of the private parser implementation.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub enum TerminalColor {
     /// The terminal's default color.
     #[default]
@@ -148,7 +148,7 @@ pub enum TerminalColor {
 }
 
 /// Drawing attributes for a cell or the active cursor.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub struct TerminalStyle {
     /// Foreground color.
     pub foreground: TerminalColor,
@@ -169,7 +169,7 @@ pub struct TerminalStyle {
 }
 
 /// Semantic content of one visible terminal cell.
-#[derive(Clone, Default, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq, Hash)]
 pub struct TerminalCell {
     /// Text held by the cell, including any combining characters.
     pub contents: String,
@@ -319,7 +319,7 @@ pub struct TerminalModes {
 }
 
 /// One exact row in a semantic terminal surface.
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq, Hash)]
 pub struct TerminalSurfaceRow {
     /// Exact cells from the first through the final terminal column.
     pub cells: Vec<TerminalCell>,

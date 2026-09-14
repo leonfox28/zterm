@@ -8,6 +8,7 @@ use crate::{
     NativeError, NativeRuntime,
     network::{parse_device, require_network},
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -46,7 +47,7 @@ impl NativeViewport {
     }
 }
 /// Complete display cell. Text never participates in Debug/log output.
-#[derive(Clone, uniffi::Record)]
+#[derive(Clone, Eq, PartialEq, uniffi::Record)]
 pub struct NativeCell {
     /// Exact cluster, including combining scalars.
     pub text: String,
@@ -64,12 +65,26 @@ pub struct NativeCell {
     pub underline_color: u32,
 }
 /// One complete row, never a per-cell foreign callback.
-#[derive(Clone, uniffi::Record)]
+#[derive(Clone, Eq, PartialEq, uniffi::Record)]
 pub struct NativeRow {
     /// Exact rectangular cells.
     pub cells: Vec<NativeCell>,
     /// Soft-wrap continuity.
     pub wrapped: bool,
+}
+/// One row of a new presentation window, relative to the supplied source only.
+#[derive(Clone, uniffi::Enum)]
+pub enum NativeRowUpdate {
+    /// Reuse the exact row object at this index of the preceding window.
+    Reuse {
+        /// Zero-based index in previous.presentation_rows(), not a logical ordinal.
+        index: u32,
+    },
+    /// A row without an equal predecessor; only these cells cross the bridge.
+    Replace {
+        /// Complete resolved row, including soft-wrap continuity.
+        row: NativeRow,
+    },
 }
 /// Latest complete frame, replacing any unobserved predecessor.
 #[derive(Clone, uniffi::Record)]
@@ -80,6 +95,8 @@ pub struct NativeFrame {
     pub rtt_ms: Option<u32>,
     /// Gesture ownership of the synchronized live grid, never of pinned history.
     pub pointer_mode: NativePointerMode,
+    /// Host-declared screen of this frame; independent of cursor and mouse modes.
+    pub active_screen: NativeActiveScreen,
     /// Opaque accounted semantic source for the exact frame drawn by Android.
     pub source: Option<Arc<NativeFrameSource>>,
     /// Local, content-free resource and query counters for acceptance evidence.
@@ -190,6 +207,22 @@ pub enum NativePointerMode {
     /// A wheel step becomes one cursor key on the alternate screen.
     AlternateScroll,
 }
+/// Semantic screen selection; Android owns its local presentation geometry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
+pub enum NativeActiveScreen {
+    /// Normal screen, which may retain scrollback.
+    Main,
+    /// Alternate screen without scrollback.
+    Alternate,
+}
+impl From<ActiveScreen> for NativeActiveScreen {
+    fn from(value: ActiveScreen) -> Self {
+        match value {
+            ActiveScreen::Main => Self::Main,
+            ActiveScreen::Alternate => Self::Alternate,
+        }
+    }
+}
 impl NativePointerMode {
     fn for_surface(surface: &AttachmentSurface) -> Self {
         if surface.modes().mouse_mode != TerminalMouseMode::None {
@@ -217,6 +250,40 @@ impl NativeFrameSource {
             &self.colors,
             self.dark,
         )
+    }
+    /// Resolves changed rows only. The caller pairs `previous` with its exact
+    /// previously resolved list; reuse never supplies source/input authority.
+    pub fn presentation_rows_from(&self, previous: Option<Arc<Self>>) -> Vec<NativeRowUpdate> {
+        let previous = previous.as_deref().filter(|old| {
+            Arc::ptr_eq(&self.origin, &old.origin)
+                && self.colors == old.colors
+                && self.dark == old.dark
+        });
+        let previous_rows = previous.map_or(&[][..], |old| &old.page.rows[old.window.clone()]);
+        let rows: HashMap<&TerminalSurfaceRow, usize> = previous_rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| (row, index))
+            .collect();
+        self.page.rows[self.window.clone()]
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
+                match previous_rows
+                    .get(index)
+                    .filter(|old| *old == row)
+                    .map(|_| index)
+                    .or_else(|| rows.get(row).copied())
+                {
+                    Some(index) => NativeRowUpdate::Reuse {
+                        index: index as u32,
+                    },
+                    None => NativeRowUpdate::Replace {
+                        row: project_row(row, &self.colors, self.dark),
+                    },
+                }
+            })
+            .collect()
     }
     /// Binds coordinates to the actual locally drawn viewport within these rows.
     /// Retains the same accounted page and all original epoch/geometry fences.
@@ -1178,6 +1245,7 @@ fn project(
         connection_path: NativeConnectionPath::Unknown,
         rtt_ms: None,
         pointer_mode: NativePointerMode::None,
+        active_screen: surface.active_screen.into(),
         stats: NativeNavigationStats::default(),
         notice: None,
         source: None,
@@ -1216,51 +1284,52 @@ fn project_rows(
     dark: bool,
 ) -> Vec<NativeRow> {
     rows.iter()
-        .map(|row| NativeRow {
-            wrapped: row.wrapped,
-            cells: row
-                .cells
-                .iter()
-                .map(|cell| {
-                    let mut foreground =
-                        color(cell.style.foreground, COLOR_FOREGROUND, colors, dark);
-                    let mut background =
-                        color(cell.style.background, COLOR_BACKGROUND, colors, dark);
-                    if cell.style.inverse {
-                        std::mem::swap(&mut foreground, &mut background);
-                    }
-                    NativeCell {
-                        text: cell.contents.clone(),
-                        width: if cell.wide_continuation {
-                            0
-                        } else if cell.wide {
-                            2
-                        } else {
-                            1
-                        },
-                        foreground,
-                        background,
-                        attributes: u8::from(cell.style.bold)
-                            | (u8::from(cell.style.dim) << 1)
-                            | (u8::from(cell.style.italic) << 2),
-                        underline: match cell.style.underline {
-                            TerminalUnderline::None => 0,
-                            TerminalUnderline::Single => 1,
-                            TerminalUnderline::Double => 2,
-                            TerminalUnderline::Curly => 3,
-                            TerminalUnderline::Dotted => 4,
-                            TerminalUnderline::Dashed => 5,
-                        },
-                        underline_color: if cell.style.underline_color == TerminalColor::Default {
-                            foreground
-                        } else {
-                            color(cell.style.underline_color, COLOR_FOREGROUND, colors, dark)
-                        },
-                    }
-                })
-                .collect(),
-        })
+        .map(|row| project_row(row, colors, dark))
         .collect()
+}
+fn project_row(row: &TerminalSurfaceRow, colors: &TerminalColorSnapshot, dark: bool) -> NativeRow {
+    NativeRow {
+        wrapped: row.wrapped,
+        cells: row
+            .cells
+            .iter()
+            .map(|cell| {
+                let mut foreground = color(cell.style.foreground, COLOR_FOREGROUND, colors, dark);
+                let mut background = color(cell.style.background, COLOR_BACKGROUND, colors, dark);
+                if cell.style.inverse {
+                    std::mem::swap(&mut foreground, &mut background);
+                }
+                NativeCell {
+                    text: cell.contents.clone(),
+                    width: if cell.wide_continuation {
+                        0
+                    } else if cell.wide {
+                        2
+                    } else {
+                        1
+                    },
+                    foreground,
+                    background,
+                    attributes: u8::from(cell.style.bold)
+                        | (u8::from(cell.style.dim) << 1)
+                        | (u8::from(cell.style.italic) << 2),
+                    underline: match cell.style.underline {
+                        TerminalUnderline::None => 0,
+                        TerminalUnderline::Single => 1,
+                        TerminalUnderline::Double => 2,
+                        TerminalUnderline::Curly => 3,
+                        TerminalUnderline::Dotted => 4,
+                        TerminalUnderline::Dashed => 5,
+                    },
+                    underline_color: if cell.style.underline_color == TerminalColor::Default {
+                        foreground
+                    } else {
+                        color(cell.style.underline_color, COLOR_FOREGROUND, colors, dark)
+                    },
+                }
+            })
+            .collect(),
+    }
 }
 #[allow(clippy::too_many_arguments)]
 fn project_navigation(

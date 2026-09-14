@@ -1,0 +1,20 @@
+[
+  {
+    "scene": "sparse",
+    "equal_png": true,
+    "bytes": 225308,
+    "sha256": "d63bfd51ee176efd3538d82245210f73d83c203dcaeb67a8c9e18e33c5f86a99"
+  },
+  {
+    "scene": "dense",
+    "equal_png": true,
+    "bytes": 639645,
+    "sha256": "372ebb82fd26ff4d32b97d5c3d044c0b71bacba037ab618cb30010d662e7c0c3"
+  },
+  {
+    "scene": "decorated",
+    "equal_png": true,
+    "bytes": 280591,
+    "sha256": "d3e934b220fbf8b45d9ce6ee532da82b715387124441ce125e5a6d49e1ef64a8"
+  }
+]

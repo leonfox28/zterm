@@ -62,9 +62,9 @@ import io.github.leonfox28.zterm.nativebridge.NativeSession
     }
     BackHandler(enabled = state.panel || !imeVisible) { if (state.panel) repository.closePanel() else repository.goHome() }
     LaunchedEffect(frame?.inputEpoch, state.sessionId) { modifiers = 0 }
-    BoxWithConstraints(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().imePadding()) {
-        val panelHeight = (maxHeight * .65f).coerceAtMost(420.dp)
-        TerminalGridLayout(cellHeight, imeAnimation, Modifier.fillMaxSize()) {
+    Box(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().imePadding()) {
+        TerminalGridLayout(cellHeight, imeAnimation, Modifier.fillMaxSize(),
+            onImeTarget = { width, height -> terminalView?.prepareImeViewport(width, height) }) {
             Row(Modifier.fillMaxWidth().height(48.dp), verticalAlignment = Alignment.CenterVertically) {
                 IconAction("back", stringResource(R.string.back)) { repository.goHome() }
                 Row(Modifier.weight(1f).fillMaxHeight().clickable { repository.togglePanel() }, verticalAlignment = Alignment.CenterVertically) {
@@ -154,7 +154,10 @@ import io.github.leonfox28.zterm.nativebridge.NativeSession
                 }
             }
         }
-        if (state.panel) {
+        // Only this optional panel needs constraints during composition.
+        // Keep the terminal's per-frame IME movement in measurement/layout.
+        if (state.panel) BoxWithConstraints(Modifier.fillMaxSize()) {
+            val panelHeight = (maxHeight * .65f).coerceAtMost(420.dp)
             Box(Modifier.fillMaxSize().padding(top = 48.dp).clickable(indication = null, interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }) { repository.closePanel() })
             Surface(Modifier.padding(top = 48.dp).fillMaxWidth().heightIn(max = panelHeight), color = MaterialTheme.colorScheme.surfaceContainer, shadowElevation = 12.dp,
                 shape = RoundedCornerShape(bottomStart = 16.dp, bottomEnd = 16.dp)) {
@@ -241,7 +244,8 @@ import io.github.leonfox28.zterm.nativebridge.NativeSession
 }
 /** The fifth, unoccupied area is below the fixed toolbar, inside the already consumed insets. */
 @OptIn(ExperimentalLayoutApi::class)
-@Composable private fun TerminalGridLayout(cellHeight: Int, imeAnimation: ImeAnimationState, modifier: Modifier, content: @Composable () -> Unit) {
+@Composable internal fun TerminalGridLayout(cellHeight: Int, imeAnimation: ImeAnimationState, modifier: Modifier,
+    onImeTarget: (Int, Int) -> Unit, content: @Composable () -> Unit) {
     val density = LocalDensity.current
     val ime = WindowInsets.ime
     val start = WindowInsets.imeAnimationSource
@@ -254,8 +258,14 @@ import io.github.leonfox28.zterm.nativebridge.NativeSession
         val toolbar = children[3].measure(chromeConstraints)
         val available = (constraints.maxHeight - header.height - divider.height - toolbar.height).coerceAtLeast(0)
         val nav = navigation.getBottom(density)
-        val remainder = terminalBottomRemainder(available, cellHeight, maxOf(nav, ime.getBottom(density)),
-            maxOf(nav, start.getBottom(density)), maxOf(nav, end.getBottom(density)), imeAnimation.running)
+        val currentBottom = maxOf(nav, ime.getBottom(density))
+        val startBottom = maxOf(nav, start.getBottom(density))
+        val endBottom = maxOf(nav, end.getBottom(density))
+        terminalImeTargetHeight(available, currentBottom, startBottom, endBottom, imeAnimation.running)?.let {
+            onImeTarget(constraints.maxWidth, it)
+        }
+        val remainder = terminalBottomRemainder(available, cellHeight, currentBottom,
+            startBottom, endBottom, imeAnimation.running)
         val terminal = children[1].measure(Constraints.fixed(constraints.maxWidth, available - remainder))
         layout(constraints.maxWidth, constraints.maxHeight) {
             header.placeRelative(0, 0)

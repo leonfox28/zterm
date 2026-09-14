@@ -1,0 +1,213 @@
+--- a/apps/android/app/src/main/java/io/github/leonfox28/zterm/TerminalView.kt
++++ b/apps/android/app/src/main/java/io/github/leonfox28/zterm/TerminalView.kt
+@@ -315,6 +315,10 @@
+     }
+     override fun onDraw(canvas: Canvas) {
+         val frame = frameForDraw() ?: return
++        android.os.Trace.beginSection("Zterm.draw")
++        android.os.Trace.setCounter("Zterm.drawnRows", frame.viewport.rows.toLong())
++        android.os.Trace.setCounter("Zterm.currentRows", current?.viewport?.rows?.toLong() ?: 0L)
++        android.os.Trace.beginSection("Zterm.geometry")
+         canvas.clipRect(0, 0, width, height)
+         val offset = kotlin.math.ceil(scrollPixels / cellHeight).toLong()
+         val firstRow = frame.firstRow + frame.windowOffset.toLong() - offset
+@@ -322,6 +326,8 @@
+         val location = IntArray(2); getLocationOnScreen(location)
+         val geometry = DrawnTerminalGeometry(cellWidth, cellHeight, baseline, shift, width, height,
+             location[0], location[1], geometryVersion, firstRow)
++        android.os.Trace.endSection()
++        android.os.Trace.beginSection("Zterm.rows")
+         canvas.drawColor(frame.background.toInt())
+         canvas.save(); canvas.translate(0f, shift)
+         frame.rows.forEachIndexed { row, line ->
+@@ -334,6 +340,8 @@
+             }
+             canvas.restore()
+         }
++        android.os.Trace.endSection()
++        android.os.Trace.beginSection("Zterm.overlays")
+         drawSelection(canvas, frame, geometry)
+         val cursorX = frame.cursorColumn.toInt() * cellWidth
+         val cursorY = (frame.firstRow + frame.windowOffset.toLong() + frame.cursorRow.toInt() - firstRow) * cellHeight
+@@ -350,6 +358,8 @@
+             canvas.drawLine(cursorX,cursorY+cellHeight-1,cursorX+extent,cursorY+cellHeight-1,paint)
+         }
+         canvas.restore()
++        android.os.Trace.endSection()
++        android.os.Trace.beginSection("Zterm.source")
+         if (drawnFrame !== frame || drawnGeometry?.firstRow != firstRow) {
+             if (drawnGeometry?.firstRow != firstRow) repository?.retireGeometry()
+             val base = if (frame === current) pendingSource ?: drawnSource else drawnSource
+@@ -359,9 +369,13 @@
+         }
+         drawnFrame = frame
+         drawnGeometry = geometry
++        android.os.Trace.endSection()
++        android.os.Trace.beginSection("Zterm.anchor")
+         updateAnchor()
++        android.os.Trace.endSection()
+         actionMode?.invalidateContentRect()
+         if (draggingHandle != null) post { extendHandle() }
++        android.os.Trace.endSection()
+     }
+     private fun drawRow(canvas: Canvas, line: NativeRow) {
+         val top = 0f
+--- a/apps/android/app/src/main/java/io/github/leonfox28/zterm/TerminalRowRenderer.kt
++++ b/apps/android/app/src/main/java/io/github/leonfox28/zterm/TerminalRowRenderer.kt
+@@ -56,8 +56,9 @@
+             }
+             val recorded = !entry.node.hasDisplayList()
+             if (recorded) {
++                android.os.Trace.beginSection("Zterm.rowRecord")
+                 val recording = entry.node.beginRecording(width, height)
+-                try { record(recording) } finally { entry.node.endRecording() }
++                try { record(recording) } finally { entry.node.endRecording(); android.os.Trace.endSection() }
+             }
+             if (binding?.row !== row || binding.content !== entry.content)
+                 bindings[ordinal] = Binding(row, entry.content)
+--- /dev/null
++++ b/apps/android/app/src/androidTest/java/io/github/leonfox28/zterm/ImeDrawDiagnosticTest.kt
+@@ -0,0 +1,143 @@
++package io.github.leonfox28.zterm
++
++import android.os.SystemClock
++import android.os.Trace
++import android.view.View
++import android.view.ViewGroup
++import android.view.WindowInsets
++import androidx.test.core.app.ActivityScenario
++import androidx.test.core.app.ApplicationProvider
++import androidx.test.platform.app.InstrumentationRegistry
++import io.github.leonfox28.zterm.nativebridge.NativeActiveScreen
++import io.github.leonfox28.zterm.nativebridge.NativeException
++import io.github.leonfox28.zterm.nativebridge.NativeViewport
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.runBlocking
++import kotlinx.coroutines.withTimeout
++import org.junit.Assert.*
++import org.junit.Assume.assumeTrue
++import org.junit.Test
++import java.io.File
++
++/** Temporary diagnostic. Requires the exact owned, already authorized emulator peer. */
++class ImeDrawDiagnosticTest {
++    private val instrumentation = InstrumentationRegistry.getInstrumentation()
++    private val app = ApplicationProvider.getApplicationContext<ZtermApplication>()
++    private val repository get() = app.repository
++    private lateinit var activity: MainActivity
++
++    @Test fun profileRealSources() = runBlocking {
++        val args = InstrumentationRegistry.getArguments()
++        assumeTrue("explicit owned fixture", args.getString("imeDrawDiagnostic") == "1")
++        val host = SavedHost(
++            "c917f7e22975b6bb4b8718fb37a54102e654013c9708dfc79532266a7c6c608f",
++            "presentation-fixture", emptyList(),
++        )
++        val store = AppStore(app)
++        val saved = store.load()
++        require(saved.hosts.all { it.id == host.id })
++        val seed = store.loadOrCreateSeed()
++        // Fixture-only recovery: the host's exact device list already confirms
++        // authorization, after a timed-out pairing response. Never replay a ticket.
++        val identity = try { app.runtime.initialize(seed, PlatformNetwork(app) {}.current(), listOf(host.native())) }
++        finally { seed.fill(0) }
++        assertEquals("673dfb5846683f7086e64d6b16474288e40a6ff5d18a01da44056bb23da30fdd", identity)
++        store.save(saved.copy(hosts = listOf(host), preferences = Preferences("en", "dark", 14), recent = null))
++        withTimeout(45_000) {
++            while (true) {
++                try { assertTrue(app.runtime.listSessions(host.id).isEmpty()); break }
++                catch (error: NativeException.RequestFailed) {
++                    if (error.code !in setOf("host_unreachable", "request_timeout", "connection_failed")) throw error
++                    delay(500)
++                }
++            }
++        }
++        val session = app.runtime.createSession(host.id, "android-ime-stage-${System.nanoTime()}", null, NativeViewport(38u, 38u), true)
++        val ready = File(app.cacheDir, "ime-stage-ready")
++        val go = File(app.cacheDir, "ime-stage-go")
++        ready.delete(); go.delete()
++        try {
++            ActivityScenario.launch(MainActivity::class.java).use { scenario ->
++                scenario.onActivity { activity = it }
++                await { repository.state.value.initialized }
++                main { repository.connectHost(host.id) }
++                await { repository.frame.value?.state == "active" && !repository.state.value.busy && terminal().hasWindowFocus() }
++                assertEquals(session.sessionId, repository.state.value.sessionId)
++                await { settled() }
++                val encoded = android.util.Base64.encodeToString(fixture.toByteArray(), android.util.Base64.NO_WRAP)
++                main { assertTrue(repository.text("python3 -c 'import base64; exec(base64.b64decode(\"$encoded\"))'\r")) }
++                await { settled() && repository.frame.value?.activeScreen == NativeActiveScreen.ALTERNATE }
++                assertNotNull(repository.frame.value!!.source)
++                repeat(1) { transition(true); transition(false) }
++                ready.writeText("ready")
++                withTimeout(45_000) { while (!go.isFile) delay(50) }
++                repeat(args.getString("rounds")?.toInt() ?: 4) { round ->
++                    for (open in listOf(true, false)) {
++                        val label = if (open) "Zterm.ime.open" else "Zterm.ime.close"
++                        Trace.beginAsyncSection(label, round)
++                        try { transition(open) } finally { Trace.endAsyncSection(label, round) }
++                    }
++                }
++                main { repository.goHome() }
++                await { repository.frame.value == null }
++            }
++        } finally {
++            ready.delete(); go.delete()
++            app.runtime.closeSession(host.id, session.sessionId)
++            store.save(saved)
++        }
++    }
++
++    private fun transition(open: Boolean) {
++        main { terminal().setKeyboardVisible(open) }
++        await { activity.window.decorView.rootWindowInsets?.isVisible(WindowInsets.Type.ime()) == open && settled() }
++        SystemClock.sleep(350)
++    }
++
++    private fun settled(): Boolean {
++        val frame = repository.frame.value ?: return false
++        val view = terminal()
++        return !view.imeAnimating() && frame.state == "active" && frame.viewport.rows.toInt() ==
++            (view.height / view.gridCellHeight).coerceIn(1, 80)
++    }
++
++    private fun main(work: () -> Unit) = instrumentation.runOnMainSync(work)
++    private fun await(condition: () -> Boolean) {
++        val deadline = SystemClock.uptimeMillis() + 20_000
++        while (SystemClock.uptimeMillis() < deadline) {
++            var ready = false
++            main { ready = condition() }
++            if (ready) return
++            SystemClock.sleep(20)
++        }
++        fail("fixture condition timed out")
++    }
++    private fun terminal(): TerminalView {
++        fun find(view: View): TerminalView? {
++            if (view is TerminalView) return view
++            if (view is ViewGroup) for (index in 0 until view.childCount) find(view.getChildAt(index))?.let { return it }
++            return null
++        }
++        return requireNotNull(find(activity.window.decorView))
++    }
++
++    // Same resize fixture as TerminalUiTest's continuity scene, with two footer
++    // rows below the visible caret to exercise the user's alternate-screen case.
++    private val fixture = """
++import os, signal, sys
++initial = os.get_terminal_size().lines
++def draw(*_):
++    rows = os.get_terminal_size().lines
++    out = '\x1b[?2026h\x1b[2J\x1b[H'
++    for row in range(rows):
++        label = 'Tabs | One | Two' if row == 0 else 'ROW %02d   stable terminal content' % (row + initial - rows)
++        out += '\x1b[%d;1H%s' % (row + 1, label)
++    out += '\x1b[%d;3H\x1b[?2026l' % max(1, rows - 2)
++    sys.stdout.write(out); sys.stdout.flush()
++sys.stdout.write('\x1b[?1049h')
++signal.signal(signal.SIGWINCH, draw)
++draw()
++input()
++sys.stdout.write('\x1b[?1049l')
++""".trimIndent()
++}
