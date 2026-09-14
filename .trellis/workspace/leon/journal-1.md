@@ -741,3 +741,35 @@ Completed the reviewed Android IME continuity, bounded row reuse and display-pac
 ### Status
 
 [OK] **Completed**
+
+
+## Session 29: Update Trellis to 0.6.17
+<!-- trellis-session: v=2 fp=b848210f214ca3f4 -->
+
+**Date**: 2026-09-14
+**Task**: Update Trellis to 0.6.17
+**Branch**: `chore/trellis-0.6.17`
+
+### Summary
+
+Updated the project Trellis runtime, hooks, Pi integration, and session-insight skills to 0.6.17; preserved the project-specific inline Codex and Penpot configuration; validated generated template hashes and runtime syntax.
+
+### Main Changes
+
+- Updated Trellis-managed runtime and platform integration files from 0.6.16 to 0.6.17.
+- Preserved .trellis/config.yaml and .codex/config.toml project customizations.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `ff1f890` | chore(trellis): update to 0.6.17 |
+
+### Testing
+
+- [OK] Verified all 13 regenerated template files against the 0.6.17 template hash manifest.
+- [OK] Validated Python syntax, JSON/TOML parsing, Trellis CLI version, and runtime smoke commands.
+
+### Status
+
+[OK] **Completed**
