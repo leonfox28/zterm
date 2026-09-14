@@ -719,3 +719,25 @@ Implemented and user-reviewed desktop clipboard and Android single-file uploads,
 ### Next Steps
 
 - Prepare v0.1.31 in the feature PR, then complete protected PR/main CI, signing and immutable publication.
+
+
+## Session 28: Android IME and row preparation release handoff
+<!-- trellis-session: v=2 fp=ce3de4fd7f00229b -->
+
+**Date**: 2026-09-14
+**Task**: Android IME and row preparation release handoff
+**Branch**: `codex/android-tui-row-reuse`
+
+### Summary
+
+Completed the reviewed Android IME continuity, bounded row reuse and display-paced preparation increments. Full local just check and Android debug/release lint passed. The unchanged debug artifact retains 25 emulator passes plus one fixture skip. Archived the review with phone endpoint overshoot and broader timing gaps explicitly deferred; user authorized v0.1.32 release preparation and publication.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `ca454d1` | fix(android): preserve terminal rows through keyboard resize |
+
+### Status
+
+[OK] **Completed**
