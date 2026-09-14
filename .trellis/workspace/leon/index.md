@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 28
+- **Total Sessions**: 29
 - **Last Active**: 2026-09-14
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~743 | Active |
+| `journal-1.md` | ~775 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 29 | 2026-09-14 | Update Trellis to 0.6.17 | `ff1f890` | `chore/trellis-0.6.17` |
 | 28 | 2026-09-14 | Android IME and row preparation release handoff | `ca454d1` | `codex/android-tui-row-reuse` |
 | 27 | 2026-09-09 | Remote file uploads and Android toolbar review | `bce839b` | `feat/remote-file-upload` |
 | 26 | 2026-09-08 | Desktop connection stages and persisted startup logs | `c0e1ba9` | `fix/desktop-connection-progress` |
