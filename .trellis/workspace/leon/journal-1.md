@@ -773,3 +773,26 @@ Updated the project Trellis runtime, hooks, Pi integration, and session-insight 
 ### Status
 
 [OK] **Completed**
+
+
+## Session 30: CLI command simplification and output consistency
+<!-- trellis-session: v=2 fp=b145558dd8a65045 -->
+
+**Date**: 2026-09-16
+**Task**: CLI command simplification and output consistency
+**Branch**: `main`
+
+### Summary
+
+Implemented the approved CLI grammar and plain-text output, automatic QR/manual pairing presentation, existing-only explicit session selection, and matching docs/specs/tests. Upgraded rustls only to 0.23.45 in both dependency graphs for RUSTSEC-2026-0285. Full just check and git diff --check passed. Archived the non-PR task completed on main; no push or release.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `e97c88c` | fix(deps): upgrade rustls to 0.23.45 |
+| `8e14a8b` | feat(cli): simplify commands and unify output |
+
+### Status
+
+[OK] **Completed**
