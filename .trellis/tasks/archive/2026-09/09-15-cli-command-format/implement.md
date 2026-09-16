@@ -1,6 +1,6 @@
 # Implementation plan
 
-Status: CLI and user-approved security update implemented; full `just check` passed on 2026-09-16. User approved the two-commit plan; committing locally without push.
+Status: implemented and validated; full `just check` passed on 2026-09-16. Approved work committed locally as e97c88c and 8e14a8b; no push.
 Mode: Codex inline. One integrated CLI change, no implement/check subagents.
 
 ## 0. Review and environment gate
