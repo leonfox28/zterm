@@ -124,6 +124,7 @@ fn run_terminal_child_if_requested() -> bool {
         }
         "bare-signal" => vec!["zterm"],
         "non-tty-connect" => vec!["zterm", "connect", "local"],
+        "missing-main" => vec!["zterm", "connect", "--session", "main"],
         "stop-confirm" => vec!["zterm", "daemon", "stop"],
         _ => panic!("unknown terminal child mode"),
     };
@@ -154,7 +155,13 @@ fn run_terminal_child_if_requested() -> bool {
         };
         run_terminal(request, &runtime).await
     });
-    if mode == "non-tty-connect" {
+    if mode == "missing-main" {
+        assert!(
+            matches!(result, Err(zterm_cli::CliError::SessionOperation { ref source, .. })
+            if source.kind() == zterm_core::DomainErrorKind::SessionNotFound)
+        );
+        return true;
+    } else if mode == "non-tty-connect" {
         if matches!(result, Err(zterm_cli::CliError::Usage(ref detail))
             if detail.contains("both stdin and stdout"))
         {
@@ -173,7 +180,8 @@ fn run_terminal_child_if_requested() -> bool {
     } else if let Err(error) = result {
         eprintln!("local terminal child failed after restoration: {error:?}");
         let status = match &error {
-            zterm_cli::CliError::Daemon(error) => match error.kind() {
+            zterm_cli::CliError::Daemon(error)
+            | zterm_cli::CliError::SessionOperation { source: error, .. } => match error.kind() {
                 zterm_core::DomainErrorKind::DeadlineExceeded => 71,
                 zterm_core::DomainErrorKind::Cancelled => 72,
                 zterm_core::DomainErrorKind::LeaseLost => 73,
@@ -196,7 +204,7 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
         ["zterm", "setup", "--name", "cli-host"],
     )
     .await;
-    assert!(first.contains("Configured cli-host"));
+    assert!(first.contains("Device:  cli-host"));
     assert!(state.paths.socket().exists(), "setup starts daemon");
     let key = std::fs::read(state.paths.identity()).expect("identity bytes");
     assert_eq!(key.len(), 32);
@@ -224,9 +232,9 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
         key
     );
     let human = run(&runtime, "running status", ["zterm", "status"]).await;
-    assert!(human.contains("State: running"));
-    assert!(human.contains("Network: disabled"));
-    assert!(human.contains("Version:") && human.contains("Device: cli-host"));
+    assert!(human.contains("Daemon:          Running"));
+    assert!(human.contains("Network:         Disabled"));
+    assert!(human.contains("Version:") && human.contains("Device:          cli-host"));
     let doctor = run(&runtime, "running doctor", ["zterm", "doctor"]).await;
     assert!(doctor.contains("Endpoint bound: false"));
     assert!(doctor.contains("Address publish: disabled"));
@@ -236,7 +244,10 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
     run(&runtime, "initial daemon stop", ["zterm", "daemon", "stop"]).await;
     wait_for_socket(&state.paths, false).await;
     let stopped = run(&runtime, "stopped status", ["zterm", "status"]).await;
-    assert!(stopped.contains("configured_stopped") && stopped.contains("Network: stopped"));
+    assert!(
+        stopped.contains("Setup:           Configured")
+            && stopped.contains("Network:         Stopped")
+    );
     assert!(!state.paths.socket().exists(), "status does not restart");
     let doctor = run(&runtime, "stopped doctor", ["zterm", "doctor"]).await;
     assert!(doctor.contains("not attempted"));
@@ -275,7 +286,7 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
     assert!(rendered_log.ends_with("bounded-tail-1099\n"));
 
     let unconfirmed_reset = execute(
-        Cli::try_parse_from(["zterm", "reset", "--identity"]).expect("unconfirmed reset parses"),
+        Cli::try_parse_from(["zterm", "reset"]).expect("unconfirmed reset parses"),
         &runtime,
         InteractionMode::NonInteractive,
     )
@@ -299,6 +310,14 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
         key
     );
 
+    run_local_terminal_child(&runtime, &state.paths, "missing-main").await;
+    assert!(
+        runtime
+            .session_list("local")
+            .await
+            .expect("no implicit create")
+            .is_empty()
+    );
     let connect_output = run_local_terminal_child(&runtime, &state.paths, "connect").await;
     assert!(contains_bytes(&connect_output, TERMINAL_RESTORE_BYTES));
     let ui_sessions = runtime
@@ -389,7 +408,7 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
     drop(bare);
     wait_for_detach(&runtime, "local", &main_id.to_string()).await;
 
-    expect_terminal(&runtime, ["zterm", "session", "new", "local", "build"]).await;
+    expect_terminal(&runtime, ["zterm", "session", "create", "build"]).await;
     let created = runtime
         .session_create_for_attach("local", "build", None, viewport)
         .await
@@ -399,7 +418,11 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
         .await
         .expect("attach exact created build Session");
     let build_id = build.session_id();
-    expect_terminal(&runtime, ["zterm", "session", "attach", "local", "build"]).await;
+    expect_terminal(
+        &runtime,
+        ["zterm", "connect", "local", "--session", "build"],
+    )
+    .await;
     let occupied = runtime
         .attach("local", Some("build"), false, false, viewport)
         .await
@@ -407,7 +430,14 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
     assert!(occupied.to_string().contains("session_occupied"));
     expect_terminal(
         &runtime,
-        ["zterm", "session", "attach", "local", "build", "--takeover"],
+        [
+            "zterm",
+            "connect",
+            "local",
+            "--session",
+            "build",
+            "--takeover",
+        ],
     )
     .await;
     let takeover = runtime
@@ -425,6 +455,7 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
             "zterm",
             "session",
             "rename",
+            "--target",
             "local",
             &build_id_text,
             "review",
@@ -434,7 +465,7 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
     assert!(renamed.contains(&build_id.to_string()));
     assert!(renamed.contains("review"));
     let unconfirmed_close = execute(
-        Cli::try_parse_from(["zterm", "session", "close", "local", "review"])
+        Cli::try_parse_from(["zterm", "session", "close", "review"])
             .expect("unconfirmed close parses"),
         &runtime,
         InteractionMode::NonInteractive,
@@ -454,14 +485,14 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
     let closed = run(
         &runtime,
         "local Session close",
-        ["zterm", "session", "close", "local", "review", "--yes"],
+        ["zterm", "session", "close", "review", "--yes"],
     )
     .await;
     assert!(closed.contains(&build_id.to_string()));
     drop(build);
 
     let reset_without_confirmation = execute(
-        Cli::try_parse_from(["zterm", "reset", "--identity"]).expect("reset parses"),
+        Cli::try_parse_from(["zterm", "reset"]).expect("reset parses"),
         &runtime,
         InteractionMode::NonInteractive,
     )
@@ -471,12 +502,7 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
     assert!(state.paths.identity().exists());
     assert!(state.paths.socket().exists());
 
-    let reset = run(
-        &runtime,
-        "forced identity reset",
-        ["zterm", "reset", "--identity", "-y"],
-    )
-    .await;
+    let reset = run(&runtime, "forced identity reset", ["zterm", "reset", "-y"]).await;
     assert!(reset.contains("Managed identity state removed"));
     wait_for_socket(&state.paths, false).await;
     assert!(!state.paths.state_root().exists());
@@ -487,7 +513,7 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
     let retry = run(
         &runtime,
         "idempotent identity reset",
-        ["zterm", "reset", "--identity", "-y"],
+        ["zterm", "reset", "-y"],
     )
     .await;
     assert!(retry.contains("already absent"));
@@ -506,7 +532,7 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
         ],
     )
     .await;
-    assert!(configured_again.contains("Configured cli-host-reset"));
+    assert!(configured_again.contains("Device:  cli-host-reset"));
     let replacement_key = std::fs::read(state.paths.identity()).expect("replacement identity");
     assert_ne!(replacement_key, key, "reset never performs automatic setup");
     let detached = runtime
@@ -694,7 +720,7 @@ async fn run_local_terminal_child(
         "copy" => TERMINAL_COPY_SCREEN,
         "enhanced-prefix" => b"ZTERM_TEST_KEYBOARD_15".as_slice(),
         "bare-signal" => TERMINAL_BARE_MARKER,
-        "stop-confirm" => b"".as_slice(),
+        "stop-confirm" | "missing-main" => b"".as_slice(),
         _ => panic!("unsupported terminal PTY fixture mode"),
     };
 
@@ -737,6 +763,21 @@ async fn run_local_terminal_child(
         bytes
     });
 
+    if mode == "missing-main" {
+        let status = wait_for_terminal_child(&mut child, mode);
+        assert_terminal_attributes_restored(
+            tcgetattr(&probe).expect("missing Session termios"),
+            original,
+        );
+        drop(probe);
+        drop(master_writer);
+        let bytes = reader.join().expect("missing Session PTY reader");
+        assert!(
+            status.success(),
+            "explicit missing main child failed: {status}"
+        );
+        return bytes;
+    }
     if mode == "stop-confirm" {
         let deadline = std::time::Instant::now() + TERMINAL_TEST_TIMEOUT;
         while !contains_bytes(&captured.lock().expect("captured stop prompt"), b"[y/N]:") {

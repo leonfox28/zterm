@@ -10,7 +10,20 @@ pub async fn run_terminal(
 ) -> Result<(), CliError> {
     #[cfg(unix)]
     {
-        unix::run(request, runtime).await
+        let context = match &request.kind {
+            super::TerminalRequestKind::Attach {
+                target,
+                selector: Some(selector),
+                ..
+            } => Some((target.clone(), selector.clone())),
+            _ => None,
+        };
+        unix::run(request, runtime)
+            .await
+            .map_err(|error| match context {
+                Some((target, selector)) => error.with_session(target, selector),
+                None => error,
+            })
     }
     #[cfg(not(unix))]
     {
@@ -187,7 +200,9 @@ mod unix {
                     progress.report(ConnectionStage::SessionEnded)
                 }
                 Err(
-                    CliError::Daemon(error) | CliError::CreatedSessionAttach { source: error, .. },
+                    CliError::Daemon(error)
+                    | CliError::CreatedSessionAttach { source: error, .. }
+                    | CliError::SessionOperation { source: error, .. },
                 ) => progress.fail(error.kind()),
                 Err(CliError::Usage(_)) => progress.fail(ProgressFailure::InvalidUsage),
                 Err(CliError::Io(_)) => progress.fail(ProgressFailure::TerminalIo),

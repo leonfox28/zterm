@@ -33,22 +33,20 @@ zterm setup [--name <name>] [--profile <official-n0|self-hosted>]
             [--relay-url <https-url>]
 zterm status
 zterm doctor
-zterm pair create [--ttl <duration-with-s|m|h-suffix>] [--qr | --qr-image <new.png>]
+zterm pair create
 zterm pair accept [--stdin] [--alias <alias>]
 zterm device list
 zterm device rename <device> <alias>
 zterm device revoke <device> [-y|--yes]
-zterm connect <device|local> [--session <name-or-id>] [--takeover]
-zterm session list [<device|local>]
-zterm session new <device|local> <name> [--cwd <host-path>]
-zterm session attach <device|local> <session> [--takeover]
-zterm session rename <device|local> <session> <new-name>
-zterm session close <device|local> <session> [-y|--yes]
-zterm daemon status
+zterm connect [<target>] [--session <name-or-id>] [--takeover]
+zterm session list [--target <target>]
+zterm session create <name> [--target <target>] [--cwd <host-path>]
+zterm session rename <session> <new-name> [--target <target>]
+zterm session close <session> [--target <target>] [-y|--yes]
 zterm daemon stop [-y|--yes]
 zterm daemon restart [-y|--yes]
 zterm logs [-n|--lines <n>]
-zterm reset --identity [-y|--yes]
+zterm reset [-y|--yes]
 zterm update [--version <vSEMVER>] [-y|--yes]
 zterm uninstall [-y|--yes]
 ```
@@ -58,8 +56,9 @@ start the daemon. Pair, device, connect, and Session commands start it on demand
 only after validating an
 existing setup. Inspection, logs, stop, help/version, and parse failures never
 start it. With setup complete, bare `zterm` is equivalent to
-`zterm connect local --session main`; before setup it only prints setup
-guidance.
+`zterm connect local`; before setup it only prints setup
+guidance. Only omitted `--session` enables atomic creation of `main`; an explicit
+`--session main` (like any explicit name/ID) requires an existing Session.
 
 First setup defaults to `official-n0`; `zterm setup --name <name>` is enough.
 Commands print human-readable text. Update, daemon stop and daemon restart list

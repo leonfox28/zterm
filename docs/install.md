@@ -142,7 +142,7 @@ the new daemon starts; the old Session's shell and programs have ended.
 An ordinary external terminal waits for the actual update result. On a
 configured server, update stages and the final outcome are also recorded in
 the existing daemon log. After reconnecting, check `zterm --version`,
-`zterm daemon status`, and `zterm logs`. If the daemon cannot start, use SSH or
+`zterm status`, and `zterm logs`. If the daemon cannot start, use SSH or
 another independent terminal to inspect the same information and follow the
 restart guidance. Acceptance is not a claim that installation has succeeded.
 

@@ -21,9 +21,10 @@ for version codes and signing.
 ## Connect
 
 On the host, create a one-time ticket using the existing `zterm pair create`.
-`--qr` displays a camera-readable code in a sufficiently wide interactive
-terminal; `--qr-image new.png` writes a private PNG without overwriting a file.
-The ticket text remains available for manual entry. Treat both as credentials.
+It automatically displays a camera-readable QR in a sufficiently wide interactive
+terminal together with the same ticket text for manual entry. A narrow terminal
+falls back to text; redirected stdout contains only the ticket and a newline.
+The ticket expires after 10 minutes. Treat both QR and text as credentials.
 
 Use **Add host** in Android. Scan with the camera, select an image through the
 system picker at the lower left, or open the manual dialog at the lower right.

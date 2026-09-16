@@ -85,7 +85,7 @@ impl Failure {
 fn channel_error() -> DaemonError {
     DaemonError::new(
         DomainErrorKind::OperationOutcomeUnknown,
-        "Update control connection closed or failed. If the update was accepted, it may still be running; check zterm --version, zterm daemon status and zterm logs before retrying.",
+        "Update control connection closed or failed. If the update was accepted, it may still be running; check zterm --version, zterm status and zterm logs before retrying.",
     )
 }
 

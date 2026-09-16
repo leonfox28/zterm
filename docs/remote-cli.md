@@ -43,15 +43,21 @@ These inspection commands do not start a daemon or create state:
 ```text
 zterm status
 zterm doctor
-zterm daemon status
 zterm logs [-n|--lines <n>]
 ```
 
-`status` and `daemon status` summarize the device name, version, daemon state,
+`status` summarizes the device name, version, daemon state,
 infrastructure, network state, and running Session names/count. `doctor` shows
 the detailed local socket/lock and network observations, effective account,
 managed state, and the lack of automatic login startup. Public inspection
-output is human-readable text; `--json` is not supported.
+output is human-readable text; `--json` is not supported. Single-object fields
+are aligned, lists are name-first and full IDs appear on a separate line.
+Setup distinguishes Not configured from Configured even when the daemon is stopped.
+Results (including doctor reports and logs) use stdout; prompts, confirmations,
+progress and errors use stderr. Public execution errors have one `Error:` prefix.
+A typed missing-Session error includes a shell-quoted `session list --target=...`
+hint, while cancellation, unknown outcomes and created-but-not-attached failures
+retain their distinct diagnostics.
 
 `logs` reads a bounded tail once: 100 lines by default, at most 1,000 lines and
 1 MiB. `-n` is the short spelling of `--lines`; missing logs produce an English
@@ -85,23 +91,19 @@ update. Reset/uninstall still confirm actual deletion even with no Sessions.
 Pairing commands are:
 
 ```text
-zterm pair create [--ttl <duration-with-s|m|h-suffix>] [--qr | --qr-image <new.png>]
+zterm pair create
 zterm pair accept [--stdin] [--alias <alias>]
 ```
 
-`pair create` writes the one-time bearer ticket to standard output once, with
-validity and receiving instructions on standard error. The default validity is
-10 minutes; valid values range from `60s` to `1h`. Keep the ticket out of command
-arguments, environment variables, shell history, logs, and
-error reports.
-
-Use `--qr` to display that same ticket as a monochrome QR on interactive stdout,
-or `--qr-image <new.png>` to save a private PNG without overwriting an existing
-file. PNG mode still prints the original ticket on stdout. The two flags are
-mutually exclusive. If the committed ticket is too large for a QR, the terminal
-is too narrow, or image writing fails, the command explains the presentation
-failure and prints the same valid ticket for manual entry. It does not create a
-second offer. QR images carry the ticket's bearer authority and expiry.
+`pair create` creates one ticket with a 10-minute validity. Interactive stdout
+shows a monochrome QR and the same manual ticket. If the terminal is too narrow,
+its width is unavailable, or QR encoding fails, it retains the manual ticket and
+explains the fallback on stderr; no second offer is created. Noninteractive
+stdout contains exactly the raw ticket plus one newline, with no ANSI or guidance.
+Validity and receiving instructions always go to stderr. Actual output-write
+failures still fail the command. There are no TTL/QR options or PNG export.
+Keep the ticket out of command arguments, environment variables, shell history,
+logs and error reports; the QR carries the same bearer authority and expiry.
 
 By default, `pair accept` reads one bounded line from an interactive TTY while
 echo is disabled. It has no ticket positional argument and no `--ticket` flag.
@@ -128,8 +130,8 @@ zterm device revoke <device> [-y|--yes]
 ```
 
 The table leads with device names and aliases and retains full device IDs,
-both directions of control permission, authorization state, and current
-connection observations. An unconnected device is not necessarily unreachable.
+Connection, Known host and Allowed here columns. Known host is the local outbound
+record, not proof of current remote permission; Allowed here is inbound Yes/No/Revoked. An unconnected device is not necessarily unreachable.
 An empty list explains how to pair a device. It does not expose route cache
 entries, direct addresses, Relay URLs, tickets, terminal content, or working
 directories.
@@ -171,25 +173,25 @@ connection, perform DNS/Pkarr lookup, or use a Relay.
 The public commands are:
 
 ```text
-zterm connect <target> [--session <name-or-id>] [--takeover]
-zterm session list [<target>]
-zterm session new <target> <name> [--cwd <host-path>]
-zterm session attach <target> <session> [--takeover]
-zterm session rename <target> <session> <new-name>
-zterm session close <target> <session> [-y|--yes]
+zterm connect [<target>] [--session <name-or-id>] [--takeover]
+zterm session list [--target <target>]
+zterm session create <name> [--target <target>] [--cwd <host-path>]
+zterm session rename <session> <new-name> [--target <target>]
+zterm session close <session> [--target <target>] [-y|--yes]
 ```
 
-`connect` defaults to `main`. If `main` does not exist, the daemon atomically
-creates and attaches it; otherwise it attaches the existing `main`. A named or
-ID-selected `connect` attaches an existing Session. `session new` creates the
+`connect` defaults to target `local`. Only when `--session` is omitted does the
+daemon atomically create or reuse `main`. An explicit `--session main`, any other
+name, or a full ID only attaches an existing Session; missing selections fail
+without creation. `session create` creates the
 named Session and immediately attaches the exact returned `SessionId`; if the
 follow-up attach fails, the created Session remains live and its ID is reported.
 `--cwd` is interpreted and validated by the selected host, not the controller.
 
-`session list` defaults to `local` when its target is omitted. Its table leads
-with names, shows Attached/Detached state, and retains full Session IDs. Empty
-results include a creation hint. Other Session commands keep their explicit
-target positions.
+All Session management commands default to `local`; use `--target <target>` for
+another host. Positionals select the Session/name, never the target. The list
+shows Target and a Name / State / Size table (columns x rows), with full IDs on
+the next line. Empty results include a default-connect creation hint.
 
 `session close` ends the exact selected Session and its PTY using shared
 `[y/N]` confirmation or explicit `-y`/`--yes`. Rename preserves the Session ID.
@@ -206,7 +208,7 @@ With no command, behavior is setup-sensitive:
 - Before setup, `zterm` prints the fixed `zterm setup` guidance and does not
   create an identity or start a daemon.
 - After setup, `zterm` is equivalent to
-  `zterm connect local --session main`.
+  `zterm connect local`.
 - `zterm --help`, `zterm --version`, parse failures, and all inspection
   commands remain side-effect free.
 
@@ -304,12 +306,12 @@ a new, independent command.
 ## Identity reset
 
 ```text
-zterm reset --identity [-y|--yes]
+zterm reset [-y|--yes]
 ```
 
 Identity reset is destructive but does not uninstall the binary. It reports
 the current public identity and running Session names, then asks once to end
-the Sessions and delete the identity. Use `-y`/`--yes` to confirm directly.
+the Sessions and delete local identity, configuration and pairing data. Use `-y`/`--yes` to confirm directly.
 Existing identity data requires confirmation even with no Sessions; an already
 absent state root is a successful no-op.
 It then performs a bounded daemon stop, obtains the lifecycle lock, rechecks

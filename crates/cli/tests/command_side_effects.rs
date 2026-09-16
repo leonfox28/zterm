@@ -28,6 +28,12 @@ async fn help_version_status_doctor_logs_and_stop_never_spawn() {
         .get_subcommands()
         .map(clap::Command::get_name)
         .collect::<Vec<_>>();
+    assert_eq!(public_commands.len(), 12);
+    let operation_count: usize = definition
+        .get_subcommands()
+        .map(|command| command.get_subcommands().count().max(1))
+        .sum();
+    assert_eq!(operation_count, 19);
     for available in [
         "setup",
         "status",
@@ -85,16 +91,15 @@ async fn help_version_status_doctor_logs_and_stop_never_spawn() {
     );
 
     let human = run(&runtime, ["zterm", "status"]).await;
-    assert!(human.contains("State: not_configured"));
-    assert!(human.contains("Active sessions: 0"));
+    assert!(human.contains("Setup:           Not configured"));
+    assert!(human.contains("Sessions:        0"));
     let doctor = run(&runtime, ["zterm", "doctor"]).await;
     assert!(doctor.contains("[ok] autostart:"));
     assert!(doctor.contains("[ok] network:") && doctor.contains("not attempted"));
     assert!(doctor.contains("[error] state_paths:"));
     assert!(doctor.contains(state.paths.state_root().to_string_lossy().as_ref()));
     assert!(doctor.contains("[ok] local_ipc:"));
-    let daemon_status = run(&runtime, ["zterm", "daemon", "status"]).await;
-    assert!(daemon_status.contains("not_configured"));
+    assert!(Cli::try_parse_from(["zterm", "daemon", "status"]).is_err());
     let stop = run(&runtime, ["zterm", "daemon", "stop"]).await;
     assert_eq!(stop, "Daemon already stopped.\n");
     let logs = run(&runtime, ["zterm", "logs", "--lines", "10"]).await;
@@ -114,7 +119,7 @@ async fn help_version_status_doctor_logs_and_stop_never_spawn() {
     for arguments in [
         vec!["zterm", "pair", "create"],
         vec!["zterm", "device", "list"],
-        vec!["zterm", "session", "list", "local"],
+        vec!["zterm", "session", "list", "--target", "local"],
     ] {
         let error = execute(
             Cli::try_parse_from(arguments).expect("daemon-required command parses"),
@@ -138,7 +143,12 @@ async fn help_version_status_doctor_logs_and_stop_never_spawn() {
         Cli::try_parse_from(["zterm", "pair", "accept", "secret-ticket"]).is_err(),
         "pair tickets are never accepted from argv"
     );
-    assert!(Cli::try_parse_from(["zterm", "reset"]).is_err());
+    assert!(Cli::try_parse_from(["zterm", "reset", "--identity"]).is_err());
+    assert!(
+        run(&runtime, ["zterm", "reset"])
+            .await
+            .contains("already absent")
+    );
 
     assert!(!state.paths.state_root().exists());
     assert!(!state.paths.runtime_dir().exists());

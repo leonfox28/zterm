@@ -15,6 +15,19 @@ receive another complete frame.
 
 ## 2. Signatures
 
+Public Session/pair/reset grammar (standard help retained, no legacy aliases):
+
+```text
+zterm status
+zterm connect [<target>] [--session <name-or-id>] [--takeover]
+zterm session list [--target <target>]
+zterm session create <name> [--target <target>] [--cwd <host-path>]
+zterm session rename <session> <new-name> [--target <target>]
+zterm session close <session> [--target <target>] [-y|--yes]
+zterm pair create
+zterm reset [-y|--yes]
+```
+
 ```rust
 LocalClient::new(socket: impl Into<PathBuf>) -> LocalClient
 LocalClient::readiness(&self) -> Result<DaemonReadiness, DaemonError>
@@ -180,19 +193,25 @@ No new crate, background owner, or second Session interpreter is introduced.
   CLI never receives a socket path, `UserPaths`, store, identity key, Endpoint,
   route, or operation lease.
 - Public clap exposes setup/status/doctor/logs, pair create/accept, device
-  list/rename/revoke, connect, Session list/new/attach/rename/close, daemon
-  status/stop/restart, and `reset --identity`. Bare invocation observes first:
+  list/rename/revoke, connect, Session list/create/rename/close, daemon
+  stop/restart, and `reset`. Bare invocation observes first:
   not-setup prints fixed setup guidance without creating state; configured
   invocation is exactly local `main` create-or-attach. Help, version, parsing
-  failures, status, doctor, logs, daemon status, and daemon stop never spawn.
+  failures, status, doctor, logs, and daemon stop never spawn.
   Setup and restart explicitly spawn; configured pair/device/connect/Session
   commands may singleflight-start one daemon but never perform setup. Public
   --json flags are removed; hidden release self-check serialization is unchanged.
   First setup defaults to official-n0 without prompting for a profile; repeated
-  setup retains the committed identity/config. Session list alone defaults its
-  omitted target to local. Pair accept uses --alias and rejects --name; its
+  setup retains the committed identity/config. Connect and all Session commands
+  default their omitted target to local; Session management uses named --target,
+  not target-first positionals. Pair accept uses --alias and rejects --name; its
   success hint shell-quotes the actual alias. Pair create emits the ticket once
-  on stdout and TTL/receiver guidance on stderr.
+  as manual text on stdout and TTL/receiver guidance on stderr. Interactive stdout
+  also includes a monochrome QR of the same ticket when width/capacity permits;
+  non-TTY stdout is exactly the ticket plus newline. Use core's 600-second default,
+  mint once, and retain that ticket if QR presentation fails. Width/QR diagnostics
+  are content-free stderr; actual output write/flush failure is not success.
+  --ttl/--qr/--qr-image and PNG export are removed, not compatibility aliases.
 - Pair accept has no ticket positional argument, flag, or environment input.
   Its default owner is a no-echo TTY line reader; non-TTY input is rejected
   before reading unless `--stdin` explicitly selects the 16 KiB-bounded EOF
@@ -204,8 +223,10 @@ No new crate, background owner, or second Session interpreter is introduced.
   precede rejection of hex-looking short/prefix text; a full DeviceId candidate
   must be lowercase and a full-ID/exact-alias collision is ambiguous.
   Session selectors are exact names or canonical 32-lowercase-hex SessionIds.
-  A default `connect` uses atomic `create_main`; after setup, bare invocation
-  resolves to the same path. Ordinary attach never steals a controller;
+  Only omitted `--session` uses selector None and atomic `create_main=true`;
+  explicit selectors (including main) use Some and create_main=false. After setup,
+  bare invocation resolves to the omitted-session path. Missing explicit Sessions
+  fail without creation. Ordinary attach never steals a controller;
   explicit takeover is the only CLI request for replacement.
 - `SessionOperationLeaseRequest/Response` is the mutation-only control exchange
   for a daemon-issued lease. A logical `LocalClient` requests it lazily before
@@ -329,7 +350,7 @@ No new crate, background owner, or second Session interpreter is introduced.
   remains definitive. An existing-session attach retains its exact bounded
   transport/protocol failure because it has no create side effect.
 - The high-level raw-terminal owner validates stdin/stdout before starting any
-  attachment work. Once `session new` or `create_main` may have submitted its
+  attachment work. Once `session create` or `create_main` may have submitted its
   stateful request, local detach, stdin EOF, and SIGINT/SIGTERM/SIGHUP record
   cancellation but continue polling the same owned future to its exact bounded
   result. Exact success reports the stable SessionId and detaches only the
@@ -698,7 +719,7 @@ No new crate, background owner, or second Session interpreter is introduced.
   which is the authority for terminal termination.
 - Local readiness, status, setup validation, stop, and update preflight do not
   require Iroh, DNS, Relay, or Internet access.
-- `setup` and `daemon restart` may spawn. Status, doctor, logs, daemon status,
+- `setup` and `daemon restart` may spawn. Status, doctor, logs,
   and daemon stop never spawn a daemon. A successful stop responds after
   session shutdown and removes only its own socket during the normal daemon
   lifecycle handoff. Restart then waits within the existing bounded deadline
@@ -754,6 +775,18 @@ No new crate, background owner, or second Session interpreter is introduced.
   empty output; unconnected is not proof of remote unreachability. Running
   state comes from IPC; configured/stopped state may open SQLite only
   after the socket proves no `StoreActor` is live.
+- Human output is plain English with aligned object fields; Setup distinguishes
+  Not configured from Configured independently of Daemon. Session tables include
+  Target, Name/State/Size (columns x rows), then full IDs. Device columns are
+  Name/Connection/Known host/Allowed here: a local outbound row is not evidence
+  of remote permission; inbound values are Yes/No/Revoked. Names use display-width
+  padding. Results, including doctor and logs, use stdout; prompts, progress,
+  confirmation and errors use stderr, flushed before input. Main owns the single
+  public execution-error prefix; hidden entry output and clap diagnostics retain
+  their existing owners. Typed SessionNotFound with safe target/selector context
+  gets a shell-quoted `session list --target=...` hint, never string-matched recovery.
+  CreatedSessionAttach retains its exact created ID; unknown outcomes remain
+  unknown. Confirmations show frozen target/impact then `Continue? [y/N]:`.
 - Doctor validates account, committed state, and socket/lock agreement without
   spawning. Linux lifecycle output names the `systemd-logind` logout limit but
   never changes linger or installs a service.
@@ -763,6 +796,15 @@ No new crate, background owner, or second Session interpreter is introduced.
   are defined in [Logging Guidelines](./logging-guidelines.md).
 
 ## 4. Validation & Error Matrix
+
+| Public CLI condition | Required result |
+| --- | --- |
+| connect without --session | Atomically create/reuse main on selected target |
+| explicit --session main/name/ID missing | SessionNotFound; no creation |
+| daemon status, session new/attach, old target-first arguments, reset --identity | Parse failure before runtime |
+| pair create with old business flags | Parse failure; --help remains side-effect free |
+| QR too narrow/unavailable/over capacity | Same manual ticket, stderr fallback; no remint |
+| redirected pair stdout | Raw ticket plus one newline; no QR/ANSI/guidance |
 
 | Initial attachment geometry | Required behavior |
 | --- | --- |
@@ -847,6 +889,12 @@ No new crate, background owner, or second Session interpreter is introduced.
 
 ## 5. Good / Base / Bad Cases
 
+- **Base:** `zterm connect` creates/reuses local main; `session create work`
+  creates then immediately attaches the exact returned ID.
+- **Good:** `connect laptop --session main` fails when missing, preserving
+  the user's explicit existing-only intent.
+- **Bad:** deciding create_main from the string "main" erases that intent.
+
 - **Good:** reattach a retained Alternate-screen child at the same outer size,
   restore its keyboard flags, and accept subsequent input without a resize.
 - **Bad:** seed resize state from a Main creation hint: equal Alternate geometry
@@ -929,6 +977,15 @@ No new crate, background owner, or second Session interpreter is introduced.
   all existing tests happen to run inside `#[tokio::test]`.
 
 ## 6. Tests Required
+
+- CLI parser/request tests assert omitted versus explicit selectors on local and
+  remote targets and reject removed spellings. `daemon_autospawn` exercises an
+  explicit missing main through the real terminal driver, then default creation
+  and retained-ID reuse; use its private IPC/PTY fixture, no extra Endpoint.
+- Pair presentation uses synthetic tickets to assert exact pipe output, same QR
+  and manual ticket, narrow/unknown-width/capacity fallback and secret redaction.
+  Main's writer tests cover write and flush errors; renderer/confirmation tests
+  retain full IDs, Unicode width, directionality and cancellation boundaries.
 
 - `daemon_autospawn` must run the real `run_terminal` initializer through an
   outer PTY: enter Alternate, detach, reattach at equal and changed sizes, then
@@ -1128,6 +1185,14 @@ their owning client modules; platform/runtime coverage must not be inferred from
 module extraction alone.
 
 ## 7. Wrong vs Correct
+
+```rust
+// Wrong: an explicit --session main unexpectedly creates state.
+let create_main = session == "main";
+// Correct: preserve omission through clap as Option<String>.
+let create_main = session.is_none();
+let selector = session;
+```
 
 ```rust
 // Wrong: a creation hint is treated as the size of an existing Session.
