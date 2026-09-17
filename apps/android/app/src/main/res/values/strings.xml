@@ -98,4 +98,10 @@
     <string name="upload_storage_failed">The remote host could not save the file.</string>
     <string name="upload_outcome_unknown">The file may have been uploaded, but its result was lost. Retrying creates another file.</string>
     <string name="upload_upgrade">Upgrade zterm on the remote host to use file uploads.</string>
+    <string name="terminal_notifications">Terminal notifications</string>
+    <string name="terminal_notifications_description">Notifications from programs in the connected terminal</string>
+    <string name="terminal_notifications_enabled">Enabled while connected, including in the background. Missed notifications are not resent.</string>
+    <string name="terminal_notifications_disabled">Allow notifications from programs while connected. Terminal use does not require notification permission.</string>
+    <string name="enable_notifications">Enable notifications</string>
+    <string name="notification_system_settings">System notification settings</string>
 </resources>

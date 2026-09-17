@@ -5299,6 +5299,27 @@ mod unix {
             assert_eq!(clipboard.bytes, b"\x1b]52;c;aGVsbG8=\x07");
             assert_eq!((clipboard.writes, clipboard.flushes), (1, 1));
             assert_eq!(presenter.baseline, baseline);
+            for (notification, bytes) in [
+                (
+                    zterm_core::terminal::TerminalNotification::osc9("结果: done".into()),
+                    "\x1b]9;结果: done\x1b\\",
+                ),
+                (
+                    zterm_core::terminal::TerminalNotification::osc777(
+                        "标题".into(),
+                        "body;结果".into(),
+                    ),
+                    "\x1b]777;notify;标题;body;结果\x1b\\",
+                ),
+            ] {
+                let mut output = ViewportFrameWriter::default();
+                presenter
+                    .write_notification(&mut output, &notification.expect("valid"))
+                    .expect("notification output");
+                assert_eq!(output.bytes, bytes.as_bytes());
+                assert_eq!((output.writes, output.flushes), (1, 1));
+                assert_eq!(presenter.baseline, baseline);
+            }
         }
 
         #[test]
@@ -5348,6 +5369,39 @@ mod unix {
             assert!(error.to_string().contains("injected clipboard failure"));
             assert_eq!(presenter.baseline, baseline);
             assert!(!error.to_string().contains(write.as_str()));
+            let notification =
+                zterm_core::terminal::TerminalNotification::osc9("secret notification".into())
+                    .expect("valid");
+            assert!(
+                presenter
+                    .write_notification(&mut ClipboardWriteFailure, &notification)
+                    .is_err()
+            );
+            assert_eq!(presenter.baseline, baseline);
+            struct FailFlush {
+                writes: usize,
+                flushes: usize,
+            }
+            impl Write for FailFlush {
+                fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                    self.writes += 1;
+                    Ok(bytes.len())
+                }
+                fn flush(&mut self) -> io::Result<()> {
+                    self.flushes += 1;
+                    Err(io::Error::other("injected flush failure"))
+                }
+            }
+            let mut output = FailFlush {
+                writes: 0,
+                flushes: 0,
+            };
+            let error = presenter
+                .write_notification(&mut output, &notification)
+                .expect_err("ambiguous flush");
+            assert!(!error.to_string().contains(notification.body()));
+            assert_eq!((output.writes, output.flushes), (1, 1));
+            assert_eq!(presenter.baseline, baseline);
         }
 
         #[test]

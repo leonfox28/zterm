@@ -150,6 +150,10 @@ these hard caps:
   latest validated `TerminalHostEffect::ClipboardWrite` per ingest. Reads,
   other selectors, malformed/empty/overflow values, and cancelled input emit
   no reply or render residue; rejection diagnostics never retain content.
+- Ordinary OSC 9/777 notification ingress and bounded host-effect aggregation
+  follow [Terminal Notifications](./terminal-notifications.md). `host_effects`
+  keeps the latest clipboard and an independent notification FIFO. UTF-8
+  continuation bytes inside control strings must not become standalone C1 ST.
 - Kitty set/push/pop/query CSI-u controls are admitted only with valid five-bit
   flags, a single parser-representable stack-pop count, and standard behavior
   values. Set/push/pop update the sole engine state and query produces one
@@ -158,7 +162,7 @@ these hard caps:
   admitted controls use the pinned Alacritty engine's stack semantics directly.
   Unrelated CSI-u remains rejected. Exact color OSC, color stack/appearance
   CSI, SGR DECRQSS and XTGETTCAP are handled by the Zterm color owner.
-  OSC 8, other OSC/DCS, APC/PM/SOS and REP remain consumed or rejected
+  OSC 8, other unsupported OSC/DCS, APC/PM/SOS and REP remain consumed or rejected
   before the engine. DEC 2026 is owned at the Zterm parsed boundary, never
   forwarded to upstream raw-byte synchronized-output buffering.
 - SGR 58/59 and all six underline shapes pass through the pinned SGR parser.

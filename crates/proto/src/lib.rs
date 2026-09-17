@@ -12,10 +12,11 @@ use zterm_core::terminal::{
     ActiveScreen, TerminalAppearance, TerminalCell, TerminalClipboardWrite, TerminalColor,
     TerminalColorProfile, TerminalColorSnapshot, TerminalColorValue, TerminalCursor,
     TerminalHistoryWindowAnchor, TerminalHistoryWindowQuery, TerminalKeyboardFlags, TerminalModes,
-    TerminalMouseEncoding, TerminalMouseMode, TerminalScrollMetrics, TerminalSize, TerminalStyle,
-    TerminalSurface, TerminalSurfaceDelta, TerminalSurfaceError, TerminalSurfaceHistoryWindowFrame,
-    TerminalSurfaceHistoryWindowResult, TerminalSurfaceRow, TerminalSurfaceRowPatch,
-    TerminalSurfaceSnapshot, TerminalUnderline, TerminalViewportDisposition,
+    TerminalMouseEncoding, TerminalMouseMode, TerminalNotification, TerminalScrollMetrics,
+    TerminalSize, TerminalStyle, TerminalSurface, TerminalSurfaceDelta, TerminalSurfaceError,
+    TerminalSurfaceHistoryWindowFrame, TerminalSurfaceHistoryWindowResult, TerminalSurfaceRow,
+    TerminalSurfaceRowPatch, TerminalSurfaceSnapshot, TerminalUnderline,
+    TerminalViewportDisposition,
 };
 use zterm_core::{
     AttachmentId, AuthGeneration, AuthorizationStatus, Capabilities, ConnectionAttemptId,
@@ -56,6 +57,36 @@ impl fmt::Debug for v2::TerminalCell {
             .field("wide", &self.wide)
             .field("wide_continuation", &self.wide_continuation)
             .field("style", &self.style)
+            .finish()
+    }
+}
+
+impl fmt::Debug for v2::TerminalNotification {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalNotification")
+            .field("attachment_id_present", &self.attachment_id.is_some())
+            .field("content", &self.content)
+            .finish()
+    }
+}
+impl fmt::Debug for v2::terminal_notification::Content {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Osc9(text) => formatter
+                .debug_struct("Osc9")
+                .field("bytes", &text.len())
+                .finish(),
+            Self::Osc777(value) => value.fmt(formatter),
+        }
+    }
+}
+impl fmt::Debug for v2::TerminalNotificationOsc777 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Osc777")
+            .field("title_bytes", &self.title.len())
+            .field("body_bytes", &self.body.len())
             .finish()
     }
 }
@@ -531,6 +562,8 @@ pub enum WireKind {
     TerminalClipboardWrite = 322,
     /// Current controller base-color observations.
     TerminalBaseColors = 324,
+    /// Ordinary transient controller notification.
+    TerminalNotification = 325,
     /// Starts an attachment-bound upload on a separate service stream.
     UploadBegin = 400,
     /// Host admission and unique transfer identity.
@@ -663,6 +696,7 @@ impl TryFrom<u32> for WireKind {
             318 => Self::TerminalSemanticHistoryWindowFrame,
             322 => Self::TerminalClipboardWrite,
             324 => Self::TerminalBaseColors,
+            325 => Self::TerminalNotification,
             400 => Self::UploadBegin,
             401 => Self::UploadReady,
             402 => Self::UploadChunk,
@@ -1239,6 +1273,41 @@ impl TryFrom<v2::TerminalModes> for TerminalModes {
             keyboard_flags,
         })
     }
+}
+
+/// Projects a validated notification into its attachment-scoped wire message.
+#[must_use]
+pub fn terminal_notification_message(
+    attachment_id: AttachmentId,
+    notification: TerminalNotification,
+) -> v2::TerminalNotification {
+    use v2::terminal_notification::Content;
+    let content = match notification.title() {
+        None => Content::Osc9(notification.body().to_owned()),
+        Some(title) => Content::Osc777(v2::TerminalNotificationOsc777 {
+            title: title.to_owned(),
+            body: notification.body().to_owned(),
+        }),
+    };
+    v2::TerminalNotification {
+        attachment_id: Some(attachment_id.into()),
+        content: Some(content),
+    }
+}
+
+/// Validates notification form, target identity, text and canonical encoded size.
+pub fn terminal_notification_from_message(
+    value: v2::TerminalNotification,
+) -> Result<(AttachmentId, TerminalNotification), ProtocolError> {
+    use v2::terminal_notification::Content;
+    let invalid = || ProtocolError::InvalidTerminalSemanticField("notification");
+    let attachment_id = value.attachment_id.ok_or_else(invalid)?.try_into()?;
+    let notification = match value.content.ok_or_else(invalid)? {
+        Content::Osc9(message) => TerminalNotification::osc9(message),
+        Content::Osc777(value) => TerminalNotification::osc777(value.title, value.body),
+    }
+    .map_err(|_| invalid())?;
+    Ok((attachment_id, notification))
 }
 
 /// Projects a validated decoded clipboard write into its redacted wire DTO.
@@ -3039,6 +3108,10 @@ mod tests {
                 v2::MessageKind::TerminalSemanticHistoryWindowFrame as u32,
             ),
             (
+                WireKind::TerminalNotification,
+                v2::MessageKind::TerminalNotification as u32,
+            ),
+            (
                 WireKind::TerminalClipboardWrite,
                 v2::MessageKind::TerminalClipboardWrite as u32,
             ),
@@ -3306,6 +3379,51 @@ mod tests {
                 TerminalSurfaceError::InvalidCellText
             ))
         ));
+    }
+
+    #[test]
+    fn notifications_round_trip_validate_and_redact_nested_content() {
+        use v2::terminal_notification::Content;
+        let id = AttachmentId::from_array([8; 16]);
+        for value in [
+            TerminalNotification::osc9("secret 结果".into()),
+            TerminalNotification::osc777("secret title".into(), "body;结果".into()),
+        ] {
+            let value = value.expect("valid notification");
+            let message = terminal_notification_message(id, value.clone());
+            assert!(!format!("{message:?}").contains("secret"));
+            assert!(!format!("{:?}", message.content).contains("secret"));
+            assert_eq!(
+                terminal_notification_from_message(message.clone()).expect("round trip"),
+                (id, value)
+            );
+            assert_message_round_trip(WireKind::TerminalNotification, message);
+        }
+        for content in [
+            None,
+            Some(Content::Osc9("4;1;20".into())),
+            Some(Content::Osc9("bad\x1bcontrol".into())),
+            Some(Content::Osc9("x".repeat(1023))),
+            Some(Content::Osc777(v2::TerminalNotificationOsc777 {
+                title: "a;b".into(),
+                body: "body".into(),
+            })),
+        ] {
+            assert!(
+                terminal_notification_from_message(v2::TerminalNotification {
+                    attachment_id: Some(id.into()),
+                    content
+                })
+                .is_err()
+            );
+        }
+        let mut missing = terminal_notification_message(
+            id,
+            TerminalNotification::osc9("hello".into()).expect("valid"),
+        );
+        missing.attachment_id = None;
+        assert!(terminal_notification_from_message(missing).is_err());
+        assert!(WireKind::TerminalNotification.is_control());
     }
 
     #[test]

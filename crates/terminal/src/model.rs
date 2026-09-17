@@ -209,7 +209,7 @@ impl TerminalModel {
                 revision: self.revision,
                 replies: Vec::new(),
                 events: Vec::new(),
-                host_effect: None,
+                host_effects: Default::default(),
             });
         }
 
@@ -261,12 +261,12 @@ impl TerminalModel {
         if self.synchronized.is_none() {
             published(self);
         }
-        let (replies, events, host_effect) = output.finish();
+        let (replies, events, host_effects) = output.finish();
         Ok(TerminalUpdate {
             revision: self.revision,
             replies,
             events,
-            host_effect,
+            host_effects,
         })
     }
 
@@ -300,7 +300,7 @@ impl TerminalModel {
                 Vec::new()
             },
             events: Vec::new(),
-            host_effect: None,
+            host_effects: Default::default(),
         })
     }
 
@@ -318,7 +318,7 @@ impl TerminalModel {
             revision: self.revision,
             replies: Vec::new(),
             events: Vec::new(),
-            host_effect: None,
+            host_effects: Default::default(),
         })
     }
 

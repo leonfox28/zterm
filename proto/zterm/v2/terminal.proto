@@ -41,6 +41,19 @@ message TerminalClipboardWrite {
   string text = 2;
 }
 
+// Ordinary transient notification; never snapshot, replay or raw escape data.
+message TerminalNotification {
+  AttachmentId attachment_id = 1;
+  oneof content {
+    string osc9 = 2;
+    TerminalNotificationOsc777 osc777 = 3;
+  }
+}
+message TerminalNotificationOsc777 {
+  string title = 1;
+  string body = 2;
+}
+
 message TerminalInput {
   OperationId operation_id = 1;
   AttachmentId attachment_id = 2;

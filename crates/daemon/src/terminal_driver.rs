@@ -11,12 +11,12 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 use zterm_core::Revision;
-#[cfg(unix)]
-use zterm_core::terminal::TerminalHostEffect;
 use zterm_core::terminal::{
     TerminalHistoryWindowQuery, TerminalSize, TerminalSurfaceDeltaResult,
     TerminalSurfaceHistoryWindowResult, TerminalSurfaceSnapshot,
 };
+#[cfg(unix)]
+use zterm_core::terminal::{TerminalHostEffect, TerminalHostEffects};
 use zterm_platform::pty::{
     PtyChild, PtyChildInterrupt, PtyChildState, PtyError, PtyExitStatus, PtyIo, PtySession, PtySize,
 };
@@ -129,7 +129,7 @@ pub struct TerminalDriver {
     finalized: bool,
 }
 
-/// Latest-only terminal host-effect broker whose target is linearized with
+/// Bounded terminal host-effect broker whose target is linearized with
 /// controller transitions by the Session actor.
 #[cfg(unix)]
 #[derive(Clone)]
@@ -147,13 +147,7 @@ struct TerminalEffectBrokerInner {
 #[derive(Default)]
 struct TerminalEffectBrokerState {
     target: Option<zterm_core::AttachmentId>,
-    pending: Option<TargetedHostEffect>,
-}
-
-#[cfg(unix)]
-struct TargetedHostEffect {
-    attachment_id: zterm_core::AttachmentId,
-    effect: TerminalHostEffect,
+    pending: TerminalHostEffects,
 }
 
 #[cfg(unix)]
@@ -177,21 +171,23 @@ impl TerminalEffectBroker {
         let mut state = lock(&self.inner.state, "terminal effect broker")?;
         if state.target != target {
             state.target = target;
-            state.pending = None;
+            state.pending.clear();
         }
         Ok(())
     }
 
-    fn publish(&self, effect: TerminalHostEffect) -> Result<(), TerminalDriverError> {
+    fn publish(&self, mut effects: TerminalHostEffects) -> Result<(), TerminalDriverError> {
+        if effects.is_empty() {
+            return Ok(());
+        }
         {
             let mut state = lock(&self.inner.state, "terminal effect broker")?;
-            let Some(attachment_id) = state.target else {
+            if state.target.is_none() {
                 return Ok(());
-            };
-            state.pending = Some(TargetedHostEffect {
-                attachment_id,
-                effect,
-            });
+            }
+            while let Some(effect) = effects.pop() {
+                state.pending.push(effect);
+            }
         }
         self.inner.wake.send_replace(());
         Ok(())
@@ -202,7 +198,7 @@ impl TerminalEffectBroker {
         &self,
         effect: TerminalHostEffect,
     ) -> Result<(), TerminalDriverError> {
-        self.publish(effect)
+        self.publish(effect.into())
     }
 
     /// Subscribes to payload-free latest-slot wakeups.
@@ -217,12 +213,8 @@ impl TerminalEffectBroker {
         attachment_id: zterm_core::AttachmentId,
     ) -> Result<Option<TerminalHostEffect>, TerminalDriverError> {
         let mut state = lock(&self.inner.state, "terminal effect broker")?;
-        if state
-            .pending
-            .as_ref()
-            .is_some_and(|pending| pending.attachment_id == attachment_id)
-        {
-            Ok(state.pending.take().map(|pending| pending.effect))
+        if state.target == Some(attachment_id) {
+            Ok(state.pending.pop())
         } else {
             Ok(None)
         }
@@ -407,9 +399,7 @@ impl TerminalDriver {
                         }
                         #[cfg(unix)]
                         {
-                            if let Some(effect) = update.host_effect
-                                && let Err(error) = model_effects.publish(effect)
-                            {
+                            if let Err(error) = model_effects.publish(update.host_effects) {
                                 model_queue.complete();
                                 model_shared.fail(error);
                                 model_queue.abort();
@@ -1310,6 +1300,64 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn notification_broker_preserves_order_and_retires_old_target_queues() {
+        use zterm_core::terminal::TerminalNotification;
+        let broker = TerminalEffectBroker::new();
+        let first = zterm_core::AttachmentId::from_array([1; 16]);
+        let second = zterm_core::AttachmentId::from_array([2; 16]);
+        let notification = |index| {
+            TerminalHostEffect::Notification(
+                TerminalNotification::osc9(format!("event {index}")).expect("valid notification"),
+            )
+        };
+        broker
+            .publish(notification(0).into())
+            .expect("unowned drop");
+        broker.set_target(Some(first)).expect("target");
+        assert!(broker.take_for(first).expect("take").is_none());
+        for index in 1..=40 {
+            broker
+                .publish(notification(index).into())
+                .expect("bounded publish");
+        }
+        assert!(
+            broker
+                .take_for(second)
+                .expect("observer excluded")
+                .is_none()
+        );
+        for index in 9..=40 {
+            assert_eq!(
+                broker.take_for(first).expect("take"),
+                Some(notification(index))
+            );
+        }
+        assert!(broker.take_for(first).expect("drained").is_none());
+        broker.publish(notification(41).into()).expect("pending");
+        broker.set_target(Some(first)).expect("healthy same target");
+        assert_eq!(
+            broker.take_for(first).expect("preserved"),
+            Some(notification(41))
+        );
+        broker
+            .publish(notification(42).into())
+            .expect("pending takeover");
+        broker.set_target(Some(second)).expect("takeover");
+        assert!(broker.take_for(second).expect("no transfer").is_none());
+        broker
+            .publish(notification(43).into())
+            .expect("pending disconnect");
+        broker.set_target(None).expect("disconnect/end");
+        broker.set_target(Some(second)).expect("reconnect");
+        assert!(broker.take_for(second).expect("no replay").is_none());
+        broker.publish(notification(44).into()).expect("fresh");
+        assert_eq!(
+            broker.take_for(second).expect("fresh delivery"),
+            Some(notification(44))
+        );
+    }
+
+    #[test]
     fn host_effect_broker_is_event_time_targeted_latest_only_and_non_replaying() {
         fn clipboard(text: &str) -> TerminalHostEffect {
             TerminalHostEffect::ClipboardWrite(
@@ -1324,7 +1372,7 @@ mod tests {
         let wake = broker.subscribe();
 
         broker
-            .publish(clipboard("unowned"))
+            .publish(clipboard("unowned").into())
             .expect("publish unowned effect");
         assert!(!wake.has_changed().expect("open wake channel"));
         broker
@@ -1338,10 +1386,10 @@ mod tests {
         );
 
         broker
-            .publish(clipboard("old"))
+            .publish(clipboard("old").into())
             .expect("publish old effect");
         broker
-            .publish(clipboard("latest"))
+            .publish(clipboard("latest").into())
             .expect("publish latest effect");
         assert!(
             broker
@@ -1352,7 +1400,10 @@ mod tests {
         let TerminalHostEffect::ClipboardWrite(write) = broker
             .take_for(first)
             .expect("take from first target")
-            .expect("latest first effect");
+            .expect("latest first effect")
+        else {
+            panic!("expected clipboard effect");
+        };
         assert_eq!(write.as_str(), "latest");
         assert!(
             broker
@@ -1362,7 +1413,7 @@ mod tests {
         );
 
         broker
-            .publish(clipboard("stale takeover content"))
+            .publish(clipboard("stale takeover content").into())
             .expect("publish pre-takeover effect");
         broker
             .set_target(Some(second))
@@ -1380,16 +1431,19 @@ mod tests {
                 .is_none()
         );
         broker
-            .publish(clipboard("second controller"))
+            .publish(clipboard("second controller").into())
             .expect("publish second target effect");
         let TerminalHostEffect::ClipboardWrite(write) = broker
             .take_for(second)
             .expect("take from second target")
-            .expect("second controller effect");
+            .expect("second controller effect")
+        else {
+            panic!("expected clipboard effect");
+        };
         assert_eq!(write.as_str(), "second controller");
 
         broker
-            .publish(clipboard("disconnect content"))
+            .publish(clipboard("disconnect content").into())
             .expect("publish pre-disconnect effect");
         broker.set_target(None).expect("clear effect target");
         broker

@@ -19,8 +19,8 @@ use std::{
     time::Duration,
 };
 use zterm_core::terminal::{
-    TerminalClipboardWrite, TerminalColorProfile, TerminalHistoryWindowQuery, TerminalSurfaceDelta,
-    TerminalSurfaceHistoryWindowResult, TerminalSurfaceSnapshot,
+    TerminalClipboardWrite, TerminalColorProfile, TerminalHistoryWindowQuery, TerminalNotification,
+    TerminalSurfaceDelta, TerminalSurfaceHistoryWindowResult, TerminalSurfaceSnapshot,
 };
 use zterm_core::{
     AttachmentId, DomainErrorKind, OperationId, OperationLease, ResumeViewId, Revision, SessionId,
@@ -53,6 +53,8 @@ pub enum LocalAttachmentEvent {
     HistoryWindow(TerminalSurfaceHistoryWindowResult),
     /// One validated latest-only child clipboard write.
     ClipboardWrite(TerminalClipboardWrite),
+    /// One attachment-scoped ordinary notification.
+    Notification(TerminalNotification),
     /// The following snapshot must replace the client state atomically.
     SyncRequired(v2::TerminalSyncRequired),
     /// A prepared takeover committed successfully.
@@ -94,6 +96,9 @@ impl fmt::Debug for LocalAttachmentEvent {
                 .debug_tuple("SemanticHistoryWindow")
                 .field(result)
                 .finish(),
+            Self::Notification(value) => {
+                formatter.debug_tuple("Notification").field(value).finish()
+            }
             Self::ClipboardWrite(write) => formatter
                 .debug_tuple("ClipboardWrite")
                 .field(write)
@@ -1106,6 +1111,21 @@ impl SessionClient {
                 }
                 self.pending_history_window = None;
                 Ok(LocalAttachmentEvent::HistoryWindow(result))
+            }
+            WireKind::TerminalNotification => {
+                if frame.request_id != 0 || frame.deadline_ms != 0 {
+                    return Err(malformed("terminal notification must be unsolicited"));
+                }
+                let message = frame
+                    .decode_message(WireKind::TerminalNotification)
+                    .map_err(protocol_error)?;
+                let (attachment_id, notification) =
+                    zterm_proto::terminal_notification_from_message(message)
+                        .map_err(protocol_error)?;
+                if attachment_id != self.attachment_id {
+                    return Err(malformed("terminal notification attachment_id mismatch"));
+                }
+                Ok(LocalAttachmentEvent::Notification(notification))
             }
             WireKind::TerminalClipboardWrite => {
                 if frame.request_id != 0 {
@@ -3432,6 +3452,53 @@ mod tests {
                 .kind(),
             DomainErrorKind::MalformedFrame
         );
+    }
+
+    #[tokio::test]
+    async fn notification_events_require_unsolicited_identity_on_both_routes() {
+        let session = SessionId::from_array([0xb1; 16]);
+        let id = AttachmentId::from_array([0xb2; 16]);
+        let wrong = AttachmentId::from_array([0xb3; 16]);
+        for target in [
+            ResolvedSessionTarget::local(),
+            ResolvedSessionTarget::device(zterm_core::DeviceId::from_array([0xb4; 32])),
+        ] {
+            for (request, deadline, recipient, valid) in [
+                (0, 0, id, true),
+                (1, 0, id, false),
+                (0, 1, id, false),
+                (0, 0, wrong, false),
+            ] {
+                let (mut client, mut stream) =
+                    SessionClient::terminal_driver_test_pair(target, session, id);
+                let value = TerminalNotification::osc777("标题".into(), "结果;body".into())
+                    .expect("valid notification");
+                let message = zterm_proto::terminal_notification_message(recipient, value.clone());
+                stream
+                    .write_all(
+                        &encode_message(
+                            WireKind::TerminalNotification,
+                            request,
+                            deadline,
+                            &message,
+                        )
+                        .expect("encode"),
+                    )
+                    .await
+                    .expect("write");
+                let event = client.read_event(Duration::from_secs(1)).await;
+                if valid {
+                    assert!(
+                        matches!(event, Ok(LocalAttachmentEvent::Notification(received)) if received == value)
+                    );
+                } else {
+                    assert_eq!(
+                        event.expect_err("invalid notification").kind(),
+                        DomainErrorKind::MalformedFrame
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]

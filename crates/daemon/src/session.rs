@@ -5256,7 +5256,10 @@ mod tests {
             .attachment
             .take_host_effect()
             .expect("take resumed attachment effect")
-            .expect("active resumed attachment is eligible");
+            .expect("active resumed attachment is eligible")
+        else {
+            panic!("expected clipboard effect");
+        };
         assert_eq!(write.as_str(), "resume after active");
 
         resumed.attachment.detach();
@@ -5380,7 +5383,10 @@ mod tests {
             .attachment
             .take_host_effect()
             .expect("take replacement attachment effect")
-            .expect("active takeover attachment is eligible");
+            .expect("active takeover attachment is eligible")
+        else {
+            panic!("expected clipboard effect");
+        };
         assert_eq!(write.as_str(), "takeover after active");
 
         replacement.attachment.detach();

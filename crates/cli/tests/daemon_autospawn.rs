@@ -1087,6 +1087,23 @@ async fn run_local_terminal_child(
             settled_copy_revision, copy_revision,
             "local copy must not reach or mutate the child PTY"
         );
+        master_writer
+            .write_all(b"ZTERM_TEST_NOTIFICATIONS\r")
+            .expect("request child notifications");
+        let deadline = std::time::Instant::now() + TERMINAL_TEST_TIMEOUT;
+        let osc9 = "\x1b]9;结果: done\x1b\\".as_bytes();
+        let osc777 = "\x1b]777;notify;标题;body;结果\x1b\\".as_bytes();
+        loop {
+            let bytes = captured.lock().expect("captured notifications");
+            if count_bytes(&bytes, osc9) == 1 && count_bytes(&bytes, osc777) == 1 {
+                break;
+            }
+            drop(bytes);
+            if std::time::Instant::now() >= deadline {
+                terminate_failed_child(&mut child, "child notifications did not reach outer PTY");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     } else if mode == "screen-switch" {
         let alternate_revision = wait_for_active_viewport(runtime, 23, 80).await;
         assert!(

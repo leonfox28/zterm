@@ -84,6 +84,7 @@ The terminal wire registry is canonical and non-negotiated:
 317 TerminalHistoryWindowRequest           control
 318 TerminalSemanticHistoryWindowFrame     content
 322 TerminalClipboardWrite                 transient host effect
+325 TerminalNotification                   ordinary transient notification
 ```
 
 The product ALPNs are `zterm/2` and `zterm-pair/2`. Protobuf source/package and
@@ -335,3 +336,8 @@ Upload kinds 400–407 and bit-3 hosting capability use typed DTO validation in
 `zterm-proto::upload`. Chunk frames have a 64 KiB payload plus framing allowance;
 global frame/control caps stay unchanged. See [Single-file Upload](./file-upload.md)
 for state order, correlation, flow control and error contracts.
+
+Ordinary OSC 9/777 domain validation, nested protobuf redaction and the kind-325
+contract are specified in [Terminal Notifications](./terminal-notifications.md).
+`TerminalUpdate.host_effects` holds an independent latest clipboard slot and
+notification FIFO; no effect enters revisioned terminal content.

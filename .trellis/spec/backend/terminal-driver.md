@@ -52,7 +52,7 @@ blocking PtyReader
   -> fixed-capacity, no-drop byte queue
   -> one ordered TerminalModel mutation point
   -> controlled query replies to the same PtySession
-  -> validated transient host effect to one controller-targeted latest slot
+  -> validated transient host effects to controller-targeted bounded storage
   -> one latest revision condition
 ```
 
@@ -99,12 +99,14 @@ blocking PtyReader
   may discard its checkpoint and fetch one full latest snapshot.
 - Transient host effects do not enter revision state or the PTY byte queue.
   After terminal ingest releases the model mutex, one broker mutex snapshots
-  the Session-installed controller target and replaces a single pending value;
+  the Session-installed controller target and admits bounded pending values;
   no target means drop. A payload-free `watch<()>` only wakes attachment
   writers. `take_for(id)` removes the value only for its event-time target, and
-  every target change clears stale pending content. Thus a slow or disconnected
-  controller cannot backpressure PTY drain, create an effect queue, broadcast
-  to observers, or replay content to a later controller.
+  every target change clears stale pending content. Clipboard is latest-only;
+  notifications use a separate 32-entry FIFO with oldest eviction, as specified
+  in [Terminal Notifications](./terminal-notifications.md). Thus a slow or
+  disconnected controller cannot backpressure PTY drain, grow unbounded storage,
+  broadcast to observers, or replay content to a later controller.
 - Host-effect delivery storage is a Unix attachment capability. The shared
   Windows build still performs terminal-model ingestion, but retains no broker,
   target, pending payload, or wake subscription; controller-target reconciliation
@@ -170,7 +172,7 @@ No environment variable or network object participates in this data path.
 | `sync_changed` sees checkpoint revision equal to the published model | `Ok(None)`; do not replace the checkpoint or publish a frame |
 | `sync_changed` sees a behind/incompatible checkpoint | one semantic Delta/Resync and replace the checkpoint at that exact latest state |
 | host effect is produced with no eligible target | drop it without waking a writer or failing PTY drain |
-| multiple effects precede one take | retain only the latest value for the event-time target |
+| multiple effects precede one take | latest clipboard plus bounded notification FIFO for the event-time target |
 | controller target changes | atomically clear the old pending value before a new target can take |
 
 ### 5. Good / Base / Bad Cases

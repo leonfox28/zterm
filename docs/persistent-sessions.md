@@ -170,3 +170,32 @@ The explicit Foundation black-box gate additionally exercises pinned tmux and
 Herdr builds in task-private sockets/directories. It is intentionally excluded
 from routine pull-request and `main` CI because it downloads external pinned
 artifacts.
+
+## Program notifications
+
+Programs can send ordinary notifications using OSC 9 or OSC 777:
+
+```sh
+printf '\033]9;Build finished\007'
+printf '\033]777;notify;Build;Tests passed\033\\'
+```
+
+Zterm parses and validates the request on the host, then sends it only to the
+currently connected controller. Desktop clients forward the same form to the
+outer terminal; Ghostty is the primary supported target. The outer terminal and
+OS control permission, sound and display. Android posts an ordinary system
+notification; enable it under **Settings → Terminal notifications** in the app.
+
+Requests generated without a connected controller are discarded. Disconnect,
+takeover and session end clear pending requests, and reconnect never replays
+missed notifications. These are transient events, separate from screen history.
+Each pending notification queue holds up to 32 requests, discarding the oldest
+on overflow. The canonical OSC body, including command and separators, is limited
+to 1,024 UTF-8 bytes; invalid/control text is rejected.
+
+OSC 99, standalone bell forwarding, numeric OSC 9 progress/subcommands, actions,
+notification updates, tmux passthrough and external push are not included.
+Programs must actually emit OSC 9/777: zterm does not change its hosted terminal
+identity or force an application's environment-based notification detection.
+Use matching updated host and client builds; notification kind 325 has no
+compatibility fallback to older receivers.

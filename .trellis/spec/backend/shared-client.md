@@ -291,3 +291,12 @@ copied list of labels alone is not evidence.
 The terminal driver captures `UploadOrigin` and validates it again for final input;
 a stale upload-input error is local and must not close a replacement driver.
 See [Single-file Upload](./file-upload.md) for signatures and queue/IME fences.
+
+## Ordinary terminal notifications
+
+Kind 325 follows [Terminal Notifications](./terminal-notifications.md). The shared
+view stores a bounded notification FIFO independently of the latest clipboard
+and lifecycle queue. NativeTerminal exports `next_notification()` plus
+`notification_is_current(generation)`; the opaque generation changes on actual
+connection retirement, including reconnect within one native handle. Android
+notifications never enter NativeFrame or Activity-owned collectors.

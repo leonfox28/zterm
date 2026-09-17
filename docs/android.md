@@ -98,6 +98,20 @@ basis. Android can suspend or stop background apps; there is no foreground
 service or wake lock. Actual disconnection suspends input rather than replaying
 typed commands later. Phone-specific background behavior needs device acceptance.
 
+## Terminal notifications
+
+Open **Settings → Terminal notifications** to allow system notifications or
+adjust Android's channel settings. While the current connection is valid, OSC 9
+and OSC 777 requests from its programs become ordinary system notifications,
+including when the Activity is in the background. OSC 9 preserves the complete
+message; OSC 777 preserves title and body. Tapping opens the app.
+
+Permission denial or a disabled channel skips notifications without affecting
+terminal use. Disconnecting drops pending requests; neither reconnection nor a
+later permission grant replays them. Activity recreation does not duplicate
+notifications. Background receipt uses the existing connection lifetime: no
+foreground service, push or delivery after process termination is added.
+
 ## Build and test
 
 Native test/embedding runtimes should await `NativeRuntime.shutdown()` before

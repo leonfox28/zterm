@@ -56,6 +56,8 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
     }
     private var terminal: NativeTerminal? = null
     private var observation: Job? = null
+    private var notificationObservation: Job? = null
+    val notifications = TerminalNotifications(context)
     private val frameClock = TerminalFrameClock()
     private var operation: Job? = null
     private var epoch = 0L
@@ -245,6 +247,20 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
         // is no terminal for the size consumer yet. Reapply its latest intent
         // through that same consumer without overwriting newer measurements.
         if (viewport != requestedViewport) sizes.trySend(Unit)
+        notificationObservation = scope.launch {
+            try {
+                while (isActive) {
+                    val event = attached.nextNotification()
+                    if (mine == epoch && terminal === attached && attached.notificationIsCurrent(event.generation)) {
+                        notifications.post(event, state.value.saved.preferences.language)
+                    }
+                }
+            } catch (_: NativeException.Closed) { /* No pending events survive closure. */ }
+            catch (cancel: CancellationException) { throw cancel }
+            catch (error: Exception) {
+                if (BuildConfig.DEBUG) android.util.Log.d("ZtermState", "notification_closed type=${error.javaClass.simpleName}")
+            }
+        }
         observation = scope.launch {
             try {
                 collectTerminalFrames(attached::currentFrame, attached::waitForFrame, frameClock) { next ->
@@ -294,10 +310,13 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
         scrollIntent = null
         val observer = observation
         observation = null
+        val notificationObserver = notificationObservation
+        notificationObservation = null
         while (true) { val input = keys.tryReceive().getOrNull() ?: break; input.source?.close() }
         val previous = terminal
         terminal = null
         publishFrame(null)
+        notificationObserver?.cancelAndJoin()
         observer?.cancelAndJoin()
         if (previous != null) {
             try { previous.detach() } catch (_: Exception) { /* Session is already closed or transport lost. */ }

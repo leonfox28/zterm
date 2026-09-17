@@ -701,6 +701,10 @@ impl TerminalUiSession {
                     &mut self.presenter,
                 );
             }
+            TerminalViewEvent::Notification(notification) => {
+                let stdout = io::stdout();
+                self.presenter.write_notification(&mut stdout.lock(), &notification)?;
+            }
             TerminalViewEvent::ClipboardWrite(write) => {
                 let stdout = io::stdout();
                 let mut output = stdout.lock();

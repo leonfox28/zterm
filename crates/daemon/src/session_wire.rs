@@ -1440,6 +1440,7 @@ where
     let mut lifecycle = attachment.lifecycle_watch()?;
     let mut effects = attachment.effect_watch();
     let mut revisions_open = true;
+    let mut yield_after_effect = false;
     let initial_lifecycle = lifecycle.borrow().clone();
     if write_lifecycle_event(
         &mut writer,
@@ -1485,19 +1486,13 @@ where
                     return Ok(AttachmentTaskEnd::Terminal);
                 }
             }
-            changed = effects.changed() => {
-                changed.map_err(|_| attachment_cancelled())?;
-                effects.borrow_and_update();
-                if let Some(effect) = attachment.take_host_effect()? {
-                    write_host_effect(
-                        &mut writer,
-                        attachment.attachment_id(),
-                        effect,
-                        Instant::now() + operation_timeout,
-                    ).await?;
-                }
+            effect = next_host_effect(&attachment, &mut effects), if !yield_after_effect => {
+                write_host_effect(&mut writer, attachment.attachment_id(), effect?,
+                    Instant::now() + operation_timeout).await?;
+                yield_after_effect = true;
             }
             changed = revisions.changed(), if revisions_open => {
+                yield_after_effect = false;
                 if changed.is_err() {
                     // Driver finalization closes its revision watch before the actor publishes
                     // the final drained update and SessionEnded lifecycle value. Keep the stream
@@ -1531,7 +1526,28 @@ where
                     }
                 }
             }
+            () = std::future::ready(()), if yield_after_effect => {
+                // A flood cannot monopolize visual/lifecycle work; an idle screen
+                // does not require another revision to drain the notification FIFO.
+                yield_after_effect = false;
+                tokio::task::yield_now().await;
+            }
         }
+    }
+}
+
+#[cfg(unix)]
+async fn next_host_effect(
+    attachment: &SessionAttachment,
+    wake: &mut tokio::sync::watch::Receiver<()>,
+) -> Result<zterm_core::terminal::TerminalHostEffect, DaemonError> {
+    loop {
+        // Observe before take: a coalesced wake never strands pending FIFO entries.
+        wake.borrow_and_update();
+        if let Some(effect) = attachment.take_host_effect()? {
+            return Ok(effect);
+        }
+        wake.changed().await.map_err(|_| attachment_cancelled())?;
     }
 }
 
@@ -1545,16 +1561,28 @@ async fn write_host_effect<Writer>(
 where
     Writer: AsyncWrite + Unpin,
 {
-    let zterm_core::terminal::TerminalHostEffect::ClipboardWrite(write) = effect;
-    let message = zterm_proto::terminal_clipboard_write_message(attachment_id, write);
-    let bytes =
-        encode_message(WireKind::TerminalClipboardWrite, 0, 0, &message).map_err(protocol_error)?;
+    use zterm_core::terminal::TerminalHostEffect;
+    let bytes = match effect {
+        TerminalHostEffect::ClipboardWrite(write) => encode_message(
+            WireKind::TerminalClipboardWrite,
+            0,
+            0,
+            &zterm_proto::terminal_clipboard_write_message(attachment_id, write),
+        ),
+        TerminalHostEffect::Notification(notification) => encode_message(
+            WireKind::TerminalNotification,
+            0,
+            0,
+            &zterm_proto::terminal_notification_message(attachment_id, notification),
+        ),
+    }
+    .map_err(protocol_error)?;
     write_attachment_bytes_until(
         writer,
         &bytes,
         deadline,
-        "clipboard effect exceeded its absolute deadline",
-        "write clipboard effect",
+        "terminal effect exceeded its absolute deadline",
+        "write terminal effect",
     )
     .await
 }
