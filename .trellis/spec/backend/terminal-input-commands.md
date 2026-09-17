@@ -11,9 +11,8 @@ Child application identity is never an input-routing condition.
 ## 2. Signatures
 
 ```text
-zterm connect <target> [--session <name-or-id>] [--takeover]
-zterm session new <target> <name> [--cwd <host-path>]
-zterm session attach <target> <session> [--takeover]
+zterm connect [<target>] [--session <name-or-id>] [--takeover]
+zterm session create <name> [--target <target>] [--cwd <host-path>]
 ```
 
 These commands have a fixed Ctrl+] prefix. `--escape` and the internal
@@ -79,7 +78,7 @@ do not add suffix checks to the decoder or another prefix parser.
 
 | Condition | Result |
 | --- | --- |
-| `--escape` on connect/new/attach | Clap `UnknownArgument` before execution |
+| `--escape` on connect/create | Clap `UnknownArgument` before execution |
 | Prefix plus plain/enhanced period | One local `Detach`; no chord input forwarded |
 | Unknown suffix or deadline | Local cancellation; no replay or error |
 | U+3002 suffix | Consume text scalar; no detach or physical-key inference |
@@ -107,7 +106,7 @@ Existing codec frame/paste limits and their errors remain authoritative.
 - `missing_release_reports_do_not_accumulate_held_keys`: many distinct command
   attempts without requested releases must not exhaust the held-key bound.
 - `removed_escape_option_is_rejected_on_all_terminal_entry_points`: normal
-  parsing, removed-option rejection and fixed-prefix help for all three commands.
+  parsing, removed-option rejection and fixed-prefix help for both commands.
 - `daemon_autospawn` enhanced-prefix scenario: generic child enables flags 15;
   unknown commands/timeout leave authoritative revision unchanged; enhanced
   detach restores the outer terminal; reattach preserves Session ID and mode.

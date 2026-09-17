@@ -15,7 +15,6 @@ the complete current command surface.
 | `zterm setup --name <name> --profile self-hosted --relay-url <https-url>` | yes | Select one explicit self-hosted Relay profile |
 | `zterm status` | no | Report running, configured/stopped, or not configured |
 | `zterm doctor` | no | Check account home/shell, committed state, socket/lock state, and lifecycle limits |
-| `zterm daemon status` | no | Same typed state projection as `status` |
 | `zterm daemon stop [-y|--yes]` | no | Flush a graceful stop response; stopped is success |
 | `zterm daemon restart [-y|--yes]` | yes | Stop, wait, then explicitly start one daemon |
 | `zterm logs [-n|--lines <n>]` | no | Read at most 1,000 recent lines and 1 MiB |

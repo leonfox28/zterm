@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 use unicode_width::UnicodeWidthStr;
 use zeroize::Zeroizing;
-use zterm_core::{AuthorizationStatus, MAX_TICKET_TEXT_BYTES, SessionId, validate_pair_ttl};
+use zterm_core::{AuthorizationStatus, MAX_TICKET_TEXT_BYTES, SessionId};
 use zterm_daemon::bootstrap::BootstrapResult;
 use zterm_daemon::config::validate_setup_profile;
 use zterm_daemon::error::DaemonError;
@@ -22,7 +22,7 @@ mod terminal_ui;
 
 pub use terminal_ui::run_terminal;
 
-const UPDATE_CONNECTION_GUIDANCE: &str = "Update will continue independently if this terminal disconnects. Existing sessions will end. Reconnect manually after the daemon starts; use zterm --version, zterm daemon status and zterm logs to check the result.";
+const UPDATE_CONNECTION_GUIDANCE: &str = "Update will continue independently if this terminal disconnects. Existing sessions will end. Reconnect manually after the daemon starts; use zterm --version, zterm status and zterm logs to check the result.";
 
 const SETUP_GUIDANCE: &str = "zterm is not configured. Run `zterm setup` first.\n";
 
@@ -174,7 +174,7 @@ enum Command {
         #[command(subcommand)]
         command: SessionCommand,
     },
-    /// Inspect or control the per-user daemon.
+    /// Control the per-user daemon.
     Daemon {
         /// Daemon lifecycle operation.
         #[command(subcommand)]
@@ -182,7 +182,7 @@ enum Command {
     },
     /// Print a bounded recent daemon log tail without starting anything.
     Logs(LogsArgs),
-    /// Destroy this host's managed identity and pairing state.
+    /// Remove local identity, configuration and pairing data; end all Sessions but keep the executable.
     Reset(ResetArgs),
     /// Explicitly download, verify, and install a newer official Release.
     Update(UpdateArgs),
@@ -232,23 +232,10 @@ impl ProfileArg {
 
 #[derive(Debug, Subcommand)]
 enum PairCommand {
-    /// Create a bounded one-time bearer ticket.
-    Create(PairCreateArgs),
+    /// Create a 10-minute ticket; show QR and manual text on a terminal, raw text in a pipe.
+    Create,
     /// Accept a bearer ticket from a no-echo TTY or explicit stdin automation.
     Accept(PairAcceptArgs),
-}
-
-#[derive(Debug, clap::Args)]
-struct PairCreateArgs {
-    /// Ticket lifetime such as 60s, 10m, or 1h.
-    #[arg(long, value_parser = parse_pair_ttl)]
-    ttl: Option<u32>,
-    /// Show a QR code on interactive stdout.
-    #[arg(long, conflicts_with = "qr_image")]
-    qr: bool,
-    /// Save a QR code to a new PNG file; stdout still contains the ticket.
-    #[arg(long, value_name = "NEW_PNG_PATH")]
-    qr_image: Option<PathBuf>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -291,10 +278,11 @@ struct DeviceRevokeArgs {
 #[derive(Debug, clap::Args)]
 struct ConnectArgs {
     /// Exact outbound device alias/full ID, or the reserved local target.
+    #[arg(default_value = "local")]
     target: String,
-    /// Exact Session name or canonical full Session ID.
-    #[arg(long, default_value = "main")]
-    session: String,
+    /// Connect only to this existing Session name/full ID; omit to create or reuse main.
+    #[arg(long, value_name = "NAME_OR_ID")]
+    session: Option<String>,
     /// Explicitly replace an existing controller after synchronization.
     #[arg(long)]
     takeover: bool,
@@ -307,11 +295,7 @@ enum SessionCommand {
     /// Create a named Session, then attach that exact created identity.
     ///
     /// Use Ctrl+] then . to detach. Unknown prefix commands cancel locally.
-    New(SessionNewArgs),
-    /// Attach one exact existing Session.
-    ///
-    /// Use Ctrl+] then . to detach. Unknown prefix commands cancel locally.
-    Attach(SessionAttachArgs),
+    Create(SessionCreateArgs),
     /// Rename one exact existing Session.
     Rename(SessionRenameArgs),
     /// Explicitly close one exact existing Session.
@@ -321,13 +305,14 @@ enum SessionCommand {
 #[derive(Debug, clap::Args)]
 struct SessionListArgs {
     /// Exact outbound device alias/full ID, or local (the default).
-    #[arg(default_value = "local")]
+    #[arg(long, default_value = "local")]
     target: String,
 }
 
 #[derive(clap::Args)]
-struct SessionNewArgs {
+struct SessionCreateArgs {
     /// Exact outbound device alias/full ID, or local.
+    #[arg(long, default_value = "local")]
     target: String,
     /// Exact new Session name.
     name: String,
@@ -336,10 +321,10 @@ struct SessionNewArgs {
     cwd: Option<PathBuf>,
 }
 
-impl fmt::Debug for SessionNewArgs {
+impl fmt::Debug for SessionCreateArgs {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("SessionNewArgs")
+            .debug_struct("SessionCreateArgs")
             .field("target", &self.target)
             .field("name", &self.name)
             .field("cwd", &"[REDACTED]")
@@ -349,19 +334,9 @@ impl fmt::Debug for SessionNewArgs {
 }
 
 #[derive(Debug, clap::Args)]
-struct SessionAttachArgs {
-    /// Exact outbound device alias/full ID, or local.
-    target: String,
-    /// Exact Session name or canonical full Session ID.
-    session: String,
-    /// Explicitly replace an existing controller after synchronization.
-    #[arg(long)]
-    takeover: bool,
-}
-
-#[derive(Debug, clap::Args)]
 struct SessionRenameArgs {
     /// Exact outbound device alias/full ID, or local.
+    #[arg(long, default_value = "local")]
     target: String,
     /// Exact Session name or canonical full Session ID.
     session: String,
@@ -372,6 +347,7 @@ struct SessionRenameArgs {
 #[derive(Debug, clap::Args)]
 struct SessionCloseArgs {
     /// Exact outbound device alias/full ID, or local.
+    #[arg(long, default_value = "local")]
     target: String,
     /// Exact Session name or canonical full Session ID.
     session: String,
@@ -382,8 +358,6 @@ struct SessionCloseArgs {
 
 #[derive(Debug, Subcommand)]
 enum DaemonCommand {
-    /// Show daemon state without starting it.
-    Status,
     /// Gracefully stop the daemon; already stopped succeeds.
     Stop(YesArgs),
     /// Gracefully stop and explicitly start one daemon.
@@ -406,9 +380,6 @@ struct LogsArgs {
 
 #[derive(Debug, clap::Args)]
 struct ResetArgs {
-    /// Destroy this host's exact managed identity and all pairing state.
-    #[arg(long, required = true)]
-    identity: bool,
     /// Confirm without an interactive prompt.
     #[arg(short = 'y', long)]
     yes: bool,
@@ -456,6 +427,15 @@ impl InteractionMode {
 pub enum CliError {
     /// Daemon-owned operation failed.
     Daemon(DaemonError),
+    /// A Session operation failed with safe user-selected display context.
+    SessionOperation {
+        /// Requested target; not routing authority.
+        target: String,
+        /// Exact requested Session selector.
+        selector: String,
+        /// Original typed operation failure.
+        source: DaemonError,
+    },
     /// Required CLI input is missing or contradictory.
     Usage(String),
     /// Interactive prompt I/O failed.
@@ -478,6 +458,10 @@ impl fmt::Debug for CliError {
                 .debug_struct("Daemon")
                 .field("error_kind", &error.kind())
                 .finish(),
+            Self::SessionOperation { source, .. } => formatter
+                .debug_struct("SessionOperation")
+                .field("error_kind", &source.kind())
+                .finish_non_exhaustive(),
             Self::Usage(detail) => formatter
                 .debug_struct("Usage")
                 .field("detail", &"[REDACTED]")
@@ -502,6 +486,21 @@ impl fmt::Display for CliError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Daemon(error) => error.fmt(formatter),
+            Self::SessionOperation {
+                target,
+                selector,
+                source,
+            } => {
+                if source.kind() == zterm_core::DomainErrorKind::SessionNotFound {
+                    write!(
+                        formatter,
+                        "Session '{selector}' was not found on {target}.\nRun: zterm session list --target={}",
+                        shell_quote(target)
+                    )
+                } else {
+                    write!(formatter, "Session '{selector}' on {target}: {source}")
+                }
+            }
             Self::Usage(detail) => write!(formatter, "invalid command: {detail}"),
             Self::Io(detail) => write!(formatter, "interactive terminal failed: {detail}"),
             Self::CreatedSessionAttach { session_id, source } => write!(
@@ -520,6 +519,20 @@ impl std::error::Error for CliError {}
 impl From<DaemonError> for CliError {
     fn from(error: DaemonError) -> Self {
         Self::Daemon(error)
+    }
+}
+
+impl CliError {
+    fn with_session(self, target: String, selector: String) -> Self {
+        match self {
+            Self::Daemon(source) => Self::SessionOperation {
+                target,
+                selector,
+                source,
+            },
+            // In particular, never replace the created-ID partial-success diagnostic.
+            error => error,
+        }
     }
 }
 
@@ -626,10 +639,9 @@ pub async fn execute(
         Some(Command::Doctor) => doctor(runtime).await.map(CommandOutcome::Text),
         Some(Command::Pair { command }) => pair(runtime, command, interaction).await,
         Some(Command::Device { command }) => device(runtime, command, interaction).await,
-        Some(Command::Connect(arguments)) => connect(runtime, arguments).await,
+        Some(Command::Connect(arguments)) => connect(arguments).await,
         Some(Command::Session { command }) => session(runtime, command, interaction).await,
         Some(Command::Daemon { command }) => match command {
-            DaemonCommand::Status => status(runtime).await.map(CommandOutcome::Text),
             DaemonCommand::Stop(arguments) => stop(runtime, arguments.yes, interaction)
                 .await
                 .map(CommandOutcome::Text),
@@ -649,14 +661,11 @@ async fn bare(runtime: &LocalRuntime) -> Result<CommandOutcome, CliError> {
     match runtime.observe().await? {
         ObservedState::NotConfigured => Ok(CommandOutcome::Text(SETUP_GUIDANCE.to_owned())),
         ObservedState::Running(_) | ObservedState::ConfiguredStopped(_) => {
-            connect(
-                runtime,
-                ConnectArgs {
-                    target: "local".to_owned(),
-                    session: "main".to_owned(),
-                    takeover: false,
-                },
-            )
+            connect(ConnectArgs {
+                target: "local".to_owned(),
+                session: None,
+                takeover: false,
+            })
             .await
         }
     }
@@ -668,37 +677,20 @@ async fn pair(
     interaction: InteractionMode,
 ) -> Result<CommandOutcome, CliError> {
     match command {
-        PairCommand::Create(arguments) => {
-            if arguments.qr && !io::stdout().is_terminal() {
-                return Err(CliError::Usage(
-                    "--qr requires interactive stdout; use --qr-image or the default ticket output"
-                        .to_owned(),
-                ));
-            }
-            if let Some(path) = &arguments.qr_image {
-                pair_qr::check_destination(path)?;
-            }
-            let ttl = arguments.ttl.unwrap_or(
-                u32::try_from(zterm_core::DEFAULT_PAIR_TTL_SECONDS)
-                    .expect("default TTL fits wire field"),
-            );
+        PairCommand::Create => {
+            let ttl = u32::try_from(zterm_core::DEFAULT_PAIR_TTL_SECONDS)
+                .expect("default TTL fits wire field");
             let ticket = runtime.pair_create(ttl).await?;
             eprintln!(
                 "Ticket expires in {ttl} seconds. On the connecting device, run zterm pair accept and paste this ticket."
             );
-            let mut output = Zeroizing::new(format!("{}\n", ticket.expose()));
-            let presentation = if arguments.qr {
-                pair_qr::terminal(ticket.expose()).map(|qr| output = qr)
-            } else if let Some(path) = &arguments.qr_image {
-                pair_qr::write_png(ticket.expose(), path)
-            } else {
-                Ok(())
-            };
-            if let Err(error) = presentation {
-                // The offer was already committed. Preserve that exact ticket for
-                // manual entry rather than silently create another offer.
-                eprintln!("QR presentation failed: {error}. Use the ticket printed below.");
+            let (output, fallback) = pair_qr::present(ticket.expose(), pair_qr::stdout_width());
+            if let Some(error) = fallback {
+                eprintln!("QR unavailable: {error}. Use the manual ticket below.");
             }
+            io::stderr()
+                .flush()
+                .map_err(|error| CliError::Io(error.to_string()))?;
             drop(ticket);
             Ok(CommandOutcome::PairTicket(output))
         }
@@ -751,8 +743,8 @@ async fn device(
             }
             confirm(
                 &format!(
-                    "Revoke inbound control from {}? Outbound-known={} and its Sessions remain unchanged.",
-                    selected.device_id, selected.outbound_known
+                    "Revoke access to this device\nDevice ID: {}\n\nDisconnect this device and revoke its permission to control this host. Keep its outbound record and all sessions.",
+                    selected.device_id
                 ),
                 arguments.yes,
                 interaction,
@@ -766,14 +758,11 @@ async fn device(
     }
 }
 
-async fn connect(
-    _runtime: &LocalRuntime,
-    arguments: ConnectArgs,
-) -> Result<CommandOutcome, CliError> {
+async fn connect(arguments: ConnectArgs) -> Result<CommandOutcome, CliError> {
     #[cfg(unix)]
     let kind = {
-        let create_main = arguments.session == "main";
-        let selector = (!create_main).then_some(arguments.session);
+        let create_main = arguments.session.is_none();
+        let selector = arguments.session;
         TerminalRequestKind::Attach {
             target: arguments.target,
             selector,
@@ -801,7 +790,7 @@ async fn session(
             .map_err(Into::into)
             .map(|sessions| render_sessions(sessions, &arguments.target))
             .map(CommandOutcome::Text),
-        SessionCommand::New(arguments) => {
+        SessionCommand::Create(arguments) => {
             #[cfg(unix)]
             let kind = TerminalRequestKind::Create {
                 target: arguments.target,
@@ -815,25 +804,15 @@ async fn session(
             };
             Ok(CommandOutcome::Terminal(TerminalRequest { kind }))
         }
-        SessionCommand::Attach(arguments) => {
-            #[cfg(unix)]
-            let kind = TerminalRequestKind::Attach {
-                target: arguments.target,
-                selector: Some(arguments.session),
-                create_main: false,
-                takeover: arguments.takeover,
-            };
-            #[cfg(not(unix))]
-            let kind = {
-                let _ = arguments;
-                TerminalRequestKind::Attach
-            };
-            Ok(CommandOutcome::Terminal(TerminalRequest { kind }))
-        }
         SessionCommand::Rename(arguments) => {
             let renamed = runtime
                 .session_rename(&arguments.target, &arguments.session, &arguments.new_name)
-                .await?;
+                .await
+                .map_err(|source| CliError::SessionOperation {
+                    target: arguments.target.clone(),
+                    selector: arguments.session.clone(),
+                    source,
+                })?;
             Ok(CommandOutcome::Text(format!(
                 "Session {} renamed to {}.\n",
                 renamed.session_id, renamed.name
@@ -842,15 +821,20 @@ async fn session(
         SessionCommand::Close(arguments) => {
             let preflight = runtime
                 .session_close_preflight(&arguments.target, &arguments.session)
-                .await?;
+                .await
+                .map_err(|source| CliError::SessionOperation {
+                    target: arguments.target.clone(),
+                    selector: arguments.session.clone(),
+                    source,
+                })?;
             let selected = preflight.summary();
             let exact_target = preflight
                 .target_device_id()
                 .map_or_else(|| "local".to_owned(), |device_id| device_id.to_string());
             confirm(
                 &format!(
-                    "Close Session {} ({}) on target {} and end its PTY?",
-                    selected.session_id, selected.name, exact_target
+                    "Close session: {}\nTarget: {}\nSession ID: {}\n\nEnd this session and its PTY.",
+                    selected.name, exact_target, selected.session_id
                 ),
                 arguments.yes,
                 interaction,
@@ -869,11 +853,6 @@ async fn reset(
     arguments: ResetArgs,
     interaction: InteractionMode,
 ) -> Result<CommandOutcome, CliError> {
-    if !arguments.identity {
-        return Err(CliError::Usage(
-            "reset requires the explicit --identity boundary".to_owned(),
-        ));
-    }
     let preflight = runtime.identity_reset_preflight().await?;
     if !preflight.state_present {
         return Ok(CommandOutcome::Text(
@@ -887,7 +866,7 @@ async fn reset(
         .unwrap_or("incomplete identity state");
     confirm(
         &format!(
-            "{}Destroy identity {public_identity}, remove all local pairing state, and end all running sessions?",
+            "Reset this device: local\nDevice ID: {public_identity}\n\n{}Remove local identity, configuration and pairing data. End all running sessions. Keep the zterm executable.",
             session_impact_text(&preflight.active_session_names)
         ),
         arguments.yes,
@@ -963,7 +942,7 @@ async fn uninstall(
         .unwrap_or("no committed identity");
     confirm(
         &format!(
-            "{}Uninstall zterm {}, destroy identity {}, remove all local pairing state, and end all running sessions? Devices must be paired again after reinstall.",
+            "{}Uninstall zterm {}\nDevice ID: {}\n\nRemove local identity, configuration, pairing data and the zterm executable. End all running sessions. Devices must be paired again after reinstall.",
             session_impact_text(&preflight.identity.active_session_names),
             preflight.version,
             identity
@@ -978,27 +957,6 @@ async fn uninstall(
         "Uninstalled zterm. Managed state removed: {}. Executable removed: {}.\n",
         result.state_removed, result.executable_removed
     )))
-}
-
-fn parse_pair_ttl(value: &str) -> Result<u32, String> {
-    let (digits, multiplier) = match value.as_bytes().split_last() {
-        Some((b's', digits)) => (digits, 1_u64),
-        Some((b'm', digits)) => (digits, 60_u64),
-        Some((b'h', digits)) => (digits, 60_u64 * 60),
-        _ => return Err("TTL must use a checked s, m, or h suffix".to_owned()),
-    };
-    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
-        return Err("TTL must contain only decimal digits before its suffix".to_owned());
-    }
-    let number = std::str::from_utf8(digits)
-        .map_err(|_| "TTL must be ASCII".to_owned())?
-        .parse::<u64>()
-        .map_err(|_| "TTL value is too large".to_owned())?;
-    let seconds = number
-        .checked_mul(multiplier)
-        .ok_or_else(|| "TTL value is too large".to_owned())?;
-    validate_pair_ttl(seconds).map_err(|error| error.to_string())?;
-    u32::try_from(seconds).map_err(|_| "TTL value is too large".to_owned())
 }
 
 fn read_pair_ticket(
@@ -1017,14 +975,14 @@ fn read_pair_ticket(
     }
     #[cfg(unix)]
     {
-        print!("Pair ticket: ");
-        io::stdout()
+        eprint!("Pair ticket: ");
+        io::stderr()
             .flush()
             .map_err(|error| CliError::Io(error.to_string()))?;
         let stdin = io::stdin();
         let mut reader = stdin.lock();
         let result = read_pair_ticket_no_echo_from(&stdin, &mut reader);
-        println!();
+        eprintln!();
         result
     }
     #[cfg(not(unix))]
@@ -1161,7 +1119,7 @@ fn pair_ticket_from_bytes(bytes: &[u8]) -> Result<PairTicketText, CliError> {
 
 fn confirm(impact: &str, yes: bool, interaction: InteractionMode) -> Result<(), CliError> {
     confirm_with(impact, yes, interaction, || {
-        prompt(&format!("{impact} Continue? [y/N]: "))
+        prompt(&format!("{impact}\nContinue? [y/N]: "))
     })
 }
 
@@ -1243,8 +1201,8 @@ fn padded(value: &str, width: usize) -> String {
 
 fn authorization_status(status: AuthorizationStatus) -> &'static str {
     match status {
-        AuthorizationStatus::None => "None",
-        AuthorizationStatus::Authorized => "Allowed",
+        AuthorizationStatus::None => "No",
+        AuthorizationStatus::Authorized => "Yes",
         AuthorizationStatus::Revoked => "Revoked",
     }
 }
@@ -1267,10 +1225,10 @@ fn render_devices(devices: Vec<CommandDeviceSummary>) -> String {
         .unwrap_or(4)
         .max(4);
     let mut output = format!(
-        "{}  {}  {}  Inbound control\n",
+        "{}  {}  {}  Allowed here\n",
         padded("Name", width),
         padded("Connection", 13),
-        padded("Connect to host", 15)
+        padded("Known host", 10)
     );
     for device in &devices {
         output.push_str(&format!(
@@ -1284,14 +1242,7 @@ fn render_devices(devices: Vec<CommandDeviceSummary>) -> String {
                 },
                 13
             ),
-            padded(
-                if device.outbound_known {
-                    "Available"
-                } else {
-                    "Not paired"
-                },
-                15
-            ),
+            padded(if device.outbound_known { "Yes" } else { "No" }, 10),
             authorization_status(device.inbound_status),
             device.device_id
         ));
@@ -1302,7 +1253,7 @@ fn render_devices(devices: Vec<CommandDeviceSummary>) -> String {
 fn render_sessions(sessions: Vec<CommandSessionSummary>, target: &str) -> String {
     if sessions.is_empty() {
         return format!(
-            "No running sessions. Run zterm connect {} to start the main session.\n",
+            "Target: {target}\n\nNo running sessions. Run zterm connect {} to start the main session.\n",
             connect_target(target)
         );
     }
@@ -1313,9 +1264,9 @@ fn render_sessions(sessions: Vec<CommandSessionSummary>, target: &str) -> String
         .unwrap_or(4)
         .max(4);
     let mut output = format!(
-        "{}  {}  Viewport\n",
+        "Target: {target}\n\n{}  {}  Size\n",
         padded("Name", width),
-        padded("Controller", 10)
+        padded("State", 8)
     );
     for session in sessions {
         output.push_str(&format!(
@@ -1327,7 +1278,7 @@ fn render_sessions(sessions: Vec<CommandSessionSummary>, target: &str) -> String
                 } else {
                     "Detached"
                 },
-                10
+                8
             ),
             session.viewport.columns,
             session.viewport.rows,
@@ -1450,12 +1401,20 @@ fn required_or_prompt(
 }
 
 fn prompt(text: &str) -> Result<String, CliError> {
-    print!("{text}");
-    io::stdout()
-        .flush()
+    prompt_with(text, &mut io::stdin().lock(), &mut io::stderr().lock())
+}
+
+fn prompt_with(
+    text: &str,
+    reader: &mut impl io::BufRead,
+    writer: &mut impl Write,
+) -> Result<String, CliError> {
+    writer
+        .write_all(text.as_bytes())
+        .and_then(|()| writer.flush())
         .map_err(|error| CliError::Io(error.to_string()))?;
     let mut value = String::new();
-    io::stdin()
+    reader
         .read_line(&mut value)
         .map_err(|error| CliError::Io(error.to_string()))?;
     Ok(value)
@@ -1529,14 +1488,14 @@ fn logs(runtime: &LocalRuntime, lines: usize) -> Result<String, CliError> {
 
 fn render_setup_result(result: &BootstrapResult) -> String {
     format!(
-        "Configured {}.\nDevice ID: {}\nDaemon: running\n",
+        "Device:  {}\nSetup:   Configured\nDaemon:  Running\n\nDevice ID: {}\n",
         result.config.device_name, result.endpoint_id
     )
 }
 
 fn render_setup_status(status: &DaemonStatus) -> String {
     format!(
-        "Configured {}.\nDevice ID: {}\nDaemon: running\n",
+        "Device:  {}\nSetup:   Configured\nDaemon:  Running\n\nDevice ID: {}\n",
         status.device_name, status.endpoint_id
     )
 }
@@ -1640,33 +1599,45 @@ impl StatusView {
     }
 
     fn human(&self) -> String {
-        let mut output = format!("State: {}\n", self.state);
+        let mut output = String::new();
         if let Some(name) = &self.device_name {
-            output.push_str(&format!("Device: {name}\n"));
-        }
-        if let Some(endpoint) = &self.endpoint_id {
-            output.push_str(&format!("Device ID: {endpoint}\n"));
-        }
-        if let Some(profile) = &self.infrastructure_profile {
-            output.push_str(&format!("Infrastructure: {profile}\n"));
+            output.push_str(&format!("Device:          {name}\n"));
         }
         if let Some(version) = &self.version {
-            output.push_str(&format!("Version: {version}\n"));
+            output.push_str(&format!("Version:         {version}\n"));
         }
         output.push_str(&format!(
-            "Daemon: {}\n",
-            if self.state == "running" {
-                "running"
+            "Setup:           {}\n",
+            if self.state == "not_configured" {
+                "Not configured"
             } else {
-                "stopped"
+                "Configured"
             }
         ));
-        if let Some(network) = &self.network_state {
-            output.push_str(&format!("Network: {network}\n"));
+        output.push_str(&format!(
+            "Daemon:          {}\n",
+            if self.state == "running" {
+                "Running"
+            } else {
+                "Stopped"
+            }
+        ));
+        if let Some(profile) = &self.infrastructure_profile {
+            output.push_str(&format!("Infrastructure:  {profile}\n"));
         }
-        output.push_str(&format!("Active sessions: {}\n", self.active_session_count));
+        if let Some(network) = &self.network_state {
+            let mut label = network.clone();
+            if let Some(first) = label.get_mut(..1) {
+                first.make_ascii_uppercase();
+            }
+            output.push_str(&format!("Network:         {label}\n"));
+        }
+        output.push_str(&format!("Sessions:        {}\n", self.active_session_count));
         for name in &self.active_session_names {
             output.push_str(&format!("  {name}\n"));
+        }
+        if let Some(endpoint) = &self.endpoint_id {
+            output.push_str(&format!("\nDevice ID: {endpoint}\n"));
         }
         if self.state == "not_configured" {
             output.push_str(SETUP_GUIDANCE);
@@ -1775,8 +1746,8 @@ mod tests {
         }));
 
         let human = view.human();
-        assert!(human.contains("Network: degraded"));
-        assert!(human.contains("Version: test"));
+        assert!(human.contains("Network:         Degraded"));
+        assert!(human.contains("Version:         test"));
         assert!(human.contains("  one\n  two"));
         assert!(!human.contains("Network bind attempts"));
         let diagnostics = view.diagnostics();
@@ -1841,6 +1812,55 @@ mod tests {
     }
 
     #[test]
+    fn prompts_use_the_diagnostic_writer_and_flush_before_input() {
+        use std::cell::Cell;
+        let flushed = Cell::new(false);
+        struct DiagnosticWriter<'a> {
+            bytes: Vec<u8>,
+            flushed: &'a Cell<bool>,
+        }
+        impl Write for DiagnosticWriter<'_> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.flushed.set(true);
+                Ok(())
+            }
+        }
+        struct Input<'a> {
+            flushed: &'a Cell<bool>,
+        }
+        impl Read for Input<'_> {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                unreachable!()
+            }
+        }
+        impl io::BufRead for Input<'_> {
+            fn fill_buf(&mut self) -> io::Result<&[u8]> {
+                assert!(self.flushed.get());
+                Ok(b"yes\n")
+            }
+            fn consume(&mut self, _: usize) {}
+        }
+        let mut diagnostics = DiagnosticWriter {
+            bytes: Vec::new(),
+            flushed: &flushed,
+        };
+        assert_eq!(
+            prompt_with(
+                "Continue? [y/N]: ",
+                &mut Input { flushed: &flushed },
+                &mut diagnostics
+            )
+            .expect("prompt"),
+            "yes\n"
+        );
+        assert_eq!(diagnostics.bytes, b"Continue? [y/N]: ");
+    }
+
+    #[test]
     fn independent_updater_is_hidden_and_exclusive() {
         use clap::CommandFactory;
         let parsed = Cli::try_parse_from(["zterm", "--internal-update"]).expect("internal updater");
@@ -1887,9 +1907,9 @@ mod tests {
             vec!["daemon", "restart", "-y"],
             vec!["update", "-y"],
             vec!["uninstall", "-y"],
-            vec!["reset", "--identity", "-y"],
+            vec!["reset", "-y"],
             vec!["device", "revoke", "host", "-y"],
-            vec!["session", "close", "local", "main", "-y"],
+            vec!["session", "close", "main", "-y"],
             vec!["pair", "accept", "--alias", "host"],
             vec!["logs", "-n", "20"],
             vec!["session", "list"],
@@ -1899,21 +1919,143 @@ mod tests {
     }
 
     #[test]
-    fn pair_ttl_parser_owns_suffix_and_product_bounds() {
-        assert_eq!(parse_pair_ttl("60s"), Ok(60));
-        assert_eq!(parse_pair_ttl("10m"), Ok(600));
-        assert_eq!(parse_pair_ttl("1h"), Ok(3_600));
-        for invalid in ["600", "0s", "1d", "-10m", "999999999999999999999h"] {
-            assert!(parse_pair_ttl(invalid).is_err(), "accepted {invalid}");
+    fn removed_commands_and_target_first_forms_are_rejected() {
+        for args in [
+            vec!["daemon", "status"],
+            vec!["session", "new", "local", "work"],
+            vec!["session", "attach", "local", "work"],
+            vec!["session", "list", "local"],
+            vec!["session", "create", "local", "work"],
+            vec!["session", "rename", "local", "work", "renamed"],
+            vec!["session", "close", "local", "work"],
+            vec!["reset", "--identity"],
+            vec!["pair", "create", "--ttl", "10m"],
+            vec!["pair", "create", "--qr"],
+            vec!["pair", "create", "--qr-image", "new.png"],
+        ] {
+            assert!(Cli::try_parse_from(std::iter::once("zterm").chain(args)).is_err());
         }
+        assert!(Cli::try_parse_from(["zterm", "pair", "create"]).is_ok());
+        let help = Cli::try_parse_from(["zterm", "pair", "create", "--help"]).expect_err("help");
+        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn session_management_defaults_local_and_accepts_named_remote_target() {
+        for target in [None, Some("laptop")] {
+            for tail in [
+                vec!["list"],
+                vec!["create", "work"],
+                vec!["rename", "work", "new-name"],
+                vec!["close", "work"],
+            ] {
+                let mut argv = vec!["zterm", "session"];
+                argv.extend(tail);
+                if let Some(target) = target {
+                    argv.extend(["--target", target]);
+                }
+                let Some(Command::Session { command }) =
+                    Cli::try_parse_from(argv).expect("session parses").command
+                else {
+                    panic!("session")
+                };
+                let parsed_target = match command {
+                    SessionCommand::List(args) => args.target,
+                    SessionCommand::Create(args) => {
+                        assert_eq!(args.name, "work");
+                        args.target
+                    }
+                    SessionCommand::Rename(args) => {
+                        assert_eq!(args.session, "work");
+                        assert_eq!(args.new_name, "new-name");
+                        args.target
+                    }
+                    SessionCommand::Close(args) => {
+                        assert_eq!(args.session, "work");
+                        args.target
+                    }
+                };
+                assert_eq!(parsed_target, target.unwrap_or("local"));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connect_omission_alone_enables_creation_for_local_and_remote_targets() {
+        // No runtime operation is performed while constructing a deferred request.
+        for target in ["local", "laptop"] {
+            for selector in [
+                None,
+                Some("main"),
+                Some("work"),
+                Some("7474747474747474747474747474747474"),
+            ] {
+                let mut argv = vec!["zterm", "connect", target];
+                if let Some(selector) = selector {
+                    argv.extend(["--session", selector]);
+                }
+                let cli = Cli::try_parse_from(argv).expect("connect parses");
+                let Some(Command::Connect(args)) = cli.command else {
+                    panic!("connect")
+                };
+                assert_eq!(args.target, target);
+                assert_eq!(args.session.as_deref(), selector);
+                let CommandOutcome::Terminal(request) = connect(args).await.expect("request")
+                else {
+                    panic!("terminal")
+                };
+                let TerminalRequestKind::Attach {
+                    target: actual,
+                    selector: selected,
+                    create_main,
+                    takeover,
+                } = request.kind
+                else {
+                    panic!("attach")
+                };
+                assert_eq!(actual, target);
+                assert_eq!(selected.as_deref(), selector);
+                assert_eq!(create_main, selector.is_none());
+                assert!(!takeover);
+            }
+        }
+        let cli = Cli::try_parse_from(["zterm", "connect"]).expect("default connect");
+        let Some(Command::Connect(args)) = cli.command else {
+            panic!("connect")
+        };
+        assert_eq!(args.target, "local");
+        assert!(args.session.is_none());
+    }
+
+    #[test]
+    fn session_error_context_keeps_typed_failures_and_quotes_hints() {
+        use zterm_core::DomainErrorKind;
+        let missing = CliError::Daemon(DaemonError::new(
+            DomainErrorKind::SessionNotFound,
+            "missing",
+        ))
+        .with_session("team's host".into(), "work".into());
+        assert_eq!(
+            missing.to_string(),
+            "Session 'work' was not found on team's host.\nRun: zterm session list --target='team'\"'\"'s host'"
+        );
+        assert!(!format!("{missing:?}").contains("team"));
+        let unknown = CliError::Daemon(DaemonError::new(
+            DomainErrorKind::OperationOutcomeUnknown,
+            "outcome unknown",
+        ))
+        .with_session("local".into(), "work".into());
+        assert!(unknown.to_string().contains("outcome unknown"));
+        assert!(!unknown.to_string().contains("Run:"));
     }
 
     #[test]
     fn removed_escape_option_is_rejected_on_all_terminal_entry_points() {
         for command in [
             vec!["zterm", "connect", "local"],
-            vec!["zterm", "session", "new", "local", "test"],
-            vec!["zterm", "session", "attach", "local", "main"],
+            vec!["zterm", "session", "create", "test"],
+            vec!["zterm", "connect", "--session", "main"],
         ] {
             assert!(Cli::try_parse_from(command.clone()).is_ok());
             for value in ["none", "ctrl-]", "ctrl-a"] {
@@ -1961,13 +2103,15 @@ mod tests {
         };
 
         let human = render_devices(vec![outbound.clone(), inbound.clone()]);
-        assert!(human.contains("Name") && human.contains("Inbound control"));
-        assert!(
-            human.contains("Available")
-                && human.contains("Allowed")
-                && human.contains("Not paired")
-        );
+        assert!(human.contains("Name") && human.contains("Allowed here"));
+        assert!(human.contains("Known host") && human.contains("Yes") && human.contains("No"));
         assert!(human.contains("Not connected") && !human.contains("Offline"));
+        let mut revoked = inbound.clone();
+        revoked.inbound_status = AuthorizationStatus::Revoked;
+        revoked.remote_name = Some("开发".into());
+        let revoked_table = render_devices(vec![outbound.clone(), revoked]);
+        assert!(revoked_table.contains("开发    Not connected"));
+        assert!(revoked_table.contains("Revoked"));
         assert!(
             human.contains(&outbound.device_id.to_string())
                 && human.contains(&inbound.device_id.to_string())
@@ -2031,8 +2175,7 @@ mod tests {
         let session = Cli::try_parse_from([
             "zterm",
             "session",
-            "new",
-            "local",
+            "create",
             "cli-debug-session",
             "--cwd",
             cwd_sentinel,

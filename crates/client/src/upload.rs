@@ -4,7 +4,10 @@ use crate::{
     error::ClientError,
     framing::FrameReader,
     model::ResolvedSessionTarget,
-    protocol::{DEFAULT_DEADLINE, malformed, protocol_error, service_error},
+    protocol::{
+        DEFAULT_DEADLINE, is_attachment_command_stream_closed, malformed, protocol_error,
+        service_error,
+    },
     transport::TransportFuture,
 };
 use std::sync::{
@@ -152,7 +155,10 @@ pub async fn upload<R: AsyncRead + Unpin + Send>(
             },
         )
         .await?;
-        match receive(&mut *connection.reader).await? {
+        match receive(&mut *connection.reader)
+            .await
+            .map_err(UploadReadError::into_error)?
+        {
             UploadMessage::Ready { id, size } if size == metadata.size() => Ok(id),
             _ => Err(malformed("unexpected upload admission response")),
         }
@@ -250,7 +256,7 @@ async fn transfer<R: AsyncRead + Unpin + Send>(
         while previous < size {
             match timeout_at(deadline, receive(reader))
                 .await
-                .map_err(|_| timed_out())??
+                .map_err(|_| UploadReadError::Stream(timed_out()))??
             {
                 UploadMessage::Progress {
                     id: received,
@@ -266,16 +272,46 @@ async fn transfer<R: AsyncRead + Unpin + Send>(
                         deadline = Instant::now() + UPLOAD_IDLE_TIMEOUT;
                     }
                 }
-                _ => return Err(malformed("invalid upload progress")),
+                _ => {
+                    return Err(UploadReadError::Response(malformed(
+                        "invalid upload progress",
+                    )));
+                }
             }
         }
-        Ok::<_, ClientError>(())
+        Ok::<_, UploadReadError>(())
     };
-    tokio::try_join!(writing, reading)?;
+    {
+        tokio::pin!(writing, reading);
+        tokio::select! {
+            biased;
+            result = &mut writing => match result {
+                Ok(()) => reading.await.map_err(UploadReadError::into_error),
+                Err(error) if error.kind() == DomainErrorKind::TransportUnavailable
+                    || is_attachment_command_stream_closed(&error) => {
+                    // The host may retire its receive direction before its
+                    // final error arrives. Keep the same reader, with one fixed
+                    // response budget; the outer upload select still cancels it.
+                    match timeout(DEFAULT_DEADLINE, reading).await {
+                        Ok(Err(UploadReadError::Response(response))) => Err(response),
+                        _ => Err(error),
+                    }
+                }
+                Err(error) => Err(error),
+            },
+            result = &mut reading => {
+                result.map_err(UploadReadError::into_error)?;
+                writing.await
+            },
+        }?;
+    }
     report(progress, UploadPhase::Finishing, size, size);
     let finish = async {
         send(&mut *connection.writer, UploadMessage::Finish { id, size }).await?;
-        match receive(&mut *connection.reader).await? {
+        match receive(&mut *connection.reader)
+            .await
+            .map_err(UploadReadError::into_error)?
+        {
             UploadMessage::Completed {
                 id: completed,
                 file,
@@ -308,8 +344,23 @@ async fn send(writer: &mut dyn UploadWriter, message: UploadMessage) -> Result<(
         .write(&message.encode(1).map_err(protocol_error)?)
         .await
 }
-async fn receive(reader: &mut dyn UploadReader) -> Result<UploadMessage, ClientError> {
-    let frame = reader.read().await?;
+enum UploadReadError {
+    Stream(ClientError),
+    Response(ClientError),
+}
+impl UploadReadError {
+    fn into_error(self) -> ClientError {
+        match self {
+            Self::Stream(error) | Self::Response(error) => error,
+        }
+    }
+}
+
+async fn receive(reader: &mut dyn UploadReader) -> Result<UploadMessage, UploadReadError> {
+    let frame = reader.read().await.map_err(UploadReadError::Stream)?;
+    decode_response(frame).map_err(UploadReadError::Response)
+}
+fn decode_response(frame: DecodedFrame) -> Result<UploadMessage, ClientError> {
     if frame.request_id != 1 || frame.deadline_ms != 0 {
         return Err(malformed("upload response correlation mismatch"));
     }
@@ -385,6 +436,226 @@ mod tests {
             session_id: SessionId::from_array([1; 16]),
             attachment_id: AttachmentId::from_array([2; 16]),
         }
+    }
+
+    struct RetirementWriter {
+        inner: AsyncUploadWriter<tokio::io::DuplexStream>,
+        tunnel: bool,
+    }
+    impl UploadWriter for RetirementWriter {
+        fn write<'a>(
+            &'a mut self,
+            bytes: &'a [u8],
+        ) -> TransportFuture<'a, Result<(), ClientError>> {
+            Box::pin(async move {
+                self.inner.write(bytes).await.map_err(|error| {
+                    if self.tunnel {
+                        crate::protocol::attachment_command_stream_closed()
+                    } else {
+                        error
+                    }
+                })
+            })
+        }
+    }
+
+    fn retiring_connection(
+        tunnel: bool,
+    ) -> (Connector, tokio::io::DuplexStream, tokio::io::DuplexStream) {
+        // Independent directions let the host stop receiving data before its
+        // final response arrives, as can happen on a real upload stream.
+        let (writer, host_reader) = tokio::io::duplex(1024);
+        let (host_writer, reader) = tokio::io::duplex(1024);
+        (
+            Connector(Mutex::new(Some(UploadConnection {
+                capabilities: Capabilities::from_bits_retain(Capabilities::FILE_UPLOAD_SERVICE),
+                reader: Box::new(FramedUploadReader::new(reader, ())),
+                writer: Box::new(RetirementWriter {
+                    inner: AsyncUploadWriter(writer),
+                    tunnel,
+                }),
+            }))),
+            host_reader,
+            host_writer,
+        )
+    }
+
+    async fn retire_upload(reader: tokio::io::DuplexStream, writer: &mut tokio::io::DuplexStream) {
+        let mut reader = FrameReader::new(reader);
+        assert!(matches!(
+            UploadMessage::decode(&reader.read().await.expect("upload fixture"))
+                .expect("upload fixture"),
+            UploadMessage::Begin { .. }
+        ));
+        drop(reader);
+        writer
+            .write_all(
+                &UploadMessage::Ready {
+                    id: TransferId::from_array([3; 16]),
+                    size: 3,
+                }
+                .encode(1)
+                .expect("upload fixture"),
+            )
+            .await
+            .expect("upload fixture");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retired_upload_preserves_service_error() {
+        for (tunnel, delay, kind) in [
+            (false, std::time::Duration::ZERO, DomainErrorKind::LeaseLost),
+            (
+                false,
+                std::time::Duration::from_secs(1),
+                DomainErrorKind::LeaseLost,
+            ),
+            (
+                true,
+                std::time::Duration::from_secs(1),
+                DomainErrorKind::LeaseLost,
+            ),
+            (
+                false,
+                std::time::Duration::from_secs(1),
+                DomainErrorKind::DeadlineExceeded,
+            ),
+        ] {
+            let (connector, reader, mut writer) = retiring_connection(tunnel);
+            let host = tokio::spawn(async move {
+                retire_upload(reader, &mut writer).await;
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                // A queued progress frame must not hide the terminal error.
+                let mut response = UploadMessage::Progress {
+                    id: TransferId::from_array([3; 16]),
+                    accepted_bytes: 0,
+                }
+                .encode(1)
+                .expect("upload fixture");
+                response.extend(
+                    zterm_proto::encode_message(
+                        WireKind::ServiceErrorResponse,
+                        1,
+                        0,
+                        &zterm_proto::v2::ServiceError {
+                            code: kind.code().to_owned(),
+                            message: "host rejected the upload".to_owned(),
+                        },
+                    )
+                    .expect("upload fixture"),
+                );
+                writer.write_all(&response).await.expect("upload fixture");
+            });
+            let (progress, _) = watch::channel(preparing());
+            let error = upload(
+                &connector,
+                ResolvedSessionTarget::local(),
+                binding(),
+                UploadMetadata::new(3, "").expect("upload fixture"),
+                b"abc".as_slice(),
+                &progress,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("upload must fail");
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.detail(), "host rejected the upload");
+            assert_eq!(progress.borrow().phase, UploadPhase::Uploading);
+            host.await.expect("upload fixture");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retired_upload_without_service_error_preserves_write_failure() {
+        for keep_open in [false, true] {
+            let (connector, reader, mut writer) = retiring_connection(false);
+            let host = tokio::spawn(async move {
+                retire_upload(reader, &mut writer).await;
+                // The completed task retains the silent response direction
+                // until its JoinHandle is consumed after the upload returns.
+                keep_open.then_some(writer)
+            });
+            let (progress, _) = watch::channel(preparing());
+            let started = Instant::now();
+            let error = upload(
+                &connector,
+                ResolvedSessionTarget::local(),
+                binding(),
+                UploadMetadata::new(3, "").expect("upload fixture"),
+                b"abc".as_slice(),
+                &progress,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("upload must fail");
+            assert_eq!(error.kind(), DomainErrorKind::TransportUnavailable);
+            assert_eq!(error.detail(), "upload stream write failed");
+            assert_eq!(
+                Instant::now() - started,
+                if keep_open {
+                    DEFAULT_DEADLINE
+                } else {
+                    std::time::Duration::ZERO
+                }
+            );
+            host.await.expect("upload fixture");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retired_upload_response_wait_remains_cancellable() {
+        let (connector, reader, mut writer) = retiring_connection(false);
+        let cancel = CancellationToken::new();
+        let host_cancel = cancel.clone();
+        let host = tokio::spawn(async move {
+            retire_upload(reader, &mut writer).await;
+            tokio::time::sleep(DEFAULT_DEADLINE / 2).await;
+            host_cancel.cancel();
+            writer
+        });
+        let (progress, _) = watch::channel(preparing());
+        let started = Instant::now();
+        let error = upload(
+            &connector,
+            ResolvedSessionTarget::local(),
+            binding(),
+            UploadMetadata::new(3, "").expect("upload fixture"),
+            b"abc".as_slice(),
+            &progress,
+            &cancel,
+        )
+        .await
+        .expect_err("upload must fail");
+        assert_eq!(error.kind(), DomainErrorKind::Cancelled);
+        assert_eq!(Instant::now() - started, DEFAULT_DEADLINE / 2);
+        host.await.expect("upload fixture");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn invalid_upload_source_does_not_wait_for_retirement_response() {
+        let (connector, reader, mut writer) = retiring_connection(false);
+        let host = tokio::spawn(async move {
+            retire_upload(reader, &mut writer).await;
+            writer
+        });
+        let (progress, _) = watch::channel(preparing());
+        let started = Instant::now();
+        let error = upload(
+            &connector,
+            ResolvedSessionTarget::local(),
+            binding(),
+            UploadMetadata::new(3, "").expect("upload fixture"),
+            [].as_slice(),
+            &progress,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("upload must fail");
+        assert_eq!(error.kind(), DomainErrorKind::UploadSourceInvalid);
+        assert_eq!(Instant::now() - started, std::time::Duration::ZERO);
+        host.await.expect("upload fixture");
     }
 
     #[tokio::test]

@@ -59,7 +59,7 @@ fn main() -> ExitCode {
     let runtime = match zterm_daemon::operations::LocalRuntime::current() {
         Ok(runtime) => runtime,
         Err(error) => {
-            eprintln!("{error}");
+            eprintln!("Error: {error}");
             return ExitCode::FAILURE;
         }
     };
@@ -69,7 +69,7 @@ fn main() -> ExitCode {
     {
         Ok(tokio) => tokio,
         Err(error) => {
-            eprintln!("unable to initialize zterm runtime: {error}");
+            eprintln!("Error: Unable to initialize zterm runtime: {error}");
             return ExitCode::FAILURE;
         }
     };
@@ -79,20 +79,25 @@ fn main() -> ExitCode {
         zterm_cli::InteractionMode::detect(),
     )) {
         Ok(zterm_cli::CommandOutcome::Text(output)) => {
-            print!("{output}");
-            ExitCode::SUCCESS
+            match write_output(&mut io::stdout().lock(), output.as_bytes()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("Error: Unable to write command output: {error}");
+                    ExitCode::FAILURE
+                }
+            }
         }
         Ok(zterm_cli::CommandOutcome::PairTicket(output)) => {
             let result = {
                 let stdout = io::stdout();
                 let mut stdout = stdout.lock();
-                write_pair_ticket(&mut stdout, output.as_bytes())
+                write_output(&mut stdout, output.as_bytes())
             };
             drop(output);
             match result {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
-                    eprintln!("unable to write pair ticket: {error}");
+                    eprintln!("Error: Unable to write pair ticket: {error}");
                     ExitCode::FAILURE
                 }
             }
@@ -101,19 +106,19 @@ fn main() -> ExitCode {
             match tokio.block_on(zterm_cli::run_terminal(request, &runtime)) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
-                    eprintln!("{error}");
+                    eprintln!("Error: {error}");
                     ExitCode::FAILURE
                 }
             }
         }
         Err(error) => {
-            eprintln!("{error}");
+            eprintln!("Error: {error}");
             ExitCode::FAILURE
         }
     }
 }
 
-fn write_pair_ticket(writer: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
+fn write_output(writer: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
     writer.write_all(bytes)?;
     writer.flush()
 }
@@ -144,9 +149,33 @@ mod tests {
     fn pair_ticket_stdout_is_exact_and_explicitly_flushed() {
         let mut writer = RecordingWriter::default();
 
-        write_pair_ticket(&mut writer, b"opaque-ticket\n").expect("ticket stdout");
+        write_output(&mut writer, b"opaque-ticket\n").expect("ticket stdout");
 
         assert_eq!(writer.bytes, b"opaque-ticket\n");
         assert_eq!(writer.flushes, 1);
+    }
+
+    #[test]
+    fn output_write_and_flush_failures_are_not_success() {
+        struct FailingWriter {
+            fail_write: bool,
+        }
+        impl Write for FailingWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.fail_write {
+                    Err(io::ErrorKind::BrokenPipe.into())
+                } else {
+                    Ok(bytes.len())
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        for fail_write in [true, false] {
+            assert!(
+                write_output(&mut FailingWriter { fail_write }, b"synthetic-ticket\n").is_err()
+            );
+        }
     }
 }

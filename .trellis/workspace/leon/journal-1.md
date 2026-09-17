@@ -773,3 +773,48 @@ Updated the project Trellis runtime, hooks, Pi integration, and session-insight 
 ### Status
 
 [OK] **Completed**
+
+
+## Session 30: CLI command simplification and output consistency
+<!-- trellis-session: v=2 fp=b145558dd8a65045 -->
+
+**Date**: 2026-09-16
+**Task**: CLI command simplification and output consistency
+**Branch**: `main`
+
+### Summary
+
+Implemented the approved CLI grammar and plain-text output, automatic QR/manual pairing presentation, existing-only explicit session selection, and matching docs/specs/tests. Upgraded rustls only to 0.23.45 in both dependency graphs for RUSTSEC-2026-0285. Full just check and git diff --check passed. Archived the non-PR task completed on main; no push or release.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `e97c88c` | fix(deps): upgrade rustls to 0.23.45 |
+| `8e14a8b` | feat(cli): simplify commands and unify output |
+
+### Status
+
+[OK] **Completed**
+
+
+## Session 31: Fix PR 44 upload retirement error race
+<!-- trellis-session: v=2 fp=90d51e5a03fd4835 -->
+
+**Date**: 2026-09-17
+**Task**: Fix PR 44 upload retirement error race
+**Branch**: `codex/cli-command-format`
+
+### Summary
+
+Diagnosed a pre-existing shared upload error-precedence race blocking PR 44. Preserve buffered or delayed host errors after raw or desktop tunnel write closure within the existing 5-second response budget; keep EOF/timeout fallback, cancellation, invalid-source behavior and no replay. Added deterministic paused-time regressions (verified red before the fix), kept daemon lease_lost assertions unchanged, and documented the owning contract. Six client upload tests, all four daemon upload tests and full just check passed locally. Follow-up remains on codex/cli-command-format for hosted CI and PR merge; no new task created.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `be1945e` | fix(upload): preserve host errors after write closure |
+
+### Status
+
+[OK] **Completed**
