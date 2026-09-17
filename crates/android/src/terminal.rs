@@ -1,5 +1,8 @@
 //! Application-owned native terminal reducer. UI observers only read complete frames.
 mod navigation;
+mod notifications;
+pub use notifications::NativeNotification;
+use notifications::NotificationBridge;
 pub mod upload;
 use navigation::Navigation;
 use upload::{ActiveUpload, NativeUpload};
@@ -394,6 +397,7 @@ impl NativeKey {
 /// One attachment retained by the Application, not by an Activity's subscription.
 #[derive(uniffi::Object)]
 pub struct NativeTerminal {
+    notifications: Arc<NotificationBridge>,
     upload_input_generation: Arc<AtomicU64>,
     session_id: SessionId,
     commands: mpsc::Sender<Command>,
@@ -454,6 +458,14 @@ struct Command {
 }
 #[uniffi::export]
 impl NativeTerminal {
+    /// Consumes one live notification; independent of frame observation/recreation.
+    pub async fn next_notification(&self) -> Result<NativeNotification, NativeError> {
+        self.notifications.next(&self.cancel).await
+    }
+    /// Validates a consumed event immediately before platform delivery.
+    pub fn notification_is_current(&self, generation: u64) -> bool {
+        !self.cancel.is_cancelled() && self.notifications.is_current(generation)
+    }
     /// Reserves the single upload/input pause before launching an Android picker.
     pub async fn reserve_upload(&self, input_epoch: u64) -> Result<Arc<NativeUpload>, NativeError> {
         let (reply, result) = oneshot::channel();
@@ -638,6 +650,7 @@ impl NativeTerminal {
     }
     /// Explicit navigation detach leaves the host process alive.
     pub async fn detach(&self) -> Result<(), NativeError> {
+        self.notifications.connected(false);
         self.submit(Action::Detach).await
     }
 }
@@ -673,6 +686,7 @@ impl NativeTerminal {
 }
 impl Drop for NativeTerminal {
     fn drop(&mut self) {
+        self.notifications.connected(false);
         self.cancel.cancel();
     }
 }
@@ -755,7 +769,9 @@ impl NativeRuntime {
             let (commands, receiver) = mpsc::channel(32);
             let cancel = closed.child_token();
             let upload_input_generation = Arc::new(AtomicU64::new(0));
+            let notifications = Arc::new(NotificationBridge::new());
             let terminal = Arc::new(NativeTerminal {
+                notifications: Arc::clone(&notifications),
                 upload_input_generation: Arc::clone(&upload_input_generation),
                 session_id,
                 commands,
@@ -772,6 +788,7 @@ impl NativeRuntime {
                 dark,
                 Arc::new(controller),
                 upload_input_generation,
+                notifications,
             ));
             // Attach's viewport is only a creation hint on the host. A retained
             // Session still has its previous controller's dimensions. Install
@@ -794,6 +811,7 @@ async fn run(
     mut dark: bool,
     upload_connector: Arc<dyn zterm_client::upload::UploadConnector>,
     upload_input_generation: Arc<AtomicU64>,
+    notifications: Arc<NotificationBridge>,
 ) {
     let mut state = "synchronizing";
     let mut connection = None;
@@ -915,8 +933,9 @@ async fn run(
                     TerminalViewEvent::TransportState(value) => {
                         state = match value { TerminalViewTransportState::Active => "active",
                             TerminalViewTransportState::Reconnecting => "reconnecting", _ => "synchronizing" };
-                        if state == "reconnecting" { healthy_resize = false; navigation.disconnected(); input_epoch += 1; }
+                        if state == "reconnecting" { notifications.connected(false); healthy_resize = false; navigation.disconnected(); input_epoch += 1; }
                         if state == "active" {
+                            notifications.connected(true);
                             healthy_resize = false;
                             if let Some(bytes) = navigation.active() && !bytes.is_empty()
                                 && writer.write_input(bytes).await.is_err() { navigation.reset(); input_epoch += 1; state = "reconnecting"; }
@@ -956,9 +975,10 @@ async fn run(
                         Ok(request) => { query = request; prefetch = true; Ok(()) }, Err(error) => Err(error),
                     },
                     TerminalViewEvent::SyncRequired { .. } => { state = "synchronizing"; Ok(()) },
-                    TerminalViewEvent::LeaseLost { .. } => { healthy_resize = false; navigation.disconnected(); input_epoch += 1; state = "lease_lost"; Ok(()) },
-                    TerminalViewEvent::SessionEnded(_) => { healthy_resize = false; navigation.disconnected(); input_epoch += 1; state = "ended"; Ok(()) },
+                    TerminalViewEvent::LeaseLost { .. } => { notifications.connected(false); healthy_resize = false; navigation.disconnected(); input_epoch += 1; state = "lease_lost"; Ok(()) },
+                    TerminalViewEvent::SessionEnded(_) => { notifications.connected(false); healthy_resize = false; navigation.disconnected(); input_epoch += 1; state = "ended"; Ok(()) },
                     TerminalViewEvent::ConnectionStatus(status) => { connection = Some(status); Ok(()) },
+                    TerminalViewEvent::Notification(value) => { notifications.push(value); Ok(()) },
                     TerminalViewEvent::ClipboardWrite(_) => Ok(()),
                 },
                 Ok(None) => break,
@@ -987,6 +1007,7 @@ async fn run(
             input_epoch += 1;
         }
         if matches!(state, "reconnecting" | "ended" | "lease_lost" | "closed") {
+            notifications.connected(false);
             connection = None;
         }
         if let Some(operation) = &active_upload
@@ -1021,6 +1042,7 @@ async fn run(
             break;
         }
     }
+    notifications.connected(false);
     if !matches!(state, "ended" | "lease_lost") {
         let error = frame.borrow().error.clone();
         let next = project_navigation(

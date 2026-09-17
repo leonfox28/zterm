@@ -5,7 +5,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use zterm_core::terminal::{
     COLOR_BACKGROUND, COLOR_CURSOR, COLOR_CURSOR_TEXT, COLOR_FOREGROUND,
-    COLOR_SELECTION_BACKGROUND, COLOR_SELECTION_FOREGROUND, TerminalCell, TerminalClipboardWrite,
+    COLOR_SELECTION_BACKGROUND, COLOR_SELECTION_FOREGROUND, TerminalCell, TerminalClipboardWrite, TerminalNotification,
     TerminalColor, TerminalColorSnapshot, TerminalColorValue, TerminalKeyboardFlags, TerminalModes,
     TerminalStyle, TerminalUnderline,
 };
@@ -314,6 +314,19 @@ impl DesktopPresenter {
             .write_all(&bytes)
             .and_then(|()| writer.flush())
             .map_err(|error| terminal_io("observe physical terminal colors", error))
+    }
+
+    pub(super) fn write_notification(
+        &mut self,
+        writer: &mut impl Write,
+        notification: &TerminalNotification,
+    ) -> Result<(), CliError> {
+        let sequence = match notification.title() {
+            None => format!("\x1b]9;{}\x1b\\", notification.body()),
+            Some(title) => format!("\x1b]777;notify;{title};{}\x1b\\", notification.body()),
+        };
+        writer.write_all(sequence.as_bytes()).and_then(|()| writer.flush())
+            .map_err(|error| terminal_io("write terminal notification", error))
     }
 
     pub(super) fn write_clipboard(

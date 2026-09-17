@@ -6,6 +6,8 @@
 
 mod colors;
 pub use colors::*;
+mod notifications;
+pub use notifications::*;
 
 use std::fmt;
 
@@ -96,11 +98,16 @@ impl fmt::Debug for TerminalClipboardWrite {
 pub enum TerminalHostEffect {
     /// Replace the controlling attachment's system clipboard.
     ClipboardWrite(TerminalClipboardWrite),
+    /// Deliver an ordinary notification to the controlling attachment.
+    Notification(TerminalNotification),
 }
 
 impl fmt::Debug for TerminalHostEffect {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Notification(value) => {
+                formatter.debug_tuple("Notification").field(value).finish()
+            }
             Self::ClipboardWrite(value) => formatter
                 .debug_tuple("ClipboardWrite")
                 .field(value)
@@ -1024,8 +1031,8 @@ pub struct TerminalUpdate {
     pub replies: Vec<u8>,
     /// Bounded non-rendering side events.
     pub events: Vec<TerminalSideEvent>,
-    /// Latest transient host effect produced by this operation.
-    pub host_effect: Option<TerminalHostEffect>,
+    /// Bounded transient host effects produced by this operation.
+    pub host_effects: TerminalHostEffects,
 }
 
 impl fmt::Debug for TerminalUpdate {
@@ -1036,7 +1043,7 @@ impl fmt::Debug for TerminalUpdate {
             .field("replies", &"[REDACTED]")
             .field("reply_len", &self.replies.len())
             .field("events", &self.events)
-            .field("host_effect", &self.host_effect)
+            .field("host_effects", &self.host_effects)
             .finish()
     }
 }
@@ -1265,7 +1272,7 @@ mod tests {
                     truncated: true,
                 },
             ],
-            host_effect: Some(TerminalHostEffect::ClipboardWrite(
+            host_effects: TerminalHostEffects::from(TerminalHostEffect::ClipboardWrite(
                 TerminalClipboardWrite::new("TERM_CLIPBOARD_SENTINEL_98da".to_owned())
                     .expect("valid clipboard value"),
             )),

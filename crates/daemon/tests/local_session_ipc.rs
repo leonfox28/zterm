@@ -99,6 +99,30 @@ async fn unary_mutations_and_duplex_reconnect_share_one_live_registry() -> Resul
     wait_for_clipboard(&mut attached, "hello")
         .await
         .map_err(|error| format!("PTY clipboard effect failed: {error}"))?;
+    attached.write_input("printf '\\033]9;%s\\a\\033]777;notify;%s;%s\\033\\\\' '结果: done' '标题' 'body;结果'\n".as_bytes().to_vec())
+        .await.map_err(session_fixture::display)?;
+    for expected in [
+        zterm_core::terminal::TerminalNotification::osc9("结果: done".into()),
+        zterm_core::terminal::TerminalNotification::osc777("标题".into(), "body;结果".into()),
+    ] {
+        let expected = expected.map_err(session_fixture::display)?;
+        loop {
+            match attached
+                .read_event(EVENT_DEADLINE)
+                .await
+                .map_err(session_fixture::display)?
+            {
+                LocalAttachmentEvent::Notification(notification) => {
+                    assert_eq!(notification, expected);
+                    break;
+                }
+                LocalAttachmentEvent::LeaseLost(_) | LocalAttachmentEvent::SessionEnded(_) => {
+                    return Err("ended before notification".into());
+                }
+                _ => {}
+            }
+        }
+    }
     attached
         .write_input(b"printf 'SOCKET-RECONNECT-MARKER\\n'\n".to_vec())
         .await
@@ -159,7 +183,7 @@ async fn unary_mutations_and_duplex_reconnect_share_one_live_registry() -> Resul
             }
             LocalAttachmentEvent::SyncRequired(_) => {}
             LocalAttachmentEvent::TransportState(_) => {}
-            LocalAttachmentEvent::ClipboardWrite(_) => {}
+            LocalAttachmentEvent::ClipboardWrite(_) | LocalAttachmentEvent::Notification(_) => {}
             LocalAttachmentEvent::SessionEnded(ended) => {
                 assert_eq!(
                     ended.reason,
@@ -217,7 +241,8 @@ async fn unary_mutations_and_duplex_reconnect_share_one_live_registry() -> Resul
             | LocalAttachmentEvent::Delta(_)
             | LocalAttachmentEvent::SyncRequired(_)
             | LocalAttachmentEvent::TransportState(_)
-            | LocalAttachmentEvent::ClipboardWrite(_) => {}
+            | LocalAttachmentEvent::ClipboardWrite(_)
+            | LocalAttachmentEvent::Notification(_) => {}
             LocalAttachmentEvent::SessionEnded(ended) => break ended,
             LocalAttachmentEvent::LeaseLost(_) => {
                 return Err("controller lease was lost during daemon stop".into());
@@ -1016,7 +1041,8 @@ async fn wait_for_clipboard(
             | LocalAttachmentEvent::SyncRequired(_)
             | LocalAttachmentEvent::Takeover(_)
             | LocalAttachmentEvent::TransportState(_)
-            | LocalAttachmentEvent::ConnectionStatus(_) => {}
+            | LocalAttachmentEvent::ConnectionStatus(_)
+            | LocalAttachmentEvent::Notification(_) => {}
         }
     }
     Err("terminal stream did not produce a clipboard effect".into())
@@ -1038,7 +1064,8 @@ async fn wait_for_lease_lost(client: &mut LocalAttachmentClient) -> Result<(), S
             | LocalAttachmentEvent::Takeover(_)
             | LocalAttachmentEvent::ConnectionStatus(_)
             | LocalAttachmentEvent::HistoryWindow(_)
-            | LocalAttachmentEvent::ClipboardWrite(_) => {}
+            | LocalAttachmentEvent::ClipboardWrite(_)
+            | LocalAttachmentEvent::Notification(_) => {}
             LocalAttachmentEvent::SessionEnded(_) => {
                 return Err("session ended while waiting for controller lease loss".into());
             }

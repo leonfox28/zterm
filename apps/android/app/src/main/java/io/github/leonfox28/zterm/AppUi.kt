@@ -229,6 +229,7 @@ private fun Modifier.semanticsDescription(label: String): Modifier = this.then(M
         Surface(Modifier.fillMaxWidth().padding(vertical = 12.dp), color = MaterialTheme.colorScheme.surfaceContainer, shape = RoundedCornerShape(14.dp)) {
             Text(stringResource(R.string.font_preview), Modifier.padding(18.dp), fontFamily = FontFamily.Monospace, fontSize = fontSize.sp)
         }
+        TerminalNotificationSettings(repository.notifications)
         Row(Modifier.fillMaxWidth().padding(16.dp)) { Text(stringResource(R.string.version), Modifier.weight(1f)); Text(BuildConfig.VERSION_NAME) }
         ErrorText(state.error)
     }

@@ -812,6 +812,7 @@ impl AttachmentIo for IrohSessionIo {
                             | WireKind::TerminalLeaseLost
                             | WireKind::TerminalSessionEnded
                             | WireKind::TerminalClipboardWrite
+                            | WireKind::TerminalNotification
                             | WireKind::SessionOperationLeaseResponse
                             | WireKind::SessionMutateResponse
                             | WireKind::ServiceErrorResponse

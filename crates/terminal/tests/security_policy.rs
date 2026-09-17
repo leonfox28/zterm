@@ -4,8 +4,8 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use zterm_core::terminal::{
     MAX_SIDE_EVENTS_PER_UPDATE, MAX_TERMINAL_CLIPBOARD_BYTES, RejectedEffect, TerminalColor,
-    TerminalHostEffect, TerminalKeyboardFlags, TerminalSideEvent, TerminalSize,
-    UnsupportedSequenceKind,
+    TerminalHostEffect, TerminalHostEffects, TerminalKeyboardFlags, TerminalSideEvent,
+    TerminalSize, UnsupportedSequenceKind,
 };
 use zterm_terminal::{
     MAX_CELL_TEXT_BYTES, MAX_COMBINING_BYTES_PER_SESSION, MAX_COMBINING_CELLS_PER_SESSION,
@@ -401,25 +401,26 @@ fn osc52_write_is_strict_chunk_invariant_redacted_and_latest_only() {
     input.extend_from_slice(b"after");
 
     let mut whole = TerminalModel::new(TerminalSize::new(2, 32), 0).expect("whole model");
-    let whole_update = whole.ingest(&input).expect("whole OSC 52 ingest");
+    let mut whole_update = whole.ingest(&input).expect("whole OSC 52 ingest");
     let mut chunked = TerminalModel::new(TerminalSize::new(2, 32), 0).expect("chunked model");
-    let mut chunk_effect = None;
+    let mut chunk_effects = TerminalHostEffects::default();
     let mut chunk_events = Vec::new();
     for chunk in input.chunks(7) {
-        let update = chunked.ingest(chunk).expect("chunked OSC 52 ingest");
-        if update.host_effect.is_some() {
-            chunk_effect = update.host_effect;
+        let mut update = chunked.ingest(chunk).expect("chunked OSC 52 ingest");
+        while let Some(effect) = update.host_effects.pop() {
+            chunk_effects.push(effect);
         }
         chunk_events.extend(update.events);
     }
 
     assert_same_presented_surface(&whole, &chunked);
-    assert_eq!(whole_update.host_effect, chunk_effect);
+    assert_eq!(whole_update.host_effects, chunk_effects);
     assert_eq!(whole_update.events, chunk_events);
-    let TerminalHostEffect::ClipboardWrite(value) = whole_update
-        .host_effect
-        .as_ref()
-        .expect("latest valid write");
+    let TerminalHostEffect::ClipboardWrite(value) =
+        whole_update.host_effects.pop().expect("latest valid write")
+    else {
+        panic!("expected clipboard effect");
+    };
     assert_eq!(value.as_str(), SECOND);
     assert_eq!(
         whole_update.events,
@@ -441,11 +442,14 @@ fn osc52_exact_cap_and_both_overflow_paths_are_atomic() {
     let exact_encoded = BASE64_STANDARD.encode(&exact_text);
     assert_eq!(exact_encoded.len(), MAX_OSC52_BASE64_BYTES);
     let mut exact = TerminalModel::new(TerminalSize::new(2, 16), 0).expect("exact model");
-    let exact_update = exact
+    let mut exact_update = exact
         .ingest(format!("\x1b]52;c;{exact_encoded}\x07").as_bytes())
         .expect("exact cap accepted");
     let TerminalHostEffect::ClipboardWrite(value) =
-        exact_update.host_effect.expect("exact cap write");
+        exact_update.host_effects.pop().expect("exact cap write")
+    else {
+        panic!("expected clipboard effect");
+    };
     assert_eq!(value.as_str().len(), MAX_TERMINAL_CLIPBOARD_BYTES);
 
     let decoded_over = BASE64_STANDARD.encode("y".repeat(MAX_TERMINAL_CLIPBOARD_BYTES + 1));
@@ -453,7 +457,7 @@ fn osc52_exact_cap_and_both_overflow_paths_are_atomic() {
     let decoded_over_update = exact
         .ingest(format!("\x1b]52;c;{decoded_over}\x07visible").as_bytes())
         .expect("decoded overflow contained");
-    assert!(decoded_over_update.host_effect.is_none());
+    assert!(decoded_over_update.host_effects.is_empty());
     assert_eq!(
         decoded_over_update.events,
         vec![TerminalSideEvent::EffectRejected(
@@ -466,7 +470,7 @@ fn osc52_exact_cap_and_both_overflow_paths_are_atomic() {
     let encoded_over_update = exact
         .ingest(format!("\x1b]52;c;{encoded_over}\x1b\\tail").as_bytes())
         .expect("encoded overflow contained through terminator");
-    assert!(encoded_over_update.host_effect.is_none());
+    assert!(encoded_over_update.host_effects.is_empty());
     assert_eq!(
         encoded_over_update.events,
         vec![TerminalSideEvent::EffectRejected(
@@ -494,7 +498,7 @@ fn osc52_rejects_reads_selectors_empty_noncanonical_utf8_nul_and_cancelled_input
     for input in cases {
         let mut model = TerminalModel::new(TerminalSize::new(2, 8), 0).expect("case model");
         let update = model.ingest(input.as_bytes()).expect("rejected OSC 52");
-        assert!(update.host_effect.is_none());
+        assert!(update.host_effects.is_empty());
         assert_eq!(update.events.len(), 1);
         assert!(matches!(
             update.events[0],
@@ -507,7 +511,7 @@ fn osc52_rejects_reads_selectors_empty_noncanonical_utf8_nul_and_cancelled_input
     let update = cancelled
         .ingest(b"\x1b]52;c;YQ==\x18ok")
         .expect("cancelled OSC 52");
-    assert!(update.host_effect.is_none());
+    assert!(update.host_effects.is_empty());
     assert!(update.events.is_empty());
     assert!(visible_text(&cancelled).contains("ok"));
 }

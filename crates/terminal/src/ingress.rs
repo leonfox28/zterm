@@ -2,7 +2,8 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use zterm_core::terminal::{
     MAX_SIDE_EVENTS_PER_UPDATE, MAX_TITLE_BYTES, RejectedEffect, TerminalClipboardWrite,
-    TerminalHostEffect, TerminalSideEvent, TerminalSize, UnsupportedSequenceKind,
+    TerminalHostEffect, TerminalHostEffects, TerminalNotification, TerminalSideEvent, TerminalSize,
+    UnsupportedSequenceKind,
 };
 
 use crate::engine::AlacrittyEngine;
@@ -60,6 +61,9 @@ struct ControlString {
     overflowed: bool,
     saw_escape: bool,
     clipboard: bool,
+    utf8_remaining: u8,
+    continuation_min: u8,
+    continuation_max: u8,
 }
 
 impl ControlString {
@@ -70,10 +74,37 @@ impl ControlString {
             overflowed: false,
             saw_escape: false,
             clipboard: false,
+            utf8_remaining: 0,
+            continuation_min: 0x80,
+            continuation_max: 0xbf,
         }
     }
 
+    fn is_utf8_continuation(&self, byte: u8) -> bool {
+        self.utf8_remaining > 0 && (self.continuation_min..=self.continuation_max).contains(&byte)
+    }
+
     fn push(&mut self, byte: u8) {
+        if self.is_utf8_continuation(byte) {
+            self.utf8_remaining -= 1;
+            self.continuation_min = 0x80;
+            self.continuation_max = 0xbf;
+        } else {
+            (
+                self.utf8_remaining,
+                self.continuation_min,
+                self.continuation_max,
+            ) = match byte {
+                0xc2..=0xdf => (1, 0x80, 0xbf),
+                0xe0 => (2, 0xa0, 0xbf),
+                0xe1..=0xec | 0xee..=0xef => (2, 0x80, 0xbf),
+                0xed => (2, 0x80, 0x9f),
+                0xf0 => (3, 0x90, 0xbf),
+                0xf1..=0xf3 => (3, 0x80, 0xbf),
+                0xf4 => (3, 0x80, 0x8f),
+                _ => (0, 0x80, 0xbf),
+            };
+        }
         let maximum = if self.clipboard {
             MAX_OSC52_BASE64_BYTES.saturating_add(b"52;c;".len())
         } else {
@@ -101,7 +132,7 @@ pub(crate) struct UpdateCollector {
     replies: Vec<u8>,
     events: Vec<TerminalSideEvent>,
     dropped_events: u64,
-    host_effect: Option<TerminalHostEffect>,
+    host_effects: TerminalHostEffects,
 }
 
 impl UpdateCollector {
@@ -110,7 +141,7 @@ impl UpdateCollector {
             replies: Vec::new(),
             events: Vec::new(),
             dropped_events: 0,
-            host_effect: None,
+            host_effects: TerminalHostEffects::default(),
         }
     }
 
@@ -131,12 +162,10 @@ impl UpdateCollector {
     }
 
     fn set_host_effect(&mut self, effect: TerminalHostEffect) {
-        self.host_effect = Some(effect);
+        self.host_effects.push(effect);
     }
 
-    pub(crate) fn finish(
-        mut self,
-    ) -> (Vec<u8>, Vec<TerminalSideEvent>, Option<TerminalHostEffect>) {
+    pub(crate) fn finish(mut self) -> (Vec<u8>, Vec<TerminalSideEvent>, TerminalHostEffects) {
         if self.dropped_events > 0 {
             if self.events.len() == MAX_SIDE_EVENTS_PER_UPDATE {
                 self.events.pop();
@@ -146,7 +175,7 @@ impl UpdateCollector {
                 count: self.dropped_events,
             });
         }
-        (self.replies, self.events, self.host_effect)
+        (self.replies, self.events, self.host_effects)
     }
 }
 
@@ -301,7 +330,10 @@ impl TerminalIngressPolicy {
             PolicyState::String(mut string) => {
                 if matches!(byte, 0x18 | 0x1a) {
                     PolicyState::Ground
-                } else if byte == 0x9c || (matches!(string.kind, StringKind::Osc) && byte == 0x07) {
+                } else if (byte == 0x9c
+                    && (string.saw_escape || !string.is_utf8_continuation(byte)))
+                    || (matches!(string.kind, StringKind::Osc) && byte == 0x07)
+                {
                     self.dispatch_string(
                         string,
                         engine,
@@ -660,6 +692,23 @@ impl TerminalIngressPolicy {
                     icon_name,
                     truncated,
                 });
+            }
+            b"9" | b"777" => {
+                let notification = std::str::from_utf8(payload).ok().and_then(|text| {
+                    if command == b"9" {
+                        TerminalNotification::osc9(text.to_owned()).ok()
+                    } else {
+                        let (title, body) = text.strip_prefix("notify;")?.split_once(';')?;
+                        TerminalNotification::osc777(title.to_owned(), body.to_owned()).ok()
+                    }
+                });
+                if let Some(notification) = notification {
+                    output.set_host_effect(TerminalHostEffect::Notification(notification));
+                } else {
+                    output.push_event(TerminalSideEvent::UnsupportedSequence(
+                        UnsupportedSequenceKind::Osc,
+                    ));
+                }
             }
             b"52" => {
                 dispatch_clipboard(payload, output);

@@ -531,3 +531,15 @@ with `hw.keyboard=no` has no virtual keyboard to receive sidebar key events.
 Enable the AVD keyboard device and cold boot for a hardware-key preview, keeping
 `show_ime_with_hard_keyboard=1` for software IME checks. Verify the sidebar itself
 and guest input events; a passing instrumentation test cannot prove this path.
+
+## Ordinary system notifications
+
+[Terminal Notifications](../backend/terminal-notifications.md) owns the shared
+OSC 9/777 and kind-325 contracts. AppRepository owns one transient native-event
+consumer alongside, but separate from, frame collection. Fence repository and
+native connection generations before invoking TerminalNotifications; recreation
+and visibility changes never add consumers. Retirement cancels/joins it before
+closing the handle. Kotlin owns the stable channel, ordinary notification fields
+and Settings permission flow; Android OS state is the permission authority.
+Disabled/denied notifications are dropped without ending the connection or
+retaining content for a later grant. This adds no foreground service or push.

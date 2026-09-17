@@ -341,6 +341,10 @@ No new crate, background owner, or second Session interpreter is introduced.
   fill or block the capacity-eight lifecycle queue. Target changes, stream loss,
   detach, and Session end clear pending content; observers and later
   controllers receive no replay. The wire carries no raw OSC.
+- Ordinary notification kind 325 reuses this controller-targeted path with a
+  separate bounded FIFO, not clipboard replacement semantics. See
+  [Terminal Notifications](./terminal-notifications.md) for queue, wakeup,
+  lifecycle and presenter contracts. The viewer tunnel remains opaque.
 - A local or remote initial attachment has one deadline covering every
   pre-snapshot transport-state frame through the complete correlated snapshot
   or typed service error. For `create_main`, encode/connect failures before the
