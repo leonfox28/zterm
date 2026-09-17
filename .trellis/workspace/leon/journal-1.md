@@ -796,3 +796,25 @@ Implemented the approved CLI grammar and plain-text output, automatic QR/manual 
 ### Status
 
 [OK] **Completed**
+
+
+## Session 31: Fix PR 44 upload retirement error race
+<!-- trellis-session: v=2 fp=90d51e5a03fd4835 -->
+
+**Date**: 2026-09-17
+**Task**: Fix PR 44 upload retirement error race
+**Branch**: `codex/cli-command-format`
+
+### Summary
+
+Diagnosed a pre-existing shared upload error-precedence race blocking PR 44. Preserve buffered or delayed host errors after raw or desktop tunnel write closure within the existing 5-second response budget; keep EOF/timeout fallback, cancellation, invalid-source behavior and no replay. Added deterministic paused-time regressions (verified red before the fix), kept daemon lease_lost assertions unchanged, and documented the owning contract. Six client upload tests, all four daemon upload tests and full just check passed locally. Follow-up remains on codex/cli-command-format for hosted CI and PR merge; no new task created.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `be1945e` | fix(upload): preserve host errors after write closure |
+
+### Status
+
+[OK] **Completed**
