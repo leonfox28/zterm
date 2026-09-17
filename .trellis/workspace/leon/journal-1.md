@@ -818,3 +818,41 @@ Diagnosed a pre-existing shared upload error-precedence race blocking PR 44. Pre
 ### Status
 
 [OK] **Completed**
+
+
+## Session 32: 终端通知转发与 Android 系统通知
+<!-- trellis-session: v=2 fp=dd2cf7b3d9fc6b91 -->
+
+**Date**: 2026-09-17
+**Task**: 终端通知转发与 Android 系统通知
+**Branch**: `codex/terminal-notifications`
+
+### Summary
+
+完成 OSC 9/777 实时通知链路：桌面转发至外层终端，Android 在连接有效时发布系统通知；断线不缓存、重连不补发。用户完成 Ghostty 实际弹窗验收并授权提交、PR 和合并。
+
+### Main Changes
+
+- 新增有界通知域、kind 325 协议、控制端定向队列、生命周期清理及桌面 OSC 输出。
+- 新增 Android 原生事件队列、连接代际校验、系统通知渠道及用户主动授权入口。
+- 补齐跨层回归测试、使用文档、Trellis 规范，并归档 terminal-notifications 任务。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `6e2465b` | feat(terminal): forward live notifications to desktop and Android |
+
+### Testing
+
+- [OK] just check 通过：Rust 测试汇总 681 passed、0 failed、8 ignored；最终 just check-fast 通过。
+- [OK] Android debug、androidTest、lint 和单元测试构建通过；API 36 四项与 API 32 两项设备测试通过。
+- [OK] 真实 daemon/PTY 至桌面链路通过；用户确认 Ghostty OSC 9 和 OSC 777 中文系统弹窗均正常。
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- 按用户授权推送分支、创建 PR，等待必需 CI 检查通过后合并 main。

@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 31
+- **Total Sessions**: 32
 - **Last Active**: 2026-09-17
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~820 | Active |
+| `journal-1.md` | ~858 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 32 | 2026-09-17 | 终端通知转发与 Android 系统通知 | `6e2465b` | `codex/terminal-notifications` |
 | 31 | 2026-09-17 | Fix PR 44 upload retirement error race | `be1945e` | `codex/cli-command-format` |
 | 30 | 2026-09-16 | CLI command simplification and output consistency | `e97c88c`, `8e14a8b` | `main` |
 | 29 | 2026-09-14 | Update Trellis to 0.6.17 | `ff1f890` | `chore/trellis-0.6.17` |
