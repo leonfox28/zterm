@@ -118,3 +118,35 @@ Wrong: put progress sleep inside a repeatedly rebuilt select loop, or start a
 subscriber after the current generation. Correct: persistent interval plus latest
 state observation; continuous terminal output and already-finished operations
 must not starve completion.
+
+### Upload retirement error precedence
+
+Root cause: a local implementation defect in the shared uploader, not a missing
+wire contract. The daemon can send `lease_lost` and retire its receive direction
+while the client is still writing. Fail-fast joining of both directions can
+discard even an already-buffered service error in favor of the write failure.
+The upload's existing client owner must arbitrate these outcomes; neither
+frontend-specific handling nor a new protocol/daemon lifecycle is needed.
+The implicit assumption was that the first failed direction owns the final
+error; the original concurrent detach fixture did not deterministically cover
+both response/write completion orders.
+
+On a transfer write's `transport_unavailable` or the desktop tunnel's existing
+`is_attachment_command_stream_closed` marker, retain the existing reader for at
+most the existing 5 s response deadline. Continue validating progress/correlation
+and prefer a decoded service/response-validation error. Distinguish response
+errors from stream failures: a host-sent `deadline_exceeded` is still a response,
+not a local read timeout. EOF or timeout without a response error preserves the
+original write error. This fixed budget must not restart on progress;
+explicit cancellation still interrupts it. Do not retry data, send Finish after
+a failed write, or extend this recovery to invalid local sources.
+
+Regression tests must force both buffered and delayed service errors, EOF and a
+silent response direction, and cancellation during the bounded wait. Use
+independently closable in-memory directions and paused time, not repeated runs or
+real sleeps. Keep the daemon detach test's `lease_lost` assertion unchanged.
+`retired_upload_preserves_service_error` covers raw/tunnel write closure and
+host-sent deadline errors; `retired_upload_without_service_error_preserves_write_failure`
+checks EOF and the fixed timeout. `retired_upload_response_wait_remains_cancellable`
+and `invalid_upload_source_does_not_wait_for_retirement_response` fence cancellation
+and local-source behavior.
