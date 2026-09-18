@@ -22,8 +22,6 @@ mod terminal_ui;
 
 pub use terminal_ui::run_terminal;
 
-const UPDATE_CONNECTION_GUIDANCE: &str = "Update will continue independently if this terminal disconnects. Existing sessions will end. Reconnect manually after the daemon starts; use zterm --version, zterm status and zterm logs to check the result.";
-
 const SETUP_GUIDANCE: &str = "zterm is not configured. Run `zterm setup` first.\n";
 
 /// zterm's public command tree plus one hidden daemon entry flag.
@@ -891,29 +889,37 @@ async fn update(
             arguments.version.as_deref(),
             arguments.yes,
             |impact| {
-                eprintln!("{UPDATE_CONNECTION_GUIDANCE}");
-                confirm_sessions("Updating zterm", impact, interaction)
+                confirm(
+                    &format!(
+                        "Updating zterm will end these sessions:\n  {}",
+                        impact.active_session_names.join("\n  ")
+                    ),
+                    false,
+                    interaction,
+                )
+                .map_err(|error| {
+                    DaemonError::new(zterm_core::DomainErrorKind::Cancelled, error.to_string())
+                })
             },
             |stage| {
                 eprintln!(
                     "{}",
                     match stage {
-                        UpdateStage::Preparing =>
-                            "Downloading and verifying the release...".to_owned(),
-                        UpdateStage::Verified { version } => format!("Release {version} verified."),
-                        UpdateStage::Continuing => UPDATE_CONNECTION_GUIDANCE.to_owned(),
-                        UpdateStage::Stopping => "Stopping the daemon...".to_owned(),
-                        UpdateStage::Activating => "Installing the verified release...".to_owned(),
-                        UpdateStage::Starting => "Starting the updated daemon...".to_owned(),
+                        UpdateStage::Preparing => "Downloading update...".to_owned(),
+                        UpdateStage::Verified { version } => format!("Verified zterm {version}."),
+                        UpdateStage::Continuing => return,
+                        UpdateStage::Stopping => "Stopping daemon...".to_owned(),
+                        UpdateStage::Activating => "Installing update...".to_owned(),
+                        UpdateStage::Starting => "Starting daemon...".to_owned(),
                     }
                 )
             },
         )
         .await?;
     let startup = if result.daemon_started {
-        "Daemon: running"
+        " Daemon running.\n"
     } else {
-        "Run zterm setup to configure and start the daemon."
+        "\nRun zterm setup to configure and start the daemon.\n"
     };
     let ended = if result.ended_session_names.is_empty() {
         String::new()
@@ -924,7 +930,7 @@ async fn update(
         )
     };
     Ok(CommandOutcome::Text(format!(
-        "Updated zterm from {} to {}.\n{ended}{startup}\n",
+        "Updated zterm {} -> {}.{startup}{ended}",
         result.previous_version, result.installed_version
     )))
 }
