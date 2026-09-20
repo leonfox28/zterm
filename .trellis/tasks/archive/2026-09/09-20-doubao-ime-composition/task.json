@@ -1,0 +1,31 @@
+{
+  "id": "doubao-ime-composition",
+  "name": "doubao-ime-composition",
+  "title": "修复 Android 输入法拼音组合状态",
+  "description": "修复已复现的 Android InputConnection 光标、组合区间及状态通知缺陷，并用真实豆包 26 键验证两种显示模式。",
+  "status": "completed",
+  "dev_type": "frontend",
+  "scope": "android-ime",
+  "package": null,
+  "priority": "P2",
+  "creator": "leon",
+  "assignee": "leon",
+  "createdAt": "2026-09-20",
+  "completedAt": "2026-09-20",
+  "branch": "fix/android-ime-composition",
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [
+    "apps/android/app/src/main/java/io/github/leonfox28/zterm/TerminalView.kt",
+    "apps/android/app/src/androidTest/java/io/github/leonfox28/zterm/TerminalUiTest.kt",
+    "apps/android/app/src/androidTest/java/io/github/leonfox28/zterm/TerminalInputConnectionTest.kt",
+    ".trellis/spec/frontend/android-app.md"
+  ],
+  "notes": "User approved the described correction on 2026-09-20 and explicitly requested a new branch. Investigation evidence retained; implementation authorized on fix/android-ime-composition. User personally accepted the fixed emulator build and authorized commit, PR and merge on 2026-09-20.",
+  "meta": {}
+}

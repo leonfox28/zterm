@@ -856,3 +856,25 @@ Diagnosed a pre-existing shared upload error-precedence race blocking PR 44. Pre
 ### Next Steps
 
 - 按用户授权推送分支、创建 PR，等待必需 CI 检查通过后合并 main。
+
+
+## Session 33: Fix Android Pinyin composition with real Doubao acceptance
+<!-- trellis-session: v=2 fp=191a3eba740c0407 -->
+
+**Date**: 2026-09-20
+**Task**: Fix Android Pinyin composition with real Doubao acceptance
+**Branch**: `fix/android-ime-composition`
+
+### Summary
+
+Reproduced Doubao 26-key Pinyin leakage in display-in-editor mode; corrected Editable selection/composition and batch notifications, preserving rejection and epoch fences. Added a regression that fails on the old implementation. Both real IME modes, backspace/space confirmation, 12 focused instrumentation checks, debug/test APK builds and Debug/Release lint passed. User tried the fixed visible emulator and approved commit, PR and merge. Work branch: fix/android-ime-composition.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `a8bdd92` | fix(android): preserve IME composition state |
+
+### Status
+
+[OK] **Completed**

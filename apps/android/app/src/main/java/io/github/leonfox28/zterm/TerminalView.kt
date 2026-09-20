@@ -12,6 +12,7 @@ import android.view.Menu
 import android.view.MenuItem
 import android.widget.OverScroller
 import android.text.Editable
+import android.text.Selection
 import android.text.SpannableStringBuilder
 import android.text.InputType
 import android.view.GestureDetector
@@ -57,7 +58,7 @@ internal class TerminalView(context: Context) : View(context) {
     private var cellWidth = 1f
     private var cellHeight = 1f
     private var baseline = 1f
-    private val composing = SpannableStringBuilder()
+    private val composing = SpannableStringBuilder().apply { Selection.setSelection(this, 0) }
     private var ime: TerminalInputConnection? = null
     private val manager = context.getSystemService(InputMethodManager::class.java)
     private var lastSize: Pair<Int,Int>? = null
@@ -200,7 +201,7 @@ internal class TerminalView(context: Context) : View(context) {
         }
         if (returningLive) { scrollPixels = 0f; scroller.forceFinished(true) }
         if (epochChanged) {
-            composing.clear(); consumedModifiers(); manager.restartInput(this)
+            resetComposing(); consumedModifiers(); manager.restartInput(this)
         }
         repository?.let { owner ->
             val intent = owner.scrollIntent
@@ -591,17 +592,16 @@ internal class TerminalView(context: Context) : View(context) {
     override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection {
         outAttrs.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
         outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_FLAG_NO_FULLSCREEN or EditorInfo.IME_ACTION_NONE
-        outAttrs.initialSelStart = composing.length; outAttrs.initialSelEnd = composing.length
+        outAttrs.initialSelStart = Selection.getSelectionStart(composing)
+        outAttrs.initialSelEnd = Selection.getSelectionEnd(composing)
         outAttrs.privateImeOptions = "com.google.android.inputmethod.latin.noMicrophoneKey"
         return TerminalInputConnection().also { ime = it }
     }
-    private fun commit(value: String, paste: Boolean = false): Boolean {
-        if (current?.inputReady != true || repository?.text(value, pendingModifiers(), paste) != true) return false
-        if (value.isNotEmpty()) consumedModifiers()
-        composing.clear(); manager.updateSelection(this,0,0,-1,-1); updateAnchor(); invalidate()
-        return true
+    private fun resetComposing() {
+        composing.clear(); composing.clearSpans(); Selection.setSelection(composing, 0)
     }
     private fun updateAnchor() {
+        if (ime?.inBatchEdit == true) return
         val frame = drawnFrame ?: return
         val geometry = drawnGeometry ?: return
         if (geometry.version != geometryVersion || frame.inputEpoch != current?.inputEpoch) return
@@ -611,32 +611,90 @@ internal class TerminalView(context: Context) : View(context) {
         val y = (frame.firstRow + frame.windowOffset.toLong() + frame.cursorRow.toInt() - geometry.firstRow) * geometry.cellHeight + geometry.shift
         val visible = x in 0f..geometry.width.toFloat() && y >= 0f && y + geometry.cellHeight <= geometry.height
         val flags = if (visible) CursorAnchorInfo.FLAG_HAS_VISIBLE_REGION else CursorAnchorInfo.FLAG_HAS_INVISIBLE_REGION
-        val builder = CursorAnchorInfo.Builder().setMatrix(matrix).setSelectionRange(composing.length, composing.length)
+        val builder = CursorAnchorInfo.Builder().setMatrix(matrix)
+            .setSelectionRange(Selection.getSelectionStart(composing), Selection.getSelectionEnd(composing))
             .setInsertionMarkerLocation(x,y,y+geometry.baseline,y+geometry.cellHeight,flags)
-        if (composing.isNotEmpty()) builder.setComposingText(0,composing)
+        val start = BaseInputConnection.getComposingSpanStart(composing)
+        val end = BaseInputConnection.getComposingSpanEnd(composing)
+        if (start >= 0 && end >= start) builder.setComposingText(start, composing.subSequence(start, end))
         manager.updateCursorAnchorInfo(this,builder.build())
     }
     private inner class TerminalInputConnection : BaseInputConnection(this@TerminalView, true) {
         private val inputEpoch = current?.inputEpoch
-        private val retiredEditable = SpannableStringBuilder()
+        private val retiredEditable = SpannableStringBuilder().apply { Selection.setSelection(this, 0) }
+        private var batchDepth = 0
+        private var editorChanged = false
+        val inBatchEdit: Boolean get() = batchDepth > 0
         private fun ready() = current?.inputReady == true && current?.inputEpoch == inputEpoch
         override fun getEditable(): Editable = if (current?.inputEpoch == inputEpoch) composing else retiredEditable
-        override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean {
-            if (!ready() || (text?.length ?: 0) > 524288) return false
-            composing.replace(0,composing.length,text ?: ""); updateAnchor(); invalidate(); return true
+        override fun beginBatchEdit(): Boolean {
+            if (!ready()) return false
+            batchDepth++
+            return true
         }
-        override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean = ready() && commit(text?.toString().orEmpty())
-        override fun finishComposingText(): Boolean = ready() && (composing.isEmpty() || commit(composing.toString()))
+        override fun endBatchEdit(): Boolean {
+            if (batchDepth == 0) return false
+            batchDepth--
+            if (!ready()) { editorChanged = false; return false }
+            if (batchDepth == 0 && editorChanged) {
+                editorChanged = false
+                manager.updateSelection(this@TerminalView, Selection.getSelectionStart(composing),
+                    Selection.getSelectionEnd(composing), getComposingSpanStart(composing), getComposingSpanEnd(composing))
+                updateAnchor(); invalidate()
+            }
+            return batchDepth > 0
+        }
+        private fun edit(action: () -> Boolean): Boolean {
+            if (!beginBatchEdit()) return false
+            try { return action().also { if (it) editorChanged = true } }
+            finally { endBatchEdit() }
+        }
+        private fun canReplace(text: CharSequence): Boolean {
+            val start = getComposingSpanStart(composing).takeIf { it >= 0 } ?: Selection.getSelectionStart(composing)
+            val end = getComposingSpanEnd(composing).takeIf { it >= 0 } ?: Selection.getSelectionEnd(composing)
+            return text.length <= 524288 - (composing.length - (maxOf(start, end) - minOf(start, end)))
+        }
+        override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean {
+            if (!ready() || !canReplace(text ?: "")) return false
+            return edit { super.setComposingText(text ?: "", newCursorPosition) }
+        }
+        override fun setComposingRegion(start: Int, end: Int): Boolean = edit { super.setComposingRegion(start, end) }
+        override fun setSelection(start: Int, end: Int): Boolean = edit { super.setSelection(start, end) }
+        private fun commit(value: String, paste: Boolean = false): Boolean {
+            if (!ready() || repository?.text(value, pendingModifiers(), paste) != true) return false
+            if (value.isNotEmpty()) consumedModifiers()
+            resetComposing()
+            return true
+        }
+        override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
+            if (!ready() || !canReplace(text ?: "")) return false
+            return edit {
+                // Apply Android replacement semantics locally, then admit the
+                // resulting text once. A rejected enqueue must retain preedit,
+                // selection and composing spans exactly for a later retry.
+                // The copy constructor drops NoCopySpan, including Android's
+                // selection and composing markers; append preserves them.
+                val previous = SpannableStringBuilder().append(composing)
+                super.commitText(text ?: "", newCursorPosition)
+                if (commit(composing.toString())) true else {
+                    composing.clear(); composing.clearSpans(); composing.append(previous)
+                    false
+                }
+            }
+        }
+        override fun finishComposingText(): Boolean = edit {
+            if (composing.isEmpty()) { resetComposing(); true } else commit(composing.toString())
+        }
         override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean = delete(beforeLength,afterLength,false)
         override fun deleteSurroundingTextInCodePoints(beforeLength: Int, afterLength: Int): Boolean = delete(beforeLength,afterLength,true)
         private fun delete(before: Int, after: Int, codePoints: Boolean): Boolean {
             if (!ready()) return false
             if (before < 0 || after < 0 || before > 128 || after > 128) return false
             if (composing.isNotEmpty()) {
-                val count = if (codePoints) composing.toString().codePointCount(0,composing.length) else composing.length
-                var start = if (codePoints) Character.offsetByCodePoints(composing,composing.length,-minOf(before,count)) else (composing.length-before).coerceAtLeast(0)
-                if (start > 0 && start < composing.length && Character.isLowSurrogate(composing[start])) start--
-                composing.delete(start,composing.length); updateAnchor(); invalidate()
+                return edit {
+                    if (codePoints) super.deleteSurroundingTextInCodePoints(before, after)
+                    else super.deleteSurroundingText(before, after)
+                }
             } else {
                 if (repository?.deleteKeys(before, after, pendingModifiers()) != true) return false
                 if (before + after > 0) consumedModifiers()
@@ -649,7 +707,7 @@ internal class TerminalView(context: Context) : View(context) {
         override fun performContextMenuAction(id: Int): Boolean {
             if (!ready() || id != android.R.id.paste) return false
             val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
-            return clipboard.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString()?.let { commit(it,true) } ?: false
+            return clipboard.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString()?.let { edit { commit(it,true) } } ?: false
         }
     }
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean = handleKey(event) || super.onKeyDown(keyCode,event)

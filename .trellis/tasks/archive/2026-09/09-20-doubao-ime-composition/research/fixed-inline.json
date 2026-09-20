@@ -1,0 +1,32 @@
+[
+  {
+    "key": "n",
+    "received_hex": "",
+    "received_text": ""
+  },
+  {
+    "key": "i",
+    "received_hex": "",
+    "received_text": ""
+  },
+  {
+    "key": "h",
+    "received_hex": "",
+    "received_text": ""
+  },
+  {
+    "key": "a",
+    "received_hex": "",
+    "received_text": ""
+  },
+  {
+    "key": "o",
+    "received_hex": "",
+    "received_text": ""
+  },
+  {
+    "action": "select 你好",
+    "received_hex": "e4bda0e5a5bd",
+    "received_text": "你好"
+  }
+]

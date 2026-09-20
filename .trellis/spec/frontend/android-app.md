@@ -304,7 +304,29 @@ TUI regression tests: an intervening text/key command masks a broken exit by
 triggering its own history-to-live synchronization. Clearing a selection in
 older content preserves the reading position.
 
-InputConnection owns local preedit and commits Unicode once. Each connection
+InputConnection owns local preedit and commits Unicode once. Its Editable is the
+single source for text, selection and composing spans: initialize/reset selection
+to `(0,0)`, use BaseInputConnection's cursor/replacement/deletion semantics, and
+derive EditorInfo, context queries and cursor anchors from those same spans.
+For example, `setComposingText("n", 1)` must expose selection `(1,1)`, composing
+range `[0,1)`, before-cursor text `n`, and no after-cursor text or host input.
+Replacing with `ni` must replace the composing range, not append or commit `n`.
+Publish `updateSelection` with the actual composing range at outermost batch
+completion; do not publish intermediate cursor anchors inside a batch.
+Doubao's display-in-editor Pinyin path exposed this contract: missing selection
+spans returned empty before-cursor context and triggered premature finalization.
+Do not special-case an IME or suppress legitimate `finishComposingText` to hide it.
+
+Candidate commit applies the platform replacement locally before queue admission.
+Rejected admission preserves text, selection and composing spans exactly. A
+`SpannableStringBuilder(existing)` snapshot drops Android's `NoCopySpan` markers,
+including selection/composition; copy with an empty builder's `append(existing)`
+when rollback must retain them. Successful admission clears text/spans and resets
+selection; repeated explicit finish must not submit twice. Local surrounding
+deletion respects selection/composing boundaries and code-point requests; only
+an empty local buffer routes deletion to terminal keys.
+
+Each connection
 captures its creation input epoch; old callbacks and editable buffers cannot
 commit into a newer synchronized attachment. Copy captures the Repository
 selection version and attachment epoch, rechecking after FFI extraction before
@@ -380,6 +402,14 @@ overlay dimensions, cache resource bounds and Activity retention. IME geometry
 acceptance requires a full software keyboard: Gboard's physical-keyboard side
 strip can be shown with zero bottom inset. Verify both visibility and measured
 row changes, waiting for terminal window focus after dialog dismissal.
+`TerminalInputConnectionTest` checks cursor queries, composing replacement,
+Unicode deletion, nested batches, rejected admission and retired-buffer isolation
+without a host. Keep the real-host explicit-finish/healthy-resize tests as well.
+IME compatibility acceptance uses actual software-key taps and exact child bytes:
+for Doubao 26-key Pinyin, test both candidate-bar and display-in-editor modes.
+Typing `nihao` sends zero bytes; choosing `你好` sends exactly its UTF-8 bytes once,
+without a Pinyin prefix or trailing space. A direct `setComposingText` test alone
+does not establish compatibility with the IME's own query/callback sequence.
 Assert content taps (ordinary, mouse and alternate screen) keep IME hidden and
 the host viewport unchanged, while the explicit bottom button shows/hides IME.
 Check full-grid IME show/hide produces only two resize epochs in total, and
