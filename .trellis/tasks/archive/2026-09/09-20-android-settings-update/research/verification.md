@@ -116,3 +116,5 @@ tests and the connection-state/geometry UI tests passed.
 Debug APK SHA-256:
 `2d08981a12f10484fb99f1131a2def24cb50b7ca7dd5c60c4b1647ea89f8654d`.
 Local artifact: `apps/android/app/build/outputs/apk/debug/app-debug.apk`.
+
+Local work commit: `119f98719570c30ebf261f3895cc6d2e6d55c208` (user-approved).

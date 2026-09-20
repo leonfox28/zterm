@@ -136,7 +136,7 @@ for platform handoff coverage without inventing a production update result.
   confirmation-only downloading/installation, and manual native Toast feedback.
 - [x] Record commands/results and any device-only limitations; mark PRD
   acceptance complete only where evidence supports it.
-- [ ] Follow repository commit/finish workflow while preserving unrelated
+- [x] Follow repository commit/finish workflow while preserving unrelated
   changes. Do not archive before implementation and validation are complete.
 
 ## Risky boundaries and rollback points
@@ -159,3 +159,6 @@ See [verification.md](research/verification.md) for exact tests, simulator evide
 implementation clarifications and remaining production/device boundaries. API 26
 and a physical phone were not exercised; compact-height/large-font coverage uses
 Compose constraints on the API 36 emulator. No release or remote branch was pushed.
+
+Work committed as `119f98719570c30ebf261f3895cc6d2e6d55c208`; task archival and journal recording authorized
+by the user with `确认提交并归档`. No remote push.
