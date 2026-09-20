@@ -878,3 +878,25 @@ Reproduced Doubao 26-key Pinyin leakage in display-in-editor mode; corrected Edi
 ### Status
 
 [OK] **Completed**
+
+
+## Session 34: Android settings updates and notification controls
+<!-- trellis-session: v=2 fp=e663e1f863903c7c -->
+
+**Date**: 2026-09-20
+**Task**: Android settings updates and notification controls
+**Branch**: `feat/android-settings-update`
+
+### Summary
+
+Implemented authenticated manual and quiet startup Android update checks with native Toast feedback and 24-hour reminders, app notification preference and permission flow, and consistent connection status cards. Validation passed: 114 Rust tests, 9 JVM tests, 18 API 36 emulator tests, debug/release lint, APK build and 16 KB checks. User approved local commit and task archival. Official newer-release and physical-device upgrades remain untested. Branch feat/android-settings-update; no remote push.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `119f987` | feat(android): add update checks and unified settings |
+
+### Status
+
+[OK] **Completed**

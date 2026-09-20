@@ -1,0 +1,9 @@
+{
+  "revision": 2,
+  "notificationRows": 14,
+  "notificationTextOverflow": [],
+  "updateChevrons": 0,
+  "systemToast": true,
+  "legacyToast": false,
+  "notificationBelowScrim": true
+}

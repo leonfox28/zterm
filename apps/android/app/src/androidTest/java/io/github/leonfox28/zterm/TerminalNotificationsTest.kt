@@ -33,6 +33,22 @@ class TerminalNotificationsTest {
     private val manager = context.getSystemService(NotificationManager::class.java)
     private var phase = "platform setup"
 
+    @Test fun appSwitchDropsEventsWithoutReplayingAfterEnable() = runBlocking {
+        val notifications = TerminalNotifications(context)
+        assumeTrue("grant notification permission on the disposable install", notifications.enabled())
+        manager.cancelAll()
+        try {
+            notifications.setAppEnabled(false)
+            repeat(3) { assertFalse(notifications.post(NativeNotification(1u, null, "while off"), "en")) }
+            assertTrue(postedContent().isEmpty())
+            notifications.setAppEnabled(true)
+            assertTrue(postedContent().isEmpty())
+            assertTrue(notifications.post(NativeNotification(1u, null, "after enable"), "en"))
+            await { postedContent().size == 1 }
+            assertEquals("after enable", postedContent().single().notification.extras.getString(Notification.EXTRA_TEXT))
+        } finally { manager.cancelAll() }
+    }
+
     @Test fun grantedPermissionPostsDistinctTypedNotifications() = runBlocking {
         val notifications = TerminalNotifications(context)
         assumeTrue("grant notification permission on the disposable install", notifications.enabled())

@@ -69,6 +69,13 @@ TerminalNotificationOsc777 osc777 { title, body } } }`; request/deadline are zer
   opens the existing app, never reconnects/takes over/executes input.
 - The Settings action owns Android 13+ POST_NOTIFICATIONS requests and system
   settings access. OS state is the permission authority, refreshed on resume.
+  The persisted application switch adds a separate delivery gate (missing old
+  preference defaults On). `TerminalNotifications.setAppEnabled` and `post` share
+  synchronization; Off immediately stops future posts without clearing existing
+  notifications or retaining events. AppRepository serializes saves, retains
+  pending intent across concurrent writes, and restores the committed gate on
+  save failure. Effective UI state is app gate AND OS app/channel permission;
+  returning from Settings only enables a pending explicit On request.
   Denied/disabled events are consumed; grants do not replay them. Both foreground
   and background receive while the existing connection remains alive. No
   foreground service, push, wake lock or process-death delivery is included.

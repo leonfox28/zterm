@@ -35,11 +35,12 @@ import io.github.leonfox28.zterm.nativebridge.NativeSession
 import kotlin.math.roundToInt
 import java.util.Locale
 
-@Composable internal fun ZtermApp(repository: AppRepository) {
+@Composable internal fun ZtermApp(repository: AppRepository, updates: AppUpdates) {
     val state by repository.state.collectAsStateWithLifecycle()
     val system = LocalConfiguration.current
     val context = LocalContext.current
     val language = state.saved.preferences.language
+    val updateBlocks = remember { mutableIntStateOf(0) }
     val localized = remember(context, system, language) {
         val configuration = Configuration(system)
         if (language != "system") configuration.setLocales(LocaleList(Locale.forLanguageTag(language)))
@@ -65,14 +66,18 @@ import java.util.Locale
         background = Color(0xFFF5F8F3), surface = Color(0xFFF5F8F3), surfaceContainer = Color.White,
         surfaceContainerHigh = Color(0xFFE6EEE3), onSurface = Color(0xFF182219), onSurfaceVariant = Color(0xFF53634F),
         outline = Color(0xFF71816B), outlineVariant = Color(0xFFD4DED2))
-    CompositionLocalProvider(LocalContext provides localized, LocalConfiguration provides localized.resources.configuration) {
+    CompositionLocalProvider(LocalContext provides localized, LocalConfiguration provides localized.resources.configuration,
+        LocalUpdateBlocks provides updateBlocks) {
         MaterialTheme(colorScheme = colors) {
             Surface(Modifier.fillMaxSize()) {
-                when (state.route) {
-                    Route.Home -> HomeScreen(state, repository)
-                    Route.Settings -> SettingsScreen(state, repository)
-                    Route.Scanner -> ScannerScreen(state, repository)
-                    Route.Terminal -> TerminalScreen(state, repository)
+                Box {
+                    when (state.route) {
+                        Route.Home -> HomeScreen(state, repository)
+                        Route.Settings -> SettingsScreen(state, repository, updates)
+                        Route.Scanner -> ScannerScreen(state, repository)
+                        Route.Terminal -> TerminalScreen(state, repository)
+                    }
+                    AppUpdateHost(updates, state)
                 }
             }
         }
@@ -97,6 +102,9 @@ import java.util.Locale
             "arrow-right" -> { line(3f,12f,21f,12f); line(21f,12f,14f,5f); line(21f,12f,14f,19f) }
             "more" -> for (y in listOf(5f,12f,19f)) drawCircle(color, 1.5f*factor, Offset(12f*factor,y*factor))
             "terminal" -> { line(4f,6f,10f,12f); line(10f,12f,4f,18f); line(13f,18f,21f,18f) }
+            "download" -> { line(12f,3f,12f,15f); line(7f,10f,12f,15f); line(12f,15f,17f,10f); line(4f,16f,4f,21f); line(4f,21f,20f,21f); line(20f,21f,20f,16f) }
+            "external" -> { line(14f,3f,21f,3f); line(21f,3f,21f,10f); line(21f,3f,10f,14f); line(10f,3f,3f,3f); line(3f,3f,3f,21f); line(3f,21f,21f,21f); line(21f,21f,21f,14f) }
+            "disconnect" -> { circle(12f,12f,9f); line(8f,8f,16f,16f); line(16f,8f,8f,16f) }
             "attachment" -> {
                 val path = Path().apply {
                     moveTo(21f*factor, 11f*factor)
@@ -196,7 +204,7 @@ private fun Modifier.semanticsDescription(label: String): Modifier = this.then(M
     removing?.let { host -> ConfirmDialog(stringResource(R.string.remove_host), host.name + "\n" + stringResource(R.string.remove_host_message),
         stringResource(R.string.remove), { removing = null }) { removing = null; repository.removeHost(host.id) } }
 }
-@Composable private fun SettingsScreen(state: AppState, repository: AppRepository) {
+@Composable private fun SettingsScreen(state: AppState, repository: AppRepository, updates: AppUpdates) {
     BackHandler { repository.show(Route.Home) }
     val preferences = state.saved.preferences
     var fontSize by remember(preferences.fontSize) { mutableIntStateOf(preferences.fontSize) }
@@ -229,8 +237,8 @@ private fun Modifier.semanticsDescription(label: String): Modifier = this.then(M
         Surface(Modifier.fillMaxWidth().padding(vertical = 12.dp), color = MaterialTheme.colorScheme.surfaceContainer, shape = RoundedCornerShape(14.dp)) {
             Text(stringResource(R.string.font_preview), Modifier.padding(18.dp), fontFamily = FontFamily.Monospace, fontSize = fontSize.sp)
         }
-        TerminalNotificationSettings(repository.notifications)
-        Row(Modifier.fillMaxWidth().padding(16.dp)) { Text(stringResource(R.string.version), Modifier.weight(1f)); Text(BuildConfig.VERSION_NAME) }
+        TerminalNotificationSettings(state, repository)
+        AboutSettings(updates, state.initialized)
         ErrorText(state.error)
     }
 }
@@ -278,6 +286,7 @@ private fun Modifier.semanticsDescription(label: String): Modifier = this.then(M
 })
 @Composable internal fun ConfirmDialog(title: String, message: String, action: String,
     dismiss: () -> Unit, confirm: () -> Unit) {
+    BlockStartupUpdatePrompt()
     AlertDialog(onDismissRequest = dismiss, title = { Text(title) }, text = { Text(message) },
         confirmButton = { TextButton(confirm) { Text(action) } },
         dismissButton = { TextButton(dismiss) { Text(stringResource(R.string.cancel)) } })

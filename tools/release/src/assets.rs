@@ -8,7 +8,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail, ensure};
 use flate2::{Compression, GzBuilder, read::GzDecoder};
-use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
+use ring::signature::{Ed25519KeyPair, KeyPair};
 use semver::Version;
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
@@ -17,7 +17,7 @@ use zterm_core::release::{
     RELEASE_BOOTSTRAP_SCHEMA, RELEASE_KEY_ID, RELEASE_MANIFEST_SCHEMA, RELEASE_ORIGIN,
     ReleaseArtifact, ReleaseClassification, ReleaseManifest, ReleaseSelfCheck, artifact_filename,
     immutable_asset_url, official_release_public_key, sha256_hex, sha256_reader,
-    validate_unsigned_manifest, verify_official_release_manifest,
+    validate_unsigned_manifest, verify_checksums_signature, verify_official_release_manifest,
 };
 
 // Maintainer publication policy only; installed updaters must not depend on this list.
@@ -35,9 +35,9 @@ const INSTALLER_NAME: &str = "zterm-install.sh";
 const SBOM_NAME: &str = "zterm-sbom.spdx.json";
 const CHECKSUMS_NAME: &str = "SHA256SUMS";
 const CHECKSUMS_SIGNATURE_NAME: &str = "SHA256SUMS.sig";
-const ANDROID_APK_NAME: &str = "zterm-android-arm64.apk";
-const ANDROID_METADATA_NAME: &str = "zterm-android.json";
-const ANDROID_CERTIFICATE: &str = include_str!("../../../release/android-certificate.sha256");
+use zterm_core::release::android::{
+    APK_NAME as ANDROID_APK_NAME, AndroidMetadata, METADATA_NAME as ANDROID_METADATA_NAME,
+};
 const MAX_INSTALLER_BYTES: u64 = 256 * 1024;
 const MAX_SBOM_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
@@ -425,12 +425,6 @@ pub fn verify(directory: &Path, signed: bool) -> Result<()> {
     Ok(())
 }
 
-fn verify_checksums_signature(checksums: &[u8], signature: &[u8], public_key: &[u8]) -> Result<()> {
-    UnparsedPublicKey::new(&ED25519, public_key)
-        .verify(checksums, signature)
-        .map_err(|_| anyhow::anyhow!("complete release inventory signature is invalid"))
-}
-
 // Android tooling inspects APK package, embedded identity, signature and all ELF
 // alignments before this boundary. Here every downstream job verifies the exact
 // same bytes and their relationship to the authenticated native release source.
@@ -439,32 +433,20 @@ fn verify_android(directory: &Path, manifest: &ReleaseManifest, signed: bool) ->
         &directory.join(ANDROID_METADATA_NAME),
         MAX_RELEASE_MANIFEST_BYTES as u64,
     )?;
-    let metadata: Value =
-        serde_json::from_slice(&raw).context("Android release metadata is invalid")?;
+    let metadata = AndroidMetadata::parse(&raw, manifest, signed)
+        .context("Android release metadata is invalid")?;
+    // Publisher policy is exact for this source tree; installed runtimes must
+    // still accept a future release that raises its target or minimum SDK.
     ensure!(
-        metadata["schema"] == 1
-            && metadata["product"] == "zterm"
-            && metadata["version"] == manifest.version
-            && metadata["source_commit"] == manifest.source_commit
-            && metadata["package"] == "io.github.leonfox28.zterm"
-            && metadata["abi"] == "arm64-v8a"
-            && metadata["min_sdk"] == 26
-            && metadata["target_sdk"] == 36
-            && metadata["certificate_sha256"] == ANDROID_CERTIFICATE.trim()
-            && metadata["version_code"]
-                .as_u64()
-                .is_some_and(|code| (1..=2_100_000_000).contains(&code))
-            && metadata["signed"]
-                .as_bool()
-                .is_some_and(|value| !signed || value),
-        "Android release identity does not match the publication source"
+        metadata.min_sdk == 26 && metadata.target_sdk == 36,
+        "Android SDK policy mismatch"
     );
     let (length, digest) = digest_file(
         &directory.join(ANDROID_APK_NAME),
         MAX_RELEASE_ARTIFACT_BYTES,
     )?;
     ensure!(
-        length > 0 && metadata["length"] == length && metadata["sha256"] == digest,
+        length > 0 && metadata.length == length && metadata.sha256 == digest,
         "Android APK does not match its release metadata"
     );
     Ok(())
@@ -957,7 +939,7 @@ mod tests {
         let mut metadata = json!({"schema": 1, "product": "zterm", "version": manifest.version,
             "source_commit": manifest.source_commit, "package": "io.github.leonfox28.zterm",
             "abi": "arm64-v8a", "min_sdk": 26, "target_sdk": 36, "version_code": 102699,
-            "certificate_sha256": ANDROID_CERTIFICATE.trim(), "signed": false,
+            "certificate_sha256": zterm_core::release::android::CERTIFICATE.trim(), "signed": false,
             "length": apk.len(), "sha256": sha256_hex(apk)});
         let write = |value: &Value| {
             fs::write(

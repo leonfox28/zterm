@@ -9,6 +9,7 @@ use tokio::sync::{OnceCell, watch};
 pub mod dns;
 pub mod network;
 pub mod terminal;
+pub mod updates;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 

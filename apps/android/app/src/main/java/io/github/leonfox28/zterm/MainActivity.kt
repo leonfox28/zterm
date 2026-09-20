@@ -14,6 +14,7 @@ class MainActivity : ComponentActivity() {
         val imeAnimation = ImeAnimationState()
         ViewCompat.setWindowInsetsAnimationCallback(window.decorView, imeAnimation)
         val repository = (application as ZtermApplication).repository
-        setContent { CompositionLocalProvider(LocalImeAnimation provides imeAnimation) { ZtermApp(repository) } }
+        val updates = (application as ZtermApplication).updates
+        setContent { CompositionLocalProvider(LocalImeAnimation provides imeAnimation) { ZtermApp(repository, updates) } }
     }
 }

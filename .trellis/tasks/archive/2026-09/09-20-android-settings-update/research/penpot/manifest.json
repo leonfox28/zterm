@@ -1,0 +1,121 @@
+{
+  "page": "bd580feb-afb2-80e5-8008-aabb538508fc",
+  "pageName": "02 · 设置更新与连接提示",
+  "fileId": "c828d3cf-7d4e-8145-8008-98f4fa037d48",
+  "boards": {
+    "idle": {
+      "id": "bd580feb-afb2-80e5-8008-aabbed749c5e",
+      "name": "01 · 设置底部 / 深色"
+    },
+    "checking": {
+      "id": "bd580feb-afb2-80e5-8008-aabbedd9a2b7",
+      "name": "02 · 正在检查更新"
+    },
+    "latest": {
+      "id": "bd580feb-afb2-80e5-8008-aabbee3e2af2",
+      "name": "03 · 已是最新版 / Toast"
+    },
+    "available": {
+      "id": "bd580feb-afb2-80e5-8008-aabbeebaeb34",
+      "name": "04 · 发现新版本 / 深色"
+    },
+    "lightIdle": {
+      "id": "bd580feb-afb2-80e5-8008-aabbef4cc1e0",
+      "name": "05 · 设置底部 / 浅色"
+    },
+    "lightAvailable": {
+      "id": "bd580feb-afb2-80e5-8008-aabbeffdecce",
+      "name": "06 · 发现新版本 / 浅色"
+    },
+    "download": {
+      "id": "bd580feb-afb2-80e5-8008-aabbf0c0772d",
+      "name": "07 · 下载更新 / 深色"
+    },
+    "lightDownload": {
+      "id": "bd580feb-afb2-80e5-8008-aabbf19d9d31",
+      "name": "08 · 下载更新 / 浅色"
+    },
+    "latestStart": {
+      "id": "bd580feb-afb2-80e5-8008-aabbf295a065",
+      "name": "09 · 无更新路径 / 点击检查"
+    },
+    "latestChecking": {
+      "id": "bd580feb-afb2-80e5-8008-aabbf3b56ead",
+      "name": "10 · 无更新路径 / 检查中"
+    },
+    "connectionFailure": {
+      "id": "bd580feb-afb2-80e5-8008-aabca1343895",
+      "name": "连接失败 / 深色"
+    },
+    "connectionFailureLight": {
+      "id": "bd580feb-afb2-80e5-8008-aabca1d85977",
+      "name": "连接失败 / 浅色"
+    },
+    "connectionRetry": {
+      "id": "bd580feb-afb2-80e5-8008-aabca28af4bf",
+      "name": "13 · 连接重试中"
+    },
+    "connectionRetryLight": {
+      "id": "bd580feb-afb2-80e5-8008-aabca3485529",
+      "name": "14 · 连接重试中 / 浅色"
+    },
+    "notificationsOff": {
+      "id": "bd580feb-afb2-80e5-8008-aabee1762874",
+      "name": "15 · 终端通知 / 已关闭"
+    },
+    "notificationsOffLight": {
+      "id": "bd580feb-afb2-80e5-8008-aabee1a1fd9a",
+      "name": "16 · 终端通知 / 已关闭 / 浅色"
+    },
+    "notificationsBlocked": {
+      "id": "bd580feb-afb2-80e5-8008-aabee1cfd921",
+      "name": "17 · 终端通知 / 系统未允许"
+    },
+    "notificationsPermission": {
+      "id": "bd580feb-afb2-80e5-8008-aabee1fe2820",
+      "name": "18 · 开启系统通知 / 引导"
+    }
+  },
+  "flows": [
+    {
+      "name": "02 · 无更新：点击检查 → Toast",
+      "start": "bd580feb-afb2-80e5-8008-aabbf295a065"
+    },
+    {
+      "name": "01 · 发现更新：点击检查 → 确认下载",
+      "start": "bd580feb-afb2-80e5-8008-aabbed749c5e"
+    },
+    {
+      "name": "04 · 更新确认框",
+      "start": "bd580feb-afb2-80e5-8008-aabbeebaeb34"
+    },
+    {
+      "name": "07 · 通知开关：开 → 关",
+      "start": "bd580feb-afb2-80e5-8008-aabbed749c5e"
+    },
+    {
+      "name": "06 · 连接失败提示 / 浅色",
+      "start": "bd580feb-afb2-80e5-8008-aabca1d85977"
+    },
+    {
+      "name": "08 · 系统禁止通知：权限引导",
+      "start": "bd580feb-afb2-80e5-8008-aabee1cfd921"
+    },
+    {
+      "name": "03 · 浅色主题",
+      "start": "bd580feb-afb2-80e5-8008-aabbef4cc1e0"
+    },
+    {
+      "name": "05 · 连接失败提示 / 深色",
+      "start": "bd580feb-afb2-80e5-8008-aabca1343895"
+    }
+  ],
+  "annotations": [
+    {
+      "id": "bd580feb-afb2-80e5-8008-aac8465ca867",
+      "name": "Review v3 / Startup update policy",
+      "showInViewMode": false,
+      "revision": 3
+    }
+  ]
+}

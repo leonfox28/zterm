@@ -20,6 +20,7 @@ internal data class AppState(
     val panel: Boolean = false,
     val busy: Boolean = false,
     val error: String? = null,
+    val notificationsSaving: Boolean = false,
 )
 
 /** The Application owns mutations, streams and frames. Activity collectors own none of them. */
@@ -27,6 +28,7 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val store = AppStore(context)
     private val storage = Mutex()
+    private var notificationIntent: Boolean? = null
     private val mutable = MutableStateFlow(AppState())
     val state = mutable.asStateFlow()
     private val mutableFrame = MutableStateFlow<NativeFrame?>(null)
@@ -116,6 +118,7 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
                 try {
                     val saved = withContext(Dispatchers.IO) { store.load() }
                     runtime.initialize(seed, network.current(), saved.hosts.map { it.native() })
+                    notifications.setAppEnabled(saved.preferences.notificationsEnabled)
                     mutable.update { it.copy(saved = saved, initialized = true) }
                     network.start()
                 } finally { seed.fill(0) }
@@ -125,7 +128,35 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
     private suspend fun save(transform: (SavedState) -> SavedState) = storage.withLock {
         val next = transform(state.value.saved)
         withContext(Dispatchers.IO) { store.save(next) }
+        notifications.setAppEnabled(notificationIntent ?: next.preferences.notificationsEnabled)
         mutable.update { it.copy(saved = next) }
+    }
+    suspend fun saveUpdateReminder(reminder: UpdateReminder) {
+        // Update-policy failures are handled by the update owner, never terminal error UI.
+        if (!state.value.initialized) throw StoreFailure("storage_unavailable")
+        try { save { it.copy(updateReminder = reminder) } }
+        catch (cancel: CancellationException) { throw cancel }
+        catch (error: Exception) {
+            if (BuildConfig.DEBUG) android.util.Log.d("ZtermState", "update_reminder_save_failed type=${error.javaClass.simpleName}")
+            throw error
+        }
+    }
+    fun setNotificationsEnabled(enabled: Boolean) {
+        if (!state.value.initialized || state.value.notificationsSaving) return
+        if (enabled && !notifications.enabled()) return
+        notificationIntent = enabled
+        notifications.setAppEnabled(enabled)
+        mutable.update { it.copy(notificationsSaving = true) }
+        scope.launch {
+            try { save { it.copy(preferences = it.preferences.copy(notificationsEnabled = enabled)) } }
+            catch (cancel: CancellationException) { throw cancel }
+            catch (error: Exception) { report(error) }
+            finally {
+                notificationIntent = null
+                notifications.setAppEnabled(state.value.saved.preferences.notificationsEnabled)
+                mutable.update { it.copy(notificationsSaving = false) }
+            }
+        }
     }
     private fun act(block: suspend () -> Unit) {
         if (operation?.isActive == true || state.value.busy || !state.value.initialized) return

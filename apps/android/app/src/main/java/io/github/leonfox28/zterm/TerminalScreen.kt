@@ -90,18 +90,24 @@ import io.github.leonfox28.zterm.nativebridge.NativeSession
                 val canTakeover = state.sessionId != null && (terminalState == "lease_lost" || error in setOf("session_occupied", "controller_busy", "lease_lost"))
                 val inactive = terminalState in setOf("closed", "ended", "lease_lost") || state.error != null && frame == null
                 if (inactive || frame == null && !state.panel) {
-                    Surface(Modifier.align(Alignment.Center).padding(24.dp), shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surfaceContainer) {
-                        Column(Modifier.padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                            if (state.busy) CircularProgressIndicator(Modifier.size(24.dp))
-                            else {
-                                Text(if (error != null) errorMessage(error) else stringResource(when (terminalState) {
-                                    "ended" -> R.string.session_ended; "lease_lost" -> R.string.lease_lost; else -> R.string.connection_error
-                                }))
-                                Row {
-                                    if (canTakeover) TextButton({ taking = state.sessionId }) { Text(stringResource(R.string.takeover)) }
-                                    else TextButton(repository::retry) { Text(stringResource(R.string.retry)) }
-                                    TextButton(repository::togglePanel) { Text(stringResource(R.string.sessions)) }
-                                }
+                    val title = stringResource(when {
+                        state.busy -> R.string.connecting
+                        canTakeover -> if (terminalState == "lease_lost") R.string.lease_lost else R.string.session_occupied
+                        terminalState == "ended" || error == "session_ended" -> R.string.session_ended
+                        else -> R.string.connection_failed_title
+                    })
+                    val body = if (state.busy) stringResource(R.string.connection_pending_body, host?.name ?: "zterm")
+                        else if (error != null) errorMessage(error)
+                        else stringResource(R.string.connection_failure_body)
+                    WideStatusCard(title, body, Modifier.align(Alignment.Center).padding(24.dp),
+                        icon = "disconnect", busy = state.busy) {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                            FilledTonalButton(repository::togglePanel, Modifier.weight(1f).heightIn(min = 48.dp), enabled = !state.busy) {
+                                Text(stringResource(R.string.sessions))
+                            }
+                            Button(onClick = { if (canTakeover) taking = state.sessionId else repository.retry() },
+                                modifier = Modifier.weight(1.35f).heightIn(min = 48.dp), enabled = !state.busy) {
+                                Text(stringResource(if (canTakeover) R.string.takeover else R.string.retry))
                             }
                         }
                     }
