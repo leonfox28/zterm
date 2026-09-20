@@ -38,9 +38,7 @@ project_doc_fallback_filenames = ["AGENTS.md"]
 [agents]
 max_depth = 1
 
-# Penpot is configured only for this project. Its token stays in an ignored file.
+# Local Penpot MCP connection; the URL contains a private token.
 [mcp_servers.penpot]
-command = "uv"
-args = ["run", "--script", ".codex/penpot-mcp.py"]
-startup_timeout_sec = 60
-tool_timeout_sec = 180
+type = "http"
+url = "https://design.penpot.app/mcp/stream?userToken=eyJhbGciOiJBMjU2S1ciLCJlbmMiOiJBMjU2R0NNIn0.dETtVSwbkiwxh-zJzezTfBriBvCQB1Xc_L7jcqb80sGdKVQlQg3F-w.krIHsVs_FcLvyYHh.ky2tkqvVI5zG7Mh-gaafM_KGjw_ddxkOWV7IGE3t-1s7eB_tMNg_oRIjfhnKyHSJaztVkKs_uIDgEh1kSOHxFcBYLD21KA2G_ooGvYWANrMEuyNeUarcbZeWuhCCBA-tpjzlPcFwRUowRee3cwCFfHXW87-Uf7rqx_kmERhGcGdlVuk7aA0gyAilx0umZhTLpSguLyNcG-Bm.IJy_0oyKRdnQq-HHe2VBLQ"

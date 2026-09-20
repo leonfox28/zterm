@@ -4,11 +4,10 @@ Status: planning. Product implementation has not started.
 
 ## Tool decision (2026-09-06)
 
-The user switched the UI design tool from Figma to Penpot and explicitly
-requested project-scoped MCP configuration. `.codex/config.toml` contains only
-this project's registration. The existing hosted Penpot MCP credential is
-stored in an ignored, mode-0600 local file; no global registration was changed.
-Setup instructions are in `.codex/PENPOT.md`.
+The user switched the UI design tool from Figma to Penpot on 2026-09-06.
+The previous project-scoped MCP registration and custom transport were removed
+on 2026-09-20. See the [official Penpot MCP setup](https://help.penpot.app/mcp/)
+for future connections.
 
 ## Design document
 
@@ -355,7 +354,9 @@ The task remains **planning**, awaiting visual/interaction review. The PRD
 continues to own product requirements. No Android implementation has started.
 Construction scripts and stable board IDs are in [penpot-prototype](penpot-prototype/README.md).
 
-## Setup acceptance
+## Historical setup acceptance (2026-09-06)
+
+These checks describe the original setup, which was removed on 2026-09-20.
 
 - Codex discovers the enabled project `penpot` server.
 - MCP initialization negotiates protocol `2025-11-25` and preserves server
