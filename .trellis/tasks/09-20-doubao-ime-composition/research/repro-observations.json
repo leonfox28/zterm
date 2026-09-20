@@ -1,0 +1,32 @@
+[
+  {
+    "action": "n",
+    "host_received": "",
+    "hex": ""
+  },
+  {
+    "action": "ni",
+    "host_received": "n",
+    "hex": "6e"
+  },
+  {
+    "action": "nih",
+    "host_received": "nni",
+    "hex": "6e6e69"
+  },
+  {
+    "action": "niha",
+    "host_received": "nnini h",
+    "hex": "6e6e696e692068"
+  },
+  {
+    "action": "nihao",
+    "host_received": "nnini hni ha",
+    "hex": "6e6e696e6920686e69206861"
+  },
+  {
+    "action": "select-nihao",
+    "host_received": "nnini hni ha你好 ",
+    "hex": "6e6e696e6920686e69206861e4bda0e5a5bd20"
+  }
+]
