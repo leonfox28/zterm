@@ -660,7 +660,29 @@ signature. Every downstream inventory verification authenticates both signatures
 and all asset digests. The SPDX document includes locked Android release-runtime
 Maven coordinates as well as Cargo packages; unavailable Maven license metadata
 is honestly NOASSERTION. Android uses APK platform signing for installation;
-there is no Android updater or app-store publication in this contract.
+there is no app-store publication in this contract.
 
 Formal version codes, credential provisioning and reproduction commands are in
 `docs/releasing.md`. Stable 0.1.26 maps to 102699 and upgrades acceptance 1016.
+
+### Android update consumption (2026-09-20)
+
+The user authorized an Android updater consuming this existing inventory. Core
+`release::android::AndroidRelease::verify(tag, files, key)` authenticates the raw
+manifest and SHA256SUMS independently, rejects duplicate/path-bearing entries,
+and binds the manifest and Android metadata digests plus the APK digest. Metadata
+must agree on product/version/source commit, package, ABI and pinned certificate;
+unsigned candidates are never runtime offers. `is_newer_than(version, code)`
+requires SemVer and Android versionCode orderings to agree. APK byte limits and
+hashing reuse core release helpers. Publisher SDK policy stays exact (26/36);
+runtime accepts future SDK metadata with min>=26 and target>=min, then the Android
+adapter checks the candidate minimum against the running device. Do not freeze
+the installed updater to the target SDK of the release that originally shipped it.
+
+The release tool also uses `verify_checksums_signature` and `AndroidMetadata::parse`;
+there is one signed-checksum verifier and no release-byte/manifest schema change.
+Gradle native inputs include both reviewed release trust files. Core signed-fixture
+tests exercise mutation, incomplete/duplicate inventory, identity mismatch,
+ordering, bounds and future SDK metadata; existing release-tool fixtures preserve
+publisher behavior. See the frontend Android specification for platform/lifecycle
+errors, reminder policy, tests and correct/incorrect integration examples.

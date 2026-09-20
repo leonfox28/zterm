@@ -11,6 +11,28 @@ import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
 class IdentityStoreTest {
+    @Test fun oldStateDefaultsAndNewPreferencesAndReminderSurviveRestart() = withStore { store, directory, alias ->
+        val host = SavedHost("a".repeat(64), "Mac", emptyList(), "b".repeat(32))
+        val original = SavedState(listOf(host), Preferences("zh", "dark", 14), RecentConnection(host.id, host.lastSession!!))
+        store.save(original)
+        val file = File(directory, "state.json")
+        val old = org.json.JSONObject(file.readText())
+        old.remove("updateReminder")
+        old.getJSONObject("preferences").apply {
+            remove("notificationsEnabled"); remove("notificationPermissionRequested")
+        }
+        file.writeText(old.toString())
+        assertEquals(original, store.load())
+        val saved = original.copy(preferences = original.preferences.copy(notificationsEnabled = false,
+            notificationPermissionRequested = true), updateReminder = UpdateReminder("0.2.0", 100_000))
+        store.save(saved)
+        val reopened = AppStore(InstrumentationRegistry.getInstrumentation().targetContext, directory, alias)
+        assertEquals(saved, reopened.load())
+        val corruptedReminder = org.json.JSONObject(file.readText()).put("updateReminder",
+            org.json.JSONObject().put("version", "0.2.0").put("dismissedAt", -1))
+        file.writeText(corruptedReminder.toString())
+        assertEquals(saved.copy(updateReminder = null), reopened.load())
+    }
     private fun withStore(test: (AppStore, File, String) -> Unit) {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val alias = "zterm.test.${UUID.randomUUID()}"

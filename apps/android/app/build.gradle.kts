@@ -105,6 +105,7 @@ val buildRust = tasks.register<BuildRust>("buildRust") {
         include("Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/**")
         include("crates/**/Cargo.toml", "crates/**/build.rs", "crates/**/src/**", "proto/**")
         include("crates/android/uniffi.toml", "tools/uniffi-bindgen/**", "tools/android/native.py")
+        include("release/public-key.hex", "release/android-certificate.sha256")
         exclude("**/target/**", "**/__pycache__/**")
     })
     kotlinOutput.set(layout.buildDirectory.dir("generated/rust/kotlin"))

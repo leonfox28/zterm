@@ -1,0 +1,30 @@
+{
+  "id": "bd580feb-afb2-80e5-8008-aac8465ca867",
+  "editorOnly": true,
+  "textBounds": [
+    {
+      "id": "bd580feb-afb2-80e5-8008-aac846644df1",
+      "text": "启动检查 · 已确认的交互规则",
+      "inside": true
+    },
+    {
+      "id": "bd580feb-afb2-80e5-8008-aac8466db511",
+      "text": "冷启动 → 首屏可用 → 静默检查 → 有新版时复用现有更新弹窗",
+      "inside": true
+    },
+    {
+      "id": "bd580feb-afb2-80e5-8008-aac846767292",
+      "text": "• 每次冷启动检查一次；切回前台、旋转屏幕不重复检查。\n• 无新版或检查失败：不显示加载层、Toast、通知或错误弹窗。\n• 有新版：前台且没有权限／错误弹窗时提示，确认后才下载。\n• 点击“稍后”：同一版本 24 小时内不再自动提醒，重启后仍有效。\n• 出现更高版本可再次提醒；手动检查始终绕过暂缓提醒。\n• 手动无新版仍显示系统 Toast；手动检查失败明确提示。\n• 更新弹窗与“终端通知”开关无关，不需要通知权限。\n• 不增加定时后台检查、自动下载或强制更新。",
+      "inside": true
+    },
+    {
+      "id": "bd580feb-afb2-80e5-8008-aac846816375",
+      "text": "复用画板 04／06 的弹窗样式。这里是交互说明；原型不模拟冷启动、24 小时持久计时或真实下载。",
+      "inside": true
+    }
+  ],
+  "overlaps": [],
+  "revision": 3,
+  "pngExportReviewed": true,
+  "note": "Startup policy annotation only; existing 18 screens and 8 flows preserved. No runtime simulation."
+}

@@ -573,3 +573,99 @@ closing the handle. Kotlin owns the stable channel, ordinary notification fields
 and Settings permission flow; Android OS state is the permission authority.
 Disabled/denied notifications are dropped without ending the connection or
 retaining content for a later grant. This adds no foreground service or push.
+
+## Settings and application updates (2026-09-20)
+
+### 1. Scope / trigger
+
+Settings owns the fixed GitHub link, manual update action and terminal notification
+switch. The user approved one silent cold-launch check, optional installation and
+a 24-hour same-version reminder interval. This extends the original publication-only
+Android scope. Terminal work never waits for a check.
+
+### 2. Signatures / owners
+
+- `ZtermApplication.updates: AppUpdates` owns jobs and `StateFlow<UpdateState>`;
+  Activity/Compose never owns the network operation.
+- `UpdateSource.check(): UpdateCandidate?`, `download(candidate, file, progress)`
+  return verified candidates/downloads or stable `UpdateFailure` codes.
+- UniFFI exports `validateAndroidUpdateBuild`, `validateAndroidUpdateTag`,
+  `verifyAndroidUpdate`; opaque `NativeUpdate` owns authentication authority.
+  Its presentation fields cannot reconstruct an authorized candidate.
+- `AppRepository.saveUpdateReminder(UpdateReminder)` and
+  `setNotificationsEnabled(Boolean)` use the existing serialized atomic state save.
+
+### 3. Contracts
+
+- `AppUpdateHost` starts after an initialized, resumed UI frame. The process gate
+  is satisfied by startup or a prior manual check. Manual intent promotes an
+  in-flight check without a second fetch. Automatic no-update/failure is silent;
+  manual results use native `Toast.makeText`, consumed once.
+- Automatic offers wait for Home/Settings, resumed lifecycle, no busy/error state,
+  and no modal/permission blocker. They remain pending during Terminal/Scanner.
+  Downloads start only from the offer's confirmation. No periodic work exists.
+- Optional `state.json.updateReminder = {version, dismissedAt}` stores one bounded
+  version/time pair. Matching automatic offers are suppressed for `0 <= age < 24h`;
+  future timestamps are ignored. Newer versions and manual checks bypass it.
+  Obsolete version records are harmless and replaced on the next dismissal.
+- `preferences.notificationsEnabled` defaults to true for old files;
+  `notificationPermissionRequested` defaults to false. Missing/malformed reminder
+  data does not discard hosts/preferences. Identity encryption remains unchanged.
+- Notification Off gates posting immediately; persistence commits through the
+  existing mutex. In-flight saves retain this intent until completion. Save failure
+  restores the committed gate and reports the existing storage error. Effective
+  switch state is app preference AND OS app/channel permission; refresh on resume.
+  Permission grants enable only a pending explicit request, preserving saved Off.
+- HTTP discovery is fixed to the official repository, bounded to 256 KiB; immutable
+  signed metadata is bounded to 64 KiB each, detached signatures to 64 bytes.
+  HTTPS-only redirects, 60s check/10m download budgets, and cancellation-driven
+  socket disconnects bound work. APKs are capped at 128 MiB, streamed to private
+  cache, hashed by Rust, then inspected for package/version/code/minSdk/certificate.
+- Installer content URIs expose only `cache/updates/`, with transient read grants.
+  Unknown-source permission has explicit guidance and a return check. Consume Ready
+  into HandedOff before launch; recreation cannot relaunch. Installer return is not
+  reported as successful installation. Handed-off files survive for Android reads;
+  older-than-24h owned files are cleaned on a subsequent download.
+- Canceled partials and native handles are cleaned inside the NonCancellable block;
+  code after a dispatcher-changing cleanup can be skipped by prompt cancellation.
+- `WideStatusCard` fixes failure/retry width at available width minus 48dp (max560dp),
+  minimum284dp, radius28dp, padding24dp; update dialogs use minimum324dp. Content
+  scrolls for compact height/large fonts. Keep Retry/Sessions/takeover semantics.
+
+### 4. Validation / error matrix
+
+| Condition | Outcome |
+| --- | --- |
+| Development package, signer or source identity | `update_unsupported` before network |
+| Untrusted metadata/APK or contradictory version ordering | `update_invalid`, never installer |
+| Current/older authenticated release | manual `update_latest`; automatic silent |
+| Network/timeout or rate limit | `update_network` / `update_rate_limit`; automatic silent |
+| Disk failure / missing installer | `update_storage` / `update_install_failed` |
+| Source permission denied | Remain at explicit guidance; Cancel deletes unhanded file |
+| Notification OS block | Effective Off; request permission or explain system settings |
+
+### 5. Good / base / bad cases
+
+Good: manual tap joins startup, displays one verified offer, then confirmation starts
+one transfer. Base: current version on startup leaves UI untouched. Bad: failed
+signature presented as latest, automatic downloading, or app-drawn Toast.
+
+### 6. Required tests
+
+`AppUpdatesTest` covers one process gate, silent/manual outcomes, promotion, reminders,
+clock skew, cancellation cleanup, consent and single-use handoff. `IdentityStoreTest`
+covers migration and persistence. `SettingsUiTest` covers switch, GitHub intent,
+locale/theme/footer and real permission denial/grant. `UpdateUiTest` covers modal
+deferral, consent, responsive card geometry and FileProvider confinement.
+`UpdateInstallTest` is opt-in (`installerFixture=1`) on a disposable install with
+source permission initially denied; it exercises real settings return and a matching
+test APK in the system confirmation. Reset install appops from the host afterward:
+revocation kills the instrumented process. Official upgrade acceptance still needs
+a genuinely newer protected release; fixture handoff is not production upgrade proof.
+
+### 7. Wrong versus correct
+
+Wrong: an Activity launches its own startup job or trusts GitHub's version JSON as
+installation authority. Correct: observe the application owner; Rust authenticates
+both release signatures and checksum bindings before offering a candidate, then
+Android independently checks the downloaded APK and delegates final installation.

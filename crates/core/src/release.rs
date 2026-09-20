@@ -1,5 +1,7 @@
 //! Signed release-manifest contract shared by installers, updates, and tooling.
 
+pub mod android;
+
 use std::collections::BTreeSet;
 use std::fmt;
 use std::io::{self, Read};
@@ -340,6 +342,23 @@ pub fn verify_official_release_manifest(
 ) -> Result<ReleaseManifest, ReleaseError> {
     let public_key = official_release_public_key()?;
     verify_release_manifest(raw_manifest, signature, &public_key)
+}
+
+/// Authenticates the bounded exact release inventory, before interpreting its entries.
+pub fn verify_checksums_signature(
+    checksums: &[u8],
+    signature: &[u8],
+    public_key: &[u8],
+) -> Result<(), ReleaseError> {
+    if checksums.is_empty() || checksums.len() > MAX_RELEASE_MANIFEST_BYTES {
+        return Err(ReleaseError::ManifestSize);
+    }
+    if signature.len() != RELEASE_SIGNATURE_BYTES {
+        return Err(ReleaseError::SignatureSize);
+    }
+    UnparsedPublicKey::new(&ED25519, public_key)
+        .verify(checksums, signature)
+        .map_err(|_| ReleaseError::SignatureInvalid)
 }
 
 /// Decodes the reviewed production public key, refusing the explicit placeholder.

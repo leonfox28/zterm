@@ -24,13 +24,17 @@ internal data class SavedHost(
 ) {
     fun native() = NativeHost(id, name, relays)
 }
-internal data class Preferences(val language: String = "system", val theme: String = "system", val fontSize: Int = 12)
+internal data class Preferences(
+    val language: String = "system", val theme: String = "system", val fontSize: Int = 12,
+    val notificationsEnabled: Boolean = true, val notificationPermissionRequested: Boolean = false,
+)
 internal val terminalFontSizes = 8..16
 internal data class RecentConnection(val host: String, val session: String)
 internal data class SavedState(
     val hosts: List<SavedHost> = emptyList(),
     val preferences: Preferences = Preferences(),
     val recent: RecentConnection? = null,
+    val updateReminder: UpdateReminder? = null,
 )
 internal class StoreFailure(val code: String) : Exception(code)
 
@@ -123,7 +127,14 @@ internal class AppStore(
                 if (hosts.none { saved -> saved.id == host } || !SESSION_ID.matches(session)) throw StoreFailure("storage_unavailable")
                 RecentConnection(host, session)
             }
-            return SavedState(hosts, Preferences(language, theme, font), recent)
+            val reminder = root.optJSONObject("updateReminder")?.let {
+                val version = it.optString("version")
+                val time = it.optLong("dismissedAt")
+                if (version.length in 1..128 && time > 0) UpdateReminder(version, time) else null
+            }
+            return SavedState(hosts, Preferences(language, theme, font,
+                settings.optBoolean("notificationsEnabled", true),
+                settings.optBoolean("notificationPermissionRequested", false)), recent, reminder)
         } catch (error: StoreFailure) { throw error }
         catch (_: Exception) { throw StoreFailure("storage_unavailable") }
     }
@@ -139,9 +150,14 @@ internal class AppStore(
             }
             val settings = JSONObject().put("language", state.preferences.language)
                 .put("theme", state.preferences.theme).put("fontSize", state.preferences.fontSize)
+                .put("notificationsEnabled", state.preferences.notificationsEnabled)
+                .put("notificationPermissionRequested", state.preferences.notificationPermissionRequested)
             val recent = state.recent?.let { JSONObject().put("host", it.host).put("session", it.session) }
             val root = JSONObject().put("version", 1).put("hosts", hosts)
                 .put("preferences", settings).put("recent", recent ?: JSONObject.NULL)
+                .put("updateReminder", state.updateReminder?.let {
+                    JSONObject().put("version", it.version).put("dismissedAt", it.dismissedAt)
+                } ?: JSONObject.NULL)
             val bytes = root.toString().toByteArray(Charsets.UTF_8)
             if (bytes.size > 256 * 1024) throw StoreFailure("storage_unavailable")
             writeAtomic(stateFile, bytes)
