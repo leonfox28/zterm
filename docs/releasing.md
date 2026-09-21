@@ -155,7 +155,8 @@ Local `-PztermVersionCode` overrides are for acceptance builds, not formal CI.
 - Before draft creation, a failed release job can be rerun for the same tag.
   Signed inventories and fixture uploads use attempt-specific names; downstream
   jobs use the signing job's artifact IDs, including when only failed jobs rerun.
-  After draft creation, inspect the nonpublic evidence before deciding recovery;
+  After draft creation, inspect the nonpublic evidence and use the explicit
+  [draft recovery](#recover-an-existing-signed-draft) entry below;
   automation never deletes drafts, clobbers assets, or force-moves tags.
 - A defect in an immutable published Release needs a new version and tag.
 - Removing Intel changes the manifest target inventory. Versions through
@@ -166,3 +167,41 @@ Local `-PztermVersionCode` overrides are for acceptance builds, not formal CI.
 Repository administrators own immutable Releases, the signing Environment/key,
 and [main protection](development.md#branch-and-pull-request-flow). The operator
 checks visible prerequisites and never changes those settings.
+
+## Recover an existing signed draft
+
+If signing and all three installer jobs passed, but publication failed after
+uploading the complete draft (for example, GitHub returned HTTP 500 during
+round-trip download), retain the original tag, signed artifact and draft.
+Inspect the failed run and the draft by numeric release ID. A draft can return
+404 from the release-by-tag REST endpoint while remaining visible through the
+release list, release ID and `gh release view`; that 404 does not prove vacancy.
+
+After reviewing the original evidence and authorizing publication, dispatch
+the recovery workflow from protected main with the four exact identities:
+
+```bash
+gh workflow run release-recover.yml --ref main \
+  -f tag=v0.1.35 -f run_id=35559736119 \
+  -f artifact_id=10621537362 -f release_id=392689610
+```
+
+These example IDs identify the v0.1.35 incident; subsequent recoveries require
+their own IDs. Recovery rejects an already published release. It requires the
+original annotated tag, successful exact source main CI, successful source,
+signing and installer jobs, a retained signed artifact with a server digest,
+and the unchanged uploaded draft assets. The original frozen release verifier
+authenticates the retained signed inventory and the downloaded draft bytes.
+Downloads retry HTTP 429/500/502/503/504 and timeouts at most three times, using a
+fresh temporary directory each time. Permanent errors and corrupt inventories
+stop immediately.
+
+Recovery attests the verified draft bytes, rechecks tag and asset identities,
+then publishes the same draft by numeric ID and requires immutable status with
+the same asset IDs/digests. It does not build the product, access signing keys,
+create a release, upload assets or change a tag. Its run is the completion
+record; the original failed run remains evidence of the interruption. Before
+the final PATCH, failures leave the draft intact and the same dispatch can be
+retried after inspection. If PATCH or post-publication verification has an
+ambiguous result, inspect the release ID before any further action; published
+assets are never replaced.
