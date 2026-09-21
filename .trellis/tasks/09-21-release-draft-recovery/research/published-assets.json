@@ -1,0 +1,89 @@
+{
+  "id": 392689610,
+  "tag_name": "v0.1.35",
+  "target_commitish": "e44205beedf64cee1894a685cce4795b16d90e95",
+  "draft": false,
+  "prerelease": false,
+  "immutable": true,
+  "published_at": "2026-09-21T06:27:16Z",
+  "html_url": "https://github.com/leonfox28/zterm/releases/tag/v0.1.35",
+  "assets": [
+    {
+      "id": 578193869,
+      "name": "SHA256SUMS",
+      "size": 828,
+      "digest": "sha256:98e9d95ed04d49f02e022016662b8747b08ad1386b4cc23439d16b4c698e30b2",
+      "browser_download_url": "https://github.com/leonfox28/zterm/releases/download/v0.1.35/SHA256SUMS"
+    },
+    {
+      "id": 578193872,
+      "name": "SHA256SUMS.sig",
+      "size": 64,
+      "digest": "sha256:bcbcaf4e538a8f55ca53a97fefebb49d8b517c91ff575394acb201e6f715841d",
+      "browser_download_url": "https://github.com/leonfox28/zterm/releases/download/v0.1.35/SHA256SUMS.sig"
+    },
+    {
+      "id": 578193884,
+      "name": "zterm-aarch64-apple-darwin.tar.gz",
+      "size": 10707478,
+      "digest": "sha256:9951082f8f1507e624139d648002f3a837857a1a6878184b987dfc73e1c612c8",
+      "browser_download_url": "https://github.com/leonfox28/zterm/releases/download/v0.1.35/zterm-aarch64-apple-darwin.tar.gz"
+    },
+    {
+      "id": 578193893,
+      "name": "zterm-aarch64-unknown-linux-gnu.tar.gz",
+      "size": 12725097,
+      "digest": "sha256:d2b6f05fdfd3bbab9fc5f9f9fd4046b5bb49c734bc30fb10c71b9a5815456954",
+      "browser_download_url": "https://github.com/leonfox28/zterm/releases/download/v0.1.35/zterm-aarch64-unknown-linux-gnu.tar.gz"
+    },
+    {
+      "id": 578193868,
+      "name": "zterm-android-arm64.apk",
+      "size": 31361256,
+      "digest": "sha256:87de4f66231efa7055ac9d9825b407e2d698338534780eb6032b5fa3b9683322",
+      "browser_download_url": "https://github.com/leonfox28/zterm/releases/download/v0.1.35/zterm-android-arm64.apk"
+    },
+    {
+      "id": 578193873,
+      "name": "zterm-android.json",
+      "size": 465,
+      "digest": "sha256:83e33b47fa6f7ab2f298c43fd766fa2d64c880d3dcc2ec6c1a6944388cfe8a57",
+      "browser_download_url": "https://github.com/leonfox28/zterm/releases/download/v0.1.35/zterm-android.json"
+    },
+    {
+      "id": 578193882,
+      "name": "zterm-install.sh",
+      "size": 7866,
+      "digest": "sha256:f015fecca56224feb86711907bc5f6565d4efdc219e4d02039699ebda71973e7",
+      "browser_download_url": "https://github.com/leonfox28/zterm/releases/download/v0.1.35/zterm-install.sh"
+    },
+    {
+      "id": 578193874,
+      "name": "zterm-release.json",
+      "size": 1965,
+      "digest": "sha256:1a44facb4cb12b87ce0c5679a9ed9d828a0c729b049539aa89bd6b8d9dc31f05",
+      "browser_download_url": "https://github.com/leonfox28/zterm/releases/download/v0.1.35/zterm-release.json"
+    },
+    {
+      "id": 578193878,
+      "name": "zterm-release.json.sig",
+      "size": 64,
+      "digest": "sha256:2fd19d348aad0b5a2098af880dcbd8a4bb6f9759baa2d0ee7a0bbe9578faf80b",
+      "browser_download_url": "https://github.com/leonfox28/zterm/releases/download/v0.1.35/zterm-release.json.sig"
+    },
+    {
+      "id": 578193879,
+      "name": "zterm-sbom.spdx.json",
+      "size": 178060,
+      "digest": "sha256:277ea6f96703b0a59c763c62935536c559aac8265eaee8e384b3e5e43bf491ad",
+      "browser_download_url": "https://github.com/leonfox28/zterm/releases/download/v0.1.35/zterm-sbom.spdx.json"
+    },
+    {
+      "id": 578193900,
+      "name": "zterm-x86_64-unknown-linux-gnu.tar.gz",
+      "size": 12425365,
+      "digest": "sha256:ffff99c2636a7997a28d6ca66a84b85e97e4dfef1a0e6a4a2967497803cd5e85",
+      "browser_download_url": "https://github.com/leonfox28/zterm/releases/download/v0.1.35/zterm-x86_64-unknown-linux-gnu.tar.gz"
+    }
+  ]
+}

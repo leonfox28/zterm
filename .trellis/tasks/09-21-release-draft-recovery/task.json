@@ -15,7 +15,7 @@
   "branch": "fix/release-draft-recovery",
   "base_branch": "main",
   "worktree_path": null,
-  "commit": null,
+  "commit": "47e64cb31f0836e48a72893d91e58f503eae69f6",
   "pr_url": null,
   "subtasks": [],
   "children": [],
