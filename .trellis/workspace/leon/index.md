@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 34
-- **Last Active**: 2026-09-20
+- **Total Sessions**: 35
+- **Last Active**: 2026-09-21
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~902 | Active |
+| `journal-1.md` | ~937 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 35 | 2026-09-21 | Recover and publish v0.1.35 | `40ce996`, `47e64cb` | `chore/record-release-0.1.35` |
 | 34 | 2026-09-20 | Android settings updates and notification controls | `119f987` | `feat/android-settings-update` |
 | 33 | 2026-09-20 | Fix Android Pinyin composition with real Doubao acceptance | `a8bdd92` | `fix/android-ime-composition` |
 | 32 | 2026-09-17 | 终端通知转发与 Android 系统通知 | `6e2465b` | `codex/terminal-notifications` |

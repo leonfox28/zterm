@@ -900,3 +900,38 @@ Implemented authenticated manual and quiet startup Android update checks with na
 ### Status
 
 [OK] **Completed**
+
+
+## Session 35: Recover and publish v0.1.35
+<!-- trellis-session: v=2 fp=30612dbc72d7fd86 -->
+
+**Date**: 2026-09-21
+**Task**: Recover and publish v0.1.35
+**Branch**: `chore/record-release-0.1.35`
+
+### Summary
+
+Published immutable v0.1.35 from original signed draft after GitHub HTTP 500. PR #53 added a verified recovery workflow; recovery run 35568506797 succeeded with all 11 original asset IDs/digests and verified provenance unchanged.
+
+### Main Changes
+
+- Added main-only draft recovery, original evidence binding, bounded download retries, unchanged-asset validation and provenance before publication.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `40ce996` | chore: prepare v0.1.35 release |
+| `47e64cb` | fix(release): recover verified signed drafts |
+
+### Testing
+
+- [OK] just ci-policy and six recovery regression groups passed; PR CI succeeded; hosted recovery and APK provenance verification cover all 11 original asset digests.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- No remaining release work; v0.1.35 is the latest stable immutable Release.
