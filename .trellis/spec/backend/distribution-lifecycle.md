@@ -262,7 +262,9 @@ acts only as its foreground confirmation/progress adapter.
   hostname/FQDN lookup; this is fixture portability, not product behavior.
   Protected `release` Environment approval gates only the single seed-bearing
   signing job; verified draft creation, round-trip verification, attestation,
-  and immutable publication then proceed without a second approval.
+  and immutable publication then proceed without a second approval. An existing
+  signed draft can use the separately reviewed recovery workflow below without
+  exposing signing keys again.
 - A repo admin separately enables immutable Releases. The default workflow
   token must not receive an administration PAT merely to query that setting;
   the environment reviewer owns that precondition, and the published Release
@@ -686,3 +688,76 @@ tests exercise mutation, incomplete/duplicate inventory, identity mismatch,
 ordering, bounds and future SDK metadata; existing release-tool fixtures preserve
 publisher behavior. See the frontend Android specification for platform/lifecycle
 errors, reminder policy, tests and correct/incorrect integration examples.
+
+## Scenario: resume an existing signed draft (2026-09-21)
+
+### 1. Scope / Trigger
+
+GitHub asset download failure after complete draft upload must not require
+release replacement. The normal tag workflow remains unchanged. Recovery is
+an explicit, reviewed-main-only workflow using the original signed inventory.
+
+### 2. Signatures
+
+- `release-recover.yml` manual inputs: `tag`, `run_id`, `artifact_id`, `release_id`.
+- `recover-draft.py inspect --tag TAG --run-id ID --artifact-id ID --release-id ID --plan FILE`.
+- `recover-draft.py download|publish --plan FILE --signed DIR --roundtrip DIR`.
+- Read-only GitHub metadata and downloads precede the only mutation:
+  `PATCH /repos/leonfox28/zterm/releases/RELEASE_ID` with `{"draft": false}`.
+
+### 3. Contracts
+
+The failed original `release.yml` tag-push run, annotated tag/source, successful
+source/signing/three installer jobs, unexpired signed artifact owner/digest,
+and existing unpublished draft must agree. The frozen source's existing green
+main lookup and Rust release verifier remain their respective validation
+owners. The signed stable/prerelease classification must match the draft.
+Recovery downloads the immutable artifact by ID with digest validation and
+compares every draft asset name, size and hash to that verified inventory.
+The local execution plan is confined to one job; GitHub run/tag/artifact/draft
+identities remain the durable recovery record.
+
+A draft may be visible by ID/list while release-by-tag REST returns 404. Use
+explicit release IDs for recovery; do not infer vacancy from that response.
+The recovery workflow shares the normal release's tag concurrency group, uses
+pinned hosted actions, no signing environment/keys, and only dispatches on main.
+Each download retry gets a new temporary directory; retry HTTP 429/500/502/503/
+504 or timeouts at most three times. GitHub provenance must succeed before
+publication. Recheck the tag object, draft identity, original asset IDs/digests
+and local bytes immediately before PATCH. Require `draft=false`,
+`immutable=true`, original classification and unchanged assets afterwards.
+
+### 4. Validation & Error Matrix
+
+| Condition | Result |
+| --- | --- |
+| Wrong tag, source, run, signing artifact or draft | Fail before publication |
+| Missing successful source/signing/installer job or expired artifact | Fail before download/publication |
+| Published or immutable release | Reject recovery; never replace assets |
+| Transient draft download error | At most three fresh-directory attempts |
+| Permanent download error, missing/extra/corrupt file | Stop without publishing |
+| Draft assets or annotated tag change after initial inspection | Stop before PATCH |
+| Provenance generation fails | Workflow cannot reach publication |
+| PATCH outcome or immutable confirmation is ambiguous | Inspect release ID; no blind retry or deletion |
+
+### 5. Good/Base/Bad Cases
+
+Good: signed assets survive an HTTP 500; verify those exact bytes and publish
+that same draft. Base: a complete unchanged draft proceeds once through
+provenance and PATCH. Bad: rerun the create/upload path or delete the draft to
+make a retry look fresh.
+
+### 6. Tests Required
+
+`tests/release/recover_draft_test.py` owns evidence/identity rejection, asset
+inventory and classification checks, fresh retry directories, retry bounds,
+permanent failures, and the exact one-PATCH publication boundary. Portable CI
+runs these fixtures; actionlint and release static policy cover workflow
+triggers, action pins and required provenance/verification steps. Hosted
+recovery owns the real frozen-source verifier, provenance and immutable result.
+
+### 7. Wrong vs Correct
+
+Wrong: treat release-by-tag 404 as permission to recreate a known draft.
+Correct: bind its explicit ID and original signed artifact, verify unchanged
+bytes, attest them, then publish that same release ID.

@@ -3,6 +3,7 @@ set -eu
 
 repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 workflow="$repo_root/.github/workflows/release.yml"
+recovery_workflow="$repo_root/.github/workflows/release-recover.yml"
 ci_workflow="$repo_root/.github/workflows/ci.yml"
 justfile="$repo_root/justfile"
 green_ci_lookup="$repo_root/tools/release/find-green-main-ci.sh"
@@ -104,9 +105,22 @@ else
     fail "Linux glibc-floor image must be digest-pinned"
 fi
 
-unpinned_actions=$(grep -E '^[[:space:]]*(- )?uses:' "$workflow" \
+unpinned_actions=$(grep -hE '^[[:space:]]*(- )?uses:' "$workflow" "$recovery_workflow" \
     | grep -Ev 'uses: [.]?/[.]github/workflows/|@[0-9a-f]{40}([[:space:]]|$)' || true)
 [ -z "$unpinned_actions" ] || fail "all release actions must use commit SHAs"
+grep -Fq "github.ref == 'refs/heads/main'" "$recovery_workflow" \
+    || fail "draft recovery must execute only on reviewed main"
+grep -Fq '  workflow_dispatch:' "$recovery_workflow" \
+    || fail "draft recovery requires an explicit dispatch"
+if grep -Eq '^[[:space:]]{2}(push|pull_request|release):|secrets\.|environment: release|gh release (create|upload|delete)|--clobber' "$recovery_workflow"; then
+    fail "draft recovery must not sign, create, replace, or run implicitly"
+fi
+for recovery_boundary in 'find-green-main-ci.sh' 'digest-mismatch: error' \
+    'source/target/release/zterm-release-tool verify roundtrip' \
+    'actions/attest-build-provenance@' 'recover-draft.py publish'; do
+    grep -Fq "$recovery_boundary" "$recovery_workflow" \
+        || fail "draft recovery bypasses a publication boundary: $recovery_boundary"
+done
 unpinned_ci_actions=$(grep -hE '^[[:space:]]*(- )?uses:' "$ci_workflow" \
     "$repo_root/.github/actions/setup-ci-tools/action.yml" \
     | grep -Ev 'uses: [.]?/[.]github/actions/|@[0-9a-f]{40}([[:space:]]|$)' || true)

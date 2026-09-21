@@ -1,0 +1,108 @@
+name: recover signed release draft
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing annotated release tag
+        required: true
+        type: string
+      run_id:
+        description: Failed original signed release run
+        required: true
+        type: string
+      artifact_id:
+        description: Retained signed inventory artifact ID from that run
+        required: true
+        type: string
+      release_id:
+        description: Existing unpublished draft release ID
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: signed-native-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    if: github.repository == 'leonfox28/zterm' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      ORIGINAL_RUN: ${{ inputs.run_id }}
+      SIGNED_ARTIFACT: ${{ inputs.artifact_id }}
+      DRAFT_RELEASE: ${{ inputs.release_id }}
+    steps:
+      - name: Check out the reviewed recovery owner
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: recovery
+          persist-credentials: false
+
+      - name: Bind original source, signing, installers, artifact and draft
+        id: evidence
+        run: >-
+          python3 recovery/tools/release/recover-draft.py inspect
+          --tag "$RELEASE_TAG" --run-id "$ORIGINAL_RUN"
+          --artifact-id "$SIGNED_ARTIFACT" --release-id "$DRAFT_RELEASE"
+          --plan recovery-plan.json
+
+      - name: Check out the frozen product source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.evidence.outputs.source_commit }}
+          path: source
+          persist-credentials: false
+
+      - name: Require successful exact source main CI
+        env:
+          SOURCE_COMMIT: ${{ steps.evidence.outputs.source_commit }}
+        run: sh source/tools/release/find-green-main-ci.sh "$SOURCE_COMMIT"
+
+      - name: Install exact Rust toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal
+
+      - name: Download the retained signed inventory
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ inputs.artifact_id }}
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+          digest-mismatch: error
+          path: signed
+
+      - name: Authenticate the original signed inventory
+        run: >-
+          cargo +1.98.0 run --manifest-path source/Cargo.toml --locked --release
+          --package zterm-release-tool -- verify signed
+
+      - name: Download and compare the existing draft assets
+        run: >-
+          python3 recovery/tools/release/recover-draft.py download
+          --plan recovery-plan.json --signed signed --roundtrip roundtrip
+
+      - name: Authenticate the exact round-trip inventory
+        run: source/target/release/zterm-release-tool verify roundtrip
+
+      - name: Attest the verified existing draft inventory
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: roundtrip/*
+
+      - name: Publish the same draft and require immutable original assets
+        run: >-
+          python3 recovery/tools/release/recover-draft.py publish
+          --plan recovery-plan.json --signed signed --roundtrip roundtrip
