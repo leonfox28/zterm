@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~937 | Active |
+| `journal-1.md` | ~981 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -40,6 +40,7 @@
 | 27 | 2026-09-09 | Remote file uploads and Android toolbar review | `bce839b` | `feat/remote-file-upload` |
 | 26 | 2026-09-08 | Desktop connection stages and persisted startup logs | `c0e1ba9` | `fix/desktop-connection-progress` |
 | 25 | 2026-09-08 | Fix Android terminal keyboard on task resume | `e6f5e6b` | `fix/android-keyboard-resume` |
+| 24 | 2026-09-08 | Publish v0.1.29 Android reconnect fixes | `b13ae75`, `9041855`, `195a9dc` | `fix/android-reconnect-status` |
 | 23 | 2026-09-08 | Android reconnect recovery and connection status | `b13ae75` | `perf/android-local-scroll` |
 | 22 | 2026-09-08 | Accept Android local scrolling and publish v0.1.28 | `022ffb7`, `4eef9a4` | `perf/android-local-scroll` |
 | 21 | 2026-09-08 | Publish v0.1.27 terminal presentation continuity | `ed7c170`, `a0065d9`, `807fd41`, `cb19c75` | `feat/terminal-presentation-continuity` |

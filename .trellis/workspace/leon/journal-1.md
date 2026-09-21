@@ -635,6 +635,50 @@ Completed stale-session/default-main recovery, typed unary error retirement, and
 [OK] **Completed**
 
 
+## Session 24: Publish v0.1.29 Android reconnect fixes
+<!-- trellis-session: v=2 fp=d192193f9406a288 -->
+
+**Date**: 2026-09-08
+**Task**: Publish v0.1.29 Android reconnect fixes
+**Branch**: `fix/android-reconnect-status`
+
+### Summary
+
+Published immutable stable v0.1.29 with 11 verified native/Android assets. PR and exact-main CI, protected signing, final installer checks, local signed-inventory and production APK verification all passed.
+
+### Main Changes
+
+### Release v0.1.29
+
+The user explicitly requested the release workflow after the simulator evidence was clarified. No sub-agents were used. Work commit b13ae75 was followed by task archive 1dff46d and journal 22cc766. Release preparation used a new fix/android-reconnect-status branch, merged current main, and added version-only commit 9041855 (Cargo.toml/Cargo.lock; no dependency upgrades).
+
+- PR #37: https://github.com/leonfox28/zterm/pull/37. Reviewed head 90418557ed2b5d612388c6f19369ea2c62d39322 merged normally as 195a9dc56e3a1344defa7c15af91c0acc09c52a1; the two trees are identical.
+- PR CI 34207267339 and exact-main CI 34208238852 passed every applicable job and CI gate.
+- Main candidate artifact 10049104643 has server digest sha256:28bd8dc71749b0fb84bb2c38ad9b2f8c583892f523293dac1859bff91f57fd92, from the exact successful main run.
+- Annotated v0.1.29 points to the exact merge. Immutable releases enabled; the eligible current reviewer approved the protected signing environment under the user's release authorization. No settings/protection bypass or key exposure.
+- Formal release run https://github.com/leonfox28/zterm/actions/runs/34209372785 passed APK/manifest/checksum signing, three native signed-installer tests, draft download verification, attestation and immutable publication.
+- Release https://github.com/leonfox28/zterm/releases/tag/v0.1.29, ID 384592680, published 2026-09-08T09:22:16Z (17:22:16 Asia/Shanghai), stable, latest, non-draft, immutable, exactly 11 assets.
+- Downloaded all 11 published assets, verified every GitHub size/digest, and ran the reviewed release tool's complete signed-inventory verifier successfully.
+- The production Android inspector verified the actual downloaded APK against source 195a9dc56e3a1344defa7c15af91c0acc09c52a1: version 0.1.29, versionCode 102999, io.github.leonfox28.zterm, arm64-v8a, API 26+, target API 36, 16 KB ELF/ZIP alignment, retained certificate 391c75442091280dcd001b302d5b0a244112ab4df007057dc57e75e92a435a03. Its metadata equals zterm-android.json.
+- APK SHA-256: 6c8f614da8d93090d2f036319d63ce4514337a8067720cc21a376e79e18337b2.
+- Release notes describe stale-session/default-main recovery, fixed-English Direct/Relay and RTT, and old operation-lease handling; preserve the generated changelog and explicit physical-phone/forced-real-Relay test limits.
+
+The release operator exited successfully and removed its own private worktree. The source task is archived. No real user daemon or phone was updated. Local logs, the final download inventory, and verification inputs are under /tmp/zterm-release-0.1.29-*.
+
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `b13ae75` | fix(android): recover stale sessions and show connection status |
+| `9041855` | chore: prepare v0.1.29 release |
+| `195a9dc` | Merge pull request #37 from leonfox28/fix/android-reconnect-status |
+
+### Status
+
+[OK] **Completed**
+
+
 ## Session 25: Fix Android terminal keyboard on task resume
 <!-- trellis-session: v=2 fp=7773d6006f10b5fd -->
 
