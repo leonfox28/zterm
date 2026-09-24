@@ -8,7 +8,7 @@
 
 - ingress 明确拒绝 REP，普通 CSI u 被 Kitty-only 分支拦截；现有 ESC 7/8 工作正常。
 - 上游 REP 直接重复 Handler.input，绕过 Zterm 的组合字符配额，不能简单放开。
-- [projection.rs](../../../crates/terminal/src/projection.rs) 丢弃 strike/hidden 标志；core/wire/Android 尚无对应语义字段。源码定位见父 [研究](../09-22-terminal-protocol-audit/research/protocol-support.md)。
+- [projection.rs](../../../../../crates/terminal/src/projection.rs) 丢弃 strike/hidden 标志；core/wire/Android 尚无对应语义字段。源码定位见父 [研究](../09-22-terminal-protocol-audit/research/protocol-support.md)。
 
 ## Requirements and acceptance
 
