@@ -979,3 +979,39 @@ Published immutable v0.1.35 from original signed draft after GitHub HTTP 500. PR
 ### Next Steps
 
 - No remaining release work; v0.1.35 is the latest stable immutable Release.
+
+
+## Session 36: Complete terminal protocol compatibility
+<!-- trellis-session: v=2 fp=de2115145b13d0fe -->
+
+**Date**: 2026-09-24
+**Task**: Complete terminal protocol compatibility
+**Branch**: `feat/terminal-protocol-compatibility`
+
+### Summary
+
+Implemented and verified the approved five-item terminal protocol batch; user authorized commit and merge through protected main.
+
+### Main Changes
+
+- Bounded REP and ANSI restore, strike/conceal, cursor shape/blink, retained HTTP(S) links with Android system action, independent application titles, and accurate query replies.
+- Updated owning specs and archived the audit parent plus all five implementation tasks.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `98d28f9` | feat(terminal): complete protocol compatibility across clients |
+
+### Testing
+
+- [OK] Final just check passed on macOS arm64, including all final caret and combined-hold changes.
+- [OK] Android assemble/lint/unit checks and 34 API 36 instrumentation cases passed with an isolated host and disposable emulator.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- Push the completed branch, wait for the required GitHub CI gate, and merge the authorized PR into main.
