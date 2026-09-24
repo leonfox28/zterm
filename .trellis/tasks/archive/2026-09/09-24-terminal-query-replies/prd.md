@@ -6,8 +6,8 @@
 
 ## Confirmed facts
 
-- [colors.rs](../../../crates/terminal/src/colors.rs) 与现有测试把未知 OSC 21 字段回复为原字段加 `=?`；Kitty 要求 `unknown=` 加无填充 Base64 字段名。
-- [ingress.rs](../../../crates/terminal/src/ingress.rs) 的窗口操作分支未实现 `CSI 18t`；engine 已持有权威 size。
+- [colors.rs](../../../../../crates/terminal/src/colors.rs) 与现有测试把未知 OSC 21 字段回复为原字段加 `=?`；Kitty 要求 `unknown=` 加无填充 Base64 字段名。
+- [ingress.rs](../../../../../crates/terminal/src/ingress.rs) 的窗口操作分支未实现 `CSI 18t`；engine 已持有权威 size。
 - 依据与旧行为测试详见 [研究](../09-22-terminal-protocol-audit/research/protocol-support.md)。
 
 ## Requirements and acceptance
