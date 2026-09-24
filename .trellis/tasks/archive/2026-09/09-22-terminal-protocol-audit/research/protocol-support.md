@@ -40,22 +40,22 @@ stream. A feature in Alacritty or the outer terminal is therefore insufficient.
 
 Important source anchors, all relative to the repository root:
 
-- [Ingress CSI dispatch](../../../../crates/terminal/src/ingress.rs#L465),
-  [control-string dispatch](../../../../crates/terminal/src/ingress.rs#L626),
-  [keyboard admission](../../../../crates/terminal/src/ingress.rs#L724), and
-  [OSC 52 admission](../../../../crates/terminal/src/ingress.rs#L754).
-- [Color OSC owner](../../../../crates/terminal/src/colors.rs#L138),
-  [dynamic slots](../../../../crates/terminal/src/colors.rs#L233), and
-  [XTGETTCAP allowlist](../../../../crates/terminal/src/colors.rs#L318).
-- [Cell projection](../../../../crates/terminal/src/projection.rs#L218),
-  [cursor projection](../../../../crates/terminal/src/projection.rs#L120), and
-  [input-mode projection](../../../../crates/terminal/src/projection.rs#L289).
-- [Style and cursor domain](../../../../crates/core/src/terminal.rs#L159),
-  [terminal wire schema](../../../../proto/zterm/v2/terminal.proto), and
-  [daemon update consumption](../../../../crates/daemon/src/terminal_driver.rs#L380).
-- [Desktop notification/clipboard output](../../../../crates/cli/src/terminal_ui/ansi_presenter.rs#L320),
-  [desktop effect handling](../../../../crates/cli/src/terminal_ui/session.rs#L704), and
-  [Android effect handling](../../../../crates/android/src/terminal.rs#L981).
+- [Ingress CSI dispatch](../../../../../../crates/terminal/src/ingress.rs#L465),
+  [control-string dispatch](../../../../../../crates/terminal/src/ingress.rs#L626),
+  [keyboard admission](../../../../../../crates/terminal/src/ingress.rs#L724), and
+  [OSC 52 admission](../../../../../../crates/terminal/src/ingress.rs#L754).
+- [Color OSC owner](../../../../../../crates/terminal/src/colors.rs#L138),
+  [dynamic slots](../../../../../../crates/terminal/src/colors.rs#L233), and
+  [XTGETTCAP allowlist](../../../../../../crates/terminal/src/colors.rs#L318).
+- [Cell projection](../../../../../../crates/terminal/src/projection.rs#L218),
+  [cursor projection](../../../../../../crates/terminal/src/projection.rs#L120), and
+  [input-mode projection](../../../../../../crates/terminal/src/projection.rs#L289).
+- [Style and cursor domain](../../../../../../crates/core/src/terminal.rs#L159),
+  [terminal wire schema](../../../../../../proto/zterm/v2/terminal.proto), and
+  [daemon update consumption](../../../../../../crates/daemon/src/terminal_driver.rs#L380).
+- [Desktop notification/clipboard output](../../../../../../crates/cli/src/terminal_ui/ansi_presenter.rs#L320),
+  [desktop effect handling](../../../../../../crates/cli/src/terminal_ui/session.rs#L704), and
+  [Android effect handling](../../../../../../crates/android/src/terminal.rs#L981).
 
 The daemon processes `update.replies` and `update.host_effects`, but does not
 deliver `update.events`. Title, icon, bell and resize requests are only side
@@ -113,7 +113,7 @@ requires an `unknown=` field containing the unpadded Base64 name, here
 `unknown=bm9uc2Vuc2U`. This is directly observed in the runtime probe and follows
 `colors.rs`; `extended_colors_distinguish_unknown_dynamic_and_unsupported_and_ignore_bad_pairs`
 also asserts the current behavior. The local
-[color contract](../../../spec/backend/terminal-colors.md) documents `=?`, so a
+[color contract](../../../../../spec/backend/terminal-colors.md) documents `=?`, so a
 future conformance change needs to reconcile implementation, tests and contract.
 This finding compares today's documentation; it does not establish when the
 protocol text changed.
@@ -159,11 +159,11 @@ keyboard negotiation with [Kitty keyboard](https://sw.kovidgoyal.net/kitty/keybo
 ## Android clipboard scope clarification
 
 The user pointed out that Android selection/copy was already implemented.
-The [Android design](../../09-06-android-app/design.md#L491) explicitly specifies
+The [Android design](../../../../09-06-android-app/design.md#L491) explicitly specifies
 native-style selection handles, a floating system Copy action, and
 `ClipData`/`ClipboardManager` writes only after explicit Copy. It separately
 excludes host-driven kind-322 clipboard effects for that increment.
-The [View implementation](../../../../apps/android/app/src/main/java/io/github/leonfox28/zterm/TerminalView.kt#L540)
+The [View implementation](../../../../../../apps/android/app/src/main/java/io/github/leonfox28/zterm/TerminalView.kt#L540)
 implements that local Copy path. The discarded remote `ClipboardWrite` event
 therefore follows the design; it is not evidence that Android cannot copy.
 

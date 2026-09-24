@@ -17,7 +17,7 @@ Branch: `feat/terminal-protocol-compatibility`. User approved the detailed desig
 - `just check` passed on macOS arm64 / Rust 1.98.0: source/dependency/workflow policy, formatting, Clippy with warnings denied, secret scans, complete workspace tests, documentation, dependency/license checks and relay static/upstream verification. Existing platform-specific ignored tests remain ignored; hosted-only release/other-host coverage is not claimed.
 - `sh tools/android/build.sh :app:assembleDebug :app:assembleDebugAndroidTest :app:lintDebug :app:testDebugUnitTest` passed. Final test changes were rebuilt and Android lint/unit checks passed again.
 - `git diff --check` passed.
-- Final focused verification after strengthening combined-hold coverage and correcting the wide software underline: `cargo test -p zterm-terminal --test title_protocol`, terminal all-target Clippy, all desktop presenter tests, and CLI all-target/all-feature Clippy. The full host gate above preceded these small final test/caret refinements.
+- Final focused verification after strengthening combined-hold coverage and correcting the wide software underline: `cargo test -p zterm-terminal --test title_protocol`, terminal all-target Clippy, all desktop presenter tests, and CLI all-target/all-feature Clippy. The complete host gate was rerun successfully before committing, including these final refinements.
 - The final combined DEC 2026 regression additionally checks title, cursor, strike/conceal and links remain frozen together, queries reply immediately, and the released delta equals the full snapshot.
 
 ## Runtime acceptance
@@ -37,4 +37,4 @@ A new disposable AVD `Zterm_Protocols_0924` (Android API 36, arm64; explicit ser
 - Physical desktop hyperlink activation and prior-title restoration depend on outer-terminal OSC 8/title-stack support. No cross-terminal visual certification was performed; canonical output and cleanup were verified by automated PTY tests.
 - All newly shared schema/producer/consumer changes are intended to deploy together. Android host-driven OSC 52 remains outside this task; existing system selection and Copy are retained.
 
-The user approved commit and merge after reviewing implementation. Commit the verified changes, archive this parent and its five children, record the work, then merge through the required GitHub CI gate.
+The user approved commit and merge after reviewing implementation. The verified implementation is committed as `98d28f9b8ad4`. This parent and its five children are archived; integration proceeds through the required GitHub CI gate.
