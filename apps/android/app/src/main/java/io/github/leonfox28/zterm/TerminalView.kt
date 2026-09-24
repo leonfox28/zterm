@@ -38,6 +38,28 @@ internal class TerminalView(context: Context) : View(context) {
         }
     private var unobserve: (() -> Unit)? = null
     private var drawnFrame: NativeFrame? = null
+    private var selectionLinkAvailable = false
+    private var cursorPhaseVisible = true
+    private var cursorBlinkScheduled = false
+    private val cursorBlink = object : Runnable {
+        override fun run() {
+            cursorBlinkScheduled = false
+            if (!shouldBlinkCursor()) { cursorPhaseVisible = true; return }
+            cursorPhaseVisible = !cursorPhaseVisible
+            invalidate()
+            updateCursorBlink()
+        }
+    }
+    private fun shouldBlinkCursor() = isAttachedToWindow && isShown && windowVisibility == VISIBLE &&
+        current?.cursorVisible == true && current?.cursorBlinking == true && scrollPixels == 0f
+    private fun updateCursorBlink(reset: Boolean = false) {
+        if (reset || !shouldBlinkCursor()) {
+            removeCallbacks(cursorBlink); cursorBlinkScheduled = false; cursorPhaseVisible = true
+        }
+        if (shouldBlinkCursor() && !cursorBlinkScheduled) {
+            cursorBlinkScheduled = true; postDelayed(cursorBlink, 500)
+        }
+    }
     private var drawnGeometry: DrawnTerminalGeometry? = null
     private var geometryVersion = 0L
     var onCellHeightChanged: (Int) -> Unit = {}
@@ -248,8 +270,19 @@ internal class TerminalView(context: Context) : View(context) {
         if (gestureMode != frame?.pointerMode && childGesture) invalidateCoordinates()
         if (frame?.selection != null && actionMode == null) showSelectionActions()
         if (frame?.selection == null) { val old = actionMode; actionMode = null; old?.finish() }
+        if (previous?.selection != frame?.selection || epochChanged || geometryChanged) {
+            selectionLinkAvailable = false
+            actionMode?.invalidate()
+            if (frame?.selection != null) repository?.selectionHyperlink { uri ->
+                selectionLinkAvailable = uri != null
+                actionMode?.invalidate()
+            }
+        }
         actionMode?.invalidateContentRect()
         updateAnchor()
+        updateCursorBlink(previous?.cursorRow != frame?.cursorRow || previous?.cursorColumn != frame?.cursorColumn ||
+            previous?.cursorShape != frame?.cursorShape || previous?.cursorBlinking != frame?.cursorBlinking ||
+            previous?.cursorVisible != frame?.cursorVisible)
         postInvalidateOnAnimation()
     }
     private fun updateMetrics() {
@@ -335,11 +368,22 @@ internal class TerminalView(context: Context) : View(context) {
             canvas.restore()
         }
         drawSelection(canvas, frame, geometry)
-        val cursorX = frame.cursorColumn.toInt() * cellWidth
+        val cursorCells = frame.rows.getOrNull((frame.windowOffset + frame.cursorRow.toULong()).toInt())?.cells
+        val declaredColumn = frame.cursorColumn.toInt()
+        val cursorColumn = if (cursorCells?.getOrNull(declaredColumn)?.width == 0.toUByte() &&
+            cursorCells.getOrNull(declaredColumn - 1)?.width == 2.toUByte()) declaredColumn - 1 else declaredColumn
+        val cursorWidth = if (cursorCells?.getOrNull(cursorColumn)?.width == 2.toUByte()) cellWidth * 2 else cellWidth
+        val cursorX = cursorColumn * cellWidth
         val cursorY = (frame.firstRow + frame.windowOffset.toLong() + frame.cursorRow.toInt() - firstRow) * cellHeight
-        if (frame.cursorVisible && scrollPixels == 0f) {
+        if (frame.cursorVisible && scrollPixels == 0f && (!frame.cursorBlinking || cursorPhaseVisible)) {
             paint.color = frame.cursorColor.toInt(); paint.alpha = 130
-            canvas.drawRect(cursorX,cursorY,cursorX+cellWidth,cursorY+cellHeight,paint); paint.alpha = 255
+            val thickness = maxOf(1f, resources.displayMetrics.density * 2)
+            when (frame.cursorShape) {
+                NativeCursorShape.BLOCK -> canvas.drawRect(cursorX,cursorY,cursorX+cursorWidth,cursorY+cellHeight,paint)
+                NativeCursorShape.BEAM -> canvas.drawRect(cursorX,cursorY,cursorX+thickness,cursorY+cellHeight,paint)
+                NativeCursorShape.UNDERLINE -> canvas.drawRect(cursorX,cursorY+cellHeight-thickness,cursorX+cursorWidth,cursorY+cellHeight,paint)
+            }
+            paint.alpha = 255
         }
         if (composing.isNotEmpty() && scrollPixels == 0f) {
             paint.color = frame.background.toInt()
@@ -372,6 +416,7 @@ internal class TerminalView(context: Context) : View(context) {
             if (x >= width) return@forEachIndexed
             paint.color = cell.background.toInt(); paint.alpha = 255
             canvas.drawRect(x, top, right, top + cellHeight, paint)
+            if (cell.attributes.toInt() and 16 != 0) return@forEachIndexed
             // A plain space has no glyph ink; its background and decorations still draw.
             if (cell.text.isNotEmpty() && cell.text != " ") {
                 paint.color = cell.foreground.toInt()
@@ -381,6 +426,12 @@ internal class TerminalView(context: Context) : View(context) {
                 canvas.save(); canvas.clipRect(x, top, right, top + cellHeight)
                 canvas.drawText(cell.text, x, top + baseline, paint); canvas.restore()
                 paint.isFakeBoldText = false; paint.textSkewX = 0f; paint.alpha = 255
+            }
+            if (cell.attributes.toInt() and 8 != 0) {
+                paint.color = cell.foreground.toInt()
+                paint.strokeWidth = resources.displayMetrics.density
+                val y = top + baseline + paint.fontMetrics.ascent * .35f
+                canvas.drawLine(x, y, right, y, paint)
             }
             if (cell.underline.toInt() != 0) {
                 paint.color = cell.underlineColor.toInt(); paint.strokeWidth = resources.displayMetrics.density
@@ -540,10 +591,31 @@ internal class TerminalView(context: Context) : View(context) {
         actionMode = startActionMode(object : ActionMode.Callback2() {
             override fun onCreateActionMode(mode: ActionMode, menu: Menu): Boolean {
                 menu.add(0,android.R.id.copy,0,android.R.string.copy).setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS)
+                menu.add(0,R.id.open_terminal_link,1,R.string.open_terminal_link).apply {
+                    setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM); isVisible = false
+                }
                 return true
             }
-            override fun onPrepareActionMode(mode: ActionMode, menu: Menu): Boolean = false
+            override fun onPrepareActionMode(mode: ActionMode, menu: Menu): Boolean {
+                menu.findItem(R.id.open_terminal_link)?.isVisible = selectionLinkAvailable
+                return true
+            }
             override fun onActionItemClicked(mode: ActionMode, item: MenuItem): Boolean {
+                if (item.itemId == R.id.open_terminal_link) {
+                    repository?.selectionHyperlink { value ->
+                        val uri = value?.let(android.net.Uri::parse) ?: return@selectionHyperlink
+                        if (uri.scheme !in listOf("http", "https") || uri.host.isNullOrEmpty()) return@selectionHyperlink
+                        try {
+                            context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, uri)
+                                .addCategory(android.content.Intent.CATEGORY_BROWSABLE)
+                                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+                            repository?.clearSelection(); mode.finish()
+                        } catch (_: android.content.ActivityNotFoundException) {
+                            android.widget.Toast.makeText(context,R.string.open_terminal_link_failed,android.widget.Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                    return true
+                }
                 if (item.itemId != android.R.id.copy) return false
                 repository?.copySelection { text ->
                     context.getSystemService(android.content.ClipboardManager::class.java)
@@ -560,16 +632,22 @@ internal class TerminalView(context: Context) : View(context) {
             }
         },ActionMode.TYPE_FLOATING)
     }
+    override fun onVisibilityChanged(changedView: View, visibility: Int) {
+        super.onVisibilityChanged(changedView, visibility)
+        if (isAttachedToWindow) updateCursorBlink(reset = true)
+    }
     override fun onWindowVisibilityChanged(visibility: Int) {
         super.onWindowVisibilityChanged(visibility)
+        updateCursorBlink(reset = true)
         repository?.terminalVisible(visibility == VISIBLE)
         if (visibility != VISIBLE) { rowRenderer.clear(); scroller.forceFinished(true); draggingHandle = null; releaseGestureSource(); removeCallbacks(autoScroll) }
     }
     override fun onAttachedToWindow() {
-        super.onAttachedToWindow(); disposing = false; observeFrames()
+        super.onAttachedToWindow(); disposing = false; observeFrames(); updateCursorBlink(reset = true)
     }
     override fun onDetachedFromWindow() {
         disposing = true
+        removeCallbacks(cursorBlink); cursorBlinkScheduled = false; cursorPhaseVisible = true
         rowRenderer.clear()
         imeMeasurePending = false
         releaseGestureSource()

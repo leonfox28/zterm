@@ -7,6 +7,7 @@ pub mod domain;
 pub mod pairing;
 pub mod release;
 pub mod terminal;
+mod terminal_hyperlink;
 pub mod terminal_selection;
 pub mod transport;
 pub mod upload;

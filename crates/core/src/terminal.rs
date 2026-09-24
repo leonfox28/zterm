@@ -173,11 +173,22 @@ pub struct TerminalStyle {
     pub underline_color: TerminalColor,
     /// Foreground and background are inverted.
     pub inverse: bool,
+    /// Strikethrough decoration is active.
+    pub strike: bool,
+    /// Hide foreground glyphs and decorations without changing selectable text.
+    pub conceal: bool,
 }
+
+pub use crate::terminal_hyperlink::{
+    InvalidTerminalHyperlink, MAX_TERMINAL_HYPERLINK_BYTES, MAX_TERMINAL_HYPERLINK_ID_BYTES,
+    MAX_TERMINAL_HYPERLINK_URI_BYTES, MAX_TERMINAL_HYPERLINKS, TerminalHyperlink,
+};
 
 /// Semantic content of one visible terminal cell.
 #[derive(Clone, Default, Eq, PartialEq, Hash)]
 pub struct TerminalCell {
+    /// Optional validated shared web target.
+    pub hyperlink: Option<std::sync::Arc<TerminalHyperlink>>,
     /// Text held by the cell, including any combining characters.
     pub contents: String,
     /// Whether the cell starts a double-width character.
@@ -197,13 +208,37 @@ impl fmt::Debug for TerminalCell {
             .field("wide", &self.wide)
             .field("wide_continuation", &self.wide_continuation)
             .field("style", &self.style)
+            .field("hyperlink", &self.hyperlink)
             .finish()
     }
 }
 
 /// Semantic cursor state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TerminalCursorShape {
+    /// Filled character block.
+    #[default]
+    Block,
+    /// Vertical caret at the character's leading edge.
+    Beam,
+    /// Horizontal caret below the character.
+    Underline,
+}
+
+/// Declared cursor appearance; the blink phase is local presentation state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TerminalCursorPresentation {
+    /// Shape requested by the application.
+    pub shape: TerminalCursorShape,
+    /// Whether the cursor alternates between visible and hidden phases.
+    pub blinking: bool,
+}
+
+/// Semantic cursor state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TerminalCursor {
+    /// Cursor shape and declared blinking behavior.
+    pub presentation: TerminalCursorPresentation,
     /// Zero-based cursor row.
     pub row: u16,
     /// Zero-based cursor column.
@@ -347,6 +382,8 @@ impl fmt::Debug for TerminalSurfaceRow {
 /// Complete semantic state of one active terminal screen.
 #[derive(Clone, Eq, PartialEq)]
 pub struct TerminalSurface {
+    /// Bounded application title, independent of the persistent session name.
+    pub application_title: String,
     /// Effective Session color state.
     pub colors: TerminalColorSnapshot,
     /// Exact rectangular viewport size.
@@ -418,6 +455,8 @@ impl fmt::Debug for TerminalSurfaceRowPatch {
 /// Merged semantic update from one attachment checkpoint to the latest revision.
 #[derive(Clone, Eq, PartialEq)]
 pub struct TerminalSurfaceDelta {
+    /// Bounded application title, independent of the persistent session name.
+    pub application_title: String,
     /// Effective Session color state.
     pub colors: TerminalColorSnapshot,
     /// Checkpoint revision used as the baseline.
@@ -474,6 +513,8 @@ pub enum TerminalSurfaceError {
     InvalidColumnCount,
     /// Cell text is oversized or contains a control character.
     InvalidCellText,
+    /// Application title exceeds its byte bound or contains controls.
+    InvalidApplicationTitle,
     /// Wide-head and continuation cells are not an exact adjacent pair.
     InvalidWidePair,
     /// The cursor lies outside the declared surface.
@@ -498,6 +539,7 @@ impl fmt::Display for TerminalSurfaceError {
             Self::InvalidColumnCount => {
                 "terminal surface row width does not match its declared columns"
             }
+            Self::InvalidApplicationTitle => "terminal application title is invalid",
             Self::InvalidCellText => "terminal surface cell text is invalid",
             Self::InvalidWidePair => "terminal surface wide-cell pairing is invalid",
             Self::InvalidCursor => "terminal surface cursor is outside its viewport",
@@ -520,6 +562,11 @@ impl TerminalSurface {
     pub fn validate(&self, revision: Revision) -> Result<(), TerminalSurfaceError> {
         if !self.colors.is_valid_at(revision) {
             return Err(TerminalSurfaceError::InvalidRevision);
+        }
+        if self.application_title.len() > MAX_TITLE_BYTES
+            || self.application_title.chars().any(char::is_control)
+        {
+            return Err(TerminalSurfaceError::InvalidApplicationTitle);
         }
         validate_surface_size(self.size)?;
         if self.rows.len() != usize::from(self.size.rows) {
@@ -550,6 +597,11 @@ impl TerminalSurfaceDelta {
         }
         if !self.colors.is_valid_at(self.to_revision) {
             return Err(TerminalSurfaceError::InvalidRevision);
+        }
+        if self.application_title.len() > MAX_TITLE_BYTES
+            || self.application_title.chars().any(char::is_control)
+        {
+            return Err(TerminalSurfaceError::InvalidApplicationTitle);
         }
         validate_surface_size(self.size)?;
         if self.cursor.row >= self.size.rows || self.cursor.column >= self.size.columns {
@@ -603,6 +655,9 @@ impl TerminalSurfaceDelta {
         for patch in &self.row_patches {
             candidate.rows[usize::from(patch.row)] = patch.replacement.clone();
         }
+        candidate
+            .application_title
+            .clone_from(&self.application_title);
         candidate.colors = self.colors.clone();
         candidate.cursor = self.cursor;
         candidate.modes = self.modes;
@@ -1054,6 +1109,7 @@ mod tests {
 
     fn semantic_surface(revision: Revision) -> TerminalSurface {
         TerminalSurface {
+            application_title: String::new(),
             colors: Default::default(),
 
             size: TerminalSize::new(2, 3),
@@ -1083,6 +1139,7 @@ mod tests {
                 },
             ],
             cursor: TerminalCursor {
+                presentation: Default::default(),
                 row: 1,
                 column: 2,
                 visible: true,
@@ -1112,6 +1169,7 @@ mod tests {
 
         let mut applied = surface.clone();
         let delta = TerminalSurfaceDelta {
+            application_title: String::new(),
             colors: Default::default(),
 
             from_revision: revision,
@@ -1252,6 +1310,7 @@ mod tests {
 
         let cell = TerminalCell {
             contents: CELL_SENTINEL.to_owned(),
+            hyperlink: None,
             wide: true,
             wide_continuation: false,
             style: TerminalStyle {
@@ -1284,6 +1343,7 @@ mod tests {
             surface,
         };
         let delta = TerminalSurfaceDelta {
+            application_title: String::new(),
             colors: Default::default(),
 
             from_revision: Revision::new(47),

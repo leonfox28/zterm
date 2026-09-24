@@ -400,6 +400,7 @@ impl TerminalModel {
             })
             .collect();
         let delta = TerminalSurfaceDelta {
+            application_title: latest.application_title.clone(),
             colors: latest.colors.clone(),
             from_revision: checkpoint.revision,
             to_revision: self.published_revision(),

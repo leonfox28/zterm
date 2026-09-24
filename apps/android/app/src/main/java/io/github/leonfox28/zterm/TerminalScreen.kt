@@ -69,7 +69,7 @@ import io.github.leonfox28.zterm.nativebridge.NativeSession
                 IconAction("back", stringResource(R.string.back)) { repository.goHome() }
                 Row(Modifier.weight(1f).fillMaxHeight().clickable { repository.togglePanel() }, verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
-                        Text(session?.name ?: host?.name ?: "zterm", maxLines = 1, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                        Text(terminalDisplayTitle(session?.name ?: host?.name ?: "zterm", frame?.applicationTitle.orEmpty()), maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
                         TerminalConnectionSubtitle(host?.name.orEmpty(), frame, state.busy, state.error)
                     }
                     LineIcon("down", Modifier.padding(horizontal = 12.dp).size(20.dp))
@@ -292,3 +292,7 @@ import io.github.leonfox28.zterm.nativebridge.NativeSession
         } }, confirmButton = { TextButton({ submit(name,directory) }, enabled = name.isNotBlank() && !busy) { Text(stringResource(if (previous == null) R.string.create else R.string.save)) } },
         dismissButton = { TextButton(dismiss) { Text(stringResource(R.string.cancel)) } })
 }
+
+internal fun terminalDisplayTitle(sessionName: String, applicationTitle: String): String =
+    if (applicationTitle.isEmpty() || applicationTitle == sessionName) sessionName
+    else "$sessionName · $applicationTitle"

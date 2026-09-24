@@ -106,8 +106,8 @@ fn cancelled_controls_filtered_attributes_and_malformed_utf8_stay_contained() {
     const SECRET: &str = "FILTERED_SECRET_d61a";
     let input = [
         b"before".as_slice(),
-        format!("\x1b]8;;https://invalid/{SECRET}\x1b\\linked\x1b]8;;\x1b\\").as_bytes(),
-        b"\x1b[58;2;1;2;3m\x1b[5b\x1b[>1u",
+        format!("\x1b]8;;file://invalid/{SECRET}\x1b\\linked\x1b]8;;\x1b\\").as_bytes(),
+        b"\x1b[58;2;1;2;3m\x1b[4097b\x1b[>1u",
         format!("\x1bP{SECRET}\x18after").as_bytes(),
         b"\x1b[31;\x1acolorless\xffdone",
     ]

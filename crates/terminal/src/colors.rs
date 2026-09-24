@@ -1,4 +1,6 @@
 //! The Session's sole palette/appearance owner. Never forwards child OSC.
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD_NO_PAD;
 use std::fmt::Write as _;
 use zterm_core::Revision;
 use zterm_core::terminal::*;
@@ -193,19 +195,18 @@ impl ZtermColorState {
                     let (key, value) = item
                         .split_once('=')
                         .map_or((item, None), |(k, v)| (k, Some(v)));
-                    // Unsupported key names are reflected only if they are bounded identifiers.
-                    if key.is_empty()
-                        || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-                    {
+                    if key.is_empty() {
                         continue;
                     }
                     let slot = key_slot(key);
                     if value == Some("?") {
-                        let value = slot.map_or_else(
-                            || "?".to_owned(),
-                            |slot| encoded(self.value(slot)).unwrap_or_default(),
-                        );
-                        answers.push(format!("{key}={value}"));
+                        answers.push(match slot {
+                            Some(slot) => {
+                                let value = encoded(self.value(slot)).unwrap_or_default();
+                                format!("{key}={value}")
+                            }
+                            None => format!("unknown={}", STANDARD_NO_PAD.encode(key)),
+                        });
                     } else if let Some(slot) = slot {
                         match value {
                             None => self.set(slot, None),
@@ -281,6 +282,8 @@ pub(crate) fn sgr(style: TerminalStyle) -> String {
         (style.dim, 2),
         (style.italic, 3),
         (style.inverse, 7),
+        (style.conceal, 8),
+        (style.strike, 9),
     ] {
         if active {
             let _ = write!(s, ";{code}");

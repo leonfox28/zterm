@@ -180,13 +180,21 @@ message TerminalStyle {
   uint32 underline = 6;
   bool inverse = 7;
   TerminalColor underline_color = 8;
+  bool strike = 9;
+  bool conceal = 10;
 }
 
 message TerminalCell {
+  uint32 hyperlink = 5;
   string contents = 1;
   bool wide = 2;
   bool wide_continuation = 3;
   TerminalStyle style = 4;
+}
+
+message TerminalHyperlink {
+  string id = 1;
+  string uri = 2;
 }
 
 message TerminalSurfaceRow {
@@ -195,13 +203,28 @@ message TerminalSurfaceRow {
 }
 
 message TerminalCursor {
+  TerminalCursorPresentation presentation = 5;
   uint32 row = 1;
   uint32 column = 2;
   bool visible = 3;
   TerminalStyle style = 4;
 }
 
+enum TerminalCursorShape {
+  TERMINAL_CURSOR_SHAPE_UNSPECIFIED = 0;
+  TERMINAL_CURSOR_SHAPE_BLOCK = 1;
+  TERMINAL_CURSOR_SHAPE_BEAM = 2;
+  TERMINAL_CURSOR_SHAPE_UNDERLINE = 3;
+}
+
+message TerminalCursorPresentation {
+  TerminalCursorShape shape = 1;
+  bool blinking = 2;
+}
+
 message TerminalSurface {
+  string application_title = 9;
+  repeated TerminalHyperlink hyperlinks = 10;
   TerminalColorSnapshot colors = 8;
   uint32 row_count = 1;
   uint32 column_count = 2;
@@ -225,6 +248,8 @@ message TerminalSemanticRowPatch {
 }
 
 message TerminalSemanticDelta {
+  string application_title = 12;
+  repeated TerminalHyperlink hyperlinks = 13;
   TerminalColorSnapshot colors = 11;
   AttachmentId attachment_id = 1;
   uint64 from_revision = 2;
@@ -239,6 +264,7 @@ message TerminalSemanticDelta {
 }
 
 message TerminalSemanticHistoryWindowFrame {
+  repeated TerminalHyperlink hyperlinks = 11;
   TerminalColorSnapshot colors = 10;
   AttachmentId attachment_id = 1;
   TerminalHistoryWindowOutcome outcome = 2;

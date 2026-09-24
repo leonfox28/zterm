@@ -8,7 +8,7 @@ use zterm_core::terminal::{
 
 use crate::engine::AlacrittyEngine;
 use crate::{
-    MAX_CONTROL_SEQUENCE_BYTES, MAX_CONTROL_STRING_BYTES, MAX_OSC52_BASE64_BYTES,
+    MAX_CONTROL_SEQUENCE_BYTES, MAX_CONTROL_STRING_BYTES, MAX_OSC52_BASE64_BYTES, MAX_REPEAT_COUNT,
     MAX_REPLY_BYTES_PER_UPDATE,
 };
 
@@ -192,6 +192,7 @@ pub(crate) enum PresentationBoundary {
 pub(crate) struct TerminalIngressPolicy {
     state: PolicyState,
     utf8: Vec<u8>,
+    preceding_character: Option<char>,
     boundary: Option<PresentationBoundary>,
     synchronized_output: bool,
 }
@@ -201,6 +202,7 @@ impl Default for TerminalIngressPolicy {
         Self {
             state: PolicyState::Ground,
             utf8: Vec::with_capacity(4),
+            preceding_character: None,
             boundary: None,
             synchronized_output: false,
         }
@@ -392,7 +394,7 @@ impl TerminalIngressPolicy {
             return PolicyState::Ground;
         }
         if byte < 0x80 && self.utf8.is_empty() {
-            engine.feed_raw(&[byte]);
+            self.print_character(char::from(byte), engine, output);
             return PolicyState::Ground;
         }
 
@@ -408,20 +410,14 @@ impl TerminalIngressPolicy {
                     let Some(character) = text.chars().next() else {
                         break;
                     };
-                    let bytes = self.utf8.clone();
                     self.utf8.clear();
-                    if engine.accept_character(character) {
-                        engine.feed_raw(&bytes);
-                    } else {
-                        output.push_event(TerminalSideEvent::UnsupportedSequence(
-                            UnsupportedSequenceKind::Character,
-                        ));
-                    }
+                    self.print_character(character, engine, output);
                     break;
                 }
                 Ok(_) => break,
                 Err(error) if error.error_len().is_none() && self.utf8.len() < 4 => break,
                 Err(error) => {
+                    self.preceding_character = None;
                     let invalid = error.error_len().unwrap_or(1).min(self.utf8.len());
                     let remainder = self.utf8.split_off(invalid);
                     engine.feed_raw(&self.utf8);
@@ -436,8 +432,25 @@ impl TerminalIngressPolicy {
 
     fn flush_partial_utf8(&mut self, engine: &mut AlacrittyEngine) {
         if !self.utf8.is_empty() {
+            self.preceding_character = None;
             engine.feed_raw(&self.utf8);
             self.utf8.clear();
+        }
+    }
+
+    fn print_character(
+        &mut self,
+        character: char,
+        engine: &mut AlacrittyEngine,
+        output: &mut UpdateCollector,
+    ) {
+        if engine.accept_character(character) {
+            engine.feed_raw(character.encode_utf8(&mut [0; 4]).as_bytes());
+            self.preceding_character = Some(character);
+        } else {
+            output.push_event(TerminalSideEvent::UnsupportedSequence(
+                UnsupportedSequenceKind::Character,
+            ));
         }
     }
 
@@ -454,6 +467,7 @@ impl TerminalIngressPolicy {
         } else if sequence.bytes == b"\x1bg" {
             output.push_event(TerminalSideEvent::VisualBell);
         } else if sequence.bytes == b"\x1bc" {
+            self.preceding_character = None;
             engine.feed_reset(&sequence.bytes);
             self.synchronized_output = false;
             self.boundary = Some(PresentationBoundary::Reset);
@@ -540,6 +554,11 @@ impl TerminalIngressPolicy {
             }
         }
         if final_byte == b't' {
+            if body == b"18" {
+                let size = engine.size();
+                return output
+                    .push_reply(format!("\x1b[8;{};{}t", size.rows, size.columns).as_bytes());
+            }
             if marker.is_none()
                 && let Some([8, rows, columns]) = parameters.as_deref()
                 && *rows > 0
@@ -556,7 +575,30 @@ impl TerminalIngressPolicy {
             return Ok(());
         }
         if final_byte == b'u' {
+            if body.is_empty() {
+                engine.feed_raw(&sequence.bytes);
+                return Ok(());
+            }
             return dispatch_keyboard_mode(sequence, marker, parameters, engine, output);
+        }
+        if final_byte == b'b' {
+            let count = match (marker, parameters.as_deref()) {
+                (None, Some([] | [0])) => Some(1),
+                (None, Some([count @ 1..=MAX_REPEAT_COUNT])) => Some(*count),
+                _ => None,
+            };
+            match (count, self.preceding_character) {
+                (Some(count), Some(character)) => {
+                    for _ in 0..count {
+                        self.print_character(character, engine, output);
+                    }
+                }
+                (None, _) => output.push_event(TerminalSideEvent::UnsupportedSequence(
+                    UnsupportedSequenceKind::Csi,
+                )),
+                _ => {}
+            }
+            return Ok(());
         }
         if matches!(final_byte, b'h' | b'l') && marker == Some(b'?') {
             let Some(parameters) = parameters else {
@@ -580,7 +622,7 @@ impl TerminalIngressPolicy {
             }
             return Ok(());
         }
-        let unsupported = matches!(final_byte, b'b' | b'c') || body.contains(&b'$');
+        let unsupported = final_byte == b'c' || body.contains(&b'$');
         if unsupported {
             output.push_event(TerminalSideEvent::UnsupportedSequence(
                 UnsupportedSequenceKind::Csi,
@@ -631,6 +673,9 @@ impl TerminalIngressPolicy {
         end: &str,
     ) -> Result<(), IngressError> {
         if string.overflowed {
+            if matches!(string.kind, StringKind::Osc) && string.bytes.starts_with(b"8;") {
+                engine.close_hyperlink();
+            }
             if string.clipboard {
                 output.push_event(TerminalSideEvent::EffectRejected(
                     RejectedEffect::ClipboardWrite,
@@ -682,8 +727,19 @@ impl TerminalIngressPolicy {
         let command = fields.next().unwrap_or_default();
         let payload = fields.next().unwrap_or_default();
         match command {
+            b"8" => {
+                let accepted = std::str::from_utf8(payload)
+                    .is_ok_and(|payload| engine.set_web_hyperlink(payload));
+                if !accepted {
+                    engine.close_hyperlink();
+                    output.push_event(TerminalSideEvent::UnsupportedSequence(
+                        UnsupportedSequenceKind::Osc,
+                    ));
+                }
+            }
             b"0" | b"2" => {
-                let (title, truncated) = bounded_text(payload);
+                let (title, truncated) = bounded_application_title(payload);
+                engine.application_title.clone_from(&title);
                 output.push_event(TerminalSideEvent::TitleChanged { title, truncated });
             }
             b"1" => {
@@ -830,6 +886,18 @@ fn parse_parameters(body: &[u8]) -> (Option<u8>, Option<Vec<u16>>) {
         parsed.push(number);
     }
     (marker, Some(parsed))
+}
+
+fn bounded_application_title(bytes: &[u8]) -> (String, bool) {
+    let text = String::from_utf8_lossy(bytes);
+    let mut title = String::new();
+    for character in text.chars().filter(|character| !character.is_control()) {
+        if title.len() + character.len_utf8() > MAX_TITLE_BYTES {
+            return (title, true);
+        }
+        title.push(character);
+    }
+    (title, false)
 }
 
 fn bounded_text(bytes: &[u8]) -> (String, bool) {

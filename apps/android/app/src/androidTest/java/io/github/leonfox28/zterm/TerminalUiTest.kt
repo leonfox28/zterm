@@ -23,6 +23,114 @@ class TerminalUiTest {
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
     private val repository get() = (ui.activity.application as ZtermApplication).repository
 
+    @Test fun terminalProtocolMetadataAndSystemLinkActionSurviveReconnect() {
+        org.junit.Assume.assumeTrue("explicit disposable protocol host",
+            InstrumentationRegistry.getArguments().getString("protocolFixture") == "1")
+        val ticket = java.io.File(instrumentation.targetContext.filesDir, "protocol-ticket.txt")
+        ui.waitUntil(20_000) { repository.state.value.initialized }
+        assertTrue("fresh fixture install", repository.state.value.saved.hosts.isEmpty())
+        ui.runOnIdle { repository.setPreferences(Preferences("en", "dark", 12)) }
+        ui.runOnIdle { repository.pair(ticket.readText().trim()) }
+        ui.waitUntil(20_000) { !repository.state.value.busy && repository.state.value.saved.hosts.size == 1 }
+        ticket.delete()
+        val host = repository.state.value.saved.hosts.single()
+        require(host.name.startsWith("presentation-"))
+        instrumentation.uiAutomation.serviceInfo = instrumentation.uiAutomation.serviceInfo.apply {
+            flags = flags or android.accessibilityservice.AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
+        }
+        val name = "protocol-${System.nanoTime() % 100000}"
+        var owned: String? = null
+        val opened = java.util.concurrent.atomic.AtomicReference<String?>(null)
+        val monitor = object : android.app.Instrumentation.ActivityMonitor() {
+            override fun onStartActivity(intent: android.content.Intent): android.app.Instrumentation.ActivityResult? {
+                if (intent.action != android.content.Intent.ACTION_VIEW) return null
+                opened.set(intent.dataString)
+                return android.app.Instrumentation.ActivityResult(android.app.Activity.RESULT_OK, null)
+            }
+        }
+        instrumentation.addMonitor(monitor)
+        try {
+            ui.runOnIdle { repository.connectHost(host.id) }
+            ui.waitUntil(20_000) { repository.state.value.route == Route.Terminal && !repository.state.value.busy }
+            ui.runOnIdle { repository.createSession(name, "") }
+            await("protocol Session") { repository.frame.value?.state == "active" && !repository.state.value.busy }
+            owned = repository.state.value.sessionId
+            await("shell and geometry") { content().isNotBlank() && geometrySettled() }
+            val script = """
+                import os, sys, tty, termios
+                old = termios.tcgetattr(0)
+                def output(value): sys.stdout.write(value); sys.stdout.flush()
+                try:
+                    tty.setraw(0)
+                    output('\x1b[2J\x1b[H\x1b]2;编辑器\x07\x1b[5 q\x1b]8;id=doc;https://example.com/protocol\x07LINK\x1b]8;;\x07\r\n\x1b[9mSTRIKE\x1b[0m \x1b[8mHIDDEN\x1b[0m\r\nPROTOCOL_READY\r\n')
+                    while True:
+                        key = os.read(0, 1)
+                        if key == b'q': break
+                        if key == b'c': output('\x1b]2;\x07')
+                finally:
+                    output('\x1b[0 q\x1b]2;\x07')
+                    termios.tcsetattr(0, termios.TCSANOW, old)
+            """.trimIndent()
+            val encoded = android.util.Base64.encodeToString(script.toByteArray(), android.util.Base64.NO_WRAP)
+            ui.runOnIdle { repository.text("python3 -c 'import base64; exec(base64.b64decode(\"$encoded\"))'\r") }
+            await("protocol output") { content().contains("PROTOCOL_READY") && repository.frame.value?.applicationTitle == "编辑器" }
+            ui.onNodeWithText("$name · 编辑器").assertExists()
+            assertEquals(io.github.leonfox28.zterm.nativebridge.NativeCursorShape.BEAM, repository.frame.value!!.cursorShape)
+            assertTrue(repository.frame.value!!.cursorBlinking)
+            val styles = repository.frame.value!!.rows.first { row -> row.cells.take(6).joinToString("") { it.text } == "STRIKE" }.cells
+            assertTrue(styles[0].attributes.toInt() and 8 != 0)
+            assertTrue(styles[7].attributes.toInt() and 16 != 0)
+            val renamed = "$name-renamed"
+            ui.runOnIdle { repository.renameSession(requireNotNull(owned), renamed) }
+            await("manual rename") { !repository.state.value.busy && repository.state.value.sessions.any { it.name == renamed } }
+            ui.onNodeWithText("$renamed · 编辑器").assertExists()
+            ui.runOnIdle { repository.goHome() }
+            ui.waitUntil { repository.frame.value == null }
+            ui.runOnIdle { repository.connectHost(host.id) }
+            await("protocol reconnect") { repository.frame.value?.state == "active" && repository.frame.value?.applicationTitle == "编辑器" && geometrySettled() }
+            assertEquals(owned, repository.state.value.sessionId)
+            fun selectLink() {
+                val view = terminal()
+                val columns = repository.frame.value!!.viewport.columns.toInt()
+                val rows = repository.frame.value!!.viewport.rows.toInt()
+                gesture(view, 1.5f / columns, .5f / rows, 1.5f / columns, .5f / rows, 750)
+                await("selected link") { repository.frame.value?.selection != null }
+            }
+            selectLink()
+            val selectedTarget = java.util.concurrent.atomic.AtomicReference<String?>(null)
+            ui.runOnIdle { repository.selectionHyperlink { selectedTarget.set(it ?: "no-target") } }
+            await("selected link target") { selectedTarget.get() != null }
+            assertEquals("https://example.com/protocol", selectedTarget.get())
+            val openAction = clickSystemText("Open link")
+            if (!openAction) {
+                instrumentation.uiAutomation.takeScreenshot()?.let { bitmap ->
+                    java.io.File(instrumentation.targetContext.cacheDir, "protocol-selection.png").outputStream().use {
+                        bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it)
+                    }
+                    bitmap.recycle()
+                }
+            }
+            assertTrue("system Open link", openAction)
+            await("deliberate browser handoff") { opened.get() == "https://example.com/protocol" && repository.frame.value?.selection == null }
+            selectLink()
+            assertTrue("existing system Copy", clickSystemText("Copy"))
+            await("Copy clears selection") { repository.frame.value?.selection == null }
+            val clipboard = instrumentation.targetContext.getSystemService(ClipboardManager::class.java)
+            assertEquals("I", ui.runOnIdle { clipboard.primaryClip?.getItemAt(0)?.text?.toString() })
+            ui.runOnIdle { repository.text("c") }
+            await("empty title") { repository.frame.value?.applicationTitle == "" }
+            ui.onNodeWithText(renamed).assertExists()
+            assertTrue(repository.state.value.sessions.any { it.sessionId == owned && it.name == renamed })
+            ui.runOnIdle { repository.text("q") }
+        } finally {
+            instrumentation.removeMonitor(monitor)
+            ui.runOnIdle { repository.goHome() }
+            ui.waitUntil(15_000) { repository.frame.value == null }
+            owned?.let { id -> runBlocking { repository.runtime.closeSession(host.id, id) } }
+            ticket.delete()
+        }
+    }
+
     @Test fun keyboardDismissalSurvivesTaskResume() {
         val hostName = InstrumentationRegistry.getArguments().getString("hostName")
         org.junit.Assume.assumeTrue("explicit disposable host", hostName?.startsWith("presentation-") == true)

@@ -76,7 +76,7 @@ fn extended_colors_distinguish_unknown_dynamic_and_unsupported_and_ignore_bad_pa
     let mut m = model();
     assert_eq!(
         send(&mut m, b"\x1b]21;foreground=?;cursor=?;unsupported=?\x07"),
-        "\x1b]21;foreground=;cursor=;unsupported=?\x07"
+        "\x1b]21;foreground=;cursor=;unknown=dW5zdXBwb3J0ZWQ\x07"
     );
     send(
         &mut m,

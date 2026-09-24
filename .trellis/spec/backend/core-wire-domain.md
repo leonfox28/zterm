@@ -126,6 +126,19 @@ Color observations and snapshots follow [Terminal Colors](./terminal-colors.md):
 262 required values, 262 bounded inherited sources, valid enums/RGB/Dynamic
 roles, monotonic color stamps on Revision, explicit cursor provenance, and
 underline shape/color. Missing metadata is invalid, never an old-client default.
+Styles also carry strike and conceal. These values participate in cell equality,
+hashing, snapshot/delta/history conversion and cursor pen reporting; conceal does
+not alter text-range extraction.
+Cursor presentation is a required nested message with a valid block/beam/underline
+enum and blink declaration; absent/unknown values are rejected at wire conversion.
+Cells optionally share validated immutable HTTP(S) hyperlink values. Each snapshot,
+delta and history frame carries its own deduplicated dictionary; cell reference 0
+means none and positive references index that message only. Conversion rejects
+bad/duplicate/oversized dictionary entries and dangling references, and shares one
+Arc per decoded value. Empty Changed/Gap history responses carry no dictionary.
+URI/id Debug is redacted at both domain and protobuf boundaries. Keep existing
+frame caps; never copy a long URI into every cell or rely on link-registration
+messages arriving before a snapshot.
 
 
 - `zterm-core::terminal` owns size, screen, cell/style/cursor/modes, side
@@ -341,3 +354,9 @@ Ordinary OSC 9/777 domain validation, nested protobuf redaction and the kind-325
 contract are specified in [Terminal Notifications](./terminal-notifications.md).
 `TerminalUpdate.host_effects` holds an independent latest clipboard slot and
 notification FIFO; no effect enters revisioned terminal content.
+
+Application title is a full surface/delta string, at most MAX_TITLE_BYTES (256)
+UTF-8 bytes with no control characters. Empty clears it; missing row patches do
+not suppress it. Invalid wire titles reject the complete candidate transactionally.
+Domain/protobuf Debug omit its contents. It never enters persistent Session name
+or per-history-row metadata.

@@ -114,6 +114,7 @@ impl ScrollbarGeometry {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ComposedCursor {
+    pub(super) presentation: zterm_core::terminal::TerminalCursorPresentation,
     pub(super) row: u16,
     pub(super) column: u16,
     pub(super) visible: bool,
@@ -128,14 +129,28 @@ pub(super) struct LayoutIdentity {
 }
 
 /// Complete renderer-neutral desired frame for one physical transition.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(super) struct ComposedFrame {
+    pub(super) application_title: String,
     pub(super) physical_size: TerminalSize,
     pub(super) layout: LayoutIdentity,
     pub(super) rows: BTreeMap<u16, Vec<TerminalCell>>,
     pub(super) cursor: ComposedCursor,
     pub(super) modes: TerminalModes,
     pub(super) colors: zterm_core::terminal::TerminalColorSnapshot,
+}
+
+impl std::fmt::Debug for ComposedFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ComposedFrame")
+            .field("physical_size", &self.physical_size)
+            .field("layout", &self.layout)
+            .field("rows", &self.rows)
+            .field("cursor", &self.cursor)
+            .field("modes", &self.modes)
+            .field("colors", &self.colors)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ComposedFrame {
@@ -280,6 +295,7 @@ impl ComposedFrame {
             && surface.cursor.column < content_size.columns
         {
             ComposedCursor {
+                presentation: surface.cursor.presentation,
                 row: surface.cursor.row.saturating_sub(pan_rows),
                 column: surface.cursor.column,
                 visible: surface.cursor.visible,
@@ -287,6 +303,7 @@ impl ComposedFrame {
             }
         } else {
             ComposedCursor {
+                presentation: Default::default(),
                 row: 0,
                 column: 0,
                 visible: false,
@@ -294,6 +311,7 @@ impl ComposedFrame {
             }
         };
         Ok(Self {
+            application_title: surface.application_title.clone(),
             physical_size,
             layout: LayoutIdentity {
                 content_size,
@@ -369,6 +387,7 @@ pub(super) fn text_cells(text: &str, width: usize, style: TerminalStyle) -> Vec<
             break;
         }
         cells.push(TerminalCell {
+            hyperlink: None,
             contents: character.to_string(),
             wide: character_width == 2,
             wide_continuation: false,

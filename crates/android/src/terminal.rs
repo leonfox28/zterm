@@ -92,6 +92,8 @@ pub enum NativeRowUpdate {
 /// Latest complete frame, replacing any unobserved predecessor.
 #[derive(Clone, uniffi::Record)]
 pub struct NativeFrame {
+    /// Current application title, independent of the persistent session name.
+    pub application_title: String,
     /// Current attachment's selected network route, independent of visual sync.
     pub connection_path: NativeConnectionPath,
     /// Selected-path round-trip estimate in milliseconds; absent when unknown.
@@ -139,6 +141,10 @@ pub struct NativeFrame {
     pub cursor_column: u16,
     /// Whether to draw the cursor glyph.
     pub cursor_visible: bool,
+    /// Declared native caret shape.
+    pub cursor_shape: NativeCursorShape,
+    /// Declared blinking; phase is local to the View.
+    pub cursor_blinking: bool,
     /// Resolved cursor block color.
     pub cursor_color: u32,
     /// Default canvas color.
@@ -146,6 +152,17 @@ pub struct NativeFrame {
     /// Available retained-history offset.
     pub history_maximum: u64,
 }
+/// Caret geometry, independent of text attributes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
+pub enum NativeCursorShape {
+    /// Filled character block.
+    Block,
+    /// Leading vertical caret.
+    Beam,
+    /// Bottom horizontal caret.
+    Underline,
+}
+
 /// Address-free network route for terminal chrome.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, uniffi::Enum)]
 pub enum NativeConnectionPath {
@@ -445,6 +462,7 @@ enum Action {
     ClearSelection,
     ClearNotice,
     Copy(oneshot::Sender<Result<String, NativeError>>),
+    SelectionHyperlink(oneshot::Sender<Result<Option<String>, NativeError>>),
     Visible(bool),
     Resize(NativeViewport),
     Colors(bool),
@@ -632,6 +650,12 @@ impl NativeTerminal {
     pub async fn copy_selection(&self) -> Result<String, NativeError> {
         let (send, result) = oneshot::channel();
         self.submit(Action::Copy(send)).await?;
+        result.await.map_err(|_| NativeError::Closed)?
+    }
+    /// Resolves the current source-pinned selection only when it names one web link.
+    pub async fn selection_hyperlink(&self) -> Result<Option<String>, NativeError> {
+        let (send, result) = oneshot::channel();
+        self.submit(Action::SelectionHyperlink(send)).await?;
         result.await.map_err(|_| NativeError::Closed)?
     }
     /// Pauses speculative history work only; the connection stays owned by the App.
@@ -869,6 +893,10 @@ async fn run(
                     },
                     Action::Detach => writer.detach().await.map_err(Into::into),
                     Action::Copy(reply) => { let _ = reply.send(navigation.copy().map(TerminalClipboardWrite::into_string)); Ok(()) },
+                    Action::SelectionHyperlink(reply) => {
+                        let result = if state == "active" { navigation.selection_hyperlink() } else { Err(failure("selection_changed")) };
+                        let _ = reply.send(result); Ok(())
+                    },
                     Action::ClearSelection => { navigation.clear_selection(); Ok(()) },
                     Action::ClearNotice => { navigation.notice = None; Ok(()) },
                     Action::Visible(value) => { navigation.visible = value; prefetch = value; Ok(()) },
@@ -1264,6 +1292,7 @@ fn project(
 ) -> NativeFrame {
     let surface = &surface.surface;
     NativeFrame {
+        application_title: surface.application_title.clone(),
         connection_path: NativeConnectionPath::Unknown,
         rtt_ms: None,
         pointer_mode: NativePointerMode::None,
@@ -1292,6 +1321,12 @@ fn project(
         cursor_row: surface.cursor.row,
         cursor_column: surface.cursor.column,
         cursor_visible: surface.cursor.visible && state == "active",
+        cursor_shape: match surface.cursor.presentation.shape {
+            zterm_core::terminal::TerminalCursorShape::Block => NativeCursorShape::Block,
+            zterm_core::terminal::TerminalCursorShape::Beam => NativeCursorShape::Beam,
+            zterm_core::terminal::TerminalCursorShape::Underline => NativeCursorShape::Underline,
+        },
+        cursor_blinking: surface.cursor.presentation.blinking,
         cursor_color: slot_color(&surface.colors, COLOR_CURSOR, dark),
         background: slot_color(&surface.colors, COLOR_BACKGROUND, dark),
         history_maximum: surface
@@ -1334,7 +1369,9 @@ fn project_row(row: &TerminalSurfaceRow, colors: &TerminalColorSnapshot, dark: b
                     background,
                     attributes: u8::from(cell.style.bold)
                         | (u8::from(cell.style.dim) << 1)
-                        | (u8::from(cell.style.italic) << 2),
+                        | (u8::from(cell.style.italic) << 2)
+                        | (u8::from(cell.style.strike) << 3)
+                        | (u8::from(cell.style.conceal) << 4),
                     underline: match cell.style.underline {
                         TerminalUnderline::None => 0,
                         TerminalUnderline::Single => 1,

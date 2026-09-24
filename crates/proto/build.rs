@@ -57,6 +57,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ".zterm.v2.TerminalNotification.content",
         ".zterm.v2.TerminalNotificationOsc777",
         ".zterm.v2.TerminalCell",
+        ".zterm.v2.TerminalHyperlink",
         ".zterm.v2.TerminalSurfaceRow",
         ".zterm.v2.TerminalSurface",
         ".zterm.v2.TerminalSemanticSnapshot",

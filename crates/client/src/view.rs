@@ -2170,6 +2170,7 @@ mod tests {
         let (prepared, _peer, _, _) = terminal_test_view(false);
         let snapshot = prepared.initial_snapshot();
         let delta = TerminalViewDelta {
+            application_title: String::new(),
             colors: Default::default(),
 
             from_revision: snapshot.revision,

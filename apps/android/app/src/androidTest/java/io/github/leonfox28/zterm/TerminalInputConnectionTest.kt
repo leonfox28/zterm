@@ -106,6 +106,8 @@ class TerminalInputConnectionTest {
     }
 
     private fun frame() = NativeFrame(
+        applicationTitle = "",
+        cursorShape = NativeCursorShape.BLOCK, cursorBlinking = false,
         connectionPath = NativeConnectionPath.UNKNOWN, rttMs = null,
         pointerMode = NativePointerMode.NONE, activeScreen = NativeActiveScreen.MAIN, source = null,
         stats = NativeNavigationStats(0u, 0u, 0u, 0u, 0u, 0u, 0u), notice = null,

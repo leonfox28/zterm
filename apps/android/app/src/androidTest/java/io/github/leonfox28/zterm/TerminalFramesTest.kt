@@ -154,6 +154,8 @@ class TerminalFramesTest {
 
     private fun row(text: String) = NativeRow(listOf(NativeCell(text, 1u, 0xffffffffu, 0xff000000u, 0u, 0u, 0xffffffffu)), false)
     private fun frame(generation: ULong, source: NativeFrameSource?) = NativeFrame(
+        applicationTitle = "",
+        cursorShape = NativeCursorShape.BLOCK, cursorBlinking = false,
         connectionPath = NativeConnectionPath.UNKNOWN, rttMs = null,
         pointerMode = NativePointerMode.NONE, activeScreen = NativeActiveScreen.MAIN, source = source,
         stats = NativeNavigationStats(0u, 0u, 0u, 0u, 0u, 0u, 0u), notice = null,
