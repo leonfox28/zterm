@@ -585,6 +585,38 @@ impl Navigation {
             _ => failure("selection_changed"),
         })
     }
+    pub fn selection_hyperlink(&self) -> Result<Option<String>, NativeError> {
+        let Some(selection) = &self.selection else {
+            return Ok(None);
+        };
+        if selection.blocked {
+            return Err(failure("selection_changed"));
+        }
+        let (a, b) = (
+            selection.anchor.min(selection.focus),
+            selection.anchor.max(selection.focus),
+        );
+        let rows = selected_rows(selection, a.row, b.row)?;
+        let mut target = None;
+        for (index, row) in rows.iter().enumerate() {
+            let start = if index == 0 { usize::from(a.column) } else { 0 };
+            let end = if index + 1 == rows.len() {
+                usize::from(b.column) + 1
+            } else {
+                row.cells.len()
+            };
+            for cell in &row.cells[start..end] {
+                let Some(link) = &cell.hyperlink else {
+                    return Ok(None);
+                };
+                if target.as_ref().is_some_and(|old| old != link) {
+                    return Ok(None);
+                }
+                target = Some(Arc::clone(link));
+            }
+        }
+        Ok(target.map(|link| link.uri().to_owned()))
+    }
     pub fn clear_selection(&mut self) {
         if self.selection.take().is_some()
             && self.position == Position::History
@@ -623,6 +655,7 @@ fn selected_rows(
     Ok(rows)
 }
 pub(super) fn row_allocations(rows: &[TerminalSurfaceRow]) -> usize {
+    let mut links = std::collections::HashSet::new();
     rows.iter().fold(0usize, |sum, row| {
         sum.saturating_add(row.cells.capacity() * std::mem::size_of::<TerminalCell>())
             .saturating_add(
@@ -631,12 +664,62 @@ pub(super) fn row_allocations(rows: &[TerminalSurfaceRow]) -> usize {
                     .map(|cell| cell.contents.capacity())
                     .sum::<usize>(),
             )
+            .saturating_add(
+                row.cells
+                    .iter()
+                    .filter_map(|cell| cell.hyperlink.as_ref())
+                    .filter(|link| links.insert(Arc::as_ptr(link)))
+                    .map(|link| link.allocation_bytes())
+                    .sum::<usize>(),
+            )
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_links_use_captured_rows_require_one_target_and_count_shared_storage() {
+        let mut live = surface(1, 1, 0);
+        let before = row_allocations(&live.surface.rows);
+        let link =
+            Arc::new(TerminalHyperlink::new("doc", "https://example.com/doc").expect("link"));
+        for cell in &mut live.surface.rows[0].cells[..3] {
+            cell.hyperlink = Some(Arc::clone(&link));
+        }
+        assert_eq!(
+            row_allocations(&live.surface.rows) - before,
+            link.allocation_bytes()
+        );
+        // Equal values with distinct allocations must not evade the page budget.
+        live.surface.rows[0].cells[3].hyperlink = Some(Arc::new((*link).clone()));
+        assert_eq!(
+            row_allocations(&live.surface.rows) - before,
+            2 * link.allocation_bytes()
+        );
+        live.surface.rows[0].cells[3].hyperlink = Some(Arc::new(
+            TerminalHyperlink::new("other", "https://example.com/other").expect("other"),
+        ));
+        let mut nav = Navigation::new(&live);
+        let (page, offset) = nav.frame_source(&live).expect("drawn source");
+        nav.select_source(Arc::clone(&page), offset, 0, 0)
+            .expect("select");
+        nav.extend_source(&page, offset, 0, 2, false)
+            .expect("one target");
+        assert_eq!(
+            nav.selection_hyperlink().expect("link"),
+            Some("https://example.com/doc".into())
+        );
+        nav.extend_source(&page, offset, 0, 3, false)
+            .expect("two targets");
+        assert_eq!(
+            nav.selection_hyperlink().expect("ambiguous selection"),
+            None
+        );
+        nav.clear_selection();
+        assert_eq!(nav.selection_hyperlink().expect("cleared"), None);
+    }
     #[tokio::test]
     async fn sleeping_subscriber_receives_final_frame_before_cancellation() {
         use super::super::{NativeTerminal, project};
@@ -708,11 +791,13 @@ mod tests {
         AttachmentSurface::from_snapshot(&TerminalSurfaceSnapshot {
             revision: Revision::new(revision),
             surface: TerminalSurface {
+                application_title: String::new(),
                 colors: TerminalColorSnapshot::default(),
                 size: TerminalSize::new(4, 8),
                 active_screen: ActiveScreen::Main,
                 rows: rows(maximum as i64, 4),
                 cursor: TerminalCursor {
+                    presentation: Default::default(),
                     row: 0,
                     column: 0,
                     visible: true,
@@ -962,6 +1047,8 @@ mod tests {
                 inverse: true,
                 underline: TerminalUnderline::Curly,
                 underline_color: TerminalColor::Rgb(4, 5, 6),
+                strike: true,
+                conceal: true,
             };
         }
         check(&capture(&styled, 2, true, &origin), &old, 1);

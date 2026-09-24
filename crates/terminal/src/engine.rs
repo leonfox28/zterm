@@ -163,13 +163,15 @@ impl CombiningBudget {
 }
 
 pub(crate) struct AlacrittyEngine {
+    pub(crate) application_title: String,
     pub(crate) colors: crate::colors::ZtermColorState,
     pub(crate) grid_input: bool,
     processor: Processor,
-    term: Term<BoundedEventSink>,
+    pub(crate) term: Term<BoundedEventSink>,
     sink: BoundedEventSink,
     legacy_x10_mouse: bool,
     combining: CombiningBudget,
+    pub(crate) hyperlinks: crate::hyperlinks::Hyperlinks,
 }
 
 impl AlacrittyEngine {
@@ -182,6 +184,7 @@ impl AlacrittyEngine {
             ..Config::default()
         };
         let mut engine = Self {
+            application_title: String::new(),
             colors: crate::colors::ZtermColorState::default(),
             grid_input: false,
             processor: Processor::new(),
@@ -189,6 +192,7 @@ impl AlacrittyEngine {
             sink,
             legacy_x10_mouse: false,
             combining: CombiningBudget::default(),
+            hyperlinks: Default::default(),
         };
         // Alacritty enables alternate-scroll by default, while Zterm's public
         // contract starts with all optional input modes disabled.
@@ -207,18 +211,22 @@ impl AlacrittyEngine {
     }
 
     pub(crate) fn feed_screen_transition(&mut self, bytes: &[u8]) {
+        self.reconcile_hyperlinks();
         self.reconcile_active_combining_budget();
         self.grid_input = true;
         self.processor.advance(&mut self.term, bytes);
         self.reconcile_active_combining_budget();
+        self.reconcile_hyperlinks();
     }
 
     pub(crate) fn feed_reset(&mut self, bytes: &[u8]) {
         self.colors.reset();
+        self.application_title.clear();
         self.grid_input = true;
         self.processor.advance(&mut self.term, bytes);
         self.legacy_x10_mouse = false;
         self.combining = CombiningBudget::default();
+        self.hyperlinks = Default::default();
         self.reconcile_active_combining_budget();
     }
 
@@ -226,6 +234,7 @@ impl AlacrittyEngine {
         self.reconcile_active_combining_budget();
         self.term.resize(EngineSize::new(size));
         self.reconcile_active_combining_budget();
+        self.reconcile_hyperlinks();
     }
 
     pub(crate) fn size(&self) -> TerminalSize {
@@ -274,6 +283,7 @@ impl AlacrittyEngine {
                 1 => flags.contains(TermMode::APP_CURSOR),
                 6 => flags.contains(TermMode::ORIGIN),
                 7 => flags.contains(TermMode::LINE_WRAP),
+                12 => self.term.cursor_style().blinking,
                 25 => flags.contains(TermMode::SHOW_CURSOR),
                 47 | 1047 | 1049 => flags.contains(TermMode::ALT_SCREEN),
                 1000 => flags.contains(TermMode::MOUSE_REPORT_CLICK),

@@ -82,6 +82,7 @@ impl StartupProgress {
             );
         }
         ComposedFrame {
+            application_title: String::new(),
             physical_size,
             layout: LayoutIdentity {
                 content_size: TerminalSize::new(
@@ -93,6 +94,7 @@ impl StartupProgress {
             },
             rows,
             cursor: ComposedCursor {
+                presentation: Default::default(),
                 row: 0,
                 column: 0,
                 visible: false,

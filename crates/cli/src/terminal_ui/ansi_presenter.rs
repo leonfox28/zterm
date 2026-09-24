@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::io::{self, Write};
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -7,7 +8,7 @@ use zterm_core::terminal::{
     COLOR_BACKGROUND, COLOR_CURSOR, COLOR_CURSOR_TEXT, COLOR_FOREGROUND,
     COLOR_SELECTION_BACKGROUND, COLOR_SELECTION_FOREGROUND, TerminalCell, TerminalClipboardWrite, TerminalNotification,
     TerminalColor, TerminalColorSnapshot, TerminalColorValue, TerminalKeyboardFlags, TerminalModes,
-    TerminalStyle, TerminalUnderline,
+    TerminalStyle, TerminalUnderline, TerminalCursorShape,
 };
 use zterm_core::terminal_selection::{TerminalTextPoint, TerminalTextRange};
 
@@ -27,6 +28,9 @@ pub(super) struct DesktopPresenter {
     observed_colors: Option<TerminalColorSnapshot>,
     committed_input_modes: HostInputModes,
     selection: SelectionPresentation,
+    presented_source: Option<SelectionSourceIdentity>,
+    cursor_phase_hidden: bool,
+    cursor_deadline: Option<Instant>,
 }
 
 /// Exact child modes which change bytes produced by the physical outer
@@ -65,6 +69,18 @@ impl HostInputModes {
 }
 
 impl DesktopPresenter {
+    pub(super) fn cursor_deadline(&self) -> Option<Instant> {
+        self.cursor_deadline
+    }
+
+    pub(super) fn blink_cursor(&mut self, writer: &mut impl Write) -> Result<(), CliError> {
+        let Some(semantic) = self.semantic_baseline.clone() else { return Ok(()) };
+        self.cursor_phase_hidden = !self.cursor_phase_hidden;
+        self.cursor_deadline = Some(Instant::now() + Duration::from_millis(500));
+        self.present_candidate(writer, semantic, self.presented_source, self.selection)?;
+        Ok(())
+    }
+
     pub(super) fn observe_history_colors(&mut self, colors: TerminalColorSnapshot) -> bool {
         let current = self
             .observed_colors
@@ -166,6 +182,16 @@ impl DesktopPresenter {
             }
         }
         let semantic = desired.clone();
+        let blinking = desired.colors.custom_cursor && desired.cursor.visible
+            && desired.cursor.presentation.blinking;
+        if !blinking || self.semantic_baseline.as_ref().is_none_or(|before| before.cursor != desired.cursor) {
+            self.cursor_phase_hidden = false;
+            self.cursor_deadline = None;
+        }
+        if blinking {
+            self.cursor_deadline.get_or_insert_with(|| Instant::now() + Duration::from_millis(500));
+            if self.cursor_phase_hidden { desired.cursor.visible = false; }
+        }
         resolve_frame(&mut desired, selection.range_for(source));
         self.present_resolved(writer, desired, Some(semantic), source, selection)
     }
@@ -176,6 +202,8 @@ impl DesktopPresenter {
         writer: &mut impl Write,
         desired: ComposedFrame,
     ) -> Result<bool, CliError> {
+        self.cursor_deadline = None;
+        self.cursor_phase_hidden = false;
         self.present_resolved(writer, desired, None, None, SelectionPresentation::default())
     }
 
@@ -194,6 +222,7 @@ impl DesktopPresenter {
         // a false presentation difference later.
         desired.modes = desired_input_modes.terminal_modes();
         if self.baseline.as_ref() == Some(&desired) {
+            self.presented_source = source;
             self.selection = selection;
             self.semantic_baseline = semantic;
             return Ok(false);
@@ -203,6 +232,14 @@ impl DesktopPresenter {
         });
         let mut frame = Vec::new();
         frame.extend_from_slice(HOST_SYNC_BEGIN);
+        if baseline.is_none() {
+            frame.extend_from_slice(b"\x1b]8;;\x1b\\");
+        }
+        if baseline.is_none_or(|before| before.application_title != desired.application_title) {
+            let title = if desired.application_title.is_empty() { "zterm" } else { &desired.application_title };
+            write!(frame, "\x1b]2;{title}\x1b\\")
+                .map_err(|error| terminal_io("compose terminal title", error))?;
+        }
         let mut row_indices = BTreeMap::new();
         // An unknown outer-terminal mapping requires truthful final coverage,
         // including neutral space beyond the capped child grid. Never expose
@@ -254,6 +291,13 @@ impl DesktopPresenter {
             .map_err(|error| terminal_io("compose semantic terminal modes", error))?;
         write_style(&mut frame, desired.cursor.style)
             .map_err(|error| terminal_io("compose semantic terminal cursor", error))?;
+        let shape = match desired.cursor.presentation.shape {
+            TerminalCursorShape::Block => 2,
+            TerminalCursorShape::Underline => 4,
+            TerminalCursorShape::Beam => 6,
+        } - u8::from(desired.cursor.presentation.blinking);
+        write!(frame, "\x1b[{shape} q")
+            .map_err(|error| terminal_io("compose terminal cursor shape", error))?;
         write!(
             frame,
             "\x1b[{};{}H",
@@ -270,17 +314,20 @@ impl DesktopPresenter {
         frame.extend_from_slice(HOST_SYNC_END);
         if let Err(error) = writer.write_all(&frame) {
             self.baseline = None;
+            let _ = writer.write_all(b"\x1b]8;;\x1b\\");
             let _ = writer.write_all(HOST_SYNC_END);
             let _ = writer.flush();
             return Err(terminal_io("present semantic terminal frame", error));
         }
         if let Err(error) = writer.flush() {
             self.baseline = None;
+            let _ = writer.write_all(b"\x1b]8;;\x1b\\");
             let _ = writer.write_all(HOST_SYNC_END);
             let _ = writer.flush();
             return Err(terminal_io("present semantic terminal frame", error));
         }
         self.committed_input_modes = desired_input_modes;
+        self.presented_source = source;
         self.selection = selection;
         self.semantic_baseline = semantic;
         self.baseline = Some(desired);
@@ -434,10 +481,26 @@ fn resolve_frame(frame: &mut ComposedFrame, selection: Option<TerminalTextRange>
                 && *row_index == cursor.row
                 && cursor_span.is_some_and(|(start, end)| (start..end).contains(&column))
             {
-                (fg, bg) = (
-                    role_color(colors, COLOR_CURSOR_TEXT, bg),
-                    role_color(colors, COLOR_CURSOR, fg),
-                );
+                if cursor.presentation.shape == TerminalCursorShape::Block {
+                    (fg, bg) = (
+                        role_color(colors, COLOR_CURSOR_TEXT, bg),
+                        role_color(colors, COLOR_CURSOR, fg),
+                    );
+                } else if !cell.wide_continuation {
+                    // ANSI cannot overlay a partial-cell software caret. Paint a
+                    // bounded caret glyph and repair the original span next phase.
+                    fg = role_color(colors, COLOR_CURSOR, fg);
+                    cell.contents = match cursor.presentation.shape {
+                        TerminalCursorShape::Beam => "▏",
+                        _ => "▁",
+                    }.to_owned();
+                    if cell.wide {
+                        cell.contents.push(if cursor.presentation.shape == TerminalCursorShape::Underline { '▁' } else { ' ' });
+                    }
+                    cell.style.conceal = false;
+                    cell.style.strike = false;
+                    cell.style.underline = TerminalUnderline::None;
+                }
             }
             if cell.style.underline_color != TerminalColor::Default
                 && let PaintColor::Color(color) =
@@ -503,12 +566,20 @@ pub(super) fn semantic_dirty_runs(
 
 fn encode_semantic_row(writer: &mut impl Write, row: &[TerminalCell]) -> io::Result<()> {
     let mut style = None;
+    let mut hyperlink = None;
     let mut column = 0;
     while column < row.len() {
         let cell = &row[column];
         if cell.wide_continuation {
             column += 1;
             continue;
+        }
+        if hyperlink != cell.hyperlink.as_deref() {
+            if hyperlink.is_some() { writer.write_all(b"\x1b]8;;\x1b\\")?; }
+            hyperlink = cell.hyperlink.as_deref();
+            if let Some(link) = hyperlink {
+                write!(writer, "\x1b]8;id={};{}\x1b\\", link.id(), link.uri())?;
+            }
         }
         if style != Some(cell.style) {
             write_style(writer, cell.style)?;
@@ -521,6 +592,7 @@ fn encode_semantic_row(writer: &mut impl Write, row: &[TerminalCell]) -> io::Res
         }
         column += if cell.wide { 2 } else { 1 };
     }
+    if hyperlink.is_some() { writer.write_all(b"\x1b]8;;\x1b\\")?; }
     writer.write_all(b"\x1b[0m")
 }
 
@@ -553,6 +625,12 @@ fn write_style(writer: &mut impl Write, style: TerminalStyle) -> io::Result<()> 
     }
     if style.inverse {
         parameters.push("7".to_owned());
+    }
+    if style.conceal {
+        parameters.push("8".to_owned());
+    }
+    if style.strike {
+        parameters.push("9".to_owned());
     }
     push_semantic_color(&mut parameters, style.foreground, true);
     push_semantic_color(&mut parameters, style.background, false);
@@ -642,6 +720,60 @@ mod color_tests {
     use super::super::composition::{ComposedCursor, LayoutIdentity};
     use super::*;
     use zterm_core::{Revision, terminal::TerminalSize};
+
+    #[test]
+    fn strike_and_conceal_are_encoded_and_reset_between_runs() {
+        let mut output = Vec::new();
+        write_style(&mut output, TerminalStyle {
+            strike: true,
+            conceal: true,
+            ..TerminalStyle::default()
+        }).expect("styles");
+        write_style(&mut output, TerminalStyle::default()).expect("reset");
+        assert_eq!(output, b"\x1b[0;8;9;39;49m\x1b[0;39;49m");
+    }
+
+    #[test]
+    fn web_link_spans_close_before_plain_text_and_run_boundaries() {
+        let link = std::sync::Arc::new(zterm_core::terminal::TerminalHyperlink::new("doc", "https://example.com/").expect("link"));
+        let linked = TerminalCell { contents: "label".into(), hyperlink: Some(link), ..Default::default() };
+        let plain = TerminalCell { contents: "plain".into(), ..Default::default() };
+        let mut output = Vec::new();
+        encode_semantic_row(&mut output, &[linked.clone(), plain]).expect("mixed row");
+        let text = String::from_utf8(output).expect("UTF-8");
+        assert!(text.contains("\x1b]8;id=doc;https://example.com/\x1b\\"));
+        assert!(text.contains("label\x1b]8;;\x1b\\plain"));
+        let mut output = Vec::new();
+        encode_semantic_row(&mut output, &[linked]).expect("linked run");
+        assert!(output.ends_with(b"\x1b]8;;\x1b\\\x1b[0m"));
+    }
+
+    #[test]
+    fn software_caret_shapes_blink_without_changing_semantic_content() {
+        for shape in [TerminalCursorShape::Block, TerminalCursorShape::Beam, TerminalCursorShape::Underline] {
+            let mut desired = frame();
+            desired.colors.custom_cursor = true;
+            desired.cursor.presentation.shape = shape;
+            desired.cursor.presentation.blinking = true;
+            let mut presenter = DesktopPresenter::default();
+            let mut output = Vec::new();
+            presenter.present(&mut output, desired.clone(), None).expect("cursor on");
+            assert!(presenter.cursor_deadline().is_some());
+            let on = presenter.baseline.clone();
+            if shape == TerminalCursorShape::Underline {
+                assert_eq!(on.as_ref().expect("physical").rows[&0][0].contents, "▁▁");
+            }
+            presenter.blink_cursor(&mut output).expect("cursor off");
+            assert_ne!(on, presenter.baseline);
+            assert_eq!(presenter.semantic_baseline.as_ref(), Some(&desired));
+            assert_eq!(presenter.baseline.as_ref().expect("physical").rows[&0][0].contents, "界\u{301}");
+            presenter.blink_cursor(&mut output).expect("cursor on again");
+            assert_eq!(on, presenter.baseline);
+            desired.cursor.visible = false;
+            presenter.present(&mut output, desired, None).expect("hidden");
+            assert!(presenter.cursor_deadline().is_none());
+        }
+    }
     fn frame() -> ComposedFrame {
         let mut rows = BTreeMap::new();
         rows.insert(
@@ -674,6 +806,7 @@ mod color_tests {
             }],
         );
         ComposedFrame {
+            application_title: String::new(),
             physical_size: TerminalSize::new(2, 3),
             layout: LayoutIdentity {
                 content_size: TerminalSize::new(1, 3),
@@ -682,6 +815,7 @@ mod color_tests {
             },
             rows,
             cursor: ComposedCursor {
+                presentation: Default::default(),
                 row: 0,
                 column: 0,
                 visible: true,
@@ -691,6 +825,22 @@ mod color_tests {
             colors: TerminalColorSnapshot::default(),
         }
     }
+    #[test]
+    fn application_title_is_written_on_change_and_empty_uses_default() {
+        let mut presenter = DesktopPresenter::default();
+        let mut desired = frame();
+        desired.application_title = "编辑器".into();
+        let mut bytes = Vec::new();
+        presenter.present(&mut bytes, desired.clone(), None).expect("first title");
+        assert!(String::from_utf8_lossy(&bytes).contains("\x1b]2;编辑器\x1b\\"));
+        bytes.clear();
+        presenter.present(&mut bytes, desired.clone(), None).expect("unchanged");
+        assert!(bytes.is_empty());
+        desired.application_title.clear();
+        presenter.present(&mut bytes, desired, None).expect("clear title");
+        assert!(String::from_utf8_lossy(&bytes).contains("\x1b]2;zterm\x1b\\"));
+    }
+
     #[test]
     fn unknown_mapping_covers_blank_cells_and_retired_rows_without_preclear() {
         let mut desired = frame();
@@ -754,7 +904,9 @@ mod color_tests {
             TerminalColor::Rgb(20, 30, 40)
         );
         assert_eq!(physical.rows[&1], desired.rows[&1]);
-        assert!(!output.windows(2).any(|w| w == b"\x1b]"));
+        for command in ["4;", "10;", "11;", "12;", "21;", "104", "110", "111", "112"] {
+            assert!(!String::from_utf8_lossy(&output).contains(&format!("\x1b]{command}")));
+        }
         let mut next = desired.clone();
         next.colors.changed_at = Revision::new(1);
         next.colors.profile.values[2] = TerminalColorValue::Rgb(70, 80, 90);

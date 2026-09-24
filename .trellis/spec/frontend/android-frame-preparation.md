@@ -36,8 +36,13 @@ mutating a shared record after projection.
 
 Native reuse requires the same attachment origin and color/appearance context.
 Borrowed semantic row keys use Hash plus full Eq over cells, exact text, wide
-flags, every style field and soft-wrap continuity. Prefer an equal row at the
-same index, then match an equal row elsewhere in the bounded previous window.
+flags, every style field (including strike/conceal) and soft-wrap continuity.
+Native attributes use bits 0/1/2 for bold/dim/italic and 3/4 for strike/conceal.
+Cell equality/hash includes hyperlink identity/target so reuse cannot preserve an
+obsolete action. Native page accounting includes shared hyperlink allocations,
+deduplicated by allocation within each page; separate pages remain conservatively
+accounted. Existing cache and pin limits stay unchanged.
+Prefer an equal row at the same index, then match an equal row elsewhere in the bounded previous window.
 Core Hash derives add no fields/wire semantics. A missing/incompatible baseline
 returns only Replace records; colors/appearance conservatively replace the
 whole window. Only replacements allocate/resolve/serialize cell DTOs. The
@@ -118,3 +123,9 @@ advance authoritative native state immediately and pace only Android preparation
 Wrong: adopt text batching from a long-ASCII benchmark alone. Correct: preserve
 exact cell pixels and establish a reliable benefit with sparse/styled controls
 before changing the existing painter.
+
+Application-title changes are frame metadata only and must reuse prepared rows.
+Cursor shape/blinking are dynamic overlay metadata; phase is View-local, never a
+wire revision or a row-cache key. Conceal suppresses glyphs and decorations after
+background painting; strike uses the existing text metrics. Selection and cursor
+overlays never repaint concealed glyphs.

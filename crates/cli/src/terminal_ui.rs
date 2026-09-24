@@ -145,7 +145,8 @@ mod unix {
     const HOST_SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
     const HOST_SYNC_END: &[u8] = b"\x1b[?2026l";
     const HOST_INPUT_CAPTURE: &[u8] = b"\x1b[?1003h\x1b[?1006h";
-    const ENTER_TERMINAL_UI: &[u8] = b"\x1b[?1049h\x1b[?25l\x1b[>0u\x1b[?1003h\x1b[?1006h";
+    const ENTER_TERMINAL_UI: &[u8] =
+        b"\x1b[22;2t\x1b[?1049h\x1b[?25l\x1b[>0u\x1b[?1003h\x1b[?1006h";
     const HOST_SEQUENCE_BOUND: usize = 64;
     use zterm_client::input::RESUME_INPUT_BOUND;
     const PAGE_UP: &[u8] = b"\x1b[5~";
@@ -153,6 +154,8 @@ mod unix {
     const PASTE_START: &[u8] = b"\x1b[200~";
     const PASTE_END: &[u8] = b"\x1b[201~";
     const RESTORE_TERMINAL_UI: &[u8] = concat!(
+        "\x1b]8;;\x1b\\",
+        "\x1b[23;2t",
         "\x1b[?2026l",
         "\x1b[?9l",
         "\x1b[?1000l",
@@ -170,6 +173,7 @@ mod unix {
         "\x1b>",
         "\x1b[<u",
         "\x1b[0m",
+        "\x1b[0 q",
         "\x1b[?25h",
         "\x1b[?1049l"
     )
@@ -4034,12 +4038,14 @@ mod unix {
             TerminalSurfaceSnapshot {
                 revision,
                 surface: TerminalSurface {
+                    application_title: String::new(),
                     colors: Default::default(),
 
                     size,
                     active_screen,
                     rows,
                     cursor: TerminalCursor {
+                        presentation: Default::default(),
                         row: 0,
                         column: 0,
                         visible: true,
@@ -4487,6 +4493,7 @@ mod unix {
                 colors.profile.values[COLOR_SELECTION_BACKGROUND] =
                     TerminalColorValue::Rgb(14, 15, 16);
                 let delta = TerminalSurfaceDelta {
+                    application_title: String::new(),
                     colors,
                     from_revision: Revision::new(2),
                     to_revision: Revision::new(3),
@@ -4689,6 +4696,7 @@ mod unix {
                 ..TerminalStyle::default()
             };
             let delta = TerminalSurfaceDelta {
+                application_title: String::new(),
                 colors: Default::default(),
 
                 from_revision: Revision::new(4),
@@ -4700,6 +4708,7 @@ mod unix {
                     replacement: test_row(size.columns, "changed", styled),
                 }],
                 cursor: TerminalCursor {
+                    presentation: Default::default(),
                     row: 1,
                     column: 3,
                     visible: true,
@@ -4726,6 +4735,7 @@ mod unix {
             assert_eq!(candidate.surface.rows[1].cells[0].contents, "changed");
 
             let gap = TerminalSurfaceDelta {
+                application_title: String::new(),
                 from_revision: Revision::new(3),
                 ..delta.clone()
             };
@@ -5174,6 +5184,7 @@ mod unix {
                     [(2, 3, true), (2, 3, false), (3, 5, false), (3, 5, true)]
                 {
                     snapshot.surface.cursor = TerminalCursor {
+                        presentation: Default::default(),
                         row,
                         column,
                         visible,
@@ -5548,6 +5559,7 @@ mod unix {
             let child_flags = zterm_core::terminal::TerminalKeyboardFlags::from_bits(9)
                 .expect("valid child keyboard flags");
             let delta = TerminalSurfaceDelta {
+                application_title: String::new(),
                 colors: Default::default(),
 
                 from_revision: Revision::new(2),
@@ -5629,6 +5641,7 @@ mod unix {
 
             output = ViewportFrameWriter::default();
             let delta = TerminalSurfaceDelta {
+                application_title: String::new(),
                 colors: Default::default(),
 
                 from_revision: Revision::new(3),
@@ -5682,6 +5695,7 @@ mod unix {
                 ..TerminalModes::default()
             };
             let delta = TerminalSurfaceDelta {
+                application_title: String::new(),
                 colors: Default::default(),
 
                 from_revision: Revision::new(4),
@@ -5804,6 +5818,7 @@ mod unix {
                     .clone();
 
                 let delta = TerminalSurfaceDelta {
+                    application_title: String::new(),
                     colors: Default::default(),
 
                     from_revision: Revision::new(2),
@@ -5964,6 +5979,7 @@ mod unix {
                 let metrics_before = viewport.live_metrics;
 
                 let delta = TerminalSurfaceDelta {
+                    application_title: String::new(),
                     colors: Default::default(),
 
                     from_revision: Revision::new(2),
@@ -6100,6 +6116,7 @@ mod unix {
             let source_before = viewport.selection_source_identity(&surface);
 
             let delta = TerminalSurfaceDelta {
+                application_title: String::new(),
                 colors: Default::default(),
 
                 from_revision: Revision::new(2),
@@ -7084,7 +7101,13 @@ mod unix {
                     }
                 }
                 assert_eq!(find_bytes(&bytes, b"\x1b[?2031l").is_some(), owned);
-                assert!(find_bytes(&bytes, b"\x1b]").is_none());
+                assert_eq!(
+                    bytes.windows(2).filter(|bytes| *bytes == b"\x1b]").count(),
+                    1
+                );
+                assert!(find_bytes(&bytes, b"\x1b]8;;\x1b\\").is_some());
+                assert!(find_bytes(&bytes, b"\x1b[22;2t").is_some());
+                assert!(find_bytes(&bytes, b"\x1b[23;2t").is_some());
             }
         }
         #[test]

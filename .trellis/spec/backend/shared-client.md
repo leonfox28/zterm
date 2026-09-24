@@ -72,6 +72,10 @@ new connection through duplicate arbitration, even with valid authorization.
   frame. The source pins an immutable accounted semantic page; attachment origin,
   input epoch, active screen, viewport and monotonic `geometry_generation`
   fence its use. Equal A-B-A dimensions never revive a retired source.
+- `selection_hyperlink()` resolves one HTTP(S) target only from the current
+  pinned selection while Active. Mixed, unlinked or cleared selections return
+  none; blocked selections fail without a target. This reuses the source proof
+  from begin/extend instead of looking up the latest unpainted live grid.
 - `ViewportCache::with_budget(ViewportCacheBudget { rows, bytes })` opts Android
   into multiple pages. Default construction preserves desktop single-window
   behavior. `install_accounted_window` requires nested row allocation bytes.
@@ -300,3 +304,13 @@ and lifecycle queue. NativeTerminal exports `next_notification()` plus
 `notification_is_current(generation)`; the opaque generation changes on actual
 connection retirement, including reconnect within one native handle. Android
 notifications never enter NativeFrame or Activity-owned collectors.
+
+## Terminal protocol presentation metadata
+
+Application title travels in the existing complete surface/delta and NativeFrame,
+including metadata-only updates and reconnect snapshots. It does not change row
+content identity or persistent session names. CLI composition reads the current
+live title even while showing retained history. The sole presenter emits OSC 2
+(on change; empty means zterm); TerminalGuard pushes/pops window title with
+CSI 22;2t / 23;2t. Restoring a preexisting outer title requires title-stack support.
+No raw child title query or OSC stream is forwarded.

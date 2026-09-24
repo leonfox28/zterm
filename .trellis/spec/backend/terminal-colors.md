@@ -60,10 +60,15 @@ latest profile and supplies it with each fresh attachment identity on reconnect.
 - Render order: semantic colors, inverse, selection, software cursor. Explicit
   underline color stays explicit; default underline follows final text.
   Underline shapes are none/single/double/curly/dotted/dashed.
-- Any explicit cursor/cursor-text override, including Dynamic, uses a steady
-  software block over the actual glyph span. Hide the native cursor, keep CUP
+- Any explicit cursor/cursor-text override, including Dynamic, uses a software
+  cursor with the declared shape/blink over the actual glyph span. The CLI uses
+  a colored caret glyph for beam/underline (ANSI cannot overlay part of a glyph)
+  and repairs the original semantic span when it moves or blinks off. Hide the native cursor, keep CUP
   at the semantic cursor for IME, repair wide/combining old and new spans, and
   hide the cursor in history. Reset returns to inherited native behavior.
+- Native cursors use canonical DECSCUSR; software blinking is a local 500 ms
+  presenter deadline, never a host revision or network update. Invisible/history
+  cursors have no deadline. Cleanup restores the physical default cursor style.
 - The sole presenter retains separate semantic and resolved physical baselines.
   Resolve only child content; child overrides never color ZTerm chrome.
   Successful output commits both; failed output keeps semantic fallback,
@@ -79,7 +84,8 @@ latest profile and supplies it with each fresh attachment identity on reconnect.
 - OSC 21 accepts numeric entries and foreground/background/cursor/cursor_text/
   selection_foreground/selection_background. `key=?` queries; empty special
   setter means Dynamic; bare key resets. A supported Unknown query returns an
-  empty value; an unsupported key returns `=?`. Invalid setters change nothing.
+  empty value; an unsupported query key returns `unknown=` followed by its
+  unpadded Base64-encoded UTF-8 name, in request order. Invalid setters change nothing.
 - Numeric color formats: X11 `#` with high-bit component precision, scaled
   `rgb:`, finite clamped `rgbi:`; licensed case-folded X11 names are supported.
   Only fully opaque alpha is accepted. Never apply CSS short-hex semantics.

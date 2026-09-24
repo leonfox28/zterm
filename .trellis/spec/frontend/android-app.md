@@ -96,6 +96,13 @@ GestureDetector/OverScroller move local pixel offsets. Hit testing uses the draw
 source, not the next unpainted frame. ActionMode.TYPE_FLOATING supplies Copy;
 Android theme handle drawables and nearest-handle hit testing support edge drag.
 Only explicit Copy writes ClipData; no automatic success toast or remote Ctrl+C.
+For a selection wholly belonging to one OSC 8 web link, the floating menu also
+offers Open link. Native lookup reads the exact source-pinned selected rows and
+refuses blocked/mixed targets; attachment and selection versions fence both menu
+lookup and the click-time recheck. Reconnect/geometry/selection changes retire old
+actions. Kotlin opens only HTTP(S) with ACTION_VIEW/BROWSABLE on explicit action,
+with a local failure notice if no browser handles it. Ordinary tap/mouse routing
+and Copy are unchanged; no URI is projected into every native cell.
 
 `NativeFrame.firstRow` is the first row of a bounded presentation window,
 not necessarily the visible top. `windowOffset` is the reading offset at that
@@ -153,7 +160,17 @@ the same cell painter directly. Compose a complete frame from background, reused
 or updated text and current overlays; do not depend on old Canvas pixels surviving.
 Do not build a full-history bitmap or cache cursor, selection or preedit in nodes.
 
-The cell painter omits only glyph submission/foreground setup for an empty string
+Concealed cells paint only their background: glyphs, underline and strike are
+hidden without changing semantic text or explicit Copy. Visible strike draws
+across the full glyph cell span. Selection and cursor overlays do not repaint
+concealed glyphs.
+Cursor shape and blinking come from native semantic metadata. Block/beam/underline
+are dynamic overlays, outside row RenderNodes. The View schedules a local 500 ms
+blink only when attached, shown, window-visible and displaying a visible live
+blinking cursor; hidden/background/detached views cancel it. The phase does not
+modify row data or create native/network updates.
+
+For other cells, the painter omits only glyph submission/foreground setup for an empty string
 or exactly one ASCII space. Always paint the cell background and declared underline;
 do not skip the whole blank cell, use generic whitespace detection, or trim its
 semantic text. A space followed by a combining mark still needs glyph drawing.
@@ -669,3 +686,17 @@ Wrong: an Activity launches its own startup job or trusts GitHub's version JSON 
 installation authority. Correct: observe the application owner; Rust authenticates
 both release signatures and checksum bindings before offering a candidate, then
 Android independently checks the downloaded APK and delegates final installation.
+
+## Application title and link actions
+
+TerminalStatus carries applicationTitle independently of saved Session names.
+The fixed-height header uses session · application title, omits an empty or
+identical suffix, and truncates to one ellipsized line. Terminal title changes
+never invoke rename/storage/list mutation.
+
+Open link shares the existing source-pinned selection: native lookup must find
+one validated HTTP(S) target throughout the selected span, and AppRepository
+fences delivery with both selection version and attachment epoch. Menu availability
+stores only a boolean; clicking rechecks the current native target. Copy is
+unchanged. ACTION_VIEW is a deliberate system handoff; absent handlers produce
+a localized message without recording the URI.

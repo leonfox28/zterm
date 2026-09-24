@@ -27,6 +27,78 @@ import java.util.concurrent.TimeUnit
 class TerminalRenderingTest {
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
 
+    @Test fun cursorBlinkStopsWhenHiddenAndResumesWithoutANativeFrame() {
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            lateinit var terminal: TerminalView
+            scenario.onActivity { activity ->
+                terminal = TerminalView(activity)
+                activity.setContentView(terminal)
+                terminal.update(frame(0, 0, 1, 0).copy(cursorVisible = true, cursorRow = 0u,
+                    cursorBlinking = true), 12)
+            }
+            instrumentation.waitForIdleSync()
+            fun capture(): Bitmap {
+                lateinit var bitmap: Bitmap
+                instrumentation.runOnMainSync { bitmap = pixels(terminal) }
+                return bitmap
+            }
+            fun changesFrom(before: Bitmap): Boolean {
+                repeat(20) {
+                    SystemClock.sleep(75)
+                    val next = capture()
+                    val changed = !before.sameAs(next)
+                    next.recycle()
+                    if (changed) return true
+                }
+                return false
+            }
+            val first = capture()
+            assertTrue("local timer changes caret pixels", changesFrom(first)); first.recycle()
+            instrumentation.runOnMainSync { terminal.visibility = android.view.View.INVISIBLE }
+            val hidden = capture()
+            SystemClock.sleep(650)
+            val later = capture()
+            assertTrue("hidden View has no continuing blink", hidden.sameAs(later))
+            hidden.recycle(); later.recycle()
+            instrumentation.runOnMainSync { terminal.visibility = android.view.View.VISIBLE }
+            val resumed = capture()
+            assertTrue("visibility alone restarts the timer", changesFrom(resumed)); resumed.recycle()
+        }
+    }
+
+    @Test fun cursorShapesProduceDistinctOverlaysWithoutChangingRows() {
+        instrumentation.runOnMainSync {
+            val base = frame(0, 0, 1, 0).copy(cursorVisible = true, cursorRow = 0u)
+            val images = listOf(NativeCursorShape.BLOCK, NativeCursorShape.BEAM, NativeCursorShape.UNDERLINE)
+                .map { pixels(liveView(base.copy(cursorShape = it))) }
+            try {
+                assertFalse(images[0].sameAs(images[1]))
+                assertFalse(images[1].sameAs(images[2]))
+                assertFalse(images[0].sameAs(images[2]))
+            } finally { images.forEach { it.recycle() } }
+        }
+    }
+
+    @Test fun concealHidesGlyphsAndDecorationsWhileStrikeChangesPixels() {
+        instrumentation.runOnMainSync {
+            val plain = frame(0, 0, 1, 0).copy(cursorVisible = false)
+            fun withStyle(attributes: UByte, underline: UByte = 0u, text: String = "M") = plain.copy(
+                rows = plain.rows.map { row -> row.copy(cells = row.cells.map {
+                    it.copy(text = text, attributes = attributes, underline = underline)
+                }) })
+            val visible = pixels(liveView(withStyle(0u)))
+            val struck = pixels(liveView(withStyle(8u)))
+            val hidden = pixels(liveView(withStyle(24u, 1u)))
+            val blank = pixels(liveView(withStyle(0u, text = " ")))
+            try {
+                assertFalse("strike adds visible decoration", visible.sameAs(struck))
+                assertTrue("conceal suppresses glyphs and every decoration", hidden.sameAs(blank))
+            } finally {
+                visible.recycle(); struck.recycle(); hidden.recycle(); blank.recycle()
+            }
+        }
+    }
+
     @Test fun blankCellsKeepBackgroundsDecorationsAndAdjacentGlyphs() {
         instrumentation.runOnMainSync {
             val base = NativeCell(" ", 1u, Color.WHITE.toUInt(), Color.BLUE.toUInt(), 0u, 0u, Color.CYAN.toUInt())
@@ -769,6 +841,8 @@ class TerminalRenderingTest {
     private fun frame(offset: Int, windowOffset: Int, count: Int, maximum: Int = 1000, marker: Int = 995): NativeFrame {
         val first = maximum - windowOffset
         return NativeFrame(
+        applicationTitle = "",
+        cursorShape = NativeCursorShape.BLOCK, cursorBlinking = false,
             connectionPath = NativeConnectionPath.UNKNOWN, rttMs = null,
             pointerMode = NativePointerMode.NONE, activeScreen = NativeActiveScreen.MAIN, source = null,
             stats = NativeNavigationStats(0u, 0u, 0u, 0u, 0u, 0u, 0u), notice = null,

@@ -2,21 +2,24 @@
 
 use std::fmt;
 
+mod terminal_links;
 pub mod upload;
+use terminal_links::{LinkEncoder, decode_links, decode_row};
+#[cfg(test)]
+use zterm_core::terminal::{TerminalCell, TerminalSurfaceRow};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use prost::Message;
 use zeroize::{Zeroize, Zeroizing};
 use zterm_core::terminal::{
-    ActiveScreen, TerminalAppearance, TerminalCell, TerminalClipboardWrite, TerminalColor,
-    TerminalColorProfile, TerminalColorSnapshot, TerminalColorValue, TerminalCursor,
-    TerminalHistoryWindowAnchor, TerminalHistoryWindowQuery, TerminalKeyboardFlags, TerminalModes,
-    TerminalMouseEncoding, TerminalMouseMode, TerminalNotification, TerminalScrollMetrics,
-    TerminalSize, TerminalStyle, TerminalSurface, TerminalSurfaceDelta, TerminalSurfaceError,
-    TerminalSurfaceHistoryWindowFrame, TerminalSurfaceHistoryWindowResult, TerminalSurfaceRow,
-    TerminalSurfaceRowPatch, TerminalSurfaceSnapshot, TerminalUnderline,
-    TerminalViewportDisposition,
+    ActiveScreen, TerminalAppearance, TerminalClipboardWrite, TerminalColor, TerminalColorProfile,
+    TerminalColorSnapshot, TerminalColorValue, TerminalCursor, TerminalHistoryWindowAnchor,
+    TerminalHistoryWindowQuery, TerminalKeyboardFlags, TerminalModes, TerminalMouseEncoding,
+    TerminalMouseMode, TerminalNotification, TerminalScrollMetrics, TerminalSize, TerminalStyle,
+    TerminalSurface, TerminalSurfaceDelta, TerminalSurfaceError, TerminalSurfaceHistoryWindowFrame,
+    TerminalSurfaceHistoryWindowResult, TerminalSurfaceRowPatch, TerminalSurfaceSnapshot,
+    TerminalUnderline, TerminalViewportDisposition,
 };
 use zterm_core::{
     AttachmentId, AuthGeneration, AuthorizationStatus, Capabilities, ConnectionAttemptId,
@@ -1479,6 +1482,8 @@ impl From<TerminalStyle> for v2::TerminalStyle {
             underline: value.underline as u32,
             underline_color: Some(value.underline_color.into()),
             inverse: value.inverse,
+            strike: value.strike,
+            conceal: value.conceal,
         }
     }
 }
@@ -1515,57 +1520,8 @@ impl TryFrom<v2::TerminalStyle> for TerminalStyle {
                 ))?
                 .try_into()?,
             inverse: value.inverse,
-        })
-    }
-}
-
-impl From<TerminalCell> for v2::TerminalCell {
-    fn from(value: TerminalCell) -> Self {
-        Self {
-            contents: value.contents,
-            wide: value.wide,
-            wide_continuation: value.wide_continuation,
-            style: Some(value.style.into()),
-        }
-    }
-}
-
-impl TryFrom<v2::TerminalCell> for TerminalCell {
-    type Error = ProtocolError;
-
-    fn try_from(value: v2::TerminalCell) -> Result<Self, Self::Error> {
-        Ok(Self {
-            contents: value.contents,
-            wide: value.wide,
-            wide_continuation: value.wide_continuation,
-            style: value
-                .style
-                .ok_or(ProtocolError::InvalidTerminalSemanticField("cell_style"))?
-                .try_into()?,
-        })
-    }
-}
-
-impl From<TerminalSurfaceRow> for v2::TerminalSurfaceRow {
-    fn from(value: TerminalSurfaceRow) -> Self {
-        Self {
-            cells: value.cells.into_iter().map(Into::into).collect(),
-            wrapped: value.wrapped,
-        }
-    }
-}
-
-impl TryFrom<v2::TerminalSurfaceRow> for TerminalSurfaceRow {
-    type Error = ProtocolError;
-
-    fn try_from(value: v2::TerminalSurfaceRow) -> Result<Self, Self::Error> {
-        Ok(Self {
-            cells: value
-                .cells
-                .into_iter()
-                .map(TryInto::try_into)
-                .collect::<Result<_, _>>()?,
-            wrapped: value.wrapped,
+            strike: value.strike,
+            conceal: value.conceal,
         })
     }
 }
@@ -1573,6 +1529,14 @@ impl TryFrom<v2::TerminalSurfaceRow> for TerminalSurfaceRow {
 impl From<TerminalCursor> for v2::TerminalCursor {
     fn from(value: TerminalCursor) -> Self {
         Self {
+            presentation: Some(v2::TerminalCursorPresentation {
+                shape: match value.presentation.shape {
+                    zterm_core::terminal::TerminalCursorShape::Block => 1,
+                    zterm_core::terminal::TerminalCursorShape::Beam => 2,
+                    zterm_core::terminal::TerminalCursorShape::Underline => 3,
+                },
+                blinking: value.presentation.blinking,
+            }),
             row: u32::from(value.row),
             column: u32::from(value.column),
             visible: value.visible,
@@ -1585,7 +1549,22 @@ impl TryFrom<v2::TerminalCursor> for TerminalCursor {
     type Error = ProtocolError;
 
     fn try_from(value: v2::TerminalCursor) -> Result<Self, Self::Error> {
+        let presentation =
+            value
+                .presentation
+                .ok_or(ProtocolError::InvalidTerminalSemanticField(
+                    "cursor_presentation",
+                ))?;
         Ok(Self {
+            presentation: zterm_core::terminal::TerminalCursorPresentation {
+                shape: match presentation.shape {
+                    1 => zterm_core::terminal::TerminalCursorShape::Block,
+                    2 => zterm_core::terminal::TerminalCursorShape::Beam,
+                    3 => zterm_core::terminal::TerminalCursorShape::Underline,
+                    _ => return Err(ProtocolError::InvalidTerminalSemanticField("cursor_shape")),
+                },
+                blinking: presentation.blinking,
+            },
             row: u16::try_from(value.row)
                 .map_err(|_| ProtocolError::InvalidTerminalSemanticField("cursor_row"))?,
             column: u16::try_from(value.column)
@@ -1648,15 +1627,18 @@ fn terminal_scroll_metrics(
 }
 
 fn terminal_surface_message(surface: TerminalSurface) -> v2::TerminalSurface {
+    let mut links = LinkEncoder::default();
     v2::TerminalSurface {
+        application_title: surface.application_title,
         colors: Some(surface.colors.into()),
         row_count: u32::from(surface.size.rows),
         column_count: u32::from(surface.size.columns),
         active_screen: v2::TerminalActiveScreen::from(surface.active_screen) as i32,
-        rows: surface.rows.into_iter().map(Into::into).collect(),
+        rows: surface.rows.into_iter().map(|row| links.row(row)).collect(),
         cursor: Some(surface.cursor.into()),
         modes: Some(surface.modes.into()),
         scroll_metrics: surface.scroll_metrics.map(Into::into),
+        hyperlinks: links.finish(),
     }
 }
 
@@ -1664,18 +1646,20 @@ fn terminal_surface_from_message(
     value: v2::TerminalSurface,
     revision: zterm_core::Revision,
 ) -> Result<TerminalSurface, ProtocolError> {
+    let links = decode_links(value.hyperlinks)?;
     let size = TerminalSize::try_from(v2::TerminalViewport {
         rows: value.row_count,
         columns: value.column_count,
     })?;
     let surface = TerminalSurface {
+        application_title: value.application_title,
         colors: required_colors(value.colors)?,
         size,
         active_screen: terminal_active_screen(value.active_screen)?,
         rows: value
             .rows
             .into_iter()
-            .map(TryInto::try_into)
+            .map(|row| decode_row(row, &links))
             .collect::<Result<_, _>>()?,
         cursor: value
             .cursor
@@ -1743,7 +1727,9 @@ pub fn terminal_surface_delta_message(
     attachment_id: AttachmentId,
     delta: TerminalSurfaceDelta,
 ) -> v2::TerminalSemanticDelta {
+    let mut links = LinkEncoder::default();
     v2::TerminalSemanticDelta {
+        application_title: delta.application_title,
         colors: Some(delta.colors.into()),
         attachment_id: Some(attachment_id.into()),
         from_revision: delta.from_revision.get(),
@@ -1756,12 +1742,13 @@ pub fn terminal_surface_delta_message(
             .into_iter()
             .map(|patch| v2::TerminalSemanticRowPatch {
                 row: u32::from(patch.row),
-                replacement: Some(patch.replacement.into()),
+                replacement: Some(links.row(patch.replacement)),
             })
             .collect(),
         cursor: Some(delta.cursor.into()),
         modes: Some(delta.modes.into()),
         scroll_metrics: delta.scroll_metrics.map(Into::into),
+        hyperlinks: links.finish(),
     }
 }
 
@@ -1769,11 +1756,13 @@ pub fn terminal_surface_delta_message(
 pub fn terminal_surface_delta_from_message(
     value: v2::TerminalSemanticDelta,
 ) -> Result<(AttachmentId, TerminalSurfaceDelta), ProtocolError> {
+    let links = decode_links(value.hyperlinks)?;
     let attachment_id = value
         .attachment_id
         .ok_or(ProtocolError::InvalidTerminalSemanticField("attachment_id"))?
         .try_into()?;
     let delta = TerminalSurfaceDelta {
+        application_title: value.application_title,
         colors: required_colors(value.colors)?,
         from_revision: zterm_core::Revision::new(value.from_revision),
         to_revision: zterm_core::Revision::new(value.to_revision),
@@ -1790,12 +1779,14 @@ pub fn terminal_surface_delta_from_message(
                     row: u16::try_from(patch.row).map_err(|_| {
                         ProtocolError::InvalidTerminalSemanticField("row_patch_index")
                     })?,
-                    replacement: patch
-                        .replacement
-                        .ok_or(ProtocolError::InvalidTerminalSemanticField(
-                            "row_patch_replacement",
-                        ))?
-                        .try_into()?,
+                    replacement: decode_row(
+                        patch
+                            .replacement
+                            .ok_or(ProtocolError::InvalidTerminalSemanticField(
+                                "row_patch_replacement",
+                            ))?,
+                        &links,
+                    )?,
                 })
             })
             .collect::<Result<_, ProtocolError>>()?,
@@ -1824,6 +1815,7 @@ pub fn terminal_surface_history_window_frame_message(
     attachment_id: AttachmentId,
     result: TerminalSurfaceHistoryWindowResult,
 ) -> v2::TerminalSemanticHistoryWindowFrame {
+    let mut links = LinkEncoder::default();
     match result {
         TerminalSurfaceHistoryWindowResult::Frame(TerminalSurfaceHistoryWindowFrame {
             colors,
@@ -1845,7 +1837,8 @@ pub fn terminal_surface_history_window_frame_message(
             anchor: Some(anchor.into()),
             target_offset_from_bottom,
             first_row_from_live_top,
-            rows: rows.into_iter().map(Into::into).collect(),
+            rows: rows.into_iter().map(|row| links.row(row)).collect(),
+            hyperlinks: links.finish(),
             current_epoch: anchor.epoch.get(),
             current_revision: anchor.revision.get(),
         },
@@ -1859,6 +1852,7 @@ pub fn terminal_surface_history_window_frame_message(
                 target_offset_from_bottom: 0,
                 first_row_from_live_top: 0,
                 rows: Vec::new(),
+                hyperlinks: Vec::new(),
                 current_epoch: epoch.get(),
                 current_revision: revision.get(),
             }
@@ -1873,6 +1867,7 @@ pub fn terminal_surface_history_window_frame_message(
                 target_offset_from_bottom: 0,
                 first_row_from_live_top: 0,
                 rows: Vec::new(),
+                hyperlinks: Vec::new(),
                 current_epoch: epoch.get(),
                 current_revision: revision.get(),
             }
@@ -1885,6 +1880,7 @@ pub fn terminal_surface_history_window_from_message(
     value: v2::TerminalSemanticHistoryWindowFrame,
     query: TerminalHistoryWindowQuery,
 ) -> Result<(AttachmentId, TerminalSurfaceHistoryWindowResult), ProtocolError> {
+    let links = decode_links(value.hyperlinks)?;
     let attachment_id = value
         .attachment_id
         .ok_or(ProtocolError::InvalidTerminalSemanticField("attachment_id"))?
@@ -1936,7 +1932,7 @@ pub fn terminal_surface_history_window_from_message(
                 rows: value
                     .rows
                     .into_iter()
-                    .map(TryInto::try_into)
+                    .map(|row| decode_row(row, &links))
                     .collect::<Result<_, _>>()?,
             };
             frame
@@ -1951,6 +1947,7 @@ pub fn terminal_surface_history_window_from_message(
                 || value.target_offset_from_bottom != 0
                 || value.first_row_from_live_top != 0
                 || !value.rows.is_empty()
+                || !links.is_empty()
                 || value.current_epoch > value.current_revision
                 || value.current_revision < query.anchor.revision.get()
             {
@@ -3282,9 +3279,17 @@ mod tests {
     }
 
     fn semantic_row(columns: u16, contents: &str) -> TerminalSurfaceRow {
+        let link = std::sync::Arc::new(
+            zterm_core::terminal::TerminalHyperlink::new(
+                "doc",
+                "https://example.invalid/semantic-link",
+            )
+            .expect("web link"),
+        );
         TerminalSurfaceRow {
             cells: (0..columns)
                 .map(|_| TerminalCell {
+                    hyperlink: Some(std::sync::Arc::clone(&link)),
                     contents: contents.to_owned(),
                     style: TerminalStyle {
                         underline_color: Default::default(),
@@ -3296,11 +3301,42 @@ mod tests {
                         italic: true,
                         underline: TerminalUnderline::Single,
                         inverse: true,
+                        strike: true,
+                        conceal: true,
                     },
                     ..TerminalCell::default()
                 })
                 .collect(),
             wrapped: true,
+        }
+    }
+
+    #[test]
+    fn cursor_presentation_round_trips_and_rejects_missing_or_unknown_shape() {
+        use zterm_core::terminal::{TerminalCursorPresentation, TerminalCursorShape};
+        for shape in [
+            TerminalCursorShape::Block,
+            TerminalCursorShape::Beam,
+            TerminalCursorShape::Underline,
+        ] {
+            let cursor = TerminalCursor {
+                row: 0,
+                column: 0,
+                visible: true,
+                style: Default::default(),
+                presentation: TerminalCursorPresentation {
+                    shape,
+                    blinking: true,
+                },
+            };
+            let encoded: v2::TerminalCursor = cursor.into();
+            assert_eq!(TerminalCursor::try_from(encoded).expect("cursor"), cursor);
+            let mut missing = encoded;
+            missing.presentation = None;
+            assert!(TerminalCursor::try_from(missing).is_err());
+            let mut invalid = encoded;
+            invalid.presentation.as_mut().expect("presentation").shape = 99;
+            assert!(TerminalCursor::try_from(invalid).is_err());
         }
     }
 
@@ -3313,12 +3349,14 @@ mod tests {
         let snapshot = TerminalSurfaceSnapshot {
             revision,
             surface: TerminalSurface {
+                application_title: format!("title {SENTINEL}"),
                 colors: Default::default(),
 
                 size: TerminalSize::new(2, 3),
                 active_screen: ActiveScreen::Main,
                 rows: vec![semantic_row(3, SENTINEL), semantic_row(3, "x")],
                 cursor: TerminalCursor {
+                    presentation: Default::default(),
                     row: 1,
                     column: 2,
                     visible: true,
@@ -3346,6 +3384,7 @@ mod tests {
         assert_message_round_trip(WireKind::TerminalSemanticSnapshot, message);
 
         let delta = TerminalSurfaceDelta {
+            application_title: format!("title {SENTINEL}"),
             colors: Default::default(),
 
             from_revision: revision,
@@ -3368,6 +3407,17 @@ mod tests {
             terminal_surface_delta_from_message(message.clone()).expect("valid delta");
         assert_eq!(decoded_attachment, attachment_id);
         assert_eq!(decoded, delta);
+        assert!(!format!("{message:?}").contains(SENTINEL));
+        assert!(!format!("{delta:?}").contains(SENTINEL));
+        for title in ["bad\x1btitle".to_owned(), "界".repeat(86)] {
+            let mut invalid = message.clone();
+            invalid.application_title.clone_from(&title);
+            assert!(terminal_surface_delta_from_message(invalid).is_err());
+            let mut invalid =
+                terminal_surface_snapshot_message(session_id, attachment_id, snapshot.clone());
+            invalid.surface.as_mut().expect("surface").application_title = title;
+            assert!(terminal_surface_snapshot_from_message(invalid).is_err());
+        }
         assert_message_round_trip(WireKind::TerminalSemanticDelta, message);
 
         let mut malformed = terminal_surface_snapshot_message(session_id, attachment_id, snapshot);
@@ -3524,12 +3574,14 @@ mod tests {
         let size = TerminalSize::new(80, 240);
         let row = semantic_row(size.columns, "abcdefghijklmnopqrstuv");
         let surface = TerminalSurface {
+            application_title: String::new(),
             colors: Default::default(),
 
             size,
             active_screen: ActiveScreen::Main,
             rows: vec![row.clone(); usize::from(size.rows)],
             cursor: TerminalCursor {
+                presentation: Default::default(),
                 row: 79,
                 column: 239,
                 visible: true,
@@ -3666,6 +3718,7 @@ mod tests {
 
         for (current_epoch, current_revision) in [(3, 2), (0, 0)] {
             let malformed = v2::TerminalSemanticHistoryWindowFrame {
+                hyperlinks: Vec::new(),
                 colors: None,
                 attachment_id: Some(AttachmentId::from_array([0x48; 16]).into()),
                 outcome: v2::TerminalHistoryWindowOutcome::Gap as i32,

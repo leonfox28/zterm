@@ -13,7 +13,7 @@ use zterm_core::terminal::{
 use crate::MAX_CELL_TEXT_BYTES;
 use crate::engine::AlacrittyEngine;
 
-pub(crate) const CHECKPOINT_FORMAT_VERSION: u16 = 3;
+pub(crate) const CHECKPOINT_FORMAT_VERSION: u16 = 7;
 
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct InlineCellText {
@@ -53,6 +53,7 @@ impl InlineCellText {
 
 #[derive(Clone, Default, Eq, PartialEq)]
 pub(crate) struct ProjectedCell {
+    pub(crate) hyperlink: Option<std::sync::Arc<zterm_core::terminal::TerminalHyperlink>>,
     pub(crate) text: InlineCellText,
     pub(crate) wide: bool,
     pub(crate) wide_continuation: bool,
@@ -62,6 +63,7 @@ pub(crate) struct ProjectedCell {
 impl ProjectedCell {
     pub(crate) fn to_public(&self) -> TerminalCell {
         TerminalCell {
+            hyperlink: self.hyperlink.clone(),
             contents: self.text.as_str().to_owned(),
             wide: self.wide,
             wide_continuation: self.wide_continuation,
@@ -87,6 +89,7 @@ impl ProjectedRow {
 
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct ProjectedScreen {
+    pub(crate) application_title: String,
     pub(crate) colors: TerminalColorSnapshot,
     pub(crate) version: u16,
     pub(crate) size: TerminalSize,
@@ -106,6 +109,7 @@ impl ProjectedScreen {
         scroll_metrics: Option<TerminalScrollMetrics>,
     ) -> TerminalSurface {
         TerminalSurface {
+            application_title: self.application_title.clone(),
             colors: self.colors.clone(),
             size: self.size,
             active_screen: self.active_screen,
@@ -134,12 +138,25 @@ pub(crate) fn project(engine: &AlacrittyEngine) -> ProjectedScreen {
         .0
         .min(usize::from(size.columns).saturating_sub(1));
     ProjectedScreen {
+        application_title: engine.application_title.clone(),
         version: CHECKPOINT_FORMAT_VERSION,
         colors: engine.colors.snapshot.clone(),
         size,
         active_screen: engine.active_screen(),
         rows,
         cursor: TerminalCursor {
+            presentation: zterm_core::terminal::TerminalCursorPresentation {
+                shape: match term.cursor_style().shape {
+                    alacritty_terminal::vte::ansi::CursorShape::Beam => {
+                        zterm_core::terminal::TerminalCursorShape::Beam
+                    }
+                    alacritty_terminal::vte::ansi::CursorShape::Underline => {
+                        zterm_core::terminal::TerminalCursorShape::Underline
+                    }
+                    _ => zterm_core::terminal::TerminalCursorShape::Block,
+                },
+                blinking: term.cursor_style().blinking,
+            },
             row: u16::try_from(row).unwrap_or(u16::MAX),
             column: u16::try_from(column).unwrap_or(u16::MAX),
             visible: term.mode().contains(TermMode::SHOW_CURSOR),
@@ -164,7 +181,11 @@ pub(crate) fn project_row(engine: &AlacrittyEngine, line: Line) -> ProjectedRow 
             } else {
                 flags.is_empty()
             };
-            projected_cell(cell, paired)
+            let mut projected = projected_cell(cell, paired);
+            if paired {
+                projected.hyperlink = engine.cell_hyperlink(cell);
+            }
+            projected
         })
         .collect::<Vec<_>>()
         .into_boxed_slice();
@@ -212,6 +233,7 @@ fn projected_cell(cell: &Cell, paired: bool) -> ProjectedCell {
         wide,
         wide_continuation,
         style,
+        hyperlink: None,
     }
 }
 
@@ -240,6 +262,8 @@ pub(crate) fn terminal_style(cell: &Cell) -> TerminalStyle {
             .map(terminal_color)
             .unwrap_or_default(),
         inverse: cell.flags.contains(Flags::INVERSE),
+        strike: cell.flags.contains(Flags::STRIKEOUT),
+        conceal: cell.flags.contains(Flags::HIDDEN),
     }
 }
 

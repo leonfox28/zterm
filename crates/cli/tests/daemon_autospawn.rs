@@ -42,7 +42,7 @@ use state_fixture::TestState;
 #[cfg(unix)]
 const TERMINAL_CHILD_PREFIX: &str = "--zterm-test-terminal=";
 #[cfg(unix)]
-const TERMINAL_RESTORE_BYTES: &[u8] = b"\x1b[?2026l\x1b[?9l\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1007l\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[?1l\x1b>\x1b[<u\x1b[0m\x1b[?25h\x1b[?1049l";
+const TERMINAL_RESTORE_BYTES: &[u8] = b"\x1b]8;;\x1b\\\x1b[23;2t\x1b[?2026l\x1b[?9l\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1007l\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[?1l\x1b>\x1b[<u\x1b[0m\x1b[0 q\x1b[?25h\x1b[?1049l";
 #[cfg(unix)]
 const TERMINAL_CONNECT_MARKER: &[u8] = b"\xe7\x95\x8c";
 #[cfg(unix)]

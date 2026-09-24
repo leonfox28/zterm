@@ -674,6 +674,7 @@ impl SessionClient {
                 initial_snapshot: Some(TerminalSurfaceSnapshot {
                     revision: Revision::new(1),
                     surface: zterm_core::terminal::TerminalSurface {
+                        application_title: String::new(),
                         colors: Default::default(),
 
                         size: zterm_core::terminal::TerminalSize::new(24, 80),
@@ -685,6 +686,7 @@ impl SessionClient {
                             })
                             .collect(),
                         cursor: zterm_core::terminal::TerminalCursor {
+                            presentation: Default::default(),
                             row: 0,
                             column: 0,
                             visible: true,
@@ -1906,6 +1908,7 @@ mod tests {
             TerminalSurfaceSnapshot {
                 revision: Revision::new(1),
                 surface: zterm_core::terminal::TerminalSurface {
+                    application_title: String::new(),
                     colors: Default::default(),
 
                     size: zterm_core::terminal::TerminalSize::new(24, 80),
@@ -1917,6 +1920,7 @@ mod tests {
                         })
                         .collect(),
                     cursor: zterm_core::terminal::TerminalCursor {
+                        presentation: Default::default(),
                         row: 0,
                         column: 0,
                         visible: true,
@@ -2047,6 +2051,7 @@ mod tests {
             .known_revision
             .expect("replacement resume advertises an applied revision");
         let delta = TerminalSurfaceDelta {
+            application_title: String::new(),
             colors: Default::default(),
 
             from_revision: Revision::new(known_revision),
@@ -2059,6 +2064,7 @@ mod tests {
             active_screen: zterm_core::terminal::ActiveScreen::Main,
             row_patches: Vec::new(),
             cursor: zterm_core::terminal::TerminalCursor {
+                presentation: Default::default(),
                 row: 0,
                 column: 0,
                 visible: true,
@@ -2312,6 +2318,7 @@ mod tests {
         assert_eq!(direct.attachment_id(), tunneled.attachment_id());
 
         let delta = TerminalSurfaceDelta {
+            application_title: String::new(),
             colors: Default::default(),
 
             from_revision: Revision::new(1),
@@ -2320,6 +2327,7 @@ mod tests {
             active_screen: zterm_core::terminal::ActiveScreen::Main,
             row_patches: Vec::new(),
             cursor: zterm_core::terminal::TerminalCursor {
+                presentation: Default::default(),
                 row: 3,
                 column: 7,
                 visible: true,
@@ -2970,6 +2978,7 @@ mod tests {
             assert_eq!(attached_target.device_id(), Some(target_device));
 
             let delta = zterm_core::terminal::TerminalSurfaceDelta {
+                application_title: String::new(),
                 colors: Default::default(),
 
                 from_revision: Revision::new(11),
@@ -2978,6 +2987,7 @@ mod tests {
                 active_screen: zterm_core::terminal::ActiveScreen::Main,
                 row_patches: Vec::new(),
                 cursor: zterm_core::terminal::TerminalCursor {
+                    presentation: Default::default(),
                     row: 0,
                     column: 0,
                     visible: true,

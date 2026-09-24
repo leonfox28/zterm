@@ -91,7 +91,9 @@ Debug implementation exposes an `alacritty_terminal` or `vte` type.
   standard/private CPR, supported input-mode DECRQM, and the exact color,
   appearance, stack, SGR and capability queries in
   [Terminal Colors](./terminal-colors.md). Replies execute at their stream
-  position. Secondary DA and unsupported window/private queries stay rejected.
+  position. `CSI 18t` reports actual character dimensions as `CSI 8;rows;columns t`,
+  including after resize and during synchronized output. Secondary DA and other
+  unsupported window/private queries stay rejected.
 
 ### Synchronized-output publication contract
 
@@ -143,7 +145,10 @@ these hard caps:
   cannot obscure a filtered sequence such as synchronized-update 2026.
 - BEL maps to audible bell, `ESC g` to visual bell,
   `CSI 8;rows;columns t` to a validated resize request, OSC 0/2 to title, and
-  OSC 1 to icon-name. Title/icon values retain no more than 256 source bytes.
+  OSC 1 to icon-name. OSC 0/2 update the authoritative application title (at most 256 UTF-8 bytes,
+  whole-scalar truncation, controls removed); OSC 1 remains a bounded icon event.
+  Empty title and RIS clear it; screen transitions preserve it. Title side events
+  remain diagnostic only: snapshot/delta/checkpoint own delivery and DEC 2026 hold.
 - Once exact `OSC 52;` framing is recognized, a dedicated streaming state
   accepts only non-empty `c` writes with canonical padded RFC 4648 Base64,
   valid UTF-8, no NUL, and at most 512 KiB decoded text. It emits at most the
@@ -160,11 +165,24 @@ these hard caps:
   bounded reply. Ingress
   does not independently track or cap the engine's keyboard-stack depth;
   admitted controls use the pinned Alacritty engine's stack semantics directly.
-  Unrelated CSI-u remains rejected. Exact color OSC, color stack/appearance
+  Plain parameterless CSI-u restores the saved cursor; other unrelated CSI-u
+  remains rejected. Exact color OSC, color stack/appearance
   CSI, SGR DECRQSS and XTGETTCAP are handled by the Zterm color owner.
-  OSC 8, other unsupported OSC/DCS, APC/PM/SOS and REP remain consumed or rejected
+  Unsupported OSC/DCS and APC/PM/SOS remain consumed or rejected
   before the engine. DEC 2026 is owned at the Zterm parsed boundary, never
   forwarded to upstream raw-byte synchronized-output buffering.
+- REP accepts one count up to 4,096 (omitted/zero means one), rejecting an
+  oversized count without partial repetition. Ingress remembers the last admitted
+  scalar and repeats through the same combining-budget admission path, never
+  through the upstream unchecked REP loop. RIS and malformed/truncated UTF-8
+  clear the remembered scalar; the ordinary invalid-byte handling is unchanged.
+- SGR 8/28 and 9/29 preserve conceal and strike through semantic styles and
+  both renderers. Conceal hides foreground glyphs/decorations, not the original
+  selectable text; backgrounds and grid positions remain intact. SGR 0 clears both.
+- Cursor presentation preserves DECSCUSR block/beam/underline and blinking
+  independently from the text pen. DECSCUSR 0 restores the default steady block;
+  DEC 12 set/reset/query follows the actual engine blink declaration. Shape-only
+  changes travel in snapshot/delta metadata and respect synchronized publication.
 - SGR 58/59 and all six underline shapes pass through the pinned SGR parser.
   Never discard sibling 0/31/38/48 parameters because an SGR contains underline
   color. Indexed/RGB components equal to 58/59 remain ordinary components.
@@ -190,8 +208,18 @@ these hard caps:
 - A scalar crossing the cell, cell-count, or byte cap is discarded before
   Alacritty can grow `CellExtra` and produces a bounded
   `UnsupportedSequence(Character)` classification.
-- OSC 8 never reaches the engine. Underline color is a fixed optional value
-  in cell extras; count combining scalars separately from that fixed field.
+- OSC 8 admits only validated absolute HTTP(S) links, including explicit id and
+  an empty-URI closer, within the existing 1,024-byte control-string bound.
+  Invalid/oversized openers close the current link without losing ordinary text.
+  The engine shares link identities across grid cells; its registry is capped at
+  1,024 values and 1 MiB URI/id bytes across both screens, scrollback and current/
+  saved templates. IDs are at most 128 bytes; canonical URLs at most 1,024.
+  Auto IDs are deterministic within a model. Reconcile active references on
+  screen switches, resize and quota pressure; inactive counts may be conservative
+  until activation. RIS drops both grids and the registry. No historical catalog
+  of every URL is retained. Hyperlink values survive projection/history/checkpoints.
+- Underline color is a fixed optional value in cell extras; count combining
+  scalars separately from that fixed field and from bounded hyperlink storage.
 - Eight live Sessions, a maximum 240x80 viewport, 2,000 history rows, and wire
   frame bounds remain separate service limits.
 
@@ -206,8 +234,8 @@ released when the Session model is dropped.
   current Zterm subset: indexed/RGB/default colors, bold/dim/italic/underline/
   inverse, wide head/spacer, cursor, supported input modes, and the validated
   five Kitty keyboard flags, six underline shapes and underline color. Each
-  projection carries a required effective color snapshot. Hyperlinks, strike,
-  hidden and graphics are not advertised.
+  projection carries effective colors and application title. Strike/conceal and
+  validated HTTP(S) links are preserved; graphics are not advertised.
 - A projected wide head must have an adjacent spacer in the same row, and a
   spacer must have its adjacent head. The pinned engine can leave an orphan
   after non-reflow alternate-screen shrink; growth before child repaint does
@@ -225,7 +253,7 @@ released when the Session model is dropped.
 - A full snapshot contains the complete latest active screen only. Retained
   main history is fetched separately through the bounded stateless semantic
   history-window contract; it is never replayed as snapshot bytes.
-- A checkpoint uses internal format 3 and retains effective colors, revision,
+- A checkpoint uses internal format 7 and retains effective colors, revision,
   size, active-screen identity, and one
   fixed projected active viewport. It retains neither Alacritty state, inactive
   screen, nor history; capacity is exactly `rows * columns` cells.
@@ -239,12 +267,12 @@ released when the Session model is dropped.
   Base: take a standalone snapshot for a read-only caller. Bad: recapture the
   same revision immediately after producing its update.
 - Delta compares owned rows and returns sorted, unique, complete row
-  replacements plus the latest cursor, modes, screen, size, and metrics.
+  replacements plus the latest application title, cursor, modes, screen, size, and metrics.
   Future/equal revision at this low-level comparison or any
   format/size/screen mismatch returns `Resync`. The driver-level
   `sync_changed` suppresses the exact-equal no-op before calling this method.
   A newer revision whose visible rows are unchanged remains a valid semantic
-  delta with zero row patches because revision/cursor/modes/metrics are still
+  delta with zero row patches because revision/title/cursor/modes/metrics are still
   part of the attachment contract. Colors carry their own changed_at on the
   same Revision clock; zero-row palette deltas repaint retained semantic rows.
 - A valid `TerminalScrollMetrics` has nonzero `viewport_rows`,

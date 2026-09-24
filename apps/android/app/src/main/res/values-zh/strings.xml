@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="open_terminal_link">打开链接</string>
+    <string name="open_terminal_link_failed">无法打开浏览器。</string>
     <string name="app_name">zterm</string>
     <string name="settings">设置</string>
     <string name="saved_hosts">已保存的主机</string>

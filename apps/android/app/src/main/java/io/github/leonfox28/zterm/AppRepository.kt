@@ -9,7 +9,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 internal enum class Route { Home, Scanner, Terminal, Settings }
-internal data class TerminalStatus(val inputEpoch: ULong, val state: String, val error: String?, val notice: String?, val inputReady: Boolean, val connectionPath: NativeConnectionPath, val rttMs: UInt?)
+internal data class TerminalStatus(val inputEpoch: ULong, val state: String, val error: String?, val notice: String?, val inputReady: Boolean, val connectionPath: NativeConnectionPath, val rttMs: UInt?, val applicationTitle: String = "")
 internal data class AppState(
     val saved: SavedState = SavedState(),
     val initialized: Boolean = false,
@@ -34,7 +34,7 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
     private val mutableFrame = MutableStateFlow<NativeFrame?>(null)
     val frame = mutableFrame.asStateFlow()
     val terminalStatus = frame.map { it?.let { frame ->
-        TerminalStatus(frame.inputEpoch, frame.state, frame.error, frame.notice, frame.inputReady, frame.connectionPath, frame.rttMs)
+        TerminalStatus(frame.inputEpoch, frame.state, frame.error, frame.notice, frame.inputReady, frame.connectionPath, frame.rttMs, frame.applicationTitle)
     } }.distinctUntilChanged().stateIn(scope, SharingStarted.Eagerly, null)
     private val frameObservers = linkedSetOf<(NativeFrame?) -> Unit>()
     private var selectionVersion = 0L
@@ -408,6 +408,14 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
         localTerminal { target ->
             val text = target.copySelection()
             if (selected == selectionVersion && attachment == epoch) copy(text)
+        }
+    }
+    fun selectionHyperlink(deliver: (String?) -> Unit) {
+        val selected = selectionVersion
+        val attachment = epoch
+        localTerminal { target ->
+            val uri = target.selectionHyperlink()
+            if (selected == selectionVersion && attachment == epoch) deliver(uri)
         }
     }
     fun terminalVisible(visible: Boolean) {

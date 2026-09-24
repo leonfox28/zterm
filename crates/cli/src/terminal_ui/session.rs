@@ -92,7 +92,11 @@ impl TerminalUiSession {
             }
             let prefix_deadline = self.prefix.deadline();
             let viewport_deadline = self.viewport_pacer.deadline();
+            let cursor_deadline = self.presenter.cursor_deadline();
             tokio::select! {
+                () = wait_for_prefix_deadline(cursor_deadline), if cursor_deadline.is_some() => {
+                    self.presenter.blink_cursor(&mut stdout.lock())?;
+                }
                 _ = upload_tick.tick(), if self.status_renderer.upload.is_some() => {
                     self.poll_upload(stdin).await?;
                 }

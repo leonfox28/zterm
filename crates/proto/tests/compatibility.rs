@@ -695,6 +695,7 @@ fn generated_session_terminal_and_route_debug_is_redacted_without_wire_changes()
         viewport: summary.viewport,
     };
     let screen_cell = v2::TerminalCell {
+        hyperlink: 0,
         contents: SCREEN_SENTINEL.to_owned(),
         wide: false,
         wide_continuation: false,
@@ -707,6 +708,8 @@ fn generated_session_terminal_and_route_debug_is_redacted_without_wire_changes()
         }),
         revision: 41,
         surface: Some(v2::TerminalSurface {
+            application_title: String::new(),
+            hyperlinks: Vec::new(),
             colors: Some(zterm_core::terminal::TerminalColorSnapshot::default().into()),
 
             row_count: 43,
@@ -722,6 +725,8 @@ fn generated_session_terminal_and_route_debug_is_redacted_without_wire_changes()
         }),
     };
     let delta = v2::TerminalSemanticDelta {
+        application_title: String::new(),
+        hyperlinks: Vec::new(),
         colors: Some(zterm_core::terminal::TerminalColorSnapshot::default().into()),
 
         attachment_id: snapshot.attachment_id.clone(),
@@ -745,6 +750,7 @@ fn generated_session_terminal_and_route_debug_is_redacted_without_wire_changes()
         scroll_metrics: None,
     };
     let history = v2::TerminalSemanticHistoryWindowFrame {
+        hyperlinks: Vec::new(),
         colors: Some(zterm_core::terminal::TerminalColorSnapshot::default().into()),
 
         attachment_id: snapshot.attachment_id.clone(),

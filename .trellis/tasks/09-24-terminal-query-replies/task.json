@@ -1,0 +1,30 @@
+{
+  "id": "terminal-query-replies",
+  "name": "terminal-query-replies",
+  "title": "修正 OSC 21 与字符尺寸查询回复",
+  "description": "Return current Kitty OSC 21 unknown-field responses and truthful CSI 18t character dimensions without expanding unrelated query support.",
+  "status": "review",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "leon",
+  "assignee": "leon",
+  "createdAt": "2026-09-24",
+  "completedAt": null,
+  "branch": "feat/terminal-protocol-compatibility",
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": "09-22-terminal-protocol-audit",
+  "relatedFiles": [
+    ".trellis/tasks/09-24-terminal-query-replies/prd.md",
+    ".trellis/tasks/09-24-terminal-query-replies/design.md",
+    ".trellis/tasks/09-24-terminal-query-replies/implement.md"
+  ],
+  "notes": "User approved the five-item first-batch scope and moving all existing changes to a new branch on 2026-09-24. Branch created; concrete PRD/design/implementation plan prepared. Final design explicitly approved by user (开始) on 2026-09-24; implementation authorized. Inline sequential workflow. Implementation and local quality/runtime verification completed; ready for review on the feature branch. See parent research/implementation-evidence.md. No commit/push/archive performed. User explicitly authorized commit and merge on 2026-09-24; proceeding through protected main PR checks and task archival.",
+  "meta": {}
+}
