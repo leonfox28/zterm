@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 36
-- **Last Active**: 2026-09-24
+- **Total Sessions**: 37
+- **Last Active**: 2026-09-28
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~1017 | Active |
+| `journal-1.md` | ~1056 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 37 | 2026-09-28 | Complete bounded local logging and review corrections | `278f703ee9fec2f1810f731f09a842c9aafd9509` | `feat/logging-improvements` |
 | 36 | 2026-09-24 | Complete terminal protocol compatibility | `98d28f9` | `feat/terminal-protocol-compatibility` |
 | 35 | 2026-09-21 | Recover and publish v0.1.35 | `40ce996`, `47e64cb` | `chore/record-release-0.1.35` |
 | 34 | 2026-09-20 | Android settings updates and notification controls | `119f987` | `feat/android-settings-update` |
