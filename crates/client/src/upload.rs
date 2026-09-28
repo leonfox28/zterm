@@ -132,6 +132,48 @@ pub async fn upload<R: AsyncRead + Unpin + Send>(
     progress: &watch::Sender<UploadProgress>,
     cancel: &CancellationToken,
 ) -> Result<UploadedFile, ClientError> {
+    use zterm_diagnostics::{Event, Kind, Level, Operation, Outcome};
+    let operation = Operation::default();
+    let size = metadata.size();
+    let context = |event: Event| {
+        event
+            .operation(&operation)
+            .session(binding.session_id)
+            .attachment(binding.attachment_id)
+            .bytes(size)
+    };
+    zterm_diagnostics::record(context(Event::new(Kind::UploadStarted)));
+    let result = upload_inner(
+        connector, target, binding, metadata, source, progress, cancel,
+    )
+    .await;
+    let event = match &result {
+        Ok(_) => Event::new(Kind::UploadCompleted).outcome(Outcome::Success),
+        Err(error) if error.kind() == DomainErrorKind::Cancelled => {
+            Event::new(Kind::UploadCancelled).outcome(Outcome::Cancelled)
+        }
+        Err(error) => Event::new(Kind::UploadFailed)
+            .level(Level::Warn)
+            .error(error.kind())
+            .outcome(if error.kind() == DomainErrorKind::UploadOutcomeUnknown {
+                Outcome::Unknown
+            } else {
+                Outcome::Failed
+            }),
+    };
+    zterm_diagnostics::record(context(event));
+    result
+}
+
+async fn upload_inner<R: AsyncRead + Unpin + Send>(
+    connector: &dyn UploadConnector,
+    target: ResolvedSessionTarget,
+    binding: UploadBinding,
+    metadata: UploadMetadata,
+    source: R,
+    progress: &watch::Sender<UploadProgress>,
+    cancel: &CancellationToken,
+) -> Result<UploadedFile, ClientError> {
     let mut connection = tokio::select! {
         biased;
         _ = cancel.cancelled() => return Err(cancelled()),

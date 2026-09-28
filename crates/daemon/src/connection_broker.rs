@@ -379,6 +379,7 @@ enum CandidateSide {
 }
 
 struct Candidate {
+    diagnostic: zterm_diagnostics::Operation,
     remote_capabilities: OnceLock<zterm_core::Capabilities>,
     key: ConnectionCandidateKey,
     remote: DeviceId,
@@ -2321,7 +2322,19 @@ impl ConnectionBroker {
                 remote_device_id: remote,
                 accepted_generation,
             };
-            let _ = handler.handle_service_stream(stream, deadline).await;
+            let operation = zterm_diagnostics::Operation::default();
+            if let Err(error) = handler.handle_service_stream(stream, deadline).await {
+                zterm_diagnostics::record(
+                    zterm_diagnostics::Event::new(zterm_diagnostics::Kind::RequestFailed)
+                        .operation(&operation)
+                        .level(if error.kind() == DomainErrorKind::Cancelled {
+                            zterm_diagnostics::Level::Info
+                        } else {
+                            zterm_diagnostics::Level::Warn
+                        })
+                        .error(error.kind()),
+                );
+            }
             return;
         }
         #[cfg(not(unix))]
@@ -2489,6 +2502,7 @@ impl Candidate {
         let metric = ConnectionMetricGuard::new(Arc::clone(&metrics))?;
         let (cancel, _) = watch::channel(false);
         Ok(Arc::new(Self {
+            diagnostic: zterm_diagnostics::Operation::default(),
             remote_capabilities: OnceLock::new(),
             key,
             remote,
@@ -2524,6 +2538,7 @@ impl Candidate {
         self.metrics.publish();
         tracing::info!(
             component = "connection",
+            connection = self.diagnostic.id(),
             operation = if primary {
                 "primary_established"
             } else {

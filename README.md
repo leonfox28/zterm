@@ -45,7 +45,9 @@ zterm session rename <session> <new-name> [--target <target>]
 zterm session close <session> [--target <target>] [-y|--yes]
 zterm daemon stop [-y|--yes]
 zterm daemon restart [-y|--yes]
-zterm logs [-n|--lines <n>]
+zterm logs [-n|--lines <n>] [--level <level>] [--since 30m] [--include-debug] [--json]
+zterm logs debug on|off|status
+zterm logs export --output <path> [--include-debug]
 zterm reset [-y|--yes]
 zterm update [--version <vSEMVER>] [-y|--yes]
 zterm uninstall [-y|--yes]
@@ -64,7 +66,9 @@ First setup defaults to `official-n0`; `zterm setup --name <name>` is enough.
 Commands print human-readable text. Update, daemon stop and daemon restart list
 running Sessions and ask for English `[y/N]` confirmation only when they would
 end live work; use `-y` or `--yes` to confirm directly. `logs -n 100` reads recent
-records once.
+records once. Key events are saved by default; optional detail expires after 15
+minutes. See [Local logs and diagnostics](docs/logging.md) for filters, Android
+controls, export and retention limits.
 
 See [Remote sessions and the public CLI](docs/remote-cli.md) for the exact
 command, target, pairing, reconnect, takeover, raw-terminal, ambiguity, and

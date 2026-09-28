@@ -9,12 +9,15 @@ use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::Child;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use zterm_core::DomainErrorKind;
+use zterm_diagnostics::{
+    Event as DiagnosticEvent, Kind, Level, Operation, Outcome, Recorder, Stage,
+};
 use zterm_platform::local_unix::{spawn_isolated_command, take_isolated_channel};
-use zterm_platform::user_state::{UserPaths, open_append, validate_directory};
+use zterm_platform::user_state::UserPaths;
 
 use crate::distribution::{PreparedRelease, ReleaseSelection};
 use crate::error::DaemonError;
@@ -298,7 +301,9 @@ where
         channel: Channel::new(stream),
         paths,
         version: None,
-        log_enabled: false,
+        log_enabled: crate::diagnostics::configured(paths),
+        diagnostics: crate::diagnostics::recorder(paths),
+        operation: Operation::default(),
         accepted: false,
         committed: false,
     };
@@ -318,21 +323,28 @@ where
     }
     .await;
     let record = match &result {
-        Ok(result) => format!(
-            "outcome=success installed={} daemon_started={}",
-            result.installed_version, result.daemon_started
-        ),
-        Err(error) => format!(
-            "outcome={} category={} guidance=check-installed-version-and-daemon-status;use-SSH-if-disconnected;restart-daemon-if-activation-committed",
-            if worker.committed {
-                "partial_completion"
+        Ok(result) => DiagnosticEvent::new(Kind::UpdateCompleted)
+            .outcome(Outcome::Success)
+            .release_version(&result.installed_version)
+            .daemon_started(result.daemon_started),
+        Err(error) => DiagnosticEvent::new(Kind::UpdateCompleted)
+            .level(if error.kind() == DomainErrorKind::Cancelled {
+                Level::Info
             } else {
-                "failed"
-            },
-            error.kind().code()
-        ),
-    };
-    let _ = worker.log(&record);
+                Level::Warn
+            })
+            .error(error.kind())
+            .outcome(if worker.committed {
+                Outcome::PartialCompletion
+            } else if error.kind() == DomainErrorKind::Cancelled {
+                Outcome::Cancelled
+            } else {
+                Outcome::Failed
+            }),
+    }
+    .committed(worker.committed)
+    .operation(&worker.operation);
+    let _ = worker.log(record, true);
     let _ = worker
         .channel
         .send(&Event::Complete(result.clone().map_err(Into::into)));
@@ -344,59 +356,46 @@ struct Worker<'a> {
     paths: &'a UserPaths,
     version: Option<String>,
     log_enabled: bool,
+    diagnostics: Recorder,
+    operation: Operation,
     accepted: bool,
     committed: bool,
 }
 
 impl Worker<'_> {
-    fn log(&self, record: &str) -> Result<(), DaemonError> {
+    fn log(&self, record: DiagnosticEvent, durable: bool) -> Result<(), DaemonError> {
         if !self.log_enabled {
             return Ok(());
         }
-        let result = (|| {
-            validate_directory(self.paths.state_root(), self.paths.uid())?;
-            validate_directory(self.paths.logs(), self.paths.uid())?;
-            open_append(self.paths.daemon_log(), self.paths.uid())
-        })()
-        .map_err(|_| {
-            DaemonError::new(
-                DomainErrorKind::PathUnsafe,
-                "Unable to open the update outcome log.",
-            )
-        })?;
-        let mut file = result;
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        writeln!(
-            file,
-            "{timestamp} INFO update pid={} target={} accepted={} {record}",
-            std::process::id(),
-            self.version.as_deref().unwrap_or("unknown"),
-            self.accepted
-        )
-        .and_then(|()| file.sync_data())
-        .map_err(|_| {
-            DaemonError::new(
+        let mut record = record
+            .operation(&self.operation)
+            .committed(self.committed)
+            .accepted(self.accepted);
+        if let Some(version) = &self.version {
+            record = record.release_version(version);
+        }
+        let accepted = self.diagnostics.record(record);
+        if durable && (!accepted || !self.diagnostics.flush(Duration::from_secs(2))) {
+            return Err(DaemonError::new(
                 DomainErrorKind::PathUnsafe,
                 "Unable to record the update outcome.",
-            )
-        })
+            ));
+        }
+        Ok(())
     }
 }
 
 impl UpdateInteraction for Worker<'_> {
     fn progress(&mut self, stage: UpdateStage) {
         let code = match &stage {
-            UpdateStage::Preparing => "preparing",
-            UpdateStage::Verified { .. } => "verified",
-            UpdateStage::Continuing => "continuing",
-            UpdateStage::Stopping => "stopping",
-            UpdateStage::Activating => "activating",
-            UpdateStage::Starting => "starting",
+            UpdateStage::Preparing => Stage::Preparing,
+            UpdateStage::Verified { .. } => Stage::Verified,
+            UpdateStage::Continuing => Stage::Continuing,
+            UpdateStage::Stopping => Stage::Stopping,
+            UpdateStage::Activating => Stage::Activating,
+            UpdateStage::Starting => Stage::Starting,
         };
-        let _ = self.log(&format!("stage={code}"));
+        let _ = self.log(DiagnosticEvent::new(Kind::UpdateStage).stage(code), false);
         let _ = self.channel.send(&Event::Progress(stage));
     }
 
@@ -410,13 +409,16 @@ impl UpdateInteraction for Worker<'_> {
 
     fn committed(&mut self) {
         self.committed = true;
-        let _ = self.log("stage=committed");
+        let _ = self.log(
+            DiagnosticEvent::new(Kind::UpdateStage).stage(Stage::Committed),
+            true,
+        );
     }
 
     fn handoff(&mut self, prepared: &PreparedRelease) -> Result<(), DaemonError> {
         self.version = Some(prepared.version().to_owned());
         self.log_enabled = match fs::symlink_metadata(self.paths.state_root()) {
-            Ok(_) => true,
+            Ok(_) => crate::diagnostics::configured(self.paths),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
             Err(_) => {
                 return Err(DaemonError::new(
@@ -425,13 +427,29 @@ impl UpdateInteraction for Worker<'_> {
                 ));
             }
         };
-        self.log("stage=awaiting-handoff")?;
+        if self.log_enabled {
+            zterm_platform::diagnostics::Store::new(self.paths.clone())
+                .preflight()
+                .map_err(|_| {
+                    DaemonError::new(
+                        DomainErrorKind::PathUnsafe,
+                        "Unable to open the update outcome log.",
+                    )
+                })?;
+        }
+        self.log(
+            DiagnosticEvent::new(Kind::UpdateStage).stage(Stage::AwaitingHandoff),
+            true,
+        )?;
         self.channel.send(&Event::Handoff)?;
         if !matches!(self.channel.receive()?, Request::Continue) {
             return Err(cancelled());
         }
         self.accepted = true;
-        self.log("stage=accepted")?;
+        self.log(
+            DiagnosticEvent::new(Kind::UpdateStage).stage(Stage::Accepted),
+            true,
+        )?;
         // The received Continue transfers ownership even if its ACK is lost.
         let _ = self.channel.send(&Event::Accepted);
         Ok(())

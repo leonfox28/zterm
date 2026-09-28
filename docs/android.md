@@ -192,3 +192,13 @@ purposes and must not be confused.
 Xiaomi 17 Pro Max camera, system IME, touch and background behavior must be
 verified on the actual phone. Local Pixel emulator results do not establish
 Xiaomi-specific acceptance.
+
+## Local diagnostics
+
+Settings → Diagnostics saves key application, connection/reconnect and operation
+outcomes in release and debug builds. Enable detailed diagnostics for 15 minutes,
+renew the interval or switch it off early. The remaining interval survives process
+restart and the controls/export remain available after initialization failure.
+Export logs opens the system document picker; including saved detail is explicit.
+See [Local logs and diagnostics](logging.md) for content exclusions, bounded
+retention, JSONL format and sharing behavior.

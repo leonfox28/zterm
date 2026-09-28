@@ -2,8 +2,6 @@
 
 use std::fmt;
 #[cfg(unix)]
-use std::fs;
-#[cfg(unix)]
 use std::path::Path;
 use std::time::Duration;
 #[cfg(unix)]
@@ -11,9 +9,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use zterm_core::DomainErrorKind;
 use zterm_platform::account::EffectiveAccount;
-use zterm_platform::user_state::UserPaths;
 #[cfg(unix)]
-use zterm_platform::user_state::{FileLock, validate_regular_file};
+use zterm_platform::user_state::FileLock;
+use zterm_platform::user_state::UserPaths;
 
 use crate::client::LocalClient;
 use crate::error::DaemonError;
@@ -29,8 +27,6 @@ const START_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(unix)]
 const LOCK_POLL: Duration = Duration::from_millis(20);
 const READINESS_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
-#[cfg(unix)]
-const LOG_ROTATE_BYTES: u64 = 4 * 1024 * 1024;
 #[cfg(unix)]
 const RECOVERY_REBIND_BACKOFF: Duration = Duration::from_millis(20);
 
@@ -138,7 +134,6 @@ pub async fn ensure_daemon_with(
         return Ok(readiness);
     }
 
-    rotate_lifecycle_log(paths)?;
     let mut command =
         zterm_platform::local_unix::detached_command(executable, paths, internal_argument)
             .map_err(platform_error)?;
@@ -185,9 +180,31 @@ pub fn run_internal_daemon() -> Result<(), DaemonError> {
     #[cfg(unix)]
     {
         zterm_platform::local_unix::detach_current_process().map_err(platform_error)?;
-        init_lifecycle_logging();
         let paths = production_user_paths()?;
-        run_daemon(&paths)
+        let _diagnostics = crate::diagnostics::install(&paths);
+        std::panic::set_hook(Box::new(|_| {
+            zterm_diagnostics::record(
+                zterm_diagnostics::Event::new(zterm_diagnostics::Kind::ProcessPanicked)
+                    .level(zterm_diagnostics::Level::Error),
+            );
+            let _ = zterm_diagnostics::flush(Duration::from_millis(250));
+        }));
+        zterm_diagnostics::record(zterm_diagnostics::Event::new(
+            zterm_diagnostics::Kind::ProcessStarted,
+        ));
+        let result = run_daemon(&paths);
+        if let Err(error) = &result {
+            zterm_diagnostics::record(
+                zterm_diagnostics::Event::new(zterm_diagnostics::Kind::ProcessFailed)
+                    .level(zterm_diagnostics::Level::Error)
+                    .error(error.kind()),
+            );
+        } else {
+            zterm_diagnostics::record(zterm_diagnostics::Event::new(
+                zterm_diagnostics::Kind::ProcessStopped,
+            ));
+        }
+        result
     }
     #[cfg(not(unix))]
     {
@@ -359,6 +376,7 @@ fn run_daemon_with_network_mode(
             )
         }
     };
+    let _ = crate::diagnostics::register_daemon(paths, &daemon_lock);
     tracing::info!(
         component = "daemon",
         operation = "ready",
@@ -451,6 +469,8 @@ fn run_owned_daemon_listener(
                     && let Err(error) = runtime.block_on(pairing.shutdown_until(cleanup_deadline))
                 {
                     tracing::warn!(
+                        component = "daemon",
+                        operation = "cleanup_failed",
                         error_kind = error.kind().code(),
                         "pairing cleanup failed after fatal local listener exit"
                     );
@@ -459,6 +479,8 @@ fn run_owned_daemon_listener(
                     && let Err(error) = runtime.block_on(network.shutdown_until(cleanup_deadline))
                 {
                     tracing::warn!(
+                        component = "daemon",
+                        operation = "cleanup_failed",
                         error_kind = error.kind().code(),
                         "network cleanup failed after fatal local listener exit"
                     );
@@ -478,10 +500,14 @@ fn run_owned_daemon_listener(
                 // path again before replacing it.
                 match server_result {
                     Ok(()) => tracing::warn!(
+                        component = "daemon",
+                        operation = "cleanup_failed",
                         error_kind = cleanup_error.kind().code(),
                         "listener stopped before owned sessions were released; rebinding"
                     ),
                     Err(server_error) => tracing::warn!(
+                        component = "daemon",
+                        operation = "cleanup_failed",
                         error_kind = server_error.kind().code(),
                         cleanup_kind = cleanup_error.kind().code(),
                         "fatal listener exit retained owned sessions; rebinding"
@@ -497,6 +523,8 @@ fn run_owned_daemon_listener(
                         Ok(rebound) => break rebound,
                         Err(error) => {
                             tracing::warn!(
+                                component = "daemon",
+                                operation = "cleanup_failed",
                                 error_kind = platform_error_kind(&error).code(),
                                 "unable to rebind owned daemon socket; retrying"
                             );
@@ -505,6 +533,7 @@ fn run_owned_daemon_listener(
                     }
                 };
                 (listener, socket_ownership) = rebound;
+                let _ = crate::diagnostics::register_daemon(paths, daemon_lock);
                 tracing::info!(
                     component = "daemon",
                     operation = "listener_recovered",
@@ -579,54 +608,6 @@ pub(crate) async fn acquire_lifecycle_lock(
         }
         tokio::time::sleep(LOCK_POLL).await;
     }
-}
-
-#[cfg(unix)]
-fn rotate_lifecycle_log(paths: &UserPaths) -> Result<(), DaemonError> {
-    let metadata = match fs::symlink_metadata(paths.daemon_log()) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(DaemonError::new(
-                DomainErrorKind::PathUnsafe,
-                error.to_string(),
-            ));
-        }
-    };
-    validate_regular_file(paths.daemon_log(), paths.uid())
-        .map_err(|error| DaemonError::new(DomainErrorKind::PathUnsafe, error.to_string()))?;
-    if metadata.len() < LOG_ROTATE_BYTES {
-        return Ok(());
-    }
-    let archive = paths.logs().join("daemon.log.1");
-    match fs::symlink_metadata(&archive) {
-        Ok(_) => {
-            validate_regular_file(&archive, paths.uid()).map_err(|error| {
-                DaemonError::new(DomainErrorKind::PathUnsafe, error.to_string())
-            })?;
-            fs::remove_file(&archive).map_err(|error| {
-                DaemonError::new(DomainErrorKind::PathUnsafe, error.to_string())
-            })?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(DaemonError::new(
-                DomainErrorKind::PathUnsafe,
-                error.to_string(),
-            ));
-        }
-    }
-    fs::rename(paths.daemon_log(), archive)
-        .map_err(|error| DaemonError::new(DomainErrorKind::PathUnsafe, error.to_string()))
-}
-
-#[cfg(unix)]
-fn init_lifecycle_logging() {
-    let _ = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_target(true)
-        .with_max_level(tracing::Level::INFO)
-        .try_init();
 }
 
 #[cfg(unix)]

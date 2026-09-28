@@ -1,50 +1,57 @@
 //! Same-UID connection observations and bounded configured-CLI log records.
 
-use std::{
-    io::Write,
-    sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
-};
 use tokio::sync::watch;
-use zterm_client::progress::{ProgressEvent, ProgressHistory, ProgressObserver};
-use zterm_platform::user_state::{UserPaths, open_append, validate_directory};
-
-static NEXT_CONNECTION_LOG: AtomicU64 = AtomicU64::new(1);
+use zterm_client::progress::{ProgressHistory, ProgressObserver};
+use zterm_platform::user_state::UserPaths;
 
 pub(crate) fn recorder(paths: &UserPaths) -> (ProgressObserver, watch::Receiver<ProgressHistory>) {
-    let paths = paths.clone();
-    let enabled = crate::bootstrap::validate_committed_setup(&paths).is_ok();
-    let connection = NEXT_CONNECTION_LOG.fetch_add(1, Ordering::Relaxed);
-    ProgressObserver::channel(move |event| {
-        if enabled {
-            let _ = append(&paths, connection, event);
-        }
-    })
+    let log = crate::diagnostics::recorder(paths);
+    recorder_with_log(log)
 }
 
-fn append(paths: &UserPaths, connection: u64, event: ProgressEvent) -> std::io::Result<()> {
-    // Reopen after daemon startup rotation. Never create a configuration or log
-    // directory, and never let a diagnostic failure change an operation result.
-    validate_directory(paths.state_root(), paths.uid()).map_err(std::io::Error::other)?;
-    validate_directory(paths.logs(), paths.uid()).map_err(std::io::Error::other)?;
-    let mut file = open_append(paths.daemon_log(), paths.uid()).map_err(std::io::Error::other)?;
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let (stage, _) = event.stage.description();
-    let category = event.failure.map_or("none", |kind| kind.code());
-    let severity = if event.stage == zterm_core::connection_progress::ConnectionStage::Failed {
-        "WARN"
-    } else {
-        "INFO"
-    };
-    let record = format!(
-        "{timestamp} {severity} connection_startup pid={} connection={connection} version={} stage={stage} category={category}\n",
-        std::process::id(),
-        env!("CARGO_PKG_VERSION")
-    );
-    file.write_all(record.as_bytes())
+fn recorder_with_log(
+    log: zterm_diagnostics::Recorder,
+) -> (ProgressObserver, watch::Receiver<ProgressHistory>) {
+    use zterm_core::connection_progress::ConnectionStage;
+    use zterm_diagnostics::{Event, Kind, Level, Operation};
+    let operation = Operation::default();
+    ProgressObserver::channel(move |event| {
+        let terminal = matches!(
+            event.stage,
+            ConnectionStage::Starting
+                | ConnectionStage::TerminalReady
+                | ConnectionStage::Failed
+                | ConnectionStage::Cancelled
+                | ConnectionStage::SessionEnded
+        );
+        let level = if event.failure.is_some() {
+            Level::Warn
+        } else if terminal {
+            Level::Info
+        } else {
+            Level::Debug
+        };
+        let mut record = Event::new(Kind::ConnectionStartup)
+            .level(level)
+            .operation(&operation)
+            .connection(operation.id())
+            .startup(event.stage);
+        if let Some(error) = event.failure {
+            use zterm_client::progress::ProgressFailure;
+            use zterm_diagnostics::FrontendFailure;
+            record = match error {
+                ProgressFailure::Domain(error) => record.error(error),
+                ProgressFailure::TerminalIo => record.frontend_error(FrontendFailure::TerminalIo),
+                ProgressFailure::InvalidUsage => {
+                    record.frontend_error(FrontendFailure::InvalidUsage)
+                }
+                ProgressFailure::TerminalDriver => {
+                    record.frontend_error(FrontendFailure::TerminalDriver)
+                }
+            };
+        }
+        log.record(record);
+    })
 }
 
 #[cfg(unix)]
@@ -143,8 +150,10 @@ mod tests {
         )
         .expect("progress log fixture");
         crate::bootstrap::bootstrap(paths, &config).expect("configured progress fixture");
-        let (observer, history) = recorder(paths);
+        let log = crate::diagnostics::recorder(paths);
+        let (observer, history) = recorder_with_log(log.clone());
         observer.report(ConnectionStage::Starting);
+        assert!(log.flush(std::time::Duration::from_secs(2)));
         let initial = fs::read_to_string(paths.daemon_log()).expect("read progress log");
         let archive = paths.logs().join("daemon.log.1");
         fs::rename(paths.daemon_log(), &archive).expect("rotate progress log");
@@ -152,39 +161,48 @@ mod tests {
         observer.report(ConnectionStage::TerminalReady);
         observer.stop();
         observer.clone().report(ConnectionStage::RetryingConnection);
+        assert!(log.flush(std::time::Duration::from_secs(2)));
         let final_log = fs::read_to_string(paths.daemon_log()).expect("read progress log");
         assert_eq!(
             fs::read_to_string(archive).expect("read archived log"),
             initial
         );
-        assert!(initial.contains(" INFO connection_startup pid="));
-        assert!(initial.contains("stage=starting category=none"));
-        assert!(final_log.contains("stage=synchronizing_terminal"));
-        assert!(final_log.contains("stage=terminal_ready"));
-        assert_eq!(final_log.lines().count(), 2);
-        let correlation = |line: &str| {
-            line.split_whitespace()
-                .find(|field| field.starts_with("connection="))
-                .expect("progress log fixture")
-                .to_owned()
-        };
-        assert_eq!(correlation(&initial), correlation(&final_log));
+        let initial_record =
+            zterm_diagnostics::Record::decode(initial.trim().as_bytes()).expect("structured start");
+        let final_record = zterm_diagnostics::Record::decode(final_log.trim().as_bytes())
+            .expect("structured ready");
+        assert_eq!(initial_record.level, zterm_diagnostics::Level::Info);
+        assert_eq!(
+            initial_record.fields.startup_stage.as_deref(),
+            Some("starting")
+        );
+        assert_eq!(
+            final_record.fields.startup_stage.as_deref(),
+            Some("terminal_ready")
+        );
+        assert_eq!(
+            final_log.lines().count(),
+            1,
+            "intermediate stages require opt-in detail"
+        );
+        assert_eq!(
+            initial_record.fields.connection_id,
+            final_record.fields.connection_id
+        );
         assert!(!format!("{initial}{final_log}").contains("STARTUP_TARGET_SENTINEL"));
         assert_eq!(history.borrow().after(0).count(), 3);
         assert!(!paths.socket().exists());
 
-        let (failure, _) = recorder(paths);
+        let (failure, _) = recorder_with_log(log.clone());
         failure.fail(DomainErrorKind::Unauthorized);
-        assert!(
-            fs::read_to_string(paths.daemon_log())
-                .expect("progress log fixture")
-                .contains("WARN connection_startup")
-        );
-        assert!(
-            fs::read_to_string(paths.daemon_log())
-                .expect("progress log fixture")
-                .contains("stage=failed category=unauthorized")
-        );
+        assert!(log.flush(std::time::Duration::from_secs(2)));
+        let failed = fs::read_to_string(paths.daemon_log()).expect("progress log fixture");
+        let failed = zterm_diagnostics::Record::decode(
+            failed.lines().last().expect("failed record").as_bytes(),
+        )
+        .expect("typed record");
+        assert_eq!(failed.level, zterm_diagnostics::Level::Warn);
+        assert_eq!(failed.fields.category.as_deref(), Some("unauthorized"));
         // An unsafe logfile must not leak writes outside managed state or stop
         // the screen's observations; the operation owner still gets its result.
         let outside = paths.home().join("outside.log");
@@ -192,8 +210,9 @@ mod tests {
         fs::remove_file(paths.daemon_log()).expect("replace log fixture");
         std::os::unix::fs::symlink(&outside, paths.daemon_log())
             .expect("unsafe log symlink fixture");
-        let (observer, history) = recorder(paths);
+        let (observer, history) = recorder_with_log(log.clone());
         observer.report(ConnectionStage::TerminalReady);
+        assert!(!log.flush(std::time::Duration::from_secs(2)));
         assert_eq!(history.borrow().after(0).count(), 1);
         assert_eq!(
             fs::read_to_string(outside).expect("outside file unchanged"),

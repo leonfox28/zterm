@@ -909,7 +909,18 @@ impl SessionWireServer {
         .await;
         match result {
             Ok(reply) => reply,
-            Err(error) => ServiceReply::error(request_id, &error),
+            Err(error) => {
+                zterm_diagnostics::record(
+                    zterm_diagnostics::Event::new(zterm_diagnostics::Kind::RequestFailed)
+                        .level(if error.kind() == DomainErrorKind::Cancelled {
+                            zterm_diagnostics::Level::Info
+                        } else {
+                            zterm_diagnostics::Level::Warn
+                        })
+                        .error(error.kind()),
+                );
+                ServiceReply::error(request_id, &error)
+            }
         }
     }
 }

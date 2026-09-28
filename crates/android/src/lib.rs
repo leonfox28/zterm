@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio::runtime::Runtime;
 use tokio::sync::{OnceCell, watch};
 
+pub mod diagnostics;
 pub mod dns;
 pub mod network;
 pub mod terminal;

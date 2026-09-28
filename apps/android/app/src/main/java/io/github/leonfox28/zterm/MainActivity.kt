@@ -8,6 +8,14 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.core.view.ViewCompat
 
 class MainActivity : ComponentActivity() {
+    override fun onStart() {
+        super.onStart()
+        (application as ZtermApplication).diagnostics.record(io.github.leonfox28.zterm.nativebridge.AppDiagnostic.FOREGROUND)
+    }
+    override fun onStop() {
+        (application as ZtermApplication).diagnostics.record(io.github.leonfox28.zterm.nativebridge.AppDiagnostic.BACKGROUND)
+        super.onStop()
+    }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()

@@ -5,6 +5,7 @@ members = [
     "crates/cli",
     "crates/core",
     "crates/daemon",
+    "crates/diagnostics",
     "crates/platform",
     "crates/proto",
     "crates/terminal",
@@ -49,6 +50,7 @@ tempfile = "=3.27.0"
 rustix = { version = "1.1.4", features = ["event", "pipe", "termios"] }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+time = { version = "=0.3.55", features = ["formatting", "parsing"] }
 toml = "=1.1.4"
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.20", default-features = false, features = ["fmt", "registry"] }
@@ -59,6 +61,7 @@ zeroize = "=1.9.0"
 zterm-core = { path = "crates/core" }
 zterm-client = { path = "crates/client" }
 zterm-daemon = { path = "crates/daemon" }
+zterm-diagnostics = { path = "crates/diagnostics" }
 zterm-platform = { path = "crates/platform" }
 zterm-proto = { path = "crates/proto" }
 zterm-terminal = { path = "crates/terminal" }

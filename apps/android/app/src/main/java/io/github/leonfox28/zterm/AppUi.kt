@@ -238,6 +238,7 @@ private fun Modifier.semanticsDescription(label: String): Modifier = this.then(M
             Text(stringResource(R.string.font_preview), Modifier.padding(18.dp), fontFamily = FontFamily.Monospace, fontSize = fontSize.sp)
         }
         TerminalNotificationSettings(state, repository)
+        DiagnosticsSettings()
         AboutSettings(updates, state.initialized)
         ErrorText(state.error)
     }

@@ -24,7 +24,7 @@ internal data class AppState(
 )
 
 /** The Application owns mutations, streams and frames. Activity collectors own none of them. */
-internal class AppRepository(context: Context, val runtime: NativeRuntime) {
+internal class AppRepository(context: Context, val runtime: NativeRuntime, private val diagnostics: AppDiagnostics? = null) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val store = AppStore(context)
     private val storage = Mutex()
@@ -38,6 +38,7 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
     } }.distinctUntilChanged().stateIn(scope, SharingStarted.Eagerly, null)
     private val frameObservers = linkedSetOf<(NativeFrame?) -> Unit>()
     private var selectionVersion = 0L
+    private var lastViewportDiagnostic = 0L
     fun observeTerminalFrames(observer: (NativeFrame?) -> Unit): () -> Unit {
         frameObservers.add(observer)
         observer(mutableFrame.value)
@@ -45,8 +46,13 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
     }
     private fun publishFrame(next: NativeFrame?) {
         val previous = mutableFrame.value
-        if (BuildConfig.DEBUG && (previous?.state != next?.state || previous?.error != next?.error)) {
-            android.util.Log.d("ZtermState", "state=${next?.state ?: "detached"} code=${next?.error ?: "none"} rows=${next?.viewport?.rows} columns=${next?.viewport?.columns}")
+        if (diagnostics?.native?.detailEnabled() == true) {
+            if (previous?.inputReady != next?.inputReady) diagnostics.record(if (next?.inputReady == true) AppDiagnostic.INPUT_READY else AppDiagnostic.INPUT_BLOCKED)
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (previous?.viewport != next?.viewport && now - lastViewportDiagnostic >= 1000) {
+                lastViewportDiagnostic = now
+                next?.viewport?.let { diagnostics.record(AppDiagnostic.VIEWPORT, columns = it.columns.toUShort(), rows = it.rows.toUShort()) }
+            }
         }
         if (previous?.inputEpoch != next?.inputEpoch || previous?.geometryGeneration != next?.geometryGeneration || previous?.selection != next?.selection) ++selectionVersion
         // View subscribers retain an independent source before the repository
@@ -59,7 +65,7 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
     private var terminal: NativeTerminal? = null
     private var observation: Job? = null
     private var notificationObservation: Job? = null
-    val notifications = TerminalNotifications(context)
+    val notifications = TerminalNotifications(context) { diagnostics?.record(AppDiagnostic.NOTIFICATION_FAILED) }
     private val frameClock = TerminalFrameClock()
     private var operation: Job? = null
     private var epoch = 0L
@@ -76,7 +82,10 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
     private val scrolls = Channel<Scroll>(Channel.CONFLATED)
     private val sizes = Channel<Unit>(Channel.CONFLATED)
     private val network = PlatformNetwork(context) { servers ->
-        scope.launch { if (state.value.initialized) runCatching { runtime.updateDns(servers) } }
+        scope.launch {
+            diagnostics?.record(AppDiagnostic.NETWORK_CHANGED)
+            if (state.value.initialized) runCatching { runtime.updateDns(servers) }.onFailure { diagnostics?.record(AppDiagnostic.OPERATION_FAILED, "transport_unavailable") }
+        }
     }
 
     init {
@@ -121,8 +130,9 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
                     notifications.setAppEnabled(saved.preferences.notificationsEnabled)
                     mutable.update { it.copy(saved = saved, initialized = true) }
                     network.start()
+                    diagnostics?.record(AppDiagnostic.INITIALIZED)
                 } finally { seed.fill(0) }
-            } catch (error: Exception) { report(error) }
+            } catch (error: Exception) { diagnostics?.record(AppDiagnostic.INITIALIZATION_FAILED, (error as? NativeException.RequestFailed)?.code); report(error) }
         }
     }
     private suspend fun save(transform: (SavedState) -> SavedState) = storage.withLock {
@@ -137,7 +147,7 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
         try { save { it.copy(updateReminder = reminder) } }
         catch (cancel: CancellationException) { throw cancel }
         catch (error: Exception) {
-            if (BuildConfig.DEBUG) android.util.Log.d("ZtermState", "update_reminder_save_failed type=${error.javaClass.simpleName}")
+            diagnostics?.record(AppDiagnostic.STORAGE_FAILED)
             throw error
         }
     }
@@ -289,7 +299,7 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
             } catch (_: NativeException.Closed) { /* No pending events survive closure. */ }
             catch (cancel: CancellationException) { throw cancel }
             catch (error: Exception) {
-                if (BuildConfig.DEBUG) android.util.Log.d("ZtermState", "notification_closed type=${error.javaClass.simpleName}")
+                diagnostics?.record(AppDiagnostic.NOTIFICATION_FAILED, (error as? NativeException.RequestFailed)?.code)
             }
         }
         observation = scope.launch {
@@ -445,7 +455,7 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime) {
     }
     private fun report(error: Exception) {
         val code = when (error) { is NativeException.RequestFailed -> error.code; is StoreFailure -> error.code; else -> "transport_unavailable" }
-        if (BuildConfig.DEBUG) android.util.Log.d("ZtermState", "operation_error=$code type=${error.javaClass.simpleName}")
+        diagnostics?.record(if (error is StoreFailure) AppDiagnostic.STORAGE_FAILED else AppDiagnostic.OPERATION_FAILED, code)
         mutable.update { it.copy(error = code) }
     }
 }

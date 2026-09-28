@@ -813,8 +813,25 @@ async fn run_terminal_driver(
     let mut stop_after_pending = false;
     let mut local_takeover_pending = takeover;
     let mut last_state = initial_state;
+    let mut diagnostic_state = None;
 
     loop {
+        if diagnostic_state != Some(last_state) {
+            diagnostic_state = Some(last_state);
+            use zterm_diagnostics::{Event, Kind, Stage};
+            let stage = match last_state {
+                TerminalViewTransportState::Preparing => Stage::Preparing,
+                TerminalViewTransportState::Synchronizing => Stage::Synchronizing,
+                TerminalViewTransportState::Active => Stage::Active,
+                TerminalViewTransportState::Reconnecting => Stage::Reconnecting,
+            };
+            zterm_diagnostics::record(
+                Event::new(Kind::ViewStateChanged)
+                    .session(client.session_id())
+                    .attachment(client.attachment_id())
+                    .stage(stage),
+            );
+        }
         if pending.is_empty() {
             tokio::select! {
                 command = commands.recv() => {

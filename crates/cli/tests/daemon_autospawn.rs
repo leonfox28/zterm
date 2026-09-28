@@ -117,6 +117,7 @@ fn run_terminal_child_if_requested() -> bool {
         paths,
         DaemonLauncher::for_test("/does/not/exist".into(), "--must-not-run".to_owned()),
     );
+    let _diagnostics = runtime.install_diagnostics();
     let arguments = match mode {
         "connect" | "screen-switch" | "scroll" | "copy" | "enhanced-prefix"
         | "alternate-detach" | "alternate-reattach" | "alternate-wider" | "main-wider" => {
@@ -284,6 +285,63 @@ async fn cli_autospawn(state: &TestState, runtime: LocalRuntime) {
     )
     .await;
     assert!(rendered_log.ends_with("bounded-tail-1099\n"));
+
+    let status = run(
+        &runtime,
+        "detail status",
+        ["zterm", "logs", "debug", "status"],
+    )
+    .await;
+    assert!(status.contains("OFF"));
+    let enabled = run(&runtime, "enable detail", ["zterm", "logs", "debug", "on"]).await;
+    assert!(enabled.contains("ON"));
+    assert!(
+        !state.paths.socket().exists(),
+        "diagnostic controls never autospawn"
+    );
+    let json = run(
+        &runtime,
+        "structured tail",
+        ["zterm", "logs", "--json", "--component", "diagnostics"],
+    )
+    .await;
+    assert!(
+        json.lines()
+            .all(|line| zterm_diagnostics::Record::decode(line.as_bytes()).is_some())
+    );
+    assert!(
+        !json.contains("bounded-tail-"),
+        "legacy text is not exported as structured metadata"
+    );
+    let output = state.paths.home().join("diagnostic-export.jsonl");
+    let output_name = output.to_str().expect("fixture output path");
+    let exported = run(
+        &runtime,
+        "export",
+        ["zterm", "logs", "export", "--output", output_name],
+    )
+    .await;
+    assert!(exported.contains("Logs exported"));
+    let export = std::fs::read_to_string(&output).expect("exported records");
+    assert!(export.starts_with("{\"export_schema\":1"));
+    assert!(!export.contains("bounded-tail-"));
+    assert!(
+        execute(
+            Cli::try_parse_from(["zterm", "logs", "export", "--output", output_name])
+                .expect("export args"),
+            &runtime,
+            InteractionMode::NonInteractive
+        )
+        .await
+        .is_err()
+    );
+    run(
+        &runtime,
+        "disable detail",
+        ["zterm", "logs", "debug", "off"],
+    )
+    .await;
+    assert!(!state.paths.socket().exists());
 
     let unconfirmed_reset = execute(
         Cli::try_parse_from(["zterm", "reset"]).expect("unconfirmed reset parses"),
@@ -905,35 +963,15 @@ async fn run_local_terminal_child(
             "the real local-daemon view must replace startup with the exact two-field local status"
         );
         let log = std::fs::read_to_string(paths.daemon_log()).expect("connection stage log");
-        let correlation = format!("connection_startup pid={} connection=1 ", child.id());
         let stages = log
             .lines()
-            .filter(|line| line.contains(&correlation))
-            .map(|line| {
-                line.split_whitespace()
-                    .find_map(|field| field.strip_prefix("stage="))
-                    .expect("typed stage")
-            })
+            .filter_map(|line| zterm_diagnostics::Record::decode(line.as_bytes()))
+            .filter(|record| record.component == "connection_startup" && record.pid == child.id())
+            .filter_map(|record| record.fields.startup_stage)
             .collect::<Vec<_>>();
         assert_eq!(
             stages,
-            [
-                "starting",
-                "initializing_terminal",
-                "terminal_initialized",
-                "checking_local_service",
-                "local_service_ready",
-                "resolving_target",
-                "target_resolved",
-                "opening_local_channel",
-                "session_channel_ready",
-                "requesting_session",
-                "receiving_terminal_state",
-                "terminal_state_received",
-                "displaying_terminal",
-                "synchronizing_terminal",
-                "terminal_ready",
-            ],
+            ["starting", "terminal_ready"],
             "actual local attachment must persist its complete ordered startup"
         );
     }

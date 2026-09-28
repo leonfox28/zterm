@@ -187,7 +187,23 @@ mod unix {
         progress.report(ConnectionStage::Starting);
         let runtime = runtime.with_connection_progress(progress.clone());
         let result = run_observed(request, &runtime, progress.clone(), history).await;
+        let startup_finished = !progress.is_active();
         finish_startup_progress(&progress, &result);
+        if startup_finished && let Err(error) = &result {
+            use zterm_diagnostics::{Event, FrontendFailure, Kind, Level};
+            let event = Event::new(Kind::TerminalFailed).level(Level::Error);
+            let event = match error {
+                CliError::Daemon(error)
+                | CliError::CreatedSessionAttach { source: error, .. }
+                | CliError::SessionOperation { source: error, .. } => event.error(error.kind()),
+                CliError::Usage(_) => event.frontend_error(FrontendFailure::InvalidUsage),
+                CliError::Io(_) => event.frontend_error(FrontendFailure::TerminalIo),
+                CliError::TerminalDriverFailure => {
+                    event.frontend_error(FrontendFailure::TerminalDriver)
+                }
+            };
+            zterm_diagnostics::record(event);
+        }
         result.and_then(emit_completion_diagnostic)
     }
 

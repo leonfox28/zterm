@@ -6,6 +6,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+zterm-diagnostics.workspace = true
 iroh.workspace = true
 futures-util.workspace = true
 ring.workspace = true

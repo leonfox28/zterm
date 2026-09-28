@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use zterm_platform::local_unix::{DaemonLock, bind_owned_daemon_socket, detach_current_process};
 use zterm_platform::pty::{ExplicitPtyCommand, PtyHost, PtySize};
-use zterm_platform::user_state::UserPaths;
+use zterm_platform::user_state::{UserPaths, open_append};
 
 const FIXTURE_ROOT: &str = "ZTERM_UPDATE_FIXTURE_ROOT";
 const FIXTURE_ROLE: &str = "ZTERM_UPDATE_FIXTURE_ROLE";
@@ -97,6 +97,9 @@ fn fixture_process() {
                 .expect("daemon lock")
                 .expect("exclusive daemon");
             let (listener, ownership) = bind_owned_daemon_socket(&paths, &lock).expect("socket");
+            zterm_platform::diagnostics::Store::new(paths.clone())
+                .register_daemon(&lock)
+                .expect("new diagnostic writer");
             let cwd = root.clone();
             let sessions = SessionService::with_spawner(
                 setup.device_id,
@@ -167,6 +170,12 @@ fn fixture_process() {
                 &paths,
                 stream,
                 |version| async {
+                    if root.join("fail-prepare").exists() {
+                        return Err(DaemonError::new(
+                            DomainErrorKind::ReleaseSignatureInvalid,
+                            "UPDATE_PREPARATION_SECRET_SENTINEL",
+                        ));
+                    }
                     fs::write(
                         root.join("selected-version"),
                         version.unwrap_or_else(|| "latest".into()),
@@ -280,7 +289,7 @@ fn update_completes_after_its_originating_pty_ends() {
     assert!(
         fs::read_to_string(paths(root).daemon_log())
             .expect("log")
-            .contains("outcome=success installed=9.1.0")
+            .contains("\"outcome\":\"success\"")
     );
     assert_eq!(
         fs::read_to_string(root.join("prepare-count")).expect("preparation"),
@@ -356,7 +365,9 @@ fn external_terminal_waits_for_real_completion_and_log_survives_rotation() {
     );
     assert!(paths(root).logs().join("daemon.log.1").exists());
     let log = fs::read_to_string(paths(root).daemon_log()).expect("current log");
-    assert!(log.contains("outcome=success installed=9.1.0 daemon_started=true"));
+    assert!(log.contains("\"outcome\":\"success\""));
+    assert!(log.contains("\"target_version\":\"9.1.0\""));
+    assert!(log.contains("\"daemon_started\":true"));
     assert!(!log.contains(&"x".repeat(100)));
 }
 
@@ -485,8 +496,10 @@ fn startup_failure_keeps_new_binary_and_records_partial_completion() {
         executable_script(root, true)
     );
     let log = fs::read_to_string(paths(root).daemon_log()).expect("partial outcome log");
-    assert!(log.contains("outcome=partial_completion"));
-    assert!(!log.contains("outcome=success"));
+    assert!(log.contains("\"outcome\":\"partial_completion\""));
+    assert!(log.contains("\"level\":\"warn\""));
+    assert!(log.contains("\"committed\":true"));
+    assert!(!log.contains("\"outcome\":\"success\""));
 }
 
 #[test]
@@ -501,8 +514,11 @@ fn post_check_failure_restores_previous_binary_and_reports_failure() {
         original
     );
     let log = fs::read_to_string(paths(root).daemon_log()).expect("outcome log");
-    assert!(log.contains("outcome=failed"));
-    assert!(!log.contains("outcome=success") && !log.contains("outcome=partial_completion"));
+    assert!(log.contains("\"outcome\":\"failed\""));
+    assert!(
+        !log.contains("\"outcome\":\"success\"")
+            && !log.contains("\"outcome\":\"partial_completion\"")
+    );
 }
 
 #[test]
@@ -609,4 +625,35 @@ fn accepted_channel_loss_reports_unknown_outcome_not_cancellation() {
     let error = direct_update(root).expect_err("completion unavailable");
     assert_eq!(error.kind(), DomainErrorKind::OperationOutcomeUnknown);
     assert!(error.detail().contains("may still be running"));
+}
+
+#[test]
+fn preparation_failure_is_persisted_before_update_handoff() {
+    let fixture = Fixture::new();
+    let root = fixture.root.path();
+    let original = fs::read(root.join("zterm")).expect("old binary");
+    fs::write(root.join("fail-prepare"), b"fail").expect("preparation fault");
+    let error = direct_update(root).expect_err("verification failed");
+    assert_eq!(error.kind(), DomainErrorKind::ReleaseSignatureInvalid);
+    assert_eq!(
+        original,
+        fs::read(root.join("zterm")).expect("unchanged binary")
+    );
+    let log = fs::read_to_string(paths(root).daemon_log()).expect("early failure persisted");
+    let records: Vec<_> = log
+        .lines()
+        .filter_map(|line| zterm_diagnostics::Record::decode(line.as_bytes()))
+        .collect();
+    let outcome = records
+        .iter()
+        .find(|r| r.event == zterm_diagnostics::Kind::UpdateCompleted)
+        .expect("outcome");
+    assert_eq!(outcome.level, zterm_diagnostics::Level::Warn);
+    assert_eq!(outcome.fields.committed, Some(false));
+    assert_eq!(
+        outcome.fields.category.as_deref(),
+        Some("release_signature_invalid")
+    );
+    assert!(!log.contains("SENTINEL"));
+    assert!(!paths(root).socket().exists());
 }

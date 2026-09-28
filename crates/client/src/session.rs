@@ -150,6 +150,8 @@ struct ReconnectedAttachment {
 /// Real same-UID duplex socket adapter for one frontend-owned terminal attachment.
 #[doc(hidden)]
 pub struct SessionClient {
+    reconnect_diagnostic: Option<zterm_diagnostics::Operation>,
+    last_diagnostic_path: Option<i32>,
     latest_colors: TerminalColorProfile,
     color_sequence: u64,
     transport: AttachmentTransport,
@@ -252,53 +254,62 @@ impl SessionClient {
         base_colors: TerminalColorProfile,
         progress: crate::progress::ProgressObserver,
     ) -> Result<Self, DaemonError> {
-        let deadline = crate::protocol::control_deadline();
-        let (session_id, session_name) = match selector {
-            Some(SessionSelector::Id(session_id)) => (Some(session_id.into()), String::new()),
-            Some(SessionSelector::Name(name)) => (None, name.to_string()),
-            None => (None, String::new()),
-        };
-        let resume_view_id = if target.device_id().is_some() {
-            Some(random_resume_view_id()?)
-        } else {
-            None
-        };
-        let request_id = 1;
-        let bytes = encode_message(
-            WireKind::TerminalAttachRequest,
-            request_id,
-            u32::try_from(DEFAULT_DEADLINE.as_millis()).unwrap_or(u32::MAX),
-            &v2::TerminalAttachRequest {
-                base_colors: Some(base_colors.clone().into()),
-                target: Some(resolved_target_wire(target)),
-                session_id,
-                takeover,
-                session_name,
-                create_main,
-                viewport: viewport.map(Into::into),
-                resume_view_id: resume_view_id.map(Into::into),
-                known_revision: None,
-            },
-        )
-        .map_err(protocol_error)?;
-        let mut transport = tokio::time::timeout_at(deadline, connector.open(target))
-            .await
-            .map_err(|_| crate::protocol::control_timeout())??;
-        progress.report(zterm_core::connection_progress::ConnectionStage::RequestingSession);
-        if let Err(error) = transport.write_until(&bytes, deadline).await {
-            return Err(if create_main {
-                create_main_outcome_unknown()
+        use zterm_diagnostics::{Event, Kind, Level, Operation, Outcome, Stage};
+        let operation = Operation::default();
+        zterm_diagnostics::record(
+            Event::new(Kind::ConnectionStarted)
+                .operation(&operation)
+                .connection(operation.id()),
+        );
+        let result = async move {
+            let deadline = crate::protocol::control_deadline();
+            let (session_id, session_name) = match selector {
+                Some(SessionSelector::Id(session_id)) => (Some(session_id.into()), String::new()),
+                Some(SessionSelector::Name(name)) => (None, name.to_string()),
+                None => (None, String::new()),
+            };
+            let resume_view_id = if target.device_id().is_some() {
+                Some(random_resume_view_id()?)
             } else {
-                error
-            });
-        }
+                None
+            };
+            let request_id = 1;
+            let bytes = encode_message(
+                WireKind::TerminalAttachRequest,
+                request_id,
+                u32::try_from(DEFAULT_DEADLINE.as_millis()).unwrap_or(u32::MAX),
+                &v2::TerminalAttachRequest {
+                    base_colors: Some(base_colors.clone().into()),
+                    target: Some(resolved_target_wire(target)),
+                    session_id,
+                    takeover,
+                    session_name,
+                    create_main,
+                    viewport: viewport.map(Into::into),
+                    resume_view_id: resume_view_id.map(Into::into),
+                    known_revision: None,
+                },
+            )
+            .map_err(protocol_error)?;
+            let mut transport = tokio::time::timeout_at(deadline, connector.open(target))
+                .await
+                .map_err(|_| crate::protocol::control_timeout())??;
+            progress.report(zterm_core::connection_progress::ConnectionStage::RequestingSession);
+            if let Err(error) = transport.write_until(&bytes, deadline).await {
+                return Err(if create_main {
+                    create_main_outcome_unknown()
+                } else {
+                    error
+                });
+            }
 
-        // The outer result owns post-write ambiguity. The inner result is
-        // reserved for a decoded, correlated ServiceError, which is already a
-        // definitive result and must retain its exact domain category.
-        progress
-            .report(zterm_core::connection_progress::ConnectionStage::ReceivingTerminalSnapshot);
-        let response = tokio::time::timeout_at(deadline, async {
+            // The outer result owns post-write ambiguity. The inner result is
+            // reserved for a decoded, correlated ServiceError, which is already a
+            // definitive result and must retain its exact domain category.
+            progress.report(
+                zterm_core::connection_progress::ConnectionStage::ReceivingTerminalSnapshot,
+            );
+            let response = tokio::time::timeout_at(deadline, async {
             let mut pre_snapshot_states = Vec::new();
             let mut pre_snapshot_paths = Vec::new();
             let initial_snapshot = loop {
@@ -360,6 +371,8 @@ impl SessionClient {
             let pending_transport_events =
                 changed_tunnel_path_events_after_unknown(attachment_id, pre_snapshot_paths);
             Ok(Ok(Self {
+                reconnect_diagnostic: None,
+                last_diagnostic_path: None,
                 transport,
                 write_error: None,
                 takeover_deadline: None,
@@ -387,23 +400,46 @@ impl SessionClient {
         })
         .await;
 
-        match response {
-            Ok(Ok(result)) => {
-                if result.is_ok() {
-                    progress.report(
+            match response {
+                Ok(Ok(result)) => {
+                    if result.is_ok() {
+                        progress.report(
                         zterm_core::connection_progress::ConnectionStage::TerminalSnapshotReceived,
                     );
+                    }
+                    result
                 }
-                result
+                Ok(Err(_)) if create_main => Err(create_main_outcome_unknown()),
+                Ok(Err(error)) => Err(error),
+                Err(_) if create_main => Err(create_main_outcome_unknown()),
+                Err(_) => Err(DaemonError::new(
+                    DomainErrorKind::DeadlineExceeded,
+                    "timed out waiting for initial terminal snapshot",
+                )),
             }
-            Ok(Err(_)) if create_main => Err(create_main_outcome_unknown()),
-            Ok(Err(error)) => Err(error),
-            Err(_) if create_main => Err(create_main_outcome_unknown()),
-            Err(_) => Err(DaemonError::new(
-                DomainErrorKind::DeadlineExceeded,
-                "timed out waiting for initial terminal snapshot",
-            )),
         }
+        .await;
+        let event = match &result {
+            Ok(client) => Event::new(Kind::ConnectionCompleted)
+                .outcome(Outcome::Success)
+                .stage(Stage::Synchronizing)
+                .session(client.session_id)
+                .attachment(client.attachment_id),
+            Err(error) => Event::new(Kind::ConnectionFailed)
+                .error(error.kind())
+                .level(if error.kind() == DomainErrorKind::Cancelled {
+                    Level::Info
+                } else {
+                    Level::Warn
+                })
+                .outcome(if error.kind() == DomainErrorKind::Cancelled {
+                    Outcome::Cancelled
+                } else {
+                    Outcome::Failed
+                }),
+        };
+        zterm_diagnostics::record(event.operation(&operation).connection(operation.id()));
+        result
     }
 
     async fn reconnect_remote(&mut self) -> Result<(), DaemonError> {
@@ -413,6 +449,18 @@ impl SessionClient {
         loop {
             match self.reconnect_remote_once(resume_view_id).await {
                 Ok(reconnected) => {
+                    if let Some(operation) = self.reconnect_diagnostic.take() {
+                        zterm_diagnostics::record(
+                            zterm_diagnostics::Event::new(
+                                zterm_diagnostics::Kind::ReconnectCompleted,
+                            )
+                            .session(self.session_id)
+                            .attachment(reconnected.attachment_id)
+                            .operation(&operation)
+                            .stage(zterm_diagnostics::Stage::Synchronizing)
+                            .outcome(zterm_diagnostics::Outcome::Success),
+                        );
+                    }
                     self.transport = reconnected.transport;
                     self.write_error = None;
                     self.takeover_deadline = None;
@@ -452,7 +500,18 @@ impl SessionClient {
                 Err(error) if is_retryable_remote_reconnect(error.kind()) => {
                     tokio::time::sleep(Duration::from_millis(250)).await;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    if let Some(operation) = &self.reconnect_diagnostic {
+                        zterm_diagnostics::record(
+                            zterm_diagnostics::Event::new(zterm_diagnostics::Kind::ReconnectFailed)
+                                .session(self.session_id)
+                                .operation(operation)
+                                .level(zterm_diagnostics::Level::Warn)
+                                .error(error.kind()),
+                        );
+                    }
+                    return Err(error);
+                }
             }
         }
     }
@@ -580,6 +639,15 @@ impl SessionClient {
         if self.reconnect_pending {
             return;
         }
+        let diagnostic = zterm_diagnostics::Operation::default();
+        zterm_diagnostics::record(
+            zterm_diagnostics::Event::new(zterm_diagnostics::Kind::ReconnectStarted)
+                .session(self.session_id)
+                .attachment(self.attachment_id)
+                .operation(&diagnostic),
+        );
+        self.reconnect_diagnostic = Some(diagnostic);
+        self.last_diagnostic_path = None;
         self.transport.invalidate();
         self.write_error = Some(crate::protocol::attachment_cancelled());
         let history_gap = self.pending_history_window.take().map(|(_, query)| {
@@ -653,6 +721,8 @@ impl SessionClient {
                 color_sequence: Default::default(),
                 latest_colors: Default::default(),
 
+                reconnect_diagnostic: None,
+                last_diagnostic_path: None,
                 transport: AttachmentTransport::new(UnixAttachmentTransport::Direct {
                     stream,
                     decoder: FrameDecoder::new(),
@@ -772,6 +842,15 @@ impl SessionClient {
         &mut self,
         size: zterm_core::terminal::TerminalSize,
     ) -> Result<(), DaemonError> {
+        if size != self.latest_viewport && zterm_diagnostics::detail_enabled() {
+            zterm_diagnostics::record(
+                zterm_diagnostics::Event::new(zterm_diagnostics::Kind::ViewportChanged)
+                    .level(zterm_diagnostics::Level::Debug)
+                    .session(self.session_id)
+                    .attachment(self.attachment_id)
+                    .viewport(size.columns, size.rows),
+            );
+        }
         // Retain the frontend's latest desired viewport across a tunnel epoch.
         self.latest_viewport = size;
         self.send(
@@ -789,6 +868,16 @@ impl SessionClient {
 
     /// Discards the client baseline and requests a fresh snapshot.
     pub async fn request_sync(&mut self, known_revision: Revision) -> Result<(), DaemonError> {
+        if zterm_diagnostics::detail_enabled() {
+            zterm_diagnostics::record(
+                zterm_diagnostics::Event::new(zterm_diagnostics::Kind::SyncChanged)
+                    .level(zterm_diagnostics::Level::Debug)
+                    .session(self.session_id)
+                    .attachment(self.attachment_id)
+                    .reason(zterm_diagnostics::Reason::SyncRequired)
+                    .epoch(known_revision.get()),
+            );
+        }
         if self.target.device_id().is_some() {
             self.force_full_sync = true;
         }
@@ -957,7 +1046,24 @@ impl SessionClient {
             self.invalidate_transport();
             return Err(takeover_outcome_unknown());
         }
-        self.read_next_event_inner().await
+        let result = self.read_next_event_inner().await;
+        if let Ok(LocalAttachmentEvent::ConnectionStatus(status)) = &result
+            && self.last_diagnostic_path != Some(status.path)
+        {
+            self.last_diagnostic_path = Some(status.path);
+            let stage = match v2::TerminalConnectionPath::try_from(status.path) {
+                Ok(v2::TerminalConnectionPath::Direct) => zterm_diagnostics::Stage::Direct,
+                Ok(v2::TerminalConnectionPath::Relay) => zterm_diagnostics::Stage::Relay,
+                _ => zterm_diagnostics::Stage::Unknown,
+            };
+            zterm_diagnostics::record(
+                zterm_diagnostics::Event::new(zterm_diagnostics::Kind::RouteChanged)
+                    .session(self.session_id)
+                    .attachment(self.attachment_id)
+                    .stage(stage),
+            );
+        }
+        result
     }
 
     async fn read_next_event_inner(&mut self) -> Result<LocalAttachmentEvent, DaemonError> {
@@ -1167,6 +1273,12 @@ impl SessionClient {
                     .decode_message(WireKind::TerminalLeaseLost)
                     .map_err(protocol_error)?;
                 self.require_attachment(lost.attachment_id.clone())?;
+                zterm_diagnostics::record(
+                    zterm_diagnostics::Event::new(zterm_diagnostics::Kind::TerminalLeaseLost)
+                        .session(self.session_id)
+                        .attachment(self.attachment_id)
+                        .reason(zterm_diagnostics::Reason::LeaseLost),
+                );
                 Ok(LocalAttachmentEvent::LeaseLost(lost))
             }
             WireKind::TerminalSessionEnded => {
@@ -2855,6 +2967,10 @@ mod tests {
 
     #[tokio::test]
     async fn remote_reconnect_reuses_view_and_session_with_latest_frontend_checkpoint() {
+        reconnect_checkpoint_fixture().await;
+    }
+
+    async fn reconnect_checkpoint_fixture() {
         let temporary = tempfile::tempdir().expect("create reconnect fixture directory");
         let socket = temporary.path().join("daemon.sock");
         let listener = tokio::net::UnixListener::bind(&socket).expect("bind reconnect fixture IPC");
@@ -3030,7 +3146,8 @@ mod tests {
             .applied_revision
             .store(11, std::sync::atomic::Ordering::Release);
         client.latest_viewport = viewport;
-        client.reconnect_pending = true;
+        client.enter_reconnecting();
+        client.pending_transport_events.clear(); // The fixture observes the replacement epoch below.
         client
             .update_colors(colors.clone())
             .await
@@ -3106,6 +3223,101 @@ mod tests {
         assert_eq!(delta.from_revision, Revision::new(11));
         assert_eq!(delta.to_revision, Revision::new(12));
         server.await.expect("reconnect fixture server joins");
+    }
+
+    #[test]
+    fn diagnostics_correlate_real_reconnect_and_coalesce_healthy_route_samples() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "session::tests::diagnostics_reconnect_child",
+                "--ignored",
+            ])
+            .output()
+            .expect("isolated recorder fixture");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated shared-client recorder fixture"]
+    async fn diagnostics_reconnect_child() {
+        #[derive(Default)]
+        struct Memory(std::sync::Mutex<Vec<Vec<u8>>>);
+        impl zterm_diagnostics::Sink for Memory {
+            fn append(&self, _: bool, bytes: &[u8]) -> std::io::Result<()> {
+                self.0.lock().expect("records").push(bytes.into());
+                Ok(())
+            }
+            fn control(&self) -> std::io::Result<zterm_diagnostics::Control> {
+                Ok(zterm_diagnostics::Control::disabled())
+            }
+        }
+        let sink = Arc::new(Memory::default());
+        let recorder = zterm_diagnostics::Recorder::new(sink.clone()).expect("recorder");
+        assert!(zterm_diagnostics::install(recorder.clone()));
+        reconnect_checkpoint_fixture().await;
+        let (mut client, _peer) = SessionClient::terminal_driver_test_pair(
+            ResolvedSessionTarget::local(),
+            SessionId::from_array([0x61; 16]),
+            AttachmentId::from_array([0x62; 16]),
+        );
+        for rtt in 1..=100 {
+            client
+                .pending_transport_events
+                .push_back(LocalAttachmentEvent::ConnectionStatus(
+                    v2::TerminalConnectionStatusEvent {
+                        attachment_id: Some(client.attachment_id.into()),
+                        path: v2::TerminalConnectionPath::Direct as i32,
+                        rtt_ms: Some(rtt),
+                    },
+                ));
+            client.read_next_event().await.expect("healthy sample");
+        }
+        assert!(recorder.flush(Duration::from_secs(2)));
+        let records: Vec<_> = sink
+            .0
+            .lock()
+            .expect("records")
+            .iter()
+            .map(|bytes| zterm_diagnostics::Record::decode(bytes).expect("safe record"))
+            .collect();
+        use zterm_diagnostics::Kind;
+        let start = records
+            .iter()
+            .find(|r| r.event == Kind::ReconnectStarted)
+            .expect("start");
+        let completed = records
+            .iter()
+            .find(|r| r.event == Kind::ReconnectCompleted)
+            .expect("completed");
+        assert_eq!(start.fields.operation_id, completed.fields.operation_id);
+        assert_eq!(start.fields.session_id, completed.fields.session_id);
+        assert_ne!(start.fields.attachment_id, completed.fields.attachment_id);
+        assert!(completed.fields.elapsed_ms.is_some());
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| r.event == Kind::ReconnectStarted)
+                .count(),
+            1
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| r.event == Kind::RouteChanged
+                    && r.fields.session_id == Some(client.session_id.to_string()))
+                .count(),
+            1
+        );
+        assert!(
+            records
+                .iter()
+                .all(|r| r.level != zterm_diagnostics::Level::Debug)
+        );
     }
 
     #[tokio::test]

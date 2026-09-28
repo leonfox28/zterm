@@ -803,6 +803,7 @@ impl NativeRuntime {
                 cancel: cancel.clone(),
             });
             tokio::spawn(run(
+                session_id,
                 surface,
                 reader,
                 writer,
@@ -826,6 +827,7 @@ impl NativeRuntime {
 }
 #[allow(clippy::too_many_arguments)]
 async fn run(
+    session_id: SessionId,
     mut surface: AttachmentSurface,
     mut reader: zterm_client::view::TerminalViewEventReader,
     writer: TerminalViewCommandWriter,
@@ -1028,7 +1030,18 @@ async fn run(
             NativeError::RequestFailed { code } => code,
             _ => "transport_unavailable".to_owned(),
         });
-        if error.is_some() {
+        if let Some(code) = &error {
+            let mut event = zterm_diagnostics::Event::new(zterm_diagnostics::Kind::TerminalFailed)
+                .level(zterm_diagnostics::Level::Error)
+                .session(session_id)
+                .epoch(input_epoch)
+                .outcome(zterm_diagnostics::Outcome::Failed);
+            if let Some(kind) = zterm_core::DomainErrorKind::from_code(code) {
+                event = event.error(kind);
+            } else {
+                event = event.frontend_error(zterm_diagnostics::FrontendFailure::TerminalDriver);
+            }
+            zterm_diagnostics::record(event);
             state = "closed";
             healthy_resize = false;
             navigation.disconnected();

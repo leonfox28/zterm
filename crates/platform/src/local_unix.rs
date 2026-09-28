@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::user_state::{FileLock, PathError, UserPaths, open_append};
+use crate::user_state::{FileLock, PathError, UserPaths};
 
 /// Daemon lifetime lock required for socket ownership operations.
 pub struct DaemonLock(FileLock);
@@ -276,23 +276,19 @@ pub fn remove_own_socket(paths: &UserPaths, _lock: &DaemonLock) -> Result<(), Lo
     }
 }
 
-/// Builds a detached daemon command with stable cwd and managed log stdio.
+/// Builds a detached daemon command with stable cwd and null stdio; diagnostics use the coordinated sink.
 pub fn detached_command(
     executable: &Path,
     paths: &UserPaths,
     internal_argument: &str,
 ) -> Result<Command, LocalPlatformError> {
     paths.prepare_state_directories()?;
-    let log = open_append(paths.daemon_log(), paths.uid())?;
-    let stderr = log
-        .try_clone()
-        .map_err(|error| LocalPlatformError::Io(error.to_string()))?;
     let mut command = Command::new(executable);
     command
         .arg(internal_argument)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(stderr))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .current_dir(paths.home());
     Ok(command)
 }
@@ -446,6 +442,10 @@ mod tests {
             .expect("daemon lock acquired");
         let listener = bind_daemon_socket(&paths, &lock).expect("first bind");
         assert!(UnixStream::connect(paths.socket()).is_ok());
+        assert!(matches!(
+            bind_daemon_socket(&paths, &lock),
+            Err(LocalPlatformError::AlreadyRunning)
+        ));
         assert!(
             DaemonLock::try_acquire(&paths)
                 .expect("second daemon lock probe")
@@ -461,7 +461,19 @@ mod tests {
         );
 
         drop(listener);
-        let rebound = bind_daemon_socket(&paths, &lock).expect("safe stale socket replaced");
+        // Concurrent process fixtures can retain an inherited listener briefly
+        // before exec closes it. Require retirement before calling it stale;
+        // never weaken the production rule against unlinking a live socket.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let rebound = loop {
+            match bind_daemon_socket(&paths, &lock) {
+                Ok(listener) => break listener,
+                Err(LocalPlatformError::AlreadyRunning) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => panic!("safe stale socket replaced: {error:?}"),
+            }
+        };
         drop(rebound);
         remove_own_socket(&paths, &lock).expect("own socket removed");
 
