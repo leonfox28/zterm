@@ -154,7 +154,7 @@ Do not use production phone/account state or claim unavailable runtime evidence.
   specs to the implemented contracts; document commands/limits/migration in
   README, desktop/Android docs. Use `trellis-update-spec`.
 - [x] Record outcomes and platform limits in `verification.md`.
-- [ ] Only when approved scope passes, continue Trellis finish/commit workflow;
+- [x] Only when approved scope passes, continue Trellis finish/commit workflow;
   never archive this task on the strength of planning documents alone.
 
 ## Rollback and review points
@@ -204,3 +204,10 @@ distinguishes EXPIRED from STARTED. Final `just check` passed with exit 0 after
 all review corrections. The Store contract and 79-path commit plan are updated;
 no implementation or review finding remains open. Phase 3.4 is authorized by
 the user, including the following branch push and PR creation.
+
+## Completion bookkeeping (2026-09-28)
+
+Work commit: `278f703ee9fec2f1810f731f09a842c9aafd9509`. The working tree was clean after the
+79-path work commit. Implementation, review, spec sync and local acceptance are
+complete; the task proceeds through the authorized finish-work archive and
+journal, followed by the feature-branch push and PR creation.

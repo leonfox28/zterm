@@ -1,9 +1,10 @@
-# Proposed commit plan
+# Approved commit plan
 
 Branch: `feat/logging-improvements`. Base: `main` at `acecb45`.
 Status: ready after the second review and approved Store correction; final
 `just check` passed. The user explicitly approved commits and PR creation on
-2026-09-28; this plan is now being executed.
+2026-09-28. Work commit: `278f703ee9fec2f1810f731f09a842c9aafd9509`;
+the task archive and journal follow it.
 
 ## 1. Work commit
 
@@ -17,9 +18,9 @@ the full quality gate, with its deterministic regression and contract update.
 
 Validation and evidence: [verification.md](verification.md), including the
 user-requested second review and corrections in [review.md](review.md).
-Implemented user-facing behavior: [logging guide](../../../docs/logging.md).
+Implemented user-facing behavior: [logging guide](../../../../../docs/logging.md).
 
-Exact file list (79 paths):
+Exact work-commit file list before task archival (79 paths):
 
 - `.trellis/spec/backend/effective-user-state.md`
 - `.trellis/spec/backend/index.md`
