@@ -233,6 +233,7 @@ async fn serve_local_inner(
                         if recoverable_accept_error(&error) {
                             // Per-connection accept failures do not transfer or
                             // invalidate daemon/session ownership.
+                            zterm_diagnostics::record(zterm_diagnostics::Event::new(zterm_diagnostics::Kind::ListenerFailed).level(zterm_diagnostics::Level::Warn).error(DomainErrorKind::TransportUnavailable));
                             tracing::warn!(
                                 error_kind = ?error.kind(),
                                 "local listener accept failed; retrying"
@@ -245,6 +246,7 @@ async fn serve_local_inner(
                     }
                 };
                 let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+                    zterm_diagnostics::record(zterm_diagnostics::Event::new(zterm_diagnostics::Kind::AdmissionRejected).level(zterm_diagnostics::Level::Warn).error(DomainErrorKind::ResourceExhausted));
                     drop(stream);
                     continue;
                 };
@@ -369,6 +371,15 @@ async fn handle_connection(
             }
         };
         if let Err(error) = result {
+            zterm_diagnostics::record(
+                zterm_diagnostics::Event::new(zterm_diagnostics::Kind::RequestFailed)
+                    .level(if error.kind() == DomainErrorKind::Cancelled {
+                        zterm_diagnostics::Level::Info
+                    } else {
+                        zterm_diagnostics::Level::Warn
+                    })
+                    .error(error.kind()),
+            );
             tracing::debug!(
                 error_kind = error.kind().code(),
                 "local remote-Session tunnel closed"
@@ -404,6 +415,15 @@ async fn handle_connection(
             )
             .await;
         if let Err(error) = result {
+            zterm_diagnostics::record(
+                zterm_diagnostics::Event::new(zterm_diagnostics::Kind::RequestFailed)
+                    .level(if error.kind() == DomainErrorKind::Cancelled {
+                        zterm_diagnostics::Level::Info
+                    } else {
+                        zterm_diagnostics::Level::Warn
+                    })
+                    .error(error.kind()),
+            );
             tracing::debug!(
                 error_kind = error.kind().code(),
                 "local terminal attachment closed"

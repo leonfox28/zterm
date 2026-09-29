@@ -330,7 +330,20 @@ pub enum ExistingLockState {
 impl FileLock {
     /// Tries to acquire an exclusive lock, returning `None` when another owner holds it.
     pub fn try_acquire(path: &Path, uid: u32) -> Result<Option<Self>, PathError> {
-        let file = open_managed_file(path, uid, true, true)?;
+        Self::try_acquire_with_create(path, uid, true)
+    }
+
+    /// Locks an existing file without creating inspection state.
+    pub fn try_acquire_existing(path: &Path, uid: u32) -> Result<Option<Self>, PathError> {
+        Self::try_acquire_with_create(path, uid, false)
+    }
+
+    fn try_acquire_with_create(
+        path: &Path,
+        uid: u32,
+        create: bool,
+    ) -> Result<Option<Self>, PathError> {
+        let file = open_managed_file(path, uid, create, create)?;
         match file.try_lock() {
             Ok(()) => Ok(Some(Self {
                 file,
@@ -375,6 +388,11 @@ pub fn atomic_create(
 /// Opens a managed file for bounded append after validating owner, type and mode.
 pub fn open_append(path: &Path, uid: u32) -> Result<File, PathError> {
     open_managed_file(path, uid, true, true)
+}
+
+/// Opens an existing managed regular file without following a symlink.
+pub fn open_read(path: &Path, uid: u32) -> Result<File, PathError> {
+    open_managed_file(path, uid, false, false)
 }
 
 /// Validates an existing managed regular file.
@@ -650,12 +668,29 @@ fn remove_managed_state_root_with(
 }
 
 fn inspect_managed_logs(paths: &UserPaths, files: &mut Vec<PathBuf>) -> Result<(), PathError> {
-    let archive = paths.logs().join("daemon.log.1");
+    let managed = [
+        "daemon.log",
+        "daemon.log.1",
+        "daemon.debug.log",
+        "daemon.debug.log.1",
+        "diagnostics.json",
+        "writer.lock",
+    ];
     let entries = fs::read_dir(paths.logs()).map_err(|error| io_error(paths.logs(), error))?;
     for entry in entries {
         let entry = entry.map_err(|error| io_error(paths.logs(), error))?;
         let path = entry.path();
-        if path != paths.daemon_log() && path != archive {
+        if !managed.iter().any(|name| path == paths.logs().join(name))
+            && ![
+                "daemon.log",
+                "daemon.log.1",
+                "daemon.debug.log",
+                "daemon.debug.log.1",
+                "diagnostics.json",
+            ]
+            .iter()
+            .any(|name| temporary_name_matches(&paths.logs().join(name), &path))
+        {
             return Err(PathError::UnexpectedManagedEntry(path));
         }
         validate_regular_file(&path, paths.uid())?;
@@ -1314,15 +1349,32 @@ mod tests {
             atomic_write(&residue, paths.uid(), |file| file.write_all(b"residue"))
                 .expect("managed temporary residue");
         }
-        let mut log = open_append(paths.daemon_log(), paths.uid()).expect("managed log");
-        log.write_all(b"safe diagnostic\n").expect("log bytes");
-        drop(log);
-        let mut archive = open_append(&paths.logs().join("daemon.log.1"), paths.uid())
-            .expect("managed log archive");
-        archive
-            .write_all(b"older diagnostic\n")
-            .expect("archive bytes");
-        drop(archive);
+        for name in [
+            "daemon.log",
+            "daemon.log.1",
+            "daemon.debug.log",
+            "daemon.debug.log.1",
+            "diagnostics.json",
+            "writer.lock",
+        ] {
+            let mut file = open_append(&paths.logs().join(name), paths.uid())
+                .expect("managed diagnostic file");
+            file.write_all(b"safe diagnostic\n").expect("log bytes");
+        }
+        for name in [
+            "daemon.log",
+            "daemon.log.1",
+            "daemon.debug.log",
+            "daemon.debug.log.1",
+            "diagnostics.json",
+        ] {
+            atomic_write(
+                &paths.logs().join(format!(".{name}.tmp-123-456")),
+                paths.uid(),
+                |file| file.write_all(b"residue"),
+            )
+            .expect("diagnostic atomic residue");
+        }
         drop(
             FileLock::try_acquire(paths.daemon_lock(), paths.uid())
                 .expect("daemon lock probe")

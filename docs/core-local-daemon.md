@@ -37,9 +37,10 @@ admission before accepting an unapproved idle stop, so a concurrent creation
 cannot be ended based on an earlier empty observation.
 
 `logs` reads recent records once and never starts the daemon. Key lifecycle,
-Session, network, connection and pairing events use the existing daemon log.
-The existing startup check rotates a log of at least 4 MiB to `daemon.log.1`;
-there is no continuous reader or runtime size cap.
+Session, network, connection and pairing events are saved by default. Each key
+and optional detail lane rotates at runtime with 4 MiB current + one 4 MiB archive.
+See [Local logs and diagnostics](logging.md) for the 15-minute detail controls,
+filters, safe JSONL export and compatibility with an already-running old daemon.
 
 ## Per-user state
 
@@ -51,7 +52,10 @@ Persistent paths are derived from the effective UID's account database, not
 <account-home>/.zterm/identity.key
 <account-home>/.zterm/state.sqlite3
 <account-home>/.zterm/install.json       (reserved for the installer)
-<account-home>/.zterm/logs/daemon.log
+<account-home>/.zterm/logs/daemon.log[.1]
+<account-home>/.zterm/logs/daemon.debug.log[.1]
+<account-home>/.zterm/logs/diagnostics.json
+<account-home>/.zterm/logs/writer.lock
 ```
 
 Managed directories are mode `0700`; files and the Unix socket are no wider
@@ -80,8 +84,8 @@ serializes setup/launch briefly; `daemon.lock` is held for the process lifetime.
 The daemon does not acquire the lifecycle lock, and there is no PID-file kill
 fallback.
 
-The launcher redirects stdin to null, appends stdout/stderr to the managed log,
-uses the account home as cwd, and the child calls safe `setsid()` before Tokio
+The launcher redirects stdin/stdout/stderr to null; the child installs the bounded
+structured recorder, uses the account home as cwd, and calls safe `setsid()` before Tokio
 runtime initialization. There is no systemd, launchd, cron, login item,
 supervisor, or automatic update. After a crash or reboot, no daemon starts
 until an explicit setup/restart or a configured pair/device/connect/Session

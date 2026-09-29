@@ -1514,25 +1514,22 @@ fn wait_for_store_response<R>(
                 "store actor stopped before the command outcome became ambiguous",
             )),
         },
-        Err(RecvTimeoutError::Timeout) => {
-            if gate
-                .state
-                .compare_exchange(
-                    COMMAND_QUEUED,
-                    COMMAND_EXPIRED,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
+        Err(RecvTimeoutError::Timeout) => match gate.state.compare_exchange(
+            COMMAND_QUEUED,
+            COMMAND_EXPIRED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            // The actor may expire the command before its reply reaches us.
+            // Losing this race to EXPIRED still proves no execution started.
+            Ok(_) | Err(COMMAND_EXPIRED) => {
                 Err(deadline_exceeded("store command expired before starting"))
-            } else {
-                Err(DaemonError::new(
-                    DomainErrorKind::OperationOutcomeUnknown,
-                    "store command started but did not report an outcome before its deadline",
-                ))
             }
-        }
+            Err(_) => Err(DaemonError::new(
+                DomainErrorKind::OperationOutcomeUnknown,
+                "store command started but did not report an outcome before its deadline",
+            )),
+        },
     }
 }
 
@@ -1852,6 +1849,38 @@ pub fn database_bytes(paths: &UserPaths) -> Result<Vec<u8>, DaemonError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeout_preserves_queued_expired_and_started_classification() {
+        for (state, expected) in [
+            (COMMAND_QUEUED, DomainErrorKind::DeadlineExceeded),
+            (COMMAND_EXPIRED, DomainErrorKind::DeadlineExceeded),
+            (COMMAND_STARTED, DomainErrorKind::OperationOutcomeUnknown),
+        ] {
+            let gate = Arc::new(CommandGate {
+                state: AtomicU8::new(state),
+            });
+            // Keep the sender alive without a reply: EXPIRED models the exact
+            // window after the actor rejects execution but before it replies.
+            let (reply, response) = mpsc::sync_channel::<Result<(), DaemonError>>(1);
+            let result = wait_for_store_response(
+                response,
+                Arc::clone(&gate),
+                Instant::now() - Duration::from_secs(1),
+            );
+            assert_eq!(result.expect_err("elapsed deadline").kind(), expected);
+            assert_eq!(
+                gate.state.load(Ordering::Acquire),
+                if state == COMMAND_STARTED {
+                    COMMAND_STARTED
+                } else {
+                    COMMAND_EXPIRED
+                },
+                "expiry must not revoke an already-started command"
+            );
+            drop(reply);
+        }
+    }
 
     #[test]
     fn failed_authorization_transaction_leaves_no_half_row() {

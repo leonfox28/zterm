@@ -14,6 +14,8 @@ pub mod config;
 pub mod connection_broker;
 mod connection_progress;
 pub mod device_directory;
+#[cfg(unix)]
+pub mod diagnostics;
 pub mod distribution;
 pub mod error;
 pub mod identity;

@@ -9,6 +9,7 @@ publish.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+zterm-diagnostics.workspace = true
 iroh.workspace = true
 zeroize.workspace = true
 zterm-client.workspace = true

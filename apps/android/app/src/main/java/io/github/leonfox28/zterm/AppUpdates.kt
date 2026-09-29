@@ -1,5 +1,7 @@
 package io.github.leonfox28.zterm
 
+import io.github.leonfox28.zterm.nativebridge.AppDiagnostic
+
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -37,6 +39,7 @@ internal class AppUpdates(
     private val saveReminder: suspend (UpdateReminder) -> Unit,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate),
     private val now: () -> Long = System::currentTimeMillis,
+    private val diagnostics: (AppDiagnostic, String?) -> Unit = { _, _ -> },
 ) {
     private val mutable = MutableStateFlow(UpdateState())
     val state = mutable.asStateFlow()
@@ -64,6 +67,7 @@ internal class AppUpdates(
             else -> return
         }
         val mine = ++generation
+        diagnostics(AppDiagnostic.UPDATE_STARTED, null)
         mutable.value = UpdateState(phase = UpdatePhase.Checking, manual = manual)
         job = scope.launch {
             var found: UpdateCandidate? = null
@@ -96,6 +100,7 @@ internal class AppUpdates(
     }
 
     private fun checkFailed(code: String) {
+        diagnostics(AppDiagnostic.UPDATE_FAILED, code)
         val requested = mutable.value.manual
         mutable.value = UpdateState()
         if (requested) notice(code)
@@ -142,13 +147,14 @@ internal class AppUpdates(
                     file = partial
                     partial = null
                     ownsCandidate = false
+                    diagnostics(AppDiagnostic.UPDATE_VERIFIED, null)
                     mutable.value = mutable.value.copy(phase = UpdatePhase.Ready)
                 }
             } catch (timeout: TimeoutCancellationException) {
-                if (mine == generation) { ownsCandidate = false; fail("update_network") }
+                if (mine == generation) { ownsCandidate = false; diagnostics(AppDiagnostic.UPDATE_FAILED, "update_network"); fail("update_network") }
             } catch (cancel: CancellationException) { throw cancel }
             catch (error: Exception) {
-                if (mine == generation) { ownsCandidate = false; fail((error as? UpdateFailure)?.code ?: "update_download_failed") }
+                if (mine == generation) { ownsCandidate = false; diagnostics(AppDiagnostic.UPDATE_FAILED, (error as? UpdateFailure)?.code ?: "update_download_failed"); fail((error as? UpdateFailure)?.code ?: "update_download_failed") }
             } finally {
                 withContext(NonCancellable + Dispatchers.IO) {
                     try { partial?.delete() }
@@ -183,6 +189,7 @@ internal class AppUpdates(
     /** Consume before launching Android so recreation cannot launch twice. */
     fun takeInstallFile(): File? {
         if (mutable.value.phase != UpdatePhase.Ready) return null
+        diagnostics(AppDiagnostic.UPDATE_HANDED_OFF, null)
         mutable.value = mutable.value.copy(phase = UpdatePhase.HandedOff)
         return file
     }

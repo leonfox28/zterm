@@ -314,3 +314,21 @@ live title even while showing retained history. The sole presenter emits OSC 2
 (on change; empty means zterm); TerminalGuard pushes/pops window title with
 CSI 22;2t / 23;2t. Restoring a preexisting outer title requires title-stack support.
 No raw child title query or OSC stream is forwarded.
+
+## Persistent diagnostics
+
+The lightweight `zterm-diagnostics` dependency contains no daemon/platform/PTY
+owner. SessionClient records connect and one reconnect operation across attempts,
+with known Session/attachment IDs and elapsed time; successful stream acquisition
+is Synchronizing. The existing terminal driver records state changes, including
+Active only at its existing acknowledgement fence. Route events coalesce path
+changes and never include addresses or RTT-only refreshes. Upload records use the
+existing operation owner and distinguish cancellation/unknown outcomes.
+
+Global recording is optional and no-op until desktop/Android composition installs
+it. Producers never perform IO or await logging. Startup ProgressObserver still
+retires at first Active; ongoing reconnect is independent. Logging IDs never enter
+remote DTOs, authorization, replay or resume identity. See [Logging](logging-guidelines.md)
+for safe categories, two bounded lanes and tests. The isolated real tunnel resume
+fixture asserts one operation ID across old/new attachments and a single route
+event for 100 healthy RTT updates.

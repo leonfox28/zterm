@@ -25,7 +25,7 @@ explicit future task requests them; see [Distribution](./distribution-lifecycle.
 | [Database Guidelines](./database-guidelines.md) | ORM patterns, queries, migrations | To fill |
 | [Error Handling](./error-handling.md) | Error types, handling strategies | To fill |
 | [Quality Guidelines](./quality-guidelines.md) | Code standards, forbidden patterns | To fill |
-| [Logging Guidelines](./logging-guidelines.md) | Existing daemon event owners, safe fields, levels, one-shot log reading and startup rotation | Active |
+| [Logging Guidelines](./logging-guidelines.md) | Safe local events, desktop/Android runtime rotation, finite detail controls and bounded export | Active |
 | [Relay Infrastructure and Deployment Contract](./relay-deployment.md) | Official N0 default plus optional self-hosted Relay contracts | Active |
 | [Host-Authoritative Terminal Model Contract](./terminal-model.md) | Host-only Alacritty boundary, ingress caps, semantic projection, safe replies, snapshots, deltas, and history windows | Active |
 | [Terminal Color and Appearance Contract](./terminal-colors.md) | Color protocol, bounded host observations, controller base, history repaint and software cursor | Active |

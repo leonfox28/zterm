@@ -9,7 +9,8 @@ platform APIs; Rust owns semantic content, synchronization and extraction.
 
 ## 2. Signatures and owners
 
-`ZtermApplication` lazily owns one `NativeRuntime` and `AppRepository`.
+`ZtermApplication` installs `AppDiagnostics` in `onCreate` before lazily owning one
+`NativeRuntime` and `AppRepository`.
 Activity/Compose collectors observe state and never shut down connections.
 `observeTerminalFrames` synchronously delivers each latest frame on Main so Views
 can retain sources before the Repository closes its predecessor. `TerminalView`
@@ -369,11 +370,35 @@ Fence resize failure reporting by attachment epoch/handle. `AttachGeometryTest`
 changes geometry while attach is suspended and checks the actual host's final
 rows/columns; run alone with `-e attachGeometry 1` before UI startup.
 
-Development builds log native terminal state transitions and typed operation
-error codes under `ZtermState` for connected-device diagnosis. Log only state,
-code, exception type and grid dimensions; never payloads, text, credentials,
-identity seeds, host addresses or exception message trees. No per-frame log or
-release diagnostic UI is added.
+Release and debug builds persist closed, content-free diagnostics through the
+Application-owned `AppDiagnostics` / Rust recorder. Settings exposes explicit
+15-minute enable/renew/off with countdown and system CreateDocument export, even
+when native identity/network initialization fails. Kotlin performs private file
+IO on the Rust writer callback or serial IO dispatcher, never Main. Activity
+recreation/backgrounding does not close diagnostics or runtime. App-private
+no-backup `diagnostics/` contains independent key/detail current+archive lanes
+(2 MiB per file), separate `control.json`, 0700 directories and 0600 files.
+Use typed AppDiagnostic/domain categories; never raw exception/message content.
+No per-frame/input/RTT stream. Details share the native finite gate and bounded
+sampling; see [Logging](../backend/logging-guidelines.md) for the full schema,
+error matrix and clock/storage contracts. `DiagnosticsTest` and `SettingsUiTest`
+cover JNI persistence/expiry, caps, private paths, export, localized controls,
+renewal, recreation and picker cancellation in installed debug/release variants.
+Resolve `Context.noBackupFilesDir` lazily in storage work: its getter performs
+filesystem access. Persist the detail checkbox and pending export choice with
+`rememberSaveable`, since CreateDocument may recreate the stopped Activity.
+`SettingsUiTest.diagnosticsExportRetainsDetailWhileTheSystemPickerRecreatesActivity`
+is opt-in with `-e diagnosticsExportFixture 1` on a disposable emulator; it saves
+through the real system picker, checks the exported detail header/records and
+deletes its unique Downloads file. Call `Activity.recreate` on Main for this
+stopped-owner case; `ActivityScenario.recreate` first requires RESUMED.
+`DiagnosticsNetworkTest` is opt-in on a named disposable host and explicit
+emulator serial; coordinate host pause/resume from outside the emulator, then
+restart the app process to verify retained recovery events and interval state.
+Resolve `frame.source.presentationRows()` before inspecting terminal text:
+`frame.rows` is only the eager fallback. Read-only host readiness checks may
+precede the scenario; do not retry a mutation with an unknown outcome to make a
+network fixture pass.
 
 ## 4. Validation and error matrix
 

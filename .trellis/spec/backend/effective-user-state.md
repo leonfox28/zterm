@@ -50,6 +50,28 @@ identity, SQLite state, setup, and managed files.
 - Tests inject `UserPaths` below a temporary directory. Product code exposes no
   `ZTERM_HOME` or normal CLI state-path override.
 
+## Store request deadlines
+
+`StoreHandle` calls carry one absolute `Instant` deadline.
+`wait_for_store_response<R>(Receiver<Result<R, DaemonError>>, Arc<CommandGate>,
+Instant)` classifies the result using the shared QUEUED/STARTED/EXPIRED gate.
+Both the caller and actor may expire a queued command; only the actor may start
+it. An expired command cannot execute its side effect.
+
+| Observation | Result |
+| --- | --- |
+| Reply received | Return the actual operation result |
+| Timeout successfully changes QUEUED to EXPIRED | `DeadlineExceeded` |
+| Timeout observes the actor already set EXPIRED | `DeadlineExceeded` |
+| Timeout or response disconnect after STARTED | `OperationOutcomeUnknown` |
+| Response disconnect while QUEUED / EXPIRED | `StoreUnavailable` / `DeadlineExceeded` |
+
+Base case: the actor replies within the deadline. Good: if the actor expires a
+command before sending its reply, the waiter still reports definite expiry.
+Bad: treating any failed QUEUED-to-EXPIRED CAS as proof of execution. Match
+`Ok(_) | Err(COMMAND_EXPIRED)` as definite expiry; a failed CAS does not by itself
+mean STARTED. Never turn a started command into a definite no-side-effect result.
+
 ## Required evidence
 
 - Path tests cross real type/mode/symlink boundaries and prove atomic writer
@@ -60,6 +82,11 @@ identity, SQLite state, setup, and managed files.
   rollback, identity consistency, directional device rows, checked generation,
   route-cache preservation/replacement, and pre-start versus started response
   loss through `StoreActor`.
+- The private Store timeout regression keeps an empty reply channel connected
+  at an elapsed deadline and covers QUEUED, EXPIRED and STARTED deterministically.
+  Assert the error kind and that expiry preserves an already-started gate. The
+  existing StoreActor fixture separately proves expired mutations do not execute
+  and shutdown joins the owner once; do not rely on stress timing for the race.
 - CLI setup tests prove first noninteractive validation failure leaves the
   entire task-private state root absent and successful setup creates 0700/0600
   nodes. Cover omitted-profile defaults and repeated self-hosted setup without
@@ -72,3 +99,18 @@ identity, SQLite state, setup, and managed files.
 system `/tmp` alias with an effective-UID namespace. This is separate from the
 managed identity/config inventory and is not age/capacity cleaned by zterm.
 See [Single-file Upload](./file-upload.md) for path/mode/collision/publication rules.
+
+## Managed diagnostics inventory
+
+`logs/` allows `daemon.log`, `daemon.log.1`, `daemon.debug.log`,
+`daemon.debug.log.1`, `diagnostics.json` and `writer.lock`, plus exact
+same-directory atomic siblings for the five replaceable files. Unknown names,
+symlinks and unsafe nodes still block destructive cleanup. Logging never creates
+identity or changes account authority. New reset/uninstall recognizes the full
+inventory; older cleanup tools can refuse it. Doctor validates every known file.
+
+The stable writer lock coordinates runtime rotate/reopen/append; do not acquire
+a lifecycle lock from a logging worker. Read/export retains safe snapshot handles
+without holding writer coordination while streaming. Control remains separate
+from config/SQLite. See [Logging](logging-guidelines.md) for file/queue bounds,
+legacy-daemon cutover and required private-root process tests.

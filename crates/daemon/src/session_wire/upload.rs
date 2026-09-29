@@ -3,8 +3,16 @@
 use super::*;
 use zterm_client::framing::FrameReader;
 use zterm_core::upload::*;
+use zterm_diagnostics::{Event, Kind, Level, Operation, Outcome};
 use zterm_platform::upload::StagedUpload;
 use zterm_proto::upload::UploadMessage;
+
+#[derive(Default)]
+struct Observation {
+    operation: Operation,
+    session: Option<SessionId>,
+    committed: bool,
+}
 
 impl SessionWireServer {
     pub(super) async fn handle_upload<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
@@ -17,10 +25,46 @@ impl SessionWireServer {
         let begin = UploadMessage::decode(&first.frame).map_err(protocol_error);
         let (reader, mut writer) = tokio::io::split(stream);
         let mut reader = FrameReader::after_first(reader, first);
+        let mut observation = Observation::default();
         let result = self
-            .upload_stream(&mut reader, &mut writer, begin, request_id, &context)
+            .upload_stream(
+                &mut reader,
+                &mut writer,
+                begin,
+                request_id,
+                &context,
+                &mut observation,
+            )
             .await;
         if let Err(error) = &result {
+            let mut event = Event::new(
+                if error.kind() == DomainErrorKind::Cancelled && !observation.committed {
+                    Kind::UploadCancelled
+                } else {
+                    Kind::UploadFailed
+                },
+            )
+            .operation(&observation.operation)
+            .committed(observation.committed)
+            .level(if error.kind() == DomainErrorKind::Cancelled {
+                Level::Info
+            } else {
+                Level::Warn
+            })
+            .error(error.kind())
+            .outcome(if observation.committed {
+                Outcome::PartialCompletion
+            } else if error.kind() == DomainErrorKind::UploadOutcomeUnknown {
+                Outcome::Unknown
+            } else if error.kind() == DomainErrorKind::Cancelled {
+                Outcome::Cancelled
+            } else {
+                Outcome::Failed
+            });
+            if let Some(session) = observation.session {
+                event = event.session(session);
+            }
+            zterm_diagnostics::record(event);
             write_error_best_effort(
                 &mut writer,
                 request_id,
@@ -39,10 +83,13 @@ impl SessionWireServer {
         begin: Result<UploadMessage, DaemonError>,
         request_id: u64,
         context: &SessionRequestContext,
+        observation: &mut Observation,
     ) -> Result<(), DaemonError> {
         let UploadMessage::Begin { binding, metadata } = begin? else {
             return Err(malformed("upload stream must start with Begin"));
         };
+        observation.session = Some(binding.session_id);
+        let operation = &observation.operation;
         let mut admission = context
             .run_effect(
                 &self.sessions,
@@ -56,6 +103,13 @@ impl SessionWireServer {
         let id = TransferId::from_bytes(&random[..TransferId::LENGTH])
             .expect("fixed random transfer ID");
         let size = metadata.size();
+        zterm_diagnostics::record(
+            Event::new(Kind::UploadStarted)
+                .operation(operation)
+                .session(binding.session_id)
+                .attachment(binding.attachment_id)
+                .bytes(size),
+        );
         let mut staged = run_blocking_until(control_deadline(), move || {
             StagedUpload::create(binding.session_id, id, metadata).map_err(storage_error)
         })
@@ -120,6 +174,12 @@ impl SessionWireServer {
                     }
                 }
                 UploadMessage::Cancel { id: received } if received == id => {
+                    zterm_diagnostics::record(
+                        Event::new(Kind::UploadCancelled)
+                            .operation(operation)
+                            .session(binding.session_id)
+                            .outcome(Outcome::Cancelled),
+                    );
                     drop(staged);
                     return write_upload(writer, request_id, UploadMessage::Cancelled { id }).await;
                 }
@@ -148,6 +208,15 @@ impl SessionWireServer {
                             },
                         )
                         .await?;
+                    observation.committed = true;
+                    zterm_diagnostics::record(
+                        Event::new(Kind::UploadCompleted)
+                            .operation(operation)
+                            .session(binding.session_id)
+                            .bytes(size)
+                            .committed(true)
+                            .outcome(Outcome::Success),
+                    );
                     // If control changed during disk publication, keep the file but
                     // do not return a pasteable result to the retired attachment.
                     if !admission.is_current() {

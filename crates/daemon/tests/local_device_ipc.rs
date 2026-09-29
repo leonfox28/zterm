@@ -63,6 +63,7 @@ use state_fixture::TestState;
 struct RecordingRemoteAccess {
     live: Mutex<BTreeMap<DeviceId, DeviceLiveObservation>>,
     closed: Mutex<Vec<DeviceId>>,
+    fail_close: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(unix)]
@@ -104,6 +105,12 @@ impl RemoteDeviceAccess for RecordingRemoteAccess {
     ) -> Pin<Box<dyn Future<Output = Result<(), zterm_daemon::error::DaemonError>> + Send + 'a>>
     {
         Box::pin(async move {
+            if self.fail_close.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(zterm_daemon::error::DaemonError::new(
+                    DomainErrorKind::TransportUnavailable,
+                    "CLEANUP_SECRET_SENTINEL",
+                ));
+            }
             lock(&self.closed).push(device_id);
             lock(&self.live).insert(device_id, DeviceLiveObservation::default());
             Ok(())
@@ -666,4 +673,96 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(unix)]
+#[test]
+fn revoke_logs_commit_before_failed_cleanup_without_exposing_error_detail() {
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--exact", "revoke_diagnostics_child", "--ignored"])
+        .output()
+        .expect("isolated revoke fixture");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated process composition fixture"]
+async fn revoke_diagnostics_child() {
+    let sessions = SessionFixture::new(ResourceLimits::default()).expect("sessions");
+    let remote = DeviceId::from_array([0x71; 32]);
+    let harness = Harness::start(
+        sessions.service.clone(),
+        LocalIpcLimits::for_test(Duration::from_secs(5)),
+        |store| {
+            store
+                .authorize_device(remote, "DEVICE_NAME_SENTINEL", 10)
+                .expect("authorize");
+        },
+    );
+    let guard = zterm_daemon::diagnostics::install(&harness.state.paths);
+    harness
+        .access
+        .fail_close
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        harness
+            .device_client()
+            .revoke(remote)
+            .await
+            .expect_err("cleanup failure")
+            .kind(),
+        DomainErrorKind::TransportUnavailable
+    );
+    assert_eq!(
+        harness.registry.snapshot(remote).expect("registry").status,
+        AuthorizationStatus::Revoked
+    );
+    let devices = harness
+        .device_client()
+        .list()
+        .await
+        .expect("committed state");
+    assert_eq!(
+        by_id(&devices, remote).auth_status(),
+        AuthorizationStatus::Revoked
+    );
+    assert_eq!(by_id(&devices, remote).generation().get(), 2);
+    drop(guard);
+    let bytes = std::fs::read(harness.state.paths.daemon_log()).expect("persisted events");
+    let text = String::from_utf8(bytes).expect("JSONL");
+    assert!(!text.contains("SENTINEL"));
+    let records: Vec<_> = text
+        .lines()
+        .map(|line| zterm_diagnostics::Record::decode(line.as_bytes()).expect("safe record"))
+        .collect();
+    let committed = records
+        .iter()
+        .find(|r| r.event == zterm_diagnostics::Kind::AuthorizationRevoked)
+        .expect("commit event");
+    let cleanup = records
+        .iter()
+        .find(|r| r.event == zterm_diagnostics::Kind::AuthorizationCleanup)
+        .expect("cleanup outcome");
+    assert_eq!(committed.fields.committed, Some(true));
+    assert_eq!(cleanup.fields.committed, Some(true));
+    assert_eq!(
+        cleanup.fields.outcome,
+        Some(zterm_diagnostics::Outcome::PartialCompletion)
+    );
+    assert_eq!(cleanup.level, zterm_diagnostics::Level::Warn);
+    assert_eq!(committed.fields.operation_id, cleanup.fields.operation_id);
+    assert!(committed.sequence < cleanup.sequence);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| r.event == zterm_diagnostics::Kind::AuthorizationRevoked)
+            .count(),
+        1
+    );
+    harness.stop().await;
 }

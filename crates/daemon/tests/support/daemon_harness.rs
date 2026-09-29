@@ -51,6 +51,7 @@ pub fn run_child_if_requested() -> bool {
             std::process::exit(2);
         }
     };
+    let _diagnostics = zterm_daemon::diagnostics::install(&paths);
     let result = zterm_platform::local_unix::detach_current_process()
         .map_err(|error| error.to_string())
         .and_then(|()| {

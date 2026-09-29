@@ -6,6 +6,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+zterm-diagnostics.workspace = true
 flate2.workspace = true
 futures-util.workspace = true
 iroh = { workspace = true, features = ["portmapper"] }

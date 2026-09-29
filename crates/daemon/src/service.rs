@@ -777,6 +777,8 @@ impl DaemonService {
         devices: &DeviceManagement,
         deadline: Instant,
     ) -> Result<ServiceReply, DaemonError> {
+        use zterm_diagnostics::{Event as DiagnosticEvent, Kind, Level, Operation, Outcome};
+        let diagnostic = Operation::default();
         let request: v2::LocalDeviceRevokeRequest = decode_request(&frame)?;
         let device_id = request.try_into().map_err(device_wire_error)?;
 
@@ -802,31 +804,53 @@ impl DaemonService {
                 store.revoke(device_id, revoked_at_unix, deadline)
             })
             .await?;
-        guard.publish(AuthorizationSnapshot {
-            status: AuthorizationStatus::Revoked,
-            generation,
-        })?;
-
-        await_service_until(
-            deadline,
-            devices.remote_access.close_remote(device_id, deadline),
-            "closing revoked device connections",
-        )
-        .await??;
-        let sessions = self.sessions.clone();
-        run_service_blocking_until(deadline, move || {
-            sessions
-                .detach_remote_principal_until(device_id, deadline)
-                .map(|_| ())
-        })
-        .await?;
-        drop(guard);
         tracing::info!(
             component = "authorization",
             operation = "revoked",
             generation = generation.get(),
             "Inbound authorization revoked"
         );
+        zterm_diagnostics::record(
+            DiagnosticEvent::new(Kind::AuthorizationRevoked)
+                .operation(&diagnostic)
+                .committed(true)
+                .count(generation.get()),
+        );
+        let cleanup = async {
+            guard.publish(AuthorizationSnapshot {
+                status: AuthorizationStatus::Revoked,
+                generation,
+            })?;
+
+            await_service_until(
+                deadline,
+                devices.remote_access.close_remote(device_id, deadline),
+                "closing revoked device connections",
+            )
+            .await??;
+            let sessions = self.sessions.clone();
+            run_service_blocking_until(deadline, move || {
+                sessions
+                    .detach_remote_principal_until(device_id, deadline)
+                    .map(|_| ())
+            })
+            .await?;
+            Ok::<(), DaemonError>(())
+        }
+        .await;
+        let mut event = DiagnosticEvent::new(Kind::AuthorizationCleanup)
+            .operation(&diagnostic)
+            .committed(true);
+        event = match &cleanup {
+            Ok(()) => event.outcome(Outcome::Success),
+            Err(error) => event
+                .level(Level::Warn)
+                .outcome(Outcome::PartialCompletion)
+                .error(error.kind()),
+        };
+        zterm_diagnostics::record(event);
+        cleanup?;
+        drop(guard);
 
         let device = self.device_summary(devices, device_id, deadline).await?;
         ServiceReply::message(

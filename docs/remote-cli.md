@@ -49,8 +49,8 @@ zterm logs [-n|--lines <n>]
 `status` summarizes the device name, version, daemon state,
 infrastructure, network state, and running Session names/count. `doctor` shows
 the detailed local socket/lock and network observations, effective account,
-managed state, and the lack of automatic login startup. Public inspection
-output is human-readable text; `--json` is not supported. Single-object fields
+managed state, and the lack of automatic login startup. Status and doctor
+output is human-readable text; logs additionally supports `--json`. Single-object fields
 are aligned, lists are name-first and full IDs appear on a separate line.
 Setup distinguishes Not configured from Configured even when the daemon is stopped.
 Results (including doctor reports and logs) use stdout; prompts, confirmations,
@@ -60,11 +60,11 @@ hint, while cancellation, unknown outcomes and created-but-not-attached failures
 retain their distinct diagnostics.
 
 `logs` reads a bounded tail once: 100 lines by default, at most 1,000 lines and
-1 MiB. `-n` is the short spelling of `--lines`; missing logs produce an English
-explanation. There is no follow mode. Existing `daemon.log` records lifecycle,
-Session, connection, network and pairing events without terminal content or
-secrets. At daemon startup, a log of at least 4 MiB is rotated to `daemon.log.1`;
-this is a startup check, not a size cap during a long-running daemon.
+1 MiB. `-n` aliases `--lines`; missing logs produce an English explanation. Key
+events persist by default, with optional detail enabled for 15 minutes using
+`logs debug on`. Level/component/Session/time filters, archives and `--json` are
+supported. `logs export --output PATH [--include-debug]` creates a safe explicit
+export. See [Local logs and diagnostics](logging.md) for limits and migration.
 
 Daemon lifecycle commands are:
 

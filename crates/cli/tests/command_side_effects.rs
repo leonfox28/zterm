@@ -33,7 +33,13 @@ async fn help_version_status_doctor_logs_and_stop_never_spawn() {
         .get_subcommands()
         .map(|command| command.get_subcommands().count().max(1))
         .sum();
-    assert_eq!(operation_count, 19);
+    assert_eq!(operation_count, 20);
+    let logs_command = definition.find_subcommand("logs").expect("logs command");
+    assert!(logs_command.find_subcommand("export").is_some());
+    assert!(logs_command.find_subcommand("debug").is_some());
+    for control in ["on", "off", "status"] {
+        assert!(Cli::try_parse_from(["zterm", "logs", "debug", control]).is_ok());
+    }
     for available in [
         "setup",
         "status",
@@ -104,6 +110,16 @@ async fn help_version_status_doctor_logs_and_stop_never_spawn() {
     assert_eq!(stop, "Daemon already stopped.\n");
     let logs = run(&runtime, ["zterm", "logs", "--lines", "10"]).await;
     assert_eq!(logs, "No daemon logs yet.\n");
+    for action in ["on", "off", "status"] {
+        let error = execute(
+            Cli::try_parse_from(["zterm", "logs", "debug", action]).expect("control parses"),
+            &runtime,
+            InteractionMode::NonInteractive,
+        )
+        .await
+        .expect_err("requires existing setup");
+        assert!(error.to_string().contains("run `zterm setup`"));
+    }
 
     let bare = run(&runtime, ["zterm"]).await;
     assert_eq!(bare, "zterm is not configured. Run `zterm setup` first.\n");

@@ -796,8 +796,9 @@ No new crate, background owner, or second Session interpreter is introduced.
   never changes linger or installs a service.
 - `logs [-n|--lines <n>]` reads the existing bounded tail once (100 default,
   1,000 lines/1 MiB maximum). Missing logs get English guidance; no file creation,
-  autospawn, follow mode or continuous reader is allowed. Logging contracts
-  are defined in [Logging Guidelines](./logging-guidelines.md).
+  autospawn, follow mode or continuous reader is allowed. Structured filters/JSON,
+  finite `logs debug on|off|status`, and explicit `logs export --output PATH`
+  use local storage without IPC/autospawn. Logging contracts are defined in [Logging Guidelines](./logging-guidelines.md).
 
 ## 4. Validation & Error Matrix
 

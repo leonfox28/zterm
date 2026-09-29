@@ -1015,3 +1015,42 @@ Implemented and verified the approved five-item terminal protocol batch; user au
 ### Next Steps
 
 - Push the completed branch, wait for the required GitHub CI gate, and merge the authorized PR into main.
+
+
+## Session 37: Complete bounded local logging and review corrections
+<!-- trellis-session: v=2 fp=d9b94a98cc710b5f -->
+
+**Date**: 2026-09-28
+**Task**: Complete bounded local logging and review corrections
+**Branch**: `feat/logging-improvements`
+
+### Summary
+
+Completed desktop and Android key-event logging with opt-in finite diagnostics, verified the cross-platform runtime boundaries, fixed review findings and the approved Store timeout classification race, and archived the logging task.
+
+### Main Changes
+
+- Added the shared closed JSONL contract, bounded nonblocking queues, secure rotating platform storage, legacy-writer handoff, CLI inspection/control/export, and localized Android Settings/export.
+- Covered committed lifecycle outcomes and recoverable failures at their owners without recording terminal payloads, credentials, raw paths, or network addresses.
+- Corrected retention marker recovery, Android saved export selection and startup directory IO, plus the pre-existing EXPIRED-versus-STARTED Store timeout race; updated executable specs.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `278f703ee9fec2f1810f731f09a842c9aafd9509` | feat: add bounded local logs and on-demand diagnostics |
+
+### Testing
+
+- [OK] Final just check passed after all source corrections, including workspace format/Clippy/tests, dependency policy, source/release policy, and relay static checks.
+- [OK] The deterministic Store timeout regression failed before the correction and passes afterward; all 21 persistence tests pass.
+- [OK] Installed Android debug and development-signed release each passed 7 focused tests; debug lint/JVM and release assemble/instrumentation/lint passed.
+- [OK] Disposable Linux transport and Android reconnect/restart/system-document export acceptance passed; task-owned AVD and Colima fixtures were removed.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- Push feat/logging-improvements and create the user-authorized PR to main; review hosted CI results. Durable evidence is in .trellis/tasks/archive/2026-09/09-26-logging-improvements/verification.md and review.md.

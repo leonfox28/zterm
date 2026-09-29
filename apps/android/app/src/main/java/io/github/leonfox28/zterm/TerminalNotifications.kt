@@ -1,5 +1,7 @@
 package io.github.leonfox28.zterm
 
+import androidx.compose.ui.platform.testTag
+
 import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
@@ -43,7 +45,7 @@ import java.util.UUID
 import kotlinx.coroutines.flow.asStateFlow
 
 /** Application-owned platform presentation. No notification is retained for a later grant. */
-internal class TerminalNotifications(context: Context) {
+internal class TerminalNotifications(context: Context, private val failed: () -> Unit = {}) {
     private val context = context.applicationContext
     private val manager = this.context.getSystemService(NotificationManager::class.java)
     private val tag = "terminal:${UUID.randomUUID()}"
@@ -100,7 +102,7 @@ internal class TerminalNotifications(context: Context) {
             true
         } catch (error: RuntimeException) {
             // Permission revocation or a platform posting failure must not kill the collector.
-            if (BuildConfig.DEBUG) android.util.Log.d("ZtermState", "notification_skipped type=${error.javaClass.simpleName}")
+            failed()
             false
         }
     }
@@ -151,7 +153,7 @@ internal class TerminalNotifications(context: Context) {
         fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
     val effective = appEnabled && systemEnabled
     Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surfaceContainer) {
-        Row(Modifier.fillMaxWidth().heightIn(min = 74.dp)
+        Row(Modifier.fillMaxWidth().testTag("terminal-notifications").heightIn(min = 74.dp)
             .toggleable(effective, enabled = state.initialized && !state.notificationsSaving && !pending,
                 role = Role.Switch, onValueChange = change)
             .padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {

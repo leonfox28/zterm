@@ -97,6 +97,14 @@ impl fmt::Debug for Cli {
 }
 
 impl Cli {
+    /// Foreground operations which can produce persistent diagnostic outcomes.
+    pub fn records_diagnostics(&self) -> bool {
+        !matches!(
+            self.command,
+            Some(Command::Logs(_) | Command::Status | Command::Doctor)
+        )
+    }
+
     /// Whether this invocation enters the detached one-shot updater.
     #[must_use]
     pub const fn internal_update(&self) -> bool {
@@ -370,10 +378,47 @@ struct YesArgs {
 }
 
 #[derive(Debug, clap::Args)]
+#[command(args_conflicts_with_subcommands = true)]
 struct LogsArgs {
-    /// Number of recent lines (bounded to 1000).
+    /// Number of recent lines (bounded to 1000; filters search at most 1 MiB).
     #[arg(short = 'n', long, default_value_t = 100)]
     lines: usize,
+    /// Minimum severity; debug also includes detailed logs.
+    #[arg(long, value_parser = ["debug", "info", "warn", "error"])]
+    level: Option<String>,
+    /// Exact component (for example connection, session, update or android).
+    #[arg(long)]
+    component: Option<String>,
+    /// Canonical Session ID.
+    #[arg(long)]
+    session: Option<SessionId>,
+    /// Search the bounded tail since a relative duration (30s, 15m, 2h, 1d).
+    #[arg(long)]
+    since: Option<String>,
+    /// Include separately retained detailed diagnostics.
+    #[arg(long)]
+    include_debug: bool,
+    /// Emit recognized structured JSONL events only.
+    #[arg(long)]
+    json: bool,
+    #[command(subcommand)]
+    command: Option<LogsCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+enum LogsCommand {
+    /// Enable detailed diagnostics for 15 minutes, stop, or inspect status.
+    Debug {
+        #[arg(value_parser = ["on", "off", "status"])]
+        action: String,
+    },
+    /// Export retained safe records to a new private file; never overwrite.
+    Export {
+        #[arg(long)]
+        output: std::path::PathBuf,
+        #[arg(long)]
+        include_debug: bool,
+    },
 }
 
 #[derive(Debug, clap::Args)]
@@ -647,7 +692,7 @@ pub async fn execute(
                 .await
                 .map(CommandOutcome::Text),
         },
-        Some(Command::Logs(arguments)) => logs(runtime, arguments.lines).map(CommandOutcome::Text),
+        Some(Command::Logs(arguments)) => logs(runtime, arguments).map(CommandOutcome::Text),
         Some(Command::Reset(arguments)) => reset(runtime, arguments, interaction).await,
         Some(Command::Update(arguments)) => update(runtime, arguments, interaction).await,
         Some(Command::Uninstall(arguments)) => uninstall(runtime, arguments, interaction).await,
@@ -1480,14 +1525,86 @@ async fn restart(
     ))
 }
 
-fn logs(runtime: &LocalRuntime, lines: usize) -> Result<String, CliError> {
-    let mut output = String::new();
-    for line in runtime.log_tail(lines)? {
-        output.push_str(&line);
+fn logs(runtime: &LocalRuntime, arguments: LogsArgs) -> Result<String, CliError> {
+    use zterm_diagnostics::{Filter, Level};
+    match arguments.command {
+        Some(LogsCommand::Debug { action }) => {
+            let enabled = match action.as_str() {
+                "on" => Some(true),
+                "off" => Some(false),
+                _ => None,
+            };
+            let (control, pending) = runtime.log_control(enabled)?;
+            let remaining = control
+                .remaining_ms(zterm_diagnostics::now_ms())
+                .div_ceil(1000);
+            let mut output = if remaining > 0 {
+                format!("Detailed diagnostics: ON ({remaining}s remaining).\n")
+            } else {
+                "Detailed diagnostics: OFF.\n".into()
+            };
+            if pending {
+                output.push_str(
+                    "Retention cutover pending the running daemon's normal replacement.\n",
+                );
+            }
+            return Ok(output);
+        }
+        Some(LogsCommand::Export {
+            output,
+            include_debug,
+        }) => {
+            let header = runtime.export_logs(&output, include_debug)?;
+            return Ok(format!(
+                "Logs exported ({} legacy/invalid records omitted; {} older bytes excluded).\n",
+                header.omitted, header.truncated_bytes
+            ));
+        }
+        None => {}
+    }
+    let since_ms = arguments
+        .since
+        .as_deref()
+        .map(|value| {
+            zterm_diagnostics::since(value).ok_or_else(|| {
+                CliError::Usage("--since requires a positive duration with s, m, h or d.".into())
+            })
+        })
+        .transpose()?;
+    let filter = Filter {
+        lines: arguments.lines,
+        level: arguments.level.as_deref().map(|value| match value {
+            "debug" => Level::Debug,
+            "warn" => Level::Warn,
+            "error" => Level::Error,
+            _ => Level::Info,
+        }),
+        component: arguments.component,
+        session: arguments.session.map(|id| id.to_string()),
+        since_ms,
+        include_debug: arguments.include_debug,
+        json: arguments.json,
+    };
+    let tail = runtime.logs(&filter)?;
+    if tail.omitted > 0 {
+        eprintln!(
+            "{} legacy, invalid or partial log records omitted.",
+            tail.omitted
+        );
+    }
+    if tail.truncated {
+        eprintln!("Showing a bounded tail; filters do not search all retained history.");
+    }
+    let mut output = tail.lines.join("\n");
+    if !output.is_empty() {
         output.push('\n');
     }
-    if output.is_empty() && lines > 0 {
-        output.push_str("No daemon logs yet.\n");
+    if output.is_empty() && arguments.lines > 0 {
+        if arguments.json {
+            eprintln!("No matching structured logs.");
+        } else {
+            output.push_str("No daemon logs yet.\n");
+        }
     }
     Ok(output)
 }

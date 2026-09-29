@@ -5696,6 +5696,7 @@ dependencies = [
  "zeroize",
  "zterm-client",
  "zterm-core",
+ "zterm-diagnostics",
  "zterm-proto",
 ]
 
@@ -5719,6 +5720,7 @@ dependencies = [
  "zterm-client",
  "zterm-core",
  "zterm-daemon",
+ "zterm-diagnostics",
  "zterm-platform",
 ]
 
@@ -5735,6 +5737,7 @@ dependencies = [
  "tokio-util",
  "zeroize",
  "zterm-core",
+ "zterm-diagnostics",
  "zterm-proto",
 ]
 
@@ -5779,9 +5782,22 @@ dependencies = [
  "zeroize",
  "zterm-client",
  "zterm-core",
+ "zterm-diagnostics",
  "zterm-platform",
  "zterm-proto",
  "zterm-terminal",
+]
+
+[[package]]
+name = "zterm-diagnostics"
+version = "0.1.36"
+dependencies = [
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "time",
+ "zterm-core",
 ]
 
 [[package]]
@@ -5790,8 +5806,11 @@ version = "0.1.36"
 dependencies = [
  "nix 0.28.0",
  "portable-pty",
+ "serde",
+ "serde_json",
  "tempfile",
  "zterm-core",
+ "zterm-diagnostics",
 ]
 
 [[package]]

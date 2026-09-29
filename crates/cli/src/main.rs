@@ -63,6 +63,9 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let _diagnostics = cli
+        .records_diagnostics()
+        .then(|| runtime.install_diagnostics());
     let tokio = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

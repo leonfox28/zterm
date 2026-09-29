@@ -1296,6 +1296,7 @@ impl SessionService {
             return Err(reserved_main());
         }
         let entry = self.inner.rename(session_id, new_name)?;
+        tracing::info!(component = "session", operation = "renamed", session_id = %session_id, "Session renamed");
         entry.summary()
     }
 
@@ -3397,7 +3398,7 @@ fn dispatch_command(
                     .get(&attachment_id)
                     .is_some_and(|attachment| attachment.ever_active)
             {
-                tracing::info!(component = "session", operation = "controller_attached", session_id = %actor.id, attachment_id = ?attachment_id, "Controller attached");
+                tracing::info!(component = "session", operation = "controller_attached", session_id = %actor.id, attachment_id = %attachment_id, "Controller attached");
             }
             result
         }),
@@ -3787,7 +3788,7 @@ fn detach_for_remote_resume(
     reconcile_effect_target(runtime)?;
     actor.update_cached(runtime, false);
     if was_controller {
-        tracing::info!(component = "session", operation = "controller_detached", session_id = %actor.id, attachment_id = ?attachment_id, reason = "transport_closed", "Controller detached");
+        tracing::info!(component = "session", operation = "controller_detached", session_id = %actor.id, attachment_id = %attachment_id, reason = "transport_closed", "Controller detached");
     }
     Ok(saved)
 }
@@ -4127,7 +4128,7 @@ fn takeover(
         lifecycle.send_replace(AttachmentLifecycle::Active { generation });
     }
     actor.update_cached(runtime, false);
-    tracing::info!(component = "session", operation = "controller_taken_over", session_id = %actor.id, attachment_id = ?attachment_id, "Controller taken over");
+    tracing::info!(component = "session", operation = "controller_taken_over", session_id = %actor.id, attachment_id = %attachment_id, "Controller taken over");
     Ok(())
 }
 
@@ -4160,7 +4161,7 @@ fn reap_detached(actor: &SessionActor, runtime: &mut SessionRuntime) -> Result<(
     reconcile_effect_target(runtime)?;
     actor.update_cached(runtime, false);
     if let Some(attachment_id) = detached_controller {
-        tracing::info!(component = "session", operation = "controller_detached", session_id = %actor.id, attachment_id = ?attachment_id, reason = "detached", "Controller detached");
+        tracing::info!(component = "session", operation = "controller_detached", session_id = %actor.id, attachment_id = %attachment_id, reason = "detached", "Controller detached");
     }
     Ok(())
 }
@@ -5810,6 +5811,7 @@ mod tests {
     fn operational_logs_child() {
         use crate::network::{NetworkDiagnostic, NetworkReporter, NetworkState};
         use std::io::Read as _;
+        use tracing_subscriber::prelude::*;
         let temporary = tempfile::tempdir().expect("logging/admission fixture succeeds");
         let cwd = temporary.path().join("LOG_CWD_SENTINEL");
         std::fs::create_dir(&cwd).expect("logging/admission fixture succeeds");
@@ -5817,6 +5819,17 @@ mod tests {
         let writer = capture
             .try_clone()
             .expect("logging/admission fixture succeeds");
+        let paths = zterm_platform::user_state::UserPaths::for_test(
+            nix::unistd::geteuid().as_raw(),
+            temporary.path().into(),
+            temporary.path().join("state"),
+            temporary.path().join("run"),
+        );
+        paths.prepare_state_directories().expect("private logs");
+        let recorder = zterm_diagnostics::Recorder::new(Arc::new(
+            zterm_platform::diagnostics::Store::new(paths.clone()),
+        ))
+        .expect("safe recorder");
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
             .with_target(true)
@@ -5826,7 +5839,8 @@ mod tests {
                     .try_clone()
                     .expect("logging/admission fixture succeeds")
             })
-            .finish();
+            .finish()
+            .with(crate::diagnostics::ApplicationEvents(recorder.clone()));
         let dispatch = tracing::Dispatch::new(subscriber);
         let _guard = tracing::dispatcher::set_default(&dispatch);
         let id = DeviceId::from_array([0x91; 32]);
@@ -5909,6 +5923,55 @@ mod tests {
             observation.state = NetworkState::Online;
             observation.diagnostic = None;
         });
+        assert!(recorder.flush(Duration::from_secs(2)));
+        let structured = std::fs::read_to_string(paths.daemon_log()).expect("safe structured logs");
+        let records: Vec<_> = structured
+            .lines()
+            .map(|line| {
+                zterm_diagnostics::Record::decode(line.as_bytes()).expect("validated record")
+            })
+            .collect();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.event == zterm_diagnostics::Kind::SessionCreated)
+                .count(),
+            1
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.event == zterm_diagnostics::Kind::ControllerDetached)
+                .count(),
+            1
+        );
+        assert!(records.iter().any(|record| record.event
+            == zterm_diagnostics::Kind::ControllerAttached
+            && record.fields.attachment_id.is_some()));
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.event == zterm_diagnostics::Kind::NetworkChanged)
+                .count(),
+            2
+        );
+        let degraded = records
+            .iter()
+            .find(|record| {
+                record.event == zterm_diagnostics::Kind::NetworkChanged
+                    && record.level == zterm_diagnostics::Level::Warn
+            })
+            .expect("network degradation");
+        assert_eq!(
+            degraded.fields.stage,
+            Some(zterm_diagnostics::Stage::Degraded)
+        );
+        assert_eq!(
+            degraded.fields.category.as_deref(),
+            Some("home_relay_unavailable")
+        );
+        assert!(degraded.fields.publish.is_some() && degraded.fields.lookup.is_some());
+        assert!(!structured.contains("SENTINEL"));
         let mut capture = capture;
         use std::io::{Seek as _, SeekFrom};
         capture

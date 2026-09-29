@@ -358,6 +358,14 @@ fixed_id!(
     16,
     "Identifier of one local or remote view attached to a session."
 );
+impl fmt::Display for AttachmentId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.as_bytes() {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
 fixed_id!(
     ResumeViewId,
     16,

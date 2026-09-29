@@ -2,7 +2,6 @@
 
 use std::fmt;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 #[cfg(unix)]
 use std::sync::Arc;
@@ -34,8 +33,6 @@ use crate::lifecycle::{DaemonLauncher, probe_readiness};
 use crate::pairing::PairTicketText;
 use crate::service::{DaemonReadiness, DaemonStatus, SessionImpact};
 
-const MAX_LOG_LINES: usize = 1_000;
-const MAX_LOG_BYTES: u64 = 1024 * 1024;
 const IDENTITY_RESET_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Side-effect-free observation of local setup and daemon state.
@@ -1282,41 +1279,76 @@ impl LocalRuntime {
 
     /// Returns a bounded recent log tail without starting a daemon.
     pub fn log_tail(&self, requested_lines: usize) -> Result<Vec<String>, DaemonError> {
-        let lines = requested_lines.min(MAX_LOG_LINES);
-        let metadata = match fs::symlink_metadata(self.paths.daemon_log()) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => {
-                return Err(DaemonError::new(
-                    DomainErrorKind::PathUnsafe,
-                    error.to_string(),
+        self.logs(&zterm_diagnostics::Filter {
+            lines: requested_lines,
+            ..Default::default()
+        })
+        .map(|tail| tail.lines)
+    }
+
+    /// Reads a filtered bounded tail; never starts a daemon or creates paths.
+    pub fn logs(
+        &self,
+        filter: &zterm_diagnostics::Filter,
+    ) -> Result<zterm_diagnostics::Tail, DaemonError> {
+        if filter.lines == 0 {
+            return Ok(zterm_diagnostics::Tail::default());
+        }
+        let store = zterm_platform::diagnostics::Store::new(self.paths.clone());
+        let mut snapshots = store
+            .snapshots(
+                filter.include_debug || filter.level == Some(zterm_diagnostics::Level::Debug),
+            )
+            .map_err(log_error)?;
+        zterm_diagnostics::tail(&mut snapshots, filter).map_err(log_error)
+    }
+
+    /// Observes or explicitly changes the finite local diagnostics interval.
+    pub fn log_control(
+        &self,
+        enabled: Option<bool>,
+    ) -> Result<(zterm_diagnostics::Control, bool), DaemonError> {
+        use zterm_diagnostics::Sink;
+        if !crate::diagnostics::configured(&self.paths) {
+            return Err(not_setup_for_command());
+        }
+        let store = zterm_platform::diagnostics::Store::new(self.paths.clone());
+        if let Some(enabled) = enabled {
+            store
+                .set_control(if enabled {
+                    zterm_diagnostics::Control::enabled(zterm_diagnostics::now_ms())
+                } else {
+                    zterm_diagnostics::Control::disabled()
+                })
+                .map_err(log_error)?;
+            let recorder = crate::diagnostics::recorder(&self.paths);
+            if !enabled {
+                recorder.record(zterm_diagnostics::Event::new(
+                    zterm_diagnostics::Kind::DetailDisabled,
                 ));
             }
-        };
-        zterm_platform::user_state::validate_regular_file(
-            self.paths.daemon_log(),
-            self.paths.uid(),
-        )
-        .map_err(|error| DaemonError::new(DomainErrorKind::PathUnsafe, error.to_string()))?;
-        let mut file = fs::File::open(self.paths.daemon_log())
-            .map_err(|error| DaemonError::new(DomainErrorKind::PathUnsafe, error.to_string()))?;
-        let start = metadata.len().saturating_sub(MAX_LOG_BYTES);
-        file.seek(SeekFrom::Start(start))
-            .map_err(|error| DaemonError::new(DomainErrorKind::PathUnsafe, error.to_string()))?;
-        let mut bytes =
-            Vec::with_capacity(usize::try_from(metadata.len().saturating_sub(start)).unwrap_or(0));
-        file.read_to_end(&mut bytes)
-            .map_err(|error| DaemonError::new(DomainErrorKind::PathUnsafe, error.to_string()))?;
-        let text = String::from_utf8_lossy(&bytes);
-        Ok(text
-            .lines()
-            .rev()
-            .take(lines)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .map(str::to_owned)
-            .collect())
+            let _ = recorder.flush(Duration::from_secs(2));
+        }
+        Ok((
+            store.control().map_err(log_error)?,
+            store.retention_pending().map_err(log_error)?,
+        ))
+    }
+
+    /// Writes a private, no-overwrite JSONL export outside managed state.
+    pub fn export_logs(
+        &self,
+        output: &std::path::Path,
+        include_debug: bool,
+    ) -> Result<zterm_diagnostics::ExportHeader, DaemonError> {
+        zterm_platform::diagnostics::Store::new(self.paths.clone())
+            .export(output, include_debug, 0)
+            .map_err(log_error)
+    }
+
+    /// Installs diagnostics for an explicitly configured foreground process.
+    pub fn install_diagnostics(&self) -> crate::diagnostics::Guard {
+        crate::diagnostics::install(&self.paths)
     }
 
     /// Runs local-only diagnostics without spawning or using the network.
@@ -1723,6 +1755,15 @@ fn inspect_state_paths(paths: &UserPaths, setup_complete: bool) -> DoctorCheck {
     ] {
         inspect_optional_file(path, paths.uid(), &mut failures);
     }
+    for name in [
+        "daemon.log.1",
+        "daemon.debug.log",
+        "daemon.debug.log.1",
+        "diagnostics.json",
+        "writer.lock",
+    ] {
+        inspect_optional_file(&paths.logs().join(name), paths.uid(), &mut failures);
+    }
     if !setup_complete && failures.is_empty() {
         failures.push("committed setup is incomplete".to_owned());
     }
@@ -1923,6 +1964,10 @@ async fn wait_until_stopped(paths: &UserPaths) -> Result<(), DaemonError> {
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+}
+
+fn log_error(error: std::io::Error) -> DaemonError {
+    DaemonError::new(DomainErrorKind::PathUnsafe, error.to_string())
 }
 
 #[cfg(test)]

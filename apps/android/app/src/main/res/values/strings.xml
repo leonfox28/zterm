@@ -139,4 +139,12 @@
     <string name="connection_failed_title">Connection failed</string>
     <string name="connection_pending_body">Connecting to %1$s. Please wait.</string>
     <string name="connection_failure_body">Check your connection and make sure the host is online, then try again.</string>
+    <string name="diagnostics">Diagnostics</string>
+    <string name="diagnostics_description">Key events are saved locally. Terminal text, input and credentials are excluded. Logs are limited to 8 MiB in total.</string>
+    <string name="diagnostics_detail">Detailed diagnostics for 15 minutes</string>
+    <string name="diagnostics_remaining">Stops automatically in %1$d seconds</string>
+    <string name="diagnostics_renew">Renew for 15 minutes</string>
+    <string name="diagnostics_include_detail">Include saved detailed diagnostics in export</string>
+    <string name="diagnostics_export">Export logs</string>
+    <string name="diagnostics_failed">Unable to save diagnostics. Check available storage and try again.</string>
 </resources>
