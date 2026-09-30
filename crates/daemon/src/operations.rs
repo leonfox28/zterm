@@ -545,7 +545,7 @@ impl LocalRuntime {
     fn remove_autostart(&self) -> Result<(), DaemonError> {
         // Unsupported hosts cannot have a native registration created by zterm.
         if let Some(owner) = zterm_platform::autostart::Autostart::for_cleanup(&self.paths) {
-            owner.disable().map_err(autostart_error)?;
+            owner.remove_after_stop().map_err(autostart_error)?;
         }
         Ok(())
     }

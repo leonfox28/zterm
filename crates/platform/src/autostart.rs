@@ -103,6 +103,23 @@ impl Autostart {
                 return Err("autostart configuration differs from this executable; run zterm daemon autostart enable to repair it".into());
             }
             self.validate_executable(executable)?;
+            if self.manager == Manager::LaunchAgent
+                && crate::account::EffectiveAccount::current()
+                    .is_ok_and(|account| account.home() == self.home)
+            {
+                let domain = format!("gui/{}", self.uid);
+                if let Ok(output) = std::process::Command::new("/bin/launchctl")
+                    .args(["print-disabled", &domain])
+                    .output()
+                    && output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+                        line.contains(&format!("\"{LABEL}\""))
+                            && (line.contains("=> disabled") || line.contains("=> true"))
+                    })
+                {
+                    return Err("autostart is disabled by a launchctl override; inspect launchctl print-disabled for this user".into());
+                }
+            }
             if !enabled {
                 return Err("autostart service exists but is not enabled; run zterm daemon autostart enable or disable".into());
             }
@@ -169,6 +186,67 @@ impl Autostart {
         // launchd may retain the current job until logout. No KeepAlive or trigger
         // is installed, so removing its file cancels future login without bootout
         // (which would kill a running daemon and its Sessions).
+        Ok(())
+    }
+
+    /// Clears manager registration after the daemon and its Sessions have stopped.
+    pub fn remove_after_stop(&self) -> Result<(), String> {
+        self.disable()?;
+        // Library fixtures never communicate with the real account's manager.
+        let account = crate::account::EffectiveAccount::current().map_err(detail)?;
+        if account.home() != self.home || account.uid() != self.uid {
+            return Ok(());
+        }
+        match self.manager {
+            Manager::LaunchAgent => {
+                let service = format!("gui/{}/{LABEL}", self.uid);
+                let observed = std::process::Command::new("/bin/launchctl")
+                    .args(["print", &service])
+                    .output()
+                    .map_err(detail)?;
+                if !observed.status.success() {
+                    return Ok(());
+                } // No loaded GUI job.
+                let expected = format!("path = {}", self.registration().display());
+                if !String::from_utf8_lossy(&observed.stdout)
+                    .lines()
+                    .any(|line| line.trim() == expected)
+                {
+                    return Err(
+                        "loaded launchd label has a different origin; refusing to remove it".into(),
+                    );
+                }
+                let result = std::process::Command::new("/bin/launchctl")
+                    .args(["bootout", &service])
+                    .output()
+                    .map_err(detail)?;
+                if !result.status.success() {
+                    return Err(
+                        "unable to remove stopped launchd registration; retry reset/uninstall"
+                            .into(),
+                    );
+                }
+            }
+            Manager::Systemd => {
+                // Reload forgets the removed unit, without stopping any process,
+                // enabling linger, or activating a target. No bus means no
+                // running user manager to clear; next login reads the disk state.
+                if Path::new("/run/systemd/system").is_dir() {
+                    let result = std::process::Command::new("systemctl")
+                        .args(["--user", "daemon-reload"])
+                        .output()
+                        .map_err(|_| "unable to run systemctl; retry reset/uninstall".to_owned())?;
+                    if !result.status.success()
+                        && Path::new(&format!("/run/user/{}/bus", self.uid)).exists()
+                    {
+                        return Err(
+                            "unable to reload systemd user configuration; retry reset/uninstall"
+                                .into(),
+                        );
+                    }
+                }
+            }
+        }
         Ok(())
     }
 

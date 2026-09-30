@@ -35,8 +35,9 @@ Session, shell or terminal window. Stopping or crashing does not schedule a retr
 
 Updates replace the executable at its stable installed path and leave registration
 unchanged. Moving the executable requires another `enable`. Reset and uninstall
-remove only the owned files, including stale registration after state removal;
-unrecognized files and unsafe paths are refused. Service directories themselves
+remove the owned files, including stale registration after state removal. After
+stopping the daemon, they also boot out the launchd job with that exact file origin
+or reload the systemd user manager. Unrecognized files and unsafe paths are refused. Service directories themselves
 are preserved. The hidden entry accepts no state-path override.
 
 The registration commands don't alter user-supplied launchd overrides or custom
