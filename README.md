@@ -7,7 +7,8 @@ per-user state, one same-UID daemon, pairing and directional authorization, a
 daemon-owned connection broker, local and remote Session adapters, and the
 public raw-terminal CLI. The Android app adds native touch scrolling, cross-screen
 selection, system IME, QR pairing and Session management over the same shared
-client. See [Android build, usage and APK installation](docs/android.md).
+client. See [Android build, usage and APK installation](docs/android.md) and the
+[session usability roadmap](docs/roadmap.md).
 
 This is still a development build. The Linux real-Iroh remote Session target
 exists but its hosted runtime result and public multi-process CLI evidence are
