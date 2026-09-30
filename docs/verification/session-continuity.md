@@ -22,7 +22,10 @@
 
 - `cargo test -p zterm-client -p zterm-android --lib`：通过（Android 22；client 86，另 1 项显式忽略）。
 - `cargo test -p zterm-daemon --test local_ipc --test authorization --test controller_lease --test principal_detach --test session_concurrency --test terminal_recovery`：通过。
-- 后续自启动和 Android 新功能检查在对应实现后补入。临时目录测试不代表实际登录验收。
+- 自启动：平台两种配置格式、幂等、默认关闭、异常配置/外来文件保护，以及 CLI setup 前置条件、只读状态、reset 清理测试通过。
+- `single_instance`：服务管理器前台入口保留进程组、与手动启动复用同一 daemon、零 Session、stop 后退出通过。
+- Workspace Clippy（all targets/features，warnings denied）通过。
+- 后续 Android 新功能检查在对应实现后补入。临时目录测试不代表实际登录验收。
 
 ## 必须另行执行的现场验收
 

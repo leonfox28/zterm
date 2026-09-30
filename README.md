@@ -44,6 +44,7 @@ zterm session list [--target <target>]
 zterm session create <name> [--target <target>] [--cwd <host-path>]
 zterm session rename <session> <new-name> [--target <target>]
 zterm session close <session> [--target <target>] [-y|--yes]
+zterm daemon autostart <enable|disable|status>
 zterm daemon stop [-y|--yes]
 zterm daemon restart [-y|--yes]
 zterm logs [-n|--lines <n>] [--level <level>] [--since 30m] [--include-debug] [--json]

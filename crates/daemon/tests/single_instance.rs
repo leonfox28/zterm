@@ -39,6 +39,7 @@ fn main() {
         .build()
         .expect("test runtime");
     runtime.block_on(singleflight_launch());
+    runtime.block_on(foreground_login_launch());
 }
 
 #[cfg(unix)]
@@ -105,4 +106,59 @@ async fn wait_for_stop(paths: &zterm_platform::user_state::UserPaths) {
         );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+}
+
+#[cfg(unix)]
+async fn foreground_login_launch() {
+    let state = TestState::new();
+    let config = validate_setup_input("foreground-login", ValidatedInfrastructure::OfficialN0)
+        .expect("config");
+    bootstrap(&state.paths, &config).expect("setup");
+    let executable = std::env::current_exe().expect("harness");
+    let mut child = std::process::Command::new(&executable)
+        .arg(daemon_harness::foreground_argument(&state.paths))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("foreground child");
+    let client = LocalClient::new(state.paths.socket());
+    let started = std::time::Instant::now();
+    loop {
+        if client.status().await.is_ok() {
+            break;
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(child.id() as i32)))
+            .expect("child process group"),
+        nix::unistd::getpgrp(),
+        "foreground entry must not setsid"
+    );
+    let manual = ensure_daemon_with(
+        &state.paths,
+        &executable,
+        &daemon_harness::child_argument(&state.paths),
+    )
+    .await
+    .expect("manual coexists");
+    let second = ensure_daemon_with(
+        &state.paths,
+        &executable,
+        &daemon_harness::child_argument(&state.paths),
+    )
+    .await
+    .expect("repeat manual");
+    assert_eq!(manual, second);
+    assert!(child.try_wait().expect("live child").is_none());
+    assert_eq!(
+        client.status().await.expect("status").active_session_count,
+        0
+    );
+    client.stop(false).await.expect("stop foreground daemon");
+    wait_for_stop(&state.paths).await;
+    assert!(child.wait().expect("foreground exit").success());
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!state.paths.socket().exists(), "stop does not relaunch");
 }

@@ -16,8 +16,13 @@ fn main() -> ExitCode {
         #[cfg(not(unix))]
         return ExitCode::FAILURE;
     }
-    if cli.internal_daemon() {
-        return match zterm_daemon::lifecycle::run_internal_daemon() {
+    if cli.internal_daemon() || cli.internal_daemon_foreground() {
+        let result = if cli.internal_daemon_foreground() {
+            zterm_daemon::lifecycle::run_internal_daemon_foreground()
+        } else {
+            zterm_daemon::lifecycle::run_internal_daemon()
+        };
+        return match result {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("{error}");

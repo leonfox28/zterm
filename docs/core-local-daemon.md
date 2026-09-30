@@ -17,6 +17,7 @@ the complete current command surface.
 | `zterm doctor` | no | Check account home/shell, committed state, socket/lock state, and lifecycle limits |
 | `zterm daemon stop [-y|--yes]` | no | Flush a graceful stop response; stopped is success |
 | `zterm daemon restart [-y|--yes]` | yes | Stop, wait, then explicitly start one daemon |
+| `zterm daemon autostart <enable/disable/status>` | no | Opt-in next-login daemon startup; status is read-only |
 | `zterm logs [-n|--lines <n>]` | no | Read at most 1,000 recent lines and 1 MiB |
 
 After setup, running `zterm` with no command attaches local `main`; before setup
@@ -86,10 +87,12 @@ fallback.
 
 The launcher redirects stdin/stdout/stderr to null; the child installs the bounded
 structured recorder, uses the account home as cwd, and calls safe `setsid()` before Tokio
-runtime initialization. There is no systemd, launchd, cron, login item,
-supervisor, or automatic update. After a crash or reboot, no daemon starts
-until an explicit setup/restart or a configured pair/device/connect/Session
-command calls the same on-demand launcher.
+runtime initialization. Optional login startup uses a separate hidden foreground
+entry that skips `setsid()` and reuses the same daemon lock and body. It creates
+no Session, PTY, shell or terminal window. No restart-on-exit policy is installed.
+See [login autostart](autostart.md). By default, a crash/reboot still requires an
+explicit setup/restart or configured pair/device/connect/Session operation to
+invoke the on-demand launcher.
 
 Local IPC uses the shared bounded protobuf framing. The daemon authorizes the
 peer UID before decoding bytes:
@@ -172,7 +175,7 @@ workflow.
 - No M10 two-physical-network, NAT/path-migration, or new public Relay gate.
 - No GUI, Android runtime, Windows daemon/ConPTY, or iOS client in this
   milestone.
-- No boot/login autostart and no persistence of live work across daemon crash,
+- Login autostart is opt-in; no persistence of live work across daemon crash,
   restart, upgrade, or host reboot.
 - No Agent-specific state recognition, observer mode, multi-writer controller,
   or disk transcript.

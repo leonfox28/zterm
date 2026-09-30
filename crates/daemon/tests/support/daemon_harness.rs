@@ -6,12 +6,19 @@ use std::path::PathBuf;
 use zterm_platform::user_state::UserPaths;
 
 const CHILD_PREFIX: &str = "--zterm-test-daemon=";
+const FOREGROUND_CHILD_PREFIX: &str = "--zterm-test-foreground-daemon=";
 const TERMINAL_CHILD_PREFIX: &str = "--zterm-test-terminal-daemon=";
 
 /// Encodes task-private paths into the one detached child harness argument.
 #[allow(dead_code)]
 pub fn child_argument(paths: &UserPaths) -> String {
     format!("{CHILD_PREFIX}{}", encode_paths(paths))
+}
+
+/// Explicit service-manager-style child retaining its process/session identity.
+#[allow(dead_code)]
+pub fn foreground_argument(paths: &UserPaths) -> String {
+    format!("{FOREGROUND_CHILD_PREFIX}{}", encode_paths(paths))
 }
 
 /// Hidden detached-child argument for a daemon with a deterministic PTY fixture.
@@ -36,11 +43,13 @@ pub fn run_child_if_requested() -> bool {
     let Some(argument) = std::env::args().nth(1) else {
         return false;
     };
-    let (encoded, deterministic_terminal) =
+    let (encoded, deterministic_terminal, foreground) =
         if let Some(encoded) = argument.strip_prefix(CHILD_PREFIX) {
-            (encoded, false)
+            (encoded, false, false)
+        } else if let Some(encoded) = argument.strip_prefix(FOREGROUND_CHILD_PREFIX) {
+            (encoded, false, true)
         } else if let Some(encoded) = argument.strip_prefix(TERMINAL_CHILD_PREFIX) {
-            (encoded, true)
+            (encoded, true, false)
         } else {
             return false;
         };
@@ -52,20 +61,22 @@ pub fn run_child_if_requested() -> bool {
         }
     };
     let _diagnostics = zterm_daemon::diagnostics::install(&paths);
-    let result = zterm_platform::local_unix::detach_current_process()
-        .map_err(|error| error.to_string())
-        .and_then(|()| {
-            if deterministic_terminal {
-                let sessions = terminal_fixture_sessions(&paths)?;
-                zterm_daemon::lifecycle::run_local_only_daemon_with_sessions_for_test(
-                    &paths, sessions,
-                )
+    let result = (if foreground {
+        Ok(())
+    } else {
+        zterm_platform::local_unix::detach_current_process()
+    })
+    .map_err(|error| error.to_string())
+    .and_then(|()| {
+        if deterministic_terminal {
+            let sessions = terminal_fixture_sessions(&paths)?;
+            zterm_daemon::lifecycle::run_local_only_daemon_with_sessions_for_test(&paths, sessions)
                 .map_err(|error| error.to_string())
-            } else {
-                zterm_daemon::lifecycle::run_local_only_daemon_for_test(&paths)
-                    .map_err(|error| error.to_string())
-            }
-        });
+        } else {
+            zterm_daemon::lifecycle::run_local_only_daemon_for_test(&paths)
+                .map_err(|error| error.to_string())
+        }
+    });
     if let Err(error) = result {
         eprintln!("daemon harness failed: {error}");
         std::process::exit(1);

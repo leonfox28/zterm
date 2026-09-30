@@ -41,6 +41,9 @@ pub struct Cli {
         conflicts_with_all = ["internal_update", "internal_release_self_check", "internal_release_verify", "internal_release_install"]
     )]
     internal_daemon: bool,
+    /// Internal foreground entry used only by login service managers.
+    #[arg(long, hide = true, conflicts_with_all = ["internal_daemon", "internal_update", "internal_release_self_check", "internal_release_verify", "internal_release_install"])]
+    internal_daemon_foreground: bool,
     /// Internal one-shot updater entry with an inherited private channel.
     #[arg(long, hide = true, conflicts_with_all = ["internal_daemon", "internal_release_self_check", "internal_release_verify", "internal_release_install"])]
     internal_update: bool,
@@ -101,7 +104,16 @@ impl Cli {
     pub fn records_diagnostics(&self) -> bool {
         !matches!(
             self.command,
-            Some(Command::Logs(_) | Command::Status | Command::Doctor)
+            Some(
+                Command::Logs(_)
+                    | Command::Status
+                    | Command::Doctor
+                    | Command::Daemon {
+                        command: DaemonCommand::Autostart {
+                            command: AutostartCommand::Status
+                        }
+                    }
+            )
         )
     }
 
@@ -115,6 +127,12 @@ impl Cli {
     #[must_use]
     pub const fn internal_daemon(&self) -> bool {
         self.internal_daemon
+    }
+
+    /// Whether this invocation remains in the foreground for a service manager.
+    #[must_use]
+    pub const fn internal_daemon_foreground(&self) -> bool {
+        self.internal_daemon_foreground
     }
 
     /// Whether this parse selected the side-effect-free release identity entry.
@@ -142,6 +160,7 @@ impl Cli {
     #[must_use]
     pub fn has_internal_entry(&self) -> bool {
         self.internal_daemon
+            || self.internal_daemon_foreground
             || self.internal_update
             || self.internal_release_self_check
             || self.internal_release_verify.is_some()
@@ -364,10 +383,25 @@ struct SessionCloseArgs {
 
 #[derive(Debug, Subcommand)]
 enum DaemonCommand {
+    /// Opt in or out of login startup without changing the running daemon.
+    Autostart {
+        #[command(subcommand)]
+        command: AutostartCommand,
+    },
     /// Gracefully stop the daemon; already stopped succeeds.
     Stop(YesArgs),
     /// Gracefully stop and explicitly start one daemon.
     Restart(YesArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum AutostartCommand {
+    /// Enable future login startup; requires setup; does not start now.
+    Enable,
+    /// Disable future login startup; keep current Sessions running.
+    Disable,
+    /// Inspect configuration without starting or modifying anything.
+    Status,
 }
 
 #[derive(Debug, clap::Args)]
@@ -685,6 +719,11 @@ pub async fn execute(
         Some(Command::Connect(arguments)) => connect(arguments).await,
         Some(Command::Session { command }) => session(runtime, command, interaction).await,
         Some(Command::Daemon { command }) => match command {
+            DaemonCommand::Autostart { command } => Ok(CommandOutcome::Text(match command {
+                AutostartCommand::Enable => runtime.autostart_enable().await?,
+                AutostartCommand::Disable => runtime.autostart_disable().await?,
+                AutostartCommand::Status => runtime.autostart_status()?,
+            })),
             DaemonCommand::Stop(arguments) => stop(runtime, arguments.yes, interaction)
                 .await
                 .map(CommandOutcome::Text),

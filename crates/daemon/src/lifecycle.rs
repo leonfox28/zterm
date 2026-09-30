@@ -178,8 +178,14 @@ pub async fn ensure_current_daemon(_paths: &UserPaths) -> Result<DaemonReadiness
 /// Product hidden entry: detach before runtime initialization, then serve.
 pub fn run_internal_daemon() -> Result<(), DaemonError> {
     #[cfg(unix)]
+    zterm_platform::local_unix::detach_current_process().map_err(platform_error)?;
+    run_internal_daemon_foreground()
+}
+
+/// Service-manager entry: retains the original PID and never calls setsid or forks.
+pub fn run_internal_daemon_foreground() -> Result<(), DaemonError> {
+    #[cfg(unix)]
     {
-        zterm_platform::local_unix::detach_current_process().map_err(platform_error)?;
         let paths = production_user_paths()?;
         let _diagnostics = crate::diagnostics::install(&paths);
         std::panic::set_hook(Box::new(|_| {
