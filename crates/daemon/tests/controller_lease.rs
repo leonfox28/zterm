@@ -543,3 +543,40 @@ fn safe_snapshot_contains(
         .map(|text| text.contains(marker))
         .map_err(|_| "terminal snapshot rendering failed".to_owned())
 }
+
+#[cfg(unix)]
+#[test]
+fn explicit_takeover_of_a_vacant_session_commits_once_after_snapshot() -> Result<(), String> {
+    use zterm_core::{DomainErrorKind, ResourceLimits};
+    let fixture = support::Fixture::new(ResourceLimits::default())?;
+    // Covers an initially vacant Session and the race where its old controller
+    // has detached before this explicit takeover attach reaches the actor.
+    let pending = fixture
+        .service
+        .prepare_attach(fixture.principal, None, true, true, None)
+        .map_err(support::display)?;
+    let session = pending.attachment.session_id();
+    let early = fixture
+        .service
+        .takeover(fixture.principal, fixture.op(1), &pending.attachment)
+        .expect_err("unapplied initial snapshot still fences input and takeover");
+    assert_eq!(early.kind(), DomainErrorKind::NotSynchronized);
+    support::activate(&pending)?;
+    let committed = fixture
+        .service
+        .takeover(fixture.principal, fixture.op(2), &pending.attachment)
+        .map_err(support::display)?;
+    assert_eq!(session, committed.session_id);
+    let replay = fixture
+        .service
+        .takeover(fixture.principal, fixture.op(2), &pending.attachment)
+        .map_err(support::display)?;
+    assert_eq!(committed, replay);
+    pending
+        .attachment
+        .write_input(b"printf 'VACANT-TAKEOVER-READY\n'\n")
+        .map_err(support::display)?;
+    support::wait_for_text(&pending.attachment, "VACANT-TAKEOVER-READY")?;
+    fixture.service.shutdown().map_err(support::display)?;
+    Ok(())
+}

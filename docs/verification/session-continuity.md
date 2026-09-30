@@ -16,7 +16,12 @@
 - `TerminalInputConnectionTest`、`AttachGeometryTest`、`TerminalRenderingTest` 和
   `TerminalFramesTest` 提供 IME、几何及历史展示回归，仍需设备执行。
 
-未在当前环境取得首次连接异常的复现证据；不据此宣称历史问题已在真机消失。
+未取得历史首次连接 `operation_outcome_unknown` 的复现证据，不据此宣称已在真机消失。
+模拟器后台测试复现了另一项连接边界：显式接管请求到达时旧控制端已 detach，
+新 attachment 已取得空闲 lease；snapshot ACK 后再次提交 takeover 被错误拒绝为
+`not_synchronized`。修复为在验证 principal 和同步状态后提交无副作用的成功结果，
+保留 operation key 供原去重机制使用。`explicit_takeover_of_a_vacant_session_commits_once_after_snapshot`
+覆盖 ACK 前拒绝、ACK 后成功及同一 operation 的精确重试。
 
 ## 自动化执行
 
