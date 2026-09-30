@@ -11,10 +11,10 @@ fail() {
     exit 1
 }
 
-mkdir -p "$test_dir/.trellis/scripts" "$test_dir/deploy"
-printf '%s%s\n' 'tok' 'en = part.strip()' >"$test_dir/.trellis/scripts/example.py"
+mkdir -p "$test_dir/target" "$test_dir/deploy"
+printf '%s%s\n' 'tok' 'en = part.strip()' >"$test_dir/target/example.py"
 SECRET_SCAN_ROOT="$test_dir" sh "$scanner" >/dev/null \
-    || fail "ordinary Trellis token source was scanned"
+    || fail "generated build output was scanned"
 
 assert_secret_rejected() {
     case_name=$1

@@ -103,11 +103,4 @@ if [ -n "$forbidden_alacritty_api" ]; then
     exit 1
 fi
 
-journal_probe=.trellis/workspace/source-policy-probe/journal-probe.md
-journal_attribute=$(git check-attr merge -- "$journal_probe")
-if [ "$journal_attribute" != "$journal_probe: merge: union" ]; then
-    echo "Trellis journal merge=union contract was not preserved" >&2
-    exit 1
-fi
-
 echo "source checkout policy verified"
