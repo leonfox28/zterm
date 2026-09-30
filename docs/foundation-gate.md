@@ -51,8 +51,8 @@ This narrows the simulated failure to the shared outer Colima/TUN mapping or
 hairpin boundary and proves that zterm's retained Iroh candidate-discovery and
 promotion path functions in the inner double-NAT lab. It does not identify the
 cause of the user's company/home result and does not replace M10's two-real-
-network official-n0 acceptance. The current redacted record is
-`.trellis/tasks/08-24-e2e-hardening/research/controlled-qad-double-nat.md`.
+network official-n0 acceptance. The redacted record is retained in
+[Controlled QAD double-NAT evidence](verification/controlled-qad-double-nat.md).
 
 ## Scope and environment
 
