@@ -147,4 +147,13 @@
     <string name="diagnostics_include_detail">Include saved detailed diagnostics in export</string>
     <string name="diagnostics_export">Export logs</string>
     <string name="diagnostics_failed">Unable to save diagnostics. Check available storage and try again.</string>
+    <string name="background_connection">Background connection</string>
+    <string name="keep_background_connection">Keep connected in background</string>
+    <string name="background_connection_description">Keep the current terminal connected when switching apps or locking the screen. Android may still stop the app.</string>
+    <string name="background_connected">Terminal connected</string>
+    <string name="return_to_terminal">Return to terminal</string>
+    <string name="disconnect">Disconnect</string>
+    <string name="background_notification_visible">Connection notifications are visible.</string>
+    <string name="background_notification_hidden">Connection notifications are hidden by Android settings. Background connection can still run.</string>
+    <string name="background_start_failed">Background service could not start. Reopen the app to try again; the terminal is still available.</string>
 </resources>

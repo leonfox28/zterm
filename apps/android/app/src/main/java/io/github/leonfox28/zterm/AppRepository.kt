@@ -21,6 +21,8 @@ internal data class AppState(
     val busy: Boolean = false,
     val error: String? = null,
     val notificationsSaving: Boolean = false,
+    val connecting: Boolean = false,
+    val restoringSession: Boolean = false,
 )
 
 /** The Application owns mutations, streams and frames. Activity collectors own none of them. */
@@ -28,6 +30,11 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime, priva
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val store = AppStore(context)
     private val storage = Mutex()
+    private val appVisible = MutableStateFlow(false)
+    private var startedActivities = 0
+    private var restoreConsumed = false
+    private var clearRecoveryOnLoad = false
+    val backgroundConnection = BackgroundConnection(context)
     private var notificationIntent: Boolean? = null
     private val mutable = MutableStateFlow(AppState())
     val state = mutable.asStateFlow()
@@ -60,6 +67,13 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime, priva
         frameObservers.toList().forEach { it(next) }
         mutableFrame.value = next
         uploads.authorityChanged()
+        if (next?.state in setOf("ended", "closed", "lease_lost") && previous?.state != next?.state) {
+            val mine = epoch
+            scope.launch {
+                try { save { if (mine == epoch) it.copy(activeTerminal = null) else it } }
+                catch (error: Exception) { report(error) }
+            }
+        }
         if (previous !== next) previous?.source?.close()
     }
     private var terminal: NativeTerminal? = null
@@ -89,6 +103,14 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime, priva
     }
 
     init {
+        scope.launch {
+            combine(state, terminalStatus, appVisible) { app, terminal, visible ->
+                BackgroundConnectionState(
+                    backgroundConnectionWanted(app.saved.preferences.keepBackgroundConnection,
+                        app.route == Route.Terminal, app.connecting, terminal?.state),
+                    if (app.connecting) "connecting" else terminal?.state ?: "connecting", app.saved.preferences.language) to visible
+            }.distinctUntilChanged().collect { (next, visible) -> backgroundConnection.update(next, visible) }
+        }
         scope.launch {
             for (input in keys) {
                 try {
@@ -130,6 +152,8 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime, priva
                     notifications.setAppEnabled(saved.preferences.notificationsEnabled)
                     mutable.update { it.copy(saved = saved, initialized = true) }
                     network.start()
+                    if (clearRecoveryOnLoad) save { it.copy(activeTerminal = null) }
+                    restoreActiveTerminal()
                     diagnostics?.record(AppDiagnostic.INITIALIZED)
                 } finally { seed.fill(0) }
             } catch (error: Exception) { diagnostics?.record(AppDiagnostic.INITIALIZATION_FAILED, (error as? NativeException.RequestFailed)?.code); report(error) }
@@ -174,7 +198,29 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime, priva
         operation = scope.launch {
             try { block() } catch (cancel: CancellationException) { throw cancel }
             catch (error: Exception) { report(error) }
-            finally { mutable.update { it.copy(busy = false) } }
+            finally { mutable.update { it.copy(busy = false, connecting = false) } }
+        }
+    }
+    fun activityStarted() {
+        startedActivities++
+        appVisible.value = true
+        restoreActiveTerminal()
+    }
+    fun activityStopped() {
+        startedActivities = (startedActivities - 1).coerceAtLeast(0)
+        appVisible.value = startedActivities > 0
+    }
+    private fun restoreActiveTerminal() {
+        if (restoreConsumed || !appVisible.value || !state.value.initialized) return
+        restoreConsumed = true
+        val active = state.value.saved.activeTerminal ?: return
+        if (state.value.route != Route.Home) return
+        act {
+            mutable.update { it.copy(route = Route.Terminal, hostId = active.host,
+                sessionId = active.session, restoringSession = true, connecting = true) }
+            // Never list/fall back to default creation on process restoration.
+            attach(active.host, active.session, false)
+            refresh(active.host)
         }
     }
     fun clearError() { mutable.update { it.copy(error = null) }; localTerminal { it.clearNotice() } }
@@ -221,7 +267,11 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime, priva
         openHost(host, if (recent) state.value.saved.recent?.takeIf { it.host == host }?.session else null)
     }
     private suspend fun openHost(host: String, exact: String? = null) {
+        restoreConsumed = true
+        mutable.update { it.copy(connecting = true, restoringSession = false) }
         val mine = retire()
+        if (mine != epoch) return
+        save { it.copy(activeTerminal = null) }
         if (mine != epoch) return
         val last = exact ?: state.value.saved.hosts.first { it.id == host }.lastSession
         mutable.update { it.copy(route = Route.Terminal, hostId = host, sessionId = last, sessions = emptyList(), panel = false) }
@@ -265,16 +315,26 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime, priva
     fun closePanel() { mutable.update { it.copy(panel = false) } }
     fun selectSession(session: String, takeover: Boolean = false) {
         if (session == state.value.sessionId && frame.value?.state == "active") { closePanel(); return }
-        act { val host = state.value.hostId ?: return@act; attach(host, session, takeover) }
+        act {
+            val host = state.value.hostId ?: return@act
+            mutable.update { it.copy(restoringSession = false) }
+            attach(host, session, takeover)
+        }
     }
     fun retry() = act {
         val host = state.value.hostId ?: return@act
-        openHost(host, state.value.sessionId)
+        if (state.value.restoringSession) {
+            val session = state.value.sessionId ?: return@act
+            attach(host, session, false)
+        } else openHost(host, state.value.sessionId)
     }
     private suspend fun attach(host: String, session: String?, takeover: Boolean) {
+        mutable.update { it.copy(connecting = true) }
         val mine = retire()
         if (mine != epoch || state.value.route != Route.Terminal) return
         mutable.update { it.copy(sessionId = session, panel = false) }
+        save { it.copy(activeTerminal = session?.let { id -> RecentConnection(host, id) }) }
+        if (mine != epoch || state.value.route != Route.Terminal) return
         val requestedViewport = viewport
         val attached = if (session == null) runtime.connectDefaultTerminal(host, requestedViewport, dark)
             else runtime.connectTerminal(host, session, requestedViewport, dark, takeover)
@@ -311,15 +371,18 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime, priva
             catch (cancel: CancellationException) { throw cancel }
             catch (error: Exception) { if (mine == epoch) report(error) }
         }
-        save { saved -> saved.copy(hosts = saved.hosts.map { if (it.id == host) it.copy(lastSession = attachedSession) else it }, recent = RecentConnection(host, attachedSession)) }
+        save { saved -> saved.copy(hosts = saved.hosts.map { if (it.id == host) it.copy(lastSession = attachedSession) else it }, recent = RecentConnection(host, attachedSession),
+            activeTerminal = if (mine == epoch && state.value.route == Route.Terminal && frame.value?.state !in setOf("ended", "closed", "lease_lost")) RecentConnection(host, attachedSession) else null) }
     }
     fun createSession(name: String, directory: String) = act {
+        mutable.update { it.copy(restoringSession = false, connecting = true) }
         val host = state.value.hostId ?: return@act
         val mine = epoch
         val session = runtime.createSession(host, name, directory.ifBlank { null }, viewport, dark)
         // Save the returned identity before attach: retries never create again.
         if (mine == epoch) mutable.update { it.copy(sessionId = session.sessionId) }
-        save { saved -> saved.copy(hosts = saved.hosts.map { if (it.id == host) it.copy(lastSession = session.sessionId) else it }) }
+        save { saved -> saved.copy(hosts = saved.hosts.map { if (it.id == host) it.copy(lastSession = session.sessionId) else it },
+            activeTerminal = if (mine == epoch && state.value.route == Route.Terminal) RecentConnection(host, session.sessionId) else saved.activeTerminal) }
         if (mine == epoch && state.value.route == Route.Terminal && state.value.hostId == host) {
             attach(host, session.sessionId, false)
             refresh(host)
@@ -335,13 +398,17 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime, priva
         val mine = epoch
         runtime.closeSession(host, session)
         if (mine != epoch) return@act
-        if (state.value.sessionId == session) retire()
+        if (state.value.sessionId == session) {
+            retire()
+            save { it.copy(activeTerminal = null) }
+        }
         refresh(host)
         mutable.update { it.copy(panel = true) }
     }
     fun removeHost(host: String) = act {
         if (state.value.hostId == host) retire()
-        save { saved -> saved.copy(hosts = saved.hosts.filterNot { it.id == host }, recent = saved.recent?.takeUnless { it.host == host }) }
+        save { saved -> saved.copy(hosts = saved.hosts.filterNot { it.id == host }, recent = saved.recent?.takeUnless { it.host == host },
+            activeTerminal = saved.activeTerminal?.takeUnless { it.host == host }) }
         runtime.forgetHost(host)
         mutable.update { it.copy(route = Route.Home, hostId = null, sessionId = null, sessions = emptyList()) }
     }
@@ -366,10 +433,14 @@ internal class AppRepository(context: Context, val runtime: NativeRuntime, priva
         return mine
     }
     fun goHome() {
+        restoreConsumed = true
         uploads.retire()
         ++epoch
-        mutable.update { it.copy(route = Route.Home) }
+        mutable.update { it.copy(route = Route.Home, connecting = false, restoringSession = false) }
         scope.launch {
+            if (state.value.initialized) {
+                try { save { it.copy(activeTerminal = null) } } catch (error: Exception) { report(error) }
+            } else clearRecoveryOnLoad = true
             if (retire() != epoch) return@launch
             mutable.update { it.copy(route = Route.Home, hostId = null, sessionId = null, panel = false, error = null, busy = operation?.isActive == true) }
         }
