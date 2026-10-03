@@ -351,7 +351,7 @@ jobs:
           overwrite: true
           retention-days: 7
       - name: Evidence boundary
-        run: echo 'Build, lint and packaging checks only. The JVM test task currently has no separate test sources; native runtime and touch acceptance run on the local arm64 emulator and Xiaomi device.' >> "$GITHUB_STEP_SUMMARY"
+        run: echo 'Build, lint, JVM policy tests and packaging checks only. Native runtime, lifecycle and touch acceptance are recorded separately in docs/verification/session-continuity.md; emulator results do not replace phone, physical-network or signed-upgrade acceptance.' >> "$GITHUB_STEP_SUMMARY"
 
   candidate:
     name: Assemble the exact release candidate
