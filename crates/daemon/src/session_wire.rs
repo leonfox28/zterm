@@ -22,7 +22,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::sync::{mpsc, oneshot};
 #[cfg(unix)]
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 #[cfg(unix)]
 use zeroize::Zeroizing;
 #[cfg(unix)]
@@ -624,7 +624,7 @@ impl SessionWireServer {
         let reader_attachment = Arc::clone(&attachment);
         let reader_server = self.clone();
         let reader_context = context.clone();
-        let mut reader_task = tokio::spawn(async move {
+        let reader_task = tokio::spawn(async move {
             attachment_reader(
                 reader,
                 first.decoder,
@@ -642,7 +642,7 @@ impl SessionWireServer {
         let writer_attachment = Arc::clone(&attachment);
         let writer_server = self.clone();
         let writer_context = context.clone();
-        let mut writer_task = tokio::spawn(async move {
+        let writer_task = tokio::spawn(async move {
             attachment_writer(
                 writer,
                 writer_server,
@@ -654,35 +654,8 @@ impl SessionWireServer {
             .await
         });
 
-        let result = tokio::select! {
-            biased;
-            result = &mut reader_task => {
-                writer_task.abort();
-                flatten_attachment_task(result)
-            }
-            result = &mut writer_task => {
-                let writer_result = flatten_attachment_task(result);
-                if writer_result.as_ref().is_err_and(|error| {
-                    error.kind() == DomainErrorKind::DaemonStopped
-                }) {
-                    // A peer can send an explicit detach and close its read
-                    // half while a revision-only terminal update is already
-                    // writable. Give the reader its bounded opportunity to
-                    // classify the queued detach/EOF before treating the write
-                    // failure as authoritative transport loss.
-                    match tokio::time::timeout(limits.operation_timeout, &mut reader_task).await {
-                        Ok(result) => flatten_attachment_task(result),
-                        Err(_) => {
-                            reader_task.abort();
-                            writer_result
-                        }
-                    }
-                } else {
-                    reader_task.abort();
-                    writer_result
-                }
-            }
-        };
+        let result =
+            finish_attachment_tasks(reader_task, writer_task, limits.operation_timeout).await;
         let transport_loss = should_move_remote_resume_checkpoint(context.is_remote(), &result);
         if transport_loss {
             let attachment_worker = Arc::clone(&attachment);
@@ -931,6 +904,45 @@ enum AttachmentTaskEnd {
     Explicit,
     TransportEof,
     Terminal,
+    ReaderClosed,
+}
+
+#[cfg(unix)]
+async fn finish_attachment_tasks(
+    mut reader_task: JoinHandle<Result<AttachmentTaskEnd, DaemonError>>,
+    mut writer_task: JoinHandle<Result<AttachmentTaskEnd, DaemonError>>,
+    operation_timeout: Duration,
+) -> Result<AttachmentTaskEnd, DaemonError> {
+    tokio::select! {
+        biased;
+        result = &mut reader_task => {
+            writer_task.abort();
+            flatten_attachment_task(result)
+        }
+        result = &mut writer_task => {
+            let writer_result = flatten_attachment_task(result);
+            let reader_closed = matches!(&writer_result, Ok(AttachmentTaskEnd::ReaderClosed));
+            if reader_closed || writer_result.as_ref().is_err_and(|error| {
+                error.kind() == DomainErrorKind::DaemonStopped
+            }) {
+                // Dropping the reader's outbound sender can wake the writer
+                // before the reader JoinHandle publishes its result. Only the
+                // reader knows whether that end was EOF, detach or a protocol
+                // error. A concurrent write failure also gives queued detach/EOF
+                // the same bounded opportunity to finish classification.
+                match tokio::time::timeout(operation_timeout, &mut reader_task).await {
+                    Ok(result) => flatten_attachment_task(result),
+                    Err(_) => {
+                        reader_task.abort();
+                        if reader_closed { Err(attachment_cancelled()) } else { writer_result }
+                    }
+                }
+            } else {
+                reader_task.abort();
+                writer_result
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1470,7 +1482,7 @@ where
             biased;
             message = outbound.recv() => {
                 let Some(message) = message else {
-                    return Ok(AttachmentTaskEnd::Terminal);
+                    return Ok(AttachmentTaskEnd::ReaderClosed);
                 };
                 write_attachment_bytes_until(
                     &mut writer,
@@ -3117,6 +3129,42 @@ mod tests {
         .await
         .expect("reaping one response recovers one outbound slot");
         assert_eq!(receiver.len(), ATTACHMENT_OUTBOUND_CAPACITY);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn writer_observing_reader_close_preserves_the_readers_result() {
+        for expected in [
+            Ok(AttachmentTaskEnd::TransportEof),
+            Ok(AttachmentTaskEnd::Explicit),
+            Err(DomainErrorKind::MalformedFrame),
+        ] {
+            let reader = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                expected.map_err(|kind| DaemonError::new(kind, "reader fixture failure"))
+            });
+            let writer = tokio::spawn(async { Ok(AttachmentTaskEnd::ReaderClosed) });
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            assert!(writer.is_finished(), "force the writer to finish first");
+            assert!(!reader.is_finished(), "reader has not published its result");
+
+            let result = finish_attachment_tasks(reader, writer, Duration::from_secs(1)).await;
+            assert_eq!(
+                result.as_ref().copied().map_err(DaemonError::kind),
+                expected
+            );
+            assert_eq!(
+                should_move_remote_resume_checkpoint(true, &result),
+                expected == Ok(AttachmentTaskEnd::TransportEof),
+                "only the authenticated reader's clean EOF retains the checkpoint",
+            );
+        }
+
+        let reader = tokio::spawn(std::future::pending());
+        let writer = tokio::spawn(async { Ok(AttachmentTaskEnd::ReaderClosed) });
+        let error = finish_attachment_tasks(reader, writer, Duration::from_secs(1))
+            .await
+            .expect_err("a stalled reader cannot turn queue closure into successful termination");
+        assert_eq!(error.kind(), DomainErrorKind::Cancelled);
     }
 
     #[tokio::test]

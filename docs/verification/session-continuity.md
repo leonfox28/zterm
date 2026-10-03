@@ -80,6 +80,21 @@ Android 撤销通知权限会结束正在运行的应用进程，因此权限矩
 `android-ime-contact-sheet.png`，新设置截图为 `android-background-settings.png`。
 这些本机构建产物未纳入 Git。
 
+## 合并前 CI 复核（2026-10-03）
+
+[PR #59 的首轮 CI](https://github.com/leonfox28/zterm/actions/runs/37088152247)
+中，Linux x64/arm64、Android、策略、依赖和 Relay 检查通过，macOS 的既有
+`authenticated_duplex_eof_moves_checkpoint_but_explicit_and_protocol_end_do_not`
+暴露结束任务的竞争：reader 释放响应队列后、JoinHandle 发布结果前，writer 可能
+先把队列关闭报告为普通终端结束，导致原有协议错误丢失，正常 EOF 的恢复记录也
+可能被丢弃。
+
+现在 writer 仅报告 reader 已关闭队列，由共同的结束协调逻辑在原有 deadline 内
+取得 reader 的实际结果。新增虚拟时间回归强制 writer 先结束，分别验证正常 EOF、
+主动 detach、协议错误及 reader 超时；只有经过认证的正常 EOF 能保留恢复记录。
+未放宽超时或修改操作去重规则。本地 daemon lib 的 182 项测试通过，另 1 项显式
+忽略，包括新增回归及首轮 CI 失败的用例；Workspace Clippy（warnings denied）通过。
+
 ## 尚未关闭的发布验收
 
 | 范围 | 剩余判据 |
