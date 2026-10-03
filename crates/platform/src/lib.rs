@@ -2,6 +2,8 @@
 
 pub mod account;
 #[cfg(unix)]
+pub mod autostart;
+#[cfg(unix)]
 pub mod diagnostics;
 #[cfg(unix)]
 pub mod local_unix;

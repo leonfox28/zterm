@@ -477,6 +477,79 @@ impl LocalRuntime {
         }
     }
 
+    /// Configures future login only; setup and the lifetime daemon lock stay unchanged.
+    pub async fn autostart_enable(&self) -> Result<String, DaemonError> {
+        #[cfg(unix)]
+        {
+            let owner = self.autostart_owner()?;
+            crate::bootstrap::validate_committed_setup(&self.paths)?;
+            let _lock = acquire_lifecycle_lock(&self.paths, Instant::now()).await?;
+            crate::bootstrap::validate_committed_setup(&self.paths)?;
+            owner
+                .enable(self.launcher.executable())
+                .map_err(autostart_error)?;
+            Ok(
+                "Daemon autostart enabled for future logins. The current daemon is unchanged.\n"
+                    .into(),
+            )
+        }
+        #[cfg(not(unix))]
+        Err(unsupported_command_platform())
+    }
+
+    /// Cancels future login startup without stopping the current daemon or Sessions.
+    pub async fn autostart_disable(&self) -> Result<String, DaemonError> {
+        #[cfg(unix)]
+        {
+            let owner = self.autostart_owner()?;
+            // Do not create state on an unconfigured account merely to disable.
+            let _lock = if managed_root_exists(&self.paths)? {
+                Some(acquire_lifecycle_lock(&self.paths, Instant::now()).await?)
+            } else {
+                None
+            };
+            owner.disable().map_err(autostart_error)?;
+            Ok(
+                "Daemon autostart disabled. The current daemon and Sessions are unchanged.\n"
+                    .into(),
+            )
+        }
+        #[cfg(not(unix))]
+        Err(unsupported_command_platform())
+    }
+
+    /// Reads login registration and setup without starting or creating anything.
+    pub fn autostart_status(&self) -> Result<String, DaemonError> {
+        #[cfg(unix)]
+        {
+            let status = self
+                .autostart_owner()?
+                .status(self.launcher.executable())
+                .map_err(autostart_error)?;
+            if status.contains(": enabled") {
+                crate::bootstrap::validate_committed_setup(&self.paths)?;
+            }
+            Ok(status)
+        }
+        #[cfg(not(unix))]
+        Err(unsupported_command_platform())
+    }
+
+    #[cfg(unix)]
+    fn autostart_owner(&self) -> Result<zterm_platform::autostart::Autostart, DaemonError> {
+        zterm_platform::autostart::Autostart::current(&self.paths)
+            .map_err(|detail| DaemonError::new(DomainErrorKind::UnsupportedPlatform, detail))
+    }
+
+    #[cfg(unix)]
+    fn remove_autostart(&self) -> Result<(), DaemonError> {
+        // Unsupported hosts cannot have a native registration created by zterm.
+        if let Some(owner) = zterm_platform::autostart::Autostart::for_cleanup(&self.paths) {
+            owner.remove_after_stop().map_err(autostart_error)?;
+        }
+        Ok(())
+    }
+
     /// Validates or creates setup and explicitly ensures one daemon.
     pub async fn setup(&self, requested: &ValidatedConfig) -> Result<BootstrapResult, DaemonError> {
         setup_and_ensure(&self.paths, requested, &self.launcher).await
@@ -1069,6 +1142,8 @@ impl LocalRuntime {
     ) -> Result<IdentityResetResult, DaemonError> {
         let preflight = self.identity_reset_preflight().await?;
         if !preflight.state_present {
+            #[cfg(unix)]
+            self.remove_autostart()?;
             return Ok(IdentityResetResult {
                 removed: false,
                 previous_device_id: None,
@@ -1128,6 +1203,7 @@ impl LocalRuntime {
                     ));
                 }
             }
+            self.remove_autostart()?;
             zterm_platform::user_state::remove_managed_state_root(&self.paths, &lifecycle)
                 .map_err(|error| {
                     DaemonError::new(DomainErrorKind::PathUnsafe, error.to_string())
@@ -1871,11 +1947,11 @@ fn inspect_local_ipc(paths: &UserPaths, daemon_running: bool) -> DoctorCheck {
 const fn lifecycle_limitation() -> &'static str {
     #[cfg(target_os = "linux")]
     {
-        "1.0 has no boot/login autostart; systemd-logind may end the daemon after logout unless the host keeps user processes"
+        "login autostart is opt-in via zterm daemon autostart; no linger is enabled; logout may end user processes"
     }
     #[cfg(not(target_os = "linux"))]
     {
-        "1.0 has no boot/login autostart; setup/restart starts the daemon on demand"
+        "login autostart is opt-in via zterm daemon autostart; setup/restart also starts on demand"
     }
 }
 
@@ -1968,6 +2044,11 @@ async fn wait_until_stopped(paths: &UserPaths) -> Result<(), DaemonError> {
 
 fn log_error(error: std::io::Error) -> DaemonError {
     DaemonError::new(DomainErrorKind::PathUnsafe, error.to_string())
+}
+
+#[cfg(unix)]
+fn autostart_error(detail: String) -> DaemonError {
+    DaemonError::new(DomainErrorKind::PathUnsafe, detail)
 }
 
 #[cfg(test)]

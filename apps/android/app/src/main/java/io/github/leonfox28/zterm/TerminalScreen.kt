@@ -93,7 +93,7 @@ import io.github.leonfox28.zterm.nativebridge.NativeSession
                     val title = stringResource(when {
                         state.busy -> R.string.connecting
                         canTakeover -> if (terminalState == "lease_lost") R.string.lease_lost else R.string.session_occupied
-                        terminalState == "ended" || error == "session_ended" -> R.string.session_ended
+                        terminalState == "ended" || error in setOf("session_ended", "session_not_found") -> R.string.session_ended
                         else -> R.string.connection_failed_title
                     })
                     val body = if (state.busy) stringResource(R.string.connection_pending_body, host?.name ?: "zterm")

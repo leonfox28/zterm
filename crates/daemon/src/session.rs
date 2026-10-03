@@ -4015,12 +4015,18 @@ fn takeover(
     if owner != principal {
         return Err(principal_mismatch());
     }
-    if continuation
-        && runtime
-            .controller
-            .is_some_and(|controller| controller.attachment_id == attachment_id)
+    if runtime
+        .controller
+        .is_some_and(|controller| controller.attachment_id == attachment_id)
     {
+        // The previous controller can detach before an explicit takeover's
+        // attach request arrives. That attach then reserves the vacant lease.
+        // Once its snapshot is applied, committing takeover is a no-op, not a
+        // synchronization failure. Retain the operation key for reconnect replay.
         require_existing_visual_sync_controller(runtime, attachment_id)?;
+        if !continuation {
+            runtime.controller_operation = Some(operation_key);
+        }
         return Ok(());
     }
     let prepared = runtime

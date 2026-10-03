@@ -35,7 +35,8 @@ A saved host or recent card restores its remembered Session when it is still
 live. If it has ended (including after a daemon restart), the app checks the
 host's live Sessions: one available Session opens directly, multiple or occupied
 Sessions offer selection, and an empty host opens a new default `main`. The
-terminal's Retry button follows the same rule. An ended terminal remains ended
+terminal's Retry button follows the same rule for these explicit host entries
+(automatic process restoration uses the exact-ID rule described below). An ended terminal remains ended
 until you retry or enter the host again. Taking over another controller still
 requires confirmation. Tap the terminal title to expand the
 Session list. Each row offers Rename and Delete; confirmed deletion ends its
@@ -59,8 +60,10 @@ controller's measured rows and columns after synchronization. Terminal programs
 can redraw and wrapped output can reflow; the shell process and Session ID remain.
 The eight shortcut keys remain visible above the system IME. The four direction
 arrows use the same 18 dp vector size and stroke as the upload and keyboard icons;
-Esc, Tab, Ctrl and Alt remain text labels. Keyboard animation pans/clips locally and submits
-one final terminal size after the animation settles.
+Esc, Tab, Ctrl and Alt remain text labels. Keyboard animation pans/clips locally.
+When Android supplies the animation endpoint, the client submits that target
+size early; the settled layout corrects it if necessary. Unknown endpoints use
+the final measurement.
 
 The first two toolbar buttons are **Upload image** (photo icon) and **Upload file**
 (paperclip icon). Each opens its system picker directly, with one selection per
@@ -93,10 +96,35 @@ existing selected text can still be copied, while unsafe extension stops.
 
 Settings independently choose system/Chinese/English, system/dark/light and
 text size through a horizontal 8–16 sp slider in steps of 1 (default 12). Remote program text and explicit terminal colors are preserved.
-Backgrounding keeps a healthy application-owned connection on a best-effort
-basis. Android can suspend or stop background apps; there is no foreground
-service or wake lock. Actual disconnection suspends input rather than replaying
-typed commands later. Phone-specific background behavior needs device acceptance.
+Settings → **Keep connected in background** is off by default and persists across
+updates. Enabling it starts a `connectedDevice` foreground service while the app
+is visible and connecting to, or maintaining, a terminal. The Application still
+owns the existing connection and reconnect logic. An independent low-importance
+notification shows connection state and offers **Return to terminal** and
+**Disconnect**. Disconnect detaches the client; the remote Session keeps running.
+Going Home, Session end or loss of control stops the service. Turning the setting
+off stops only the service and leaves a foreground terminal connected.
+
+Notification permission denial does not prevent terminal use or service startup.
+Settings separately reports whether Android will show the connection notification.
+The service is not sticky, has no boot receiver and never repeatedly restarts
+itself after system termination. There is no wake lock; Android and device power
+policy may still suspend or stop the app. Actual disconnection suspends input
+rather than replaying typed commands later.
+
+After process termination, opening the app restores the last active terminal by
+its exact host and Session ID, regardless of the background setting. This automatic
+path never creates a default Session or silently takes control. An ended or occupied
+Session offers the Session picker, exact-ID Retry or confirmed Take over. Explicit
+Home/Disconnect clears the active record; recent connections remain available.
+The ordinary host/recent entry retains the selection behavior described above.
+Activity recreation keeps the Application connection instead of attaching again.
+Old saved files default to background disabled and no active restoration record.
+
+These choices follow the [connected-device service requirements](https://developer.android.com/develop/background-work/services/fgs/service-types)
+and [notification permission rules](https://developer.android.com/develop/ui/compose/notifications/notification-permission).
+Emulator results and outstanding phone/network acceptance are recorded separately
+in [session continuity verification](verification/session-continuity.md).
 
 ## Terminal notifications
 
@@ -109,8 +137,9 @@ message; OSC 777 preserves title and body. Tapping opens the app.
 Permission denial or a disabled channel skips notifications without affecting
 terminal use. Disconnecting drops pending requests; neither reconnection nor a
 later permission grant replays them. Activity recreation does not duplicate
-notifications. Background receipt uses the existing connection lifetime: no
-foreground service, push or delivery after process termination is added.
+notifications. Background receipt uses the existing connection lifetime, optionally extended by
+the background connection service. Terminal program notifications and connection
+status use separate channels. There is no push or delivery after process termination.
 
 ## Build and test
 

@@ -33,7 +33,7 @@ async fn help_version_status_doctor_logs_and_stop_never_spawn() {
         .get_subcommands()
         .map(|command| command.get_subcommands().count().max(1))
         .sum();
-    assert_eq!(operation_count, 20);
+    assert_eq!(operation_count, 21);
     let logs_command = definition.find_subcommand("logs").expect("logs command");
     assert!(logs_command.find_subcommand("export").is_some());
     assert!(logs_command.find_subcommand("debug").is_some());
@@ -181,4 +181,71 @@ async fn run<const N: usize>(runtime: &LocalRuntime, arguments: [&str; N]) -> St
     .expect("inspection succeeds")
     .into_text()
     .expect("inspection returns ordinary text")
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn autostart_requires_setup_never_launches_and_reset_cleans_registration() {
+    use zterm_daemon::bootstrap::bootstrap;
+    use zterm_daemon::config::{ValidatedInfrastructure, validate_setup_input};
+    let state = TestState::new();
+    let executable = std::env::current_exe().expect("test executable");
+    let runtime = LocalRuntime::for_test(
+        state.paths.clone(),
+        DaemonLauncher::for_test(executable, "--must-not-run".into()),
+    );
+    let status = Cli::try_parse_from(["zterm", "daemon", "autostart", "status"]).expect("parse");
+    assert!(!status.records_diagnostics());
+    assert!(
+        execute(status, &runtime, InteractionMode::NonInteractive)
+            .await
+            .is_ok()
+    );
+    assert!(!state.paths.state_root().exists());
+    assert!(runtime.autostart_enable().await.is_err());
+    assert!(!state.paths.state_root().exists());
+    runtime.autostart_disable().await.expect("disable absent");
+    let config = validate_setup_input("autostart-fixture", ValidatedInfrastructure::OfficialN0)
+        .expect("config");
+    let setup = bootstrap(&state.paths, &config).expect("setup without launch");
+    for _ in 0..2 {
+        runtime.autostart_enable().await.expect("enable");
+    }
+    assert!(
+        runtime
+            .autostart_status()
+            .expect("status")
+            .contains("enabled")
+    );
+    assert!(!state.paths.socket().exists());
+    for _ in 0..2 {
+        runtime.autostart_disable().await.expect("disable");
+    }
+    runtime.autostart_enable().await.expect("enable for reset");
+    runtime
+        .reset_identity(Some(setup.device_id), true)
+        .await
+        .expect("reset");
+    assert!(
+        runtime
+            .autostart_status()
+            .expect("status after reset")
+            .contains("disabled")
+    );
+    assert!(!state.paths.state_root().exists());
+}
+
+#[test]
+fn foreground_daemon_entry_is_hidden_and_exclusive() {
+    let cli = Cli::try_parse_from(["zterm", "--internal-daemon-foreground"]).expect("parse");
+    assert!(cli.internal_daemon_foreground());
+    assert!(cli.has_internal_entry());
+    for other in [
+        "--internal-daemon",
+        "--internal-update",
+        "--internal-release-self-check",
+        "status",
+    ] {
+        assert!(Cli::try_parse_from(["zterm", "--internal-daemon-foreground", other]).is_err());
+    }
 }

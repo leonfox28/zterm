@@ -18,13 +18,15 @@ class IdentityStoreTest {
         val file = File(directory, "state.json")
         val old = org.json.JSONObject(file.readText())
         old.remove("updateReminder")
+        old.remove("activeTerminal")
         old.getJSONObject("preferences").apply {
-            remove("notificationsEnabled"); remove("notificationPermissionRequested")
+            remove("notificationsEnabled"); remove("notificationPermissionRequested"); remove("keepBackgroundConnection")
         }
         file.writeText(old.toString())
         assertEquals(original, store.load())
         val saved = original.copy(preferences = original.preferences.copy(notificationsEnabled = false,
-            notificationPermissionRequested = true), updateReminder = UpdateReminder("0.2.0", 100_000))
+            notificationPermissionRequested = true, keepBackgroundConnection = true), updateReminder = UpdateReminder("0.2.0", 100_000),
+            activeTerminal = RecentConnection(host.id, host.lastSession!!))
         store.save(saved)
         val reopened = AppStore(InstrumentationRegistry.getInstrumentation().targetContext, directory, alias)
         assertEquals(saved, reopened.load())
